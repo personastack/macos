@@ -2,6 +2,12 @@
 
 All notable changes follow semantic versioning.
 
+## [0.1.1] - 2026-09-15
+
+### Fixed
+
+- Build the application icon from a source asset bundled in this repository so release runners can package the installer from a clean checkout.
+
 ## [0.1.0] - 2026-09-15
 
 ### Added

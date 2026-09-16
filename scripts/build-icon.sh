@@ -2,7 +2,7 @@
 set -eu
 
 root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-source_png="$root_dir/../art/personastack-512.png"
+source_png="$root_dir/Resources/AppIcon-source.png"
 iconset_dir="$root_dir/build/AppIcon.iconset"
 output="$root_dir/Resources/AppIcon.icns"
 
