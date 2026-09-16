@@ -11,6 +11,7 @@ struct PersonaStackApp: App {
             PersonaStackWebView(url: URL(string: "https://my.personastack.ai/user/personas")!)
                 .frame(minWidth: 1024, minHeight: 700)
                 .background(WindowPresentationConfigurator())
+                .ignoresSafeArea(.container, edges: .top)
         }
         .defaultSize(width: 1440, height: 960)
         .windowStyle(.hiddenTitleBar)
