@@ -25,6 +25,10 @@ arm64_binary=$(find "$arm64_build_dir" -type f -name PersonaStack -perm -111 -pr
 x86_64_binary=$(find "$x86_64_build_dir" -type f -name PersonaStack -perm -111 -print -quit)
 test -n "$arm64_binary"
 test -n "$x86_64_binary"
+arm64_helper=$(find "$arm64_build_dir" -type f -name PersonaStackLocalSession -perm -111 -print -quit)
+x86_64_helper=$(find "$x86_64_build_dir" -type f -name PersonaStackLocalSession -perm -111 -print -quit)
+test -n "$arm64_helper"
+test -n "$x86_64_helper"
 
 rm -rf "$bundle_dir" "$staging_dir"
 mkdir -p "$bundle_dir/Contents/MacOS" "$bundle_dir/Contents/Resources" "$staging_dir"
@@ -32,9 +36,11 @@ lipo -create \
   "$arm64_binary" \
   "$x86_64_binary" \
   -output "$bundle_dir/Contents/MacOS/PersonaStack"
+lipo -create "$arm64_helper" "$x86_64_helper" -output "$bundle_dir/Contents/MacOS/PersonaStackLocalSession"
 cp "$root_dir/Resources/Info.plist" "$bundle_dir/Contents/Info.plist"
 cp "$root_dir/Resources/AppIcon.icns" "$bundle_dir/Contents/Resources/AppIcon.icns"
 chmod 755 "$bundle_dir/Contents/MacOS/PersonaStack"
+chmod 755 "$bundle_dir/Contents/MacOS/PersonaStackLocalSession"
 plutil -replace CFBundleShortVersionString -string "$version" "$bundle_dir/Contents/Info.plist"
 
 cp -R "$bundle_dir" "$staging_dir/"

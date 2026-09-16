@@ -51,6 +51,7 @@ struct PersonaStackWebView: NSViewRepresentable {
         configuration.preferences.isFraudulentWebsiteWarningEnabled = true
         configuration.userContentController.add(context.coordinator, name: "personastackConcern")
         configuration.userContentController.addScriptMessageHandler(ChatWindowManager.shared, contentWorld: .page, name: "personastackChat")
+        configuration.userContentController.addScriptMessageHandler(LocalSessionManager.shared, contentWorld: .page, name: "personastackLocalSession")
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.allowsBackForwardNavigationGestures = true
@@ -58,6 +59,7 @@ struct PersonaStackWebView: NSViewRepresentable {
         webView.uiDelegate = context.coordinator
         context.coordinator.webView = webView
         ChatWindowManager.shared.register(webView, appURL: url)
+        LocalSessionManager.shared.register(webView, appURL: url)
         context.coordinator.requestNotificationAuthorization()
         context.coordinator.start(url)
         return webView
@@ -119,6 +121,7 @@ struct PersonaStackWebView: NSViewRepresentable {
             if webView === self.webView, navigationAction.targetFrame?.isMainFrame == true,
                ["/login", "/logout"].contains(url.path) {
                 ChatWindowManager.shared.invalidateSession()
+                LocalSessionManager.shared.invalidateSession()
             }
 
             if navigationAction.targetFrame == nil {

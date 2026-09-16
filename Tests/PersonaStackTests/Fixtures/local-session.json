@@ -1,0 +1,24 @@
+{
+  "persona_id": "persona-a",
+  "persona_name": "Local persona",
+  "workspace_id": "ws_11111111111111111111111111111111",
+  "harness": "codex",
+  "issued_at": "2026-09-16T00:00:00Z",
+  "expires_at": "2027-09-16T00:00:00Z",
+  "mcp_url": "https://mcp.personastack.ai/v1/mcp",
+  "bearer_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "persona_prompt": "Help with the task.",
+  "skills": [
+    {
+      "skill_id": "skill-fixture",
+      "slug": "fixture",
+      "digest": "sha256:e2bcc87ef9fa7a0528faef32625b0f9ccd0fa512b7ee2d9d55bc875eb27b8bfc",
+      "files": [
+        {
+          "relative_path": "SKILL.md",
+          "content": "---\nname: fixture\ndescription: Producer fixture\n---\nFollow the fixture.\n"
+        }
+      ]
+    }
+  ]
+}
