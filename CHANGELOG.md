@@ -2,6 +2,12 @@
 
 All notable changes follow semantic versioning.
 
+## [0.1.4] - 2026-09-15
+
+### Changed
+
+- Hide the window title bar while retaining the standard macOS close, minimize, and full-screen controls.
+
 ## [0.1.3] - 2026-09-15
 
 ### Added

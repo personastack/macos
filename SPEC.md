@@ -27,6 +27,10 @@ PersonaStack for macOS presents `https://my.personastack.ai` in a dedicated nati
 - Post a generic native notification when a new concern arrives while the app is running.
 - Do not pass concern text, concern IDs, workspace IDs, user IDs, credentials, or other product data through the bridge.
 
+## Version 0.1.4 behavior
+
+- Use a hidden native title bar so hosted content fills the window beneath the standard close, minimize, and full-screen controls.
+
 ## Distribution
 
 Version 0.1.0 is an unsigned universal macOS disk image. A GitHub release publishes the immutable `PersonaStack-<version>-unsigned.dmg` installer for each `v*` tag.

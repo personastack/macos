@@ -12,6 +12,7 @@ struct PersonaStackApp: App {
                 .frame(minWidth: 1024, minHeight: 700)
         }
         .defaultSize(width: 1440, height: 960)
+        .windowStyle(.hiddenTitleBar)
     }
 }
 
