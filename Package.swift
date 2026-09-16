@@ -12,5 +12,6 @@ let package = Package(
         .target(name: "PersonaStackCore"),
         .executableTarget(name: "PersonaStack", dependencies: ["PersonaStackCore"]),
         .executableTarget(name: "PersonaStackPolicyCheck", dependencies: ["PersonaStackCore"]),
+        .testTarget(name: "PersonaStackTests", dependencies: ["PersonaStackCore", "PersonaStack"]),
     ]
 )

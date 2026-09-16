@@ -24,6 +24,8 @@
   <string>14.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Record audio attachments when you choose the microphone in persona chat.</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
 </dict>

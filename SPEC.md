@@ -34,6 +34,19 @@ PersonaStack for macOS presents a selected PersonaStack web surface in a dedicat
 
 - Use a transparent full-size native title bar so hosted content fills the window beneath the standard close, minimize, and full-screen controls.
 
-## Distribution
+## Floating persona chat
+
+- The hosted page detects the reply-capable `personastackChat` handler. Its existing Chat buttons open one ordinary native window per persona instead of the browser dock.
+- Each window loads `/user/personas/chat/desktop-popout?persona_id=…` at the configured app origin. It shares the default WebKit data store. Native code never reads transcripts or calls chat APIs.
+- The title bar and native buttons are hidden. Public AppKit transparency and a public layer mask expose transparent corners. The chat card remains readable. Collapsing resizes the same web view to a 72-point window containing a 64-point avatar.
+- The hosted minus button miniaturizes to the Dock. Pin toggles `.normal` and `.floating` for that window. Avatar click collapses or expands. Avatar/header drag moves the window. Expansion preserves the expanded size at the avatar's current location and clamps to the screen.
+- Web X and Cmd-W use the hosted API-backed close flow. Failed closes keep the chat visible. Navigation errors, denied loads, login/logout navigation, and changed hosted presentation scope dispose stale windows. Same-scope main-page navigation preserves them.
+- Main bridge messages have version `1`, action `sync` with an opaque hosted storage `scope`, or `open_persona_chat` with that scope and `persona_id`. Scope is an in-memory invalidation key, never an authorization source.
+- Popout bridge messages use version `1` and only `minimize`, `close`, `collapse`, `expand`, `pin`, or `drag` with finite bounded `dx`/`dy` numbers. Reject extra keys, unregistered web views, child frames, and origins other than the configured app origin.
+- Window geometry, pinning, and the persona-window map are ephemeral. No launch restoration, all-Spaces mode, native message storage, new authentication flow, or independent stream is added.
+- Run focused native checks with `swift test --disable-xctest`. Tests use Swift Testing and in-process AppKit windows without network loads.
+- Explicit hosted/native acceptance uses the sibling web repository: build its TypeScript assets, then run `node scripts/desktop-chat-fixture.mjs`. Set `PERSONASTACK_CHAT_FIXTURE_URL` to its printed loopback URL and run `swift test --disable-xctest --filter HostedChatSmokeTests` in this repository. The fixture uses fake messages. This lane is skipped by ordinary tests and never contacts the PersonaStack API.
+
+## Installer distribution
 
 Each semantic version is an unsigned universal macOS disk image. A private GitHub release retains the immutable `PersonaStack-<version>-unsigned.dmg` installer. The release workflow copies the same DMG into a versioned public `personastack/homebrew-tap` Git tag and updates the `personastack` cask. Homebrew installs it with `brew install --cask personastack/tap/personastack`.
