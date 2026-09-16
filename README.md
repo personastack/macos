@@ -43,7 +43,7 @@ swift run PersonaStackPolicyCheck
 
 ## Release
 
-Tag a semantic version such as `v0.1.0`. The release workflow builds the unsigned disk image, attaches it to the private GitHub release, publishes it to the public Homebrew tap release, and updates the cask. The repository needs a `HOMEBREW_TAP_TOKEN` secret with write access to `personastack/homebrew-tap`.
+Tag a semantic version such as `v0.1.0`. The release workflow builds the unsigned disk image, attaches it to the private GitHub release, copies it to a versioned public Homebrew tap tag, and updates the cask. The repository needs a `HOMEBREW_TAP_TOKEN` secret with write access to `personastack/homebrew-tap`.
 
 ## Security boundary
 

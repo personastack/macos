@@ -12,7 +12,7 @@ cask "personastack" do
   version "$version"
   sha256 "$sha256"
 
-  url "https://github.com/personastack/homebrew-tap/releases/download/v#{version}/PersonaStack-#{version}-unsigned.dmg"
+  url "https://raw.githubusercontent.com/personastack/homebrew-tap/desktop-v#{version}/Downloads/PersonaStack-#{version}-unsigned.dmg"
   name "PersonaStack"
   desc "Native macOS client for PersonaStack"
   homepage "https://my.personastack.ai"
