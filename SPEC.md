@@ -18,6 +18,7 @@ PersonaStack for macOS presents a selected PersonaStack web surface in a dedicat
 - Persist site data in the app's default WebKit data store.
 - Keep Personastack-origin navigation in the app.
 - Open user-selected external links and new windows in the default browser.
+- Keep `https://accounts.google.com` OAuth popups in a native child window so Google Sign-In can return to the embedded app.
 - Allow automated top-level redirects to preserve existing OAuth callback flows.
 - Download non-displayable responses to the user's Downloads directory.
 - Expose no native JavaScript bridge, local API, credentials, or direct PersonaStack service connection.

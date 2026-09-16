@@ -2,6 +2,12 @@
 
 All notable changes follow semantic versioning.
 
+## [0.1.10] - 2026-09-15
+
+### Fixed
+
+- Complete Google Sign-In popups inside the desktop app.
+
 ## [0.1.9] - 2026-09-15
 
 ### Changed

@@ -17,6 +17,10 @@ public enum NavigationPolicy {
         return appHosts.contains(host) || host.hasSuffix(".personastack.ai")
     }
 
+    public static func isGoogleOAuthURL(_ url: URL) -> Bool {
+        url.scheme?.lowercased() == "https" && url.host?.lowercased() == "accounts.google.com"
+    }
+
     public static func shouldOpenInDefaultBrowser(_ url: URL, linkWasUserActivated: Bool, appURL: URL? = nil) -> Bool {
         linkWasUserActivated && !keepsInApp(url, appURL: appURL)
     }

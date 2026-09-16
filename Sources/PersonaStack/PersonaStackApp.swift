@@ -67,6 +67,7 @@ struct PersonaStackWebView: NSViewRepresentable {
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler, UNUserNotificationCenterDelegate {
         weak var webView: WKWebView?
         let appURL: URL
+        private var popupWindows: [ObjectIdentifier: NSWindow] = [:]
 
         init(appURL: URL) {
             self.appURL = appURL
@@ -113,7 +114,15 @@ struct PersonaStackWebView: NSViewRepresentable {
                 return .cancel
             }
 
-            if navigationAction.targetFrame == nil || NavigationPolicy.shouldOpenInDefaultBrowser(
+            if navigationAction.targetFrame == nil {
+                if NavigationPolicy.isGoogleOAuthURL(url) {
+                    return .allow
+                }
+                NSWorkspace.shared.open(url)
+                return .cancel
+            }
+
+            if NavigationPolicy.shouldOpenInDefaultBrowser(
                 url,
                 linkWasUserActivated: navigationAction.navigationType == .linkActivated,
                 appURL: appURL
@@ -135,10 +144,32 @@ struct PersonaStackWebView: NSViewRepresentable {
             for navigationAction: WKNavigationAction,
             windowFeatures: WKWindowFeatures
         ) -> WKWebView? {
-            if let url = navigationAction.request.url {
-                NSWorkspace.shared.open(url)
+            guard let url = navigationAction.request.url,
+                  NavigationPolicy.isGoogleOAuthURL(url) else {
+                if let url = navigationAction.request.url {
+                    NSWorkspace.shared.open(url)
+                }
+                return nil
             }
-            return nil
+
+            let popup = WKWebView(frame: .zero, configuration: configuration)
+            popup.navigationDelegate = self
+            popup.uiDelegate = self
+
+            let controller = NSViewController()
+            controller.view = popup
+            let window = NSWindow(contentViewController: controller)
+            window.title = "Sign in with Google"
+            window.setContentSize(NSSize(width: 520, height: 700))
+            window.center()
+            window.makeKeyAndOrderFront(nil)
+            popupWindows[ObjectIdentifier(popup)] = window
+            return popup
+        }
+
+        func webViewDidClose(_ webView: WKWebView) {
+            guard let window = popupWindows.removeValue(forKey: ObjectIdentifier(webView)) else { return }
+            window.close()
         }
 
         func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {

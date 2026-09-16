@@ -16,6 +16,8 @@ let checks = [
     LaunchConfiguration.url(arguments: ["PersonaStack", "--personastack-url", "https://personastack.ericgreer.info/user/personas"]).host == "personastack.ericgreer.info",
     LaunchConfiguration.url(arguments: ["PersonaStack", "--personastack-url", "file:///tmp/test"]) == NavigationPolicy.defaultURL,
     NavigationPolicy.keepsInApp(URL(string: "https://test.example/user/personas")!, appURL: URL(string: "https://test.example")!),
+    NavigationPolicy.isGoogleOAuthURL(URL(string: "https://accounts.google.com/gsi/select")!),
+    !NavigationPolicy.isGoogleOAuthURL(URL(string: "https://google.com/gsi/select")!),
     NavigationPolicy.keepsInApp(URL(string: "https://personastack.ai/privacy")!),
     NavigationPolicy.shouldOpenInDefaultBrowser(URL(string: "https://example.com/docs")!, linkWasUserActivated: true),
     !NavigationPolicy.shouldOpenInDefaultBrowser(URL(string: "https://accounts.google.com/o/oauth2/auth")!, linkWasUserActivated: false),
