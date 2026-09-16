@@ -2,6 +2,12 @@
 
 All notable changes follow semantic versioning.
 
+## [0.1.2] - 2026-09-15
+
+### Fixed
+
+- Discover architecture-specific Swift build products so the installer builds on both local and GitHub macOS toolchains.
+
 ## [0.1.1] - 2026-09-15
 
 ### Fixed

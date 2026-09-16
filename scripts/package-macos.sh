@@ -21,12 +21,16 @@ swift run --package-path "$root_dir" PersonaStackPolicyCheck
 rm -rf "$arm64_build_dir" "$x86_64_build_dir"
 swift build --package-path "$root_dir" --scratch-path "$arm64_build_dir" --triple arm64-apple-macosx14.0 -c "$configuration"
 swift build --package-path "$root_dir" --scratch-path "$x86_64_build_dir" --triple x86_64-apple-macosx14.0 -c "$configuration"
+arm64_binary=$(find "$arm64_build_dir" -type f -name PersonaStack -perm -111 -print -quit)
+x86_64_binary=$(find "$x86_64_build_dir" -type f -name PersonaStack -perm -111 -print -quit)
+test -n "$arm64_binary"
+test -n "$x86_64_binary"
 
 rm -rf "$bundle_dir" "$staging_dir"
 mkdir -p "$bundle_dir/Contents/MacOS" "$bundle_dir/Contents/Resources" "$staging_dir"
 lipo -create \
-  "$arm64_build_dir/out/Products/$product_configuration/PersonaStack" \
-  "$x86_64_build_dir/out/Products/$product_configuration/PersonaStack" \
+  "$arm64_binary" \
+  "$x86_64_binary" \
   -output "$bundle_dir/Contents/MacOS/PersonaStack"
 cp "$root_dir/Resources/Info.plist" "$bundle_dir/Contents/Info.plist"
 cp "$root_dir/Resources/AppIcon.icns" "$bundle_dir/Contents/Resources/AppIcon.icns"
