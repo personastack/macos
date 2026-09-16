@@ -8,7 +8,7 @@ import WebKit
 struct PersonaStackApp: App {
     var body: some Scene {
         WindowGroup("PersonaStack") {
-            PersonaStackWebView(url: URL(string: "https://my.personastack.ai/user/personas")!)
+            PersonaStackWebView(url: NavigationPolicy.defaultURL)
                 .frame(minWidth: 1024, minHeight: 700)
                 .background(WindowPresentationConfigurator())
                 .ignoresSafeArea(.container, edges: .top)

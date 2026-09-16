@@ -2,6 +2,12 @@
 
 All notable changes follow semantic versioning.
 
+## [0.1.8] - 2026-09-15
+
+### Changed
+
+- Open the LAN PersonaStack app at `personastack-ai.lan` for desktop testing.
+
 ## [0.1.7] - 2026-09-15
 
 ### Fixed

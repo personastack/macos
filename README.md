@@ -1,6 +1,6 @@
 # PersonaStack for macOS
 
-PersonaStack for macOS is the native desktop client for [my.personastack.ai](https://my.personastack.ai).
+PersonaStack for macOS is the native desktop client for the LAN PersonaStack app at `http://personastack-ai.lan`.
 
 The app opens the existing hosted PersonaStack control panel in a dedicated macOS window. It keeps the website's authentication, sessions, OAuth callbacks, uploads, downloads, realtime updates, and product behavior intact. It does not duplicate product state or call PersonaStack internal services.
 
@@ -18,14 +18,14 @@ Homebrew downloads the matching `PersonaStack-<version>-unsigned.dmg`. You can a
 
 ## Use
 
-Open PersonaStack from Applications. Sign in at `my.personastack.ai` as usual. The app stores website session data in its own persistent macOS WebKit data store.
+Open PersonaStack from Applications. Sign in at `personastack-ai.lan` as usual. The app stores website session data in its own persistent macOS WebKit data store.
 
 User-selected external links open in the default browser. Existing top-level OAuth redirects remain in the app so the current `my.personastack.ai` callback flows continue to work.
 
 ## Requirements
 
 - macOS 14 Sonoma or later
-- Internet access to `my.personastack.ai`
+- LAN access to `personastack-ai.lan`
 
 ## Build an unsigned installer
 

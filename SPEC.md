@@ -2,7 +2,7 @@
 
 ## Purpose
 
-PersonaStack for macOS presents `https://my.personastack.ai` in a dedicated native macOS application window.
+PersonaStack for macOS presents the LAN `my.personastack.ai` surface at `http://personastack-ai.lan` in a dedicated native macOS application window.
 
 ## Authority
 
@@ -12,7 +12,7 @@ PersonaStack for macOS presents `https://my.personastack.ai` in a dedicated nati
 
 ## Version 0.1.0 behavior
 
-- Start at `/user/personas` on `my.personastack.ai`.
+- Start at `/user/personas` on `personastack-ai.lan`.
 - Persist site data in the app's default WebKit data store.
 - Keep Personastack-origin navigation in the app.
 - Open user-selected external links and new windows in the default browser.
@@ -23,7 +23,7 @@ PersonaStack for macOS presents `https://my.personastack.ai` in a dedicated nati
 ## Version 0.1.3 behavior
 
 - Request macOS notification permission when the application opens.
-- Accept only the main-frame `my.personastack.ai` native bridge payload `{ "version": "1", "event": "created" }`.
+- Accept only the main-frame PersonaStack app-host native bridge payload `{ "version": "1", "event": "created" }`.
 - Post a generic native notification when a new concern arrives while the app is running.
 - Do not pass concern text, concern IDs, workspace IDs, user IDs, credentials, or other product data through the bridge.
 

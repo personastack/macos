@@ -1,7 +1,8 @@
 import Foundation
 
 public enum NavigationPolicy {
-    public static let appHosts: Set<String> = ["my.personastack.ai", "personastack.ai"]
+    public static let defaultURL = URL(string: "http://personastack-ai.lan/user/personas")!
+    public static let appHosts: Set<String> = ["my.personastack.ai", "personastack.ai", "personastack-ai.lan"]
 
     public static func keepsInApp(_ url: URL) -> Bool {
         isAppHost(url.host)
