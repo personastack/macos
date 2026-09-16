@@ -11,9 +11,8 @@ struct PersonaStackApp: App {
     var body: some Scene {
         WindowGroup("PersonaStack") {
             PersonaStackWebView(url: launchURL)
-                .frame(minWidth: 1024, minHeight: 700)
+                .frame(minWidth: 1332, minHeight: 700)
                 .background(WindowPresentationConfigurator())
-                .ignoresSafeArea(.container, edges: .top)
         }
         .defaultSize(width: 1440, height: 960)
         .windowStyle(.hiddenTitleBar)
@@ -47,6 +46,7 @@ struct PersonaStackWebView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
+        WindowPresentation.configureWebView(configuration)
         configuration.websiteDataStore = .default()
         configuration.preferences.isFraudulentWebsiteWarningEnabled = true
         configuration.userContentController.add(context.coordinator, name: "personastackConcern")
@@ -152,6 +152,7 @@ struct PersonaStackWebView: NSViewRepresentable {
                 return nil
             }
 
+            WindowPresentation.configureWebView(configuration)
             let popup = WKWebView(frame: .zero, configuration: configuration)
             popup.navigationDelegate = self
             popup.uiDelegate = self

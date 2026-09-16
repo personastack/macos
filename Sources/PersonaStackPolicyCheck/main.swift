@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import PersonaStackCore
+import WebKit
 
 let window = NSWindow(
     contentRect: .zero,
@@ -9,8 +10,11 @@ let window = NSWindow(
     defer: false
 )
 WindowPresentation.configure(window)
+let webConfiguration = WKWebViewConfiguration()
+WindowPresentation.configureWebView(webConfiguration)
 
 let checks = [
+    webConfiguration.applicationNameForUserAgent == "PersonaStackDesktop/1",
     NavigationPolicy.keepsInApp(URL(string: "https://my.personastack.ai/user/personas")!),
     LaunchConfiguration.url(arguments: ["PersonaStack"]) == NavigationPolicy.defaultURL,
     LaunchConfiguration.url(arguments: ["PersonaStack", "--personastack-url", "https://personastack.ericgreer.info/user/personas"]).host == "personastack.ericgreer.info",

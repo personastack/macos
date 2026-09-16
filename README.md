@@ -22,6 +22,8 @@ Open PersonaStack from Applications. Sign in at `my.personastack.ai` as usual. F
 
 User-selected external links open in the default browser. Existing top-level OAuth redirects remain in the app so the current `my.personastack.ai` callback flows continue to work.
 
+The WebKit user agent includes `PersonaStackDesktop/1` so the shared web sidebar can omit its redundant logo header. This token is a presentation hint only. The environment badge appears beside the web app version in the sidebar footer.
+
 ## Requirements
 
 - macOS 14 Sonoma or later
