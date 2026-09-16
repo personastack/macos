@@ -1,0 +1,26 @@
+name: Release macOS desktop app
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build unsigned installer
+        run: VERSION="${GITHUB_REF_NAME#v}" ./scripts/package-macos.sh
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" artifacts/*.dmg --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" artifacts/*.dmg --generate-notes --title "PersonaStack $GITHUB_REF_NAME"
+          fi
