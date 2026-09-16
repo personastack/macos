@@ -2,6 +2,12 @@
 
 All notable changes follow semantic versioning.
 
+## [0.1.6] - 2026-09-15
+
+### Fixed
+
+- Let hosted content fill the macOS title-bar area beneath the window controls.
+
 ## [0.1.5] - 2026-09-15
 
 ### Added

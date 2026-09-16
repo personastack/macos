@@ -10,9 +10,28 @@ struct PersonaStackApp: App {
         WindowGroup("PersonaStack") {
             PersonaStackWebView(url: URL(string: "https://my.personastack.ai/user/personas")!)
                 .frame(minWidth: 1024, minHeight: 700)
+                .background(WindowPresentationConfigurator())
         }
         .defaultSize(width: 1440, height: 960)
         .windowStyle(.hiddenTitleBar)
+    }
+}
+
+struct WindowPresentationConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        WindowPresentationView()
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    private final class WindowPresentationView: NSView {
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            DispatchQueue.main.async { [weak self] in
+                guard let window = self?.window else { return }
+                WindowPresentation.configure(window)
+            }
+        }
     }
 }
 

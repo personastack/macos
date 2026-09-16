@@ -1,5 +1,14 @@
+import AppKit
 import Foundation
 import PersonaStackCore
+
+let window = NSWindow(
+    contentRect: .zero,
+    styleMask: [.titled, .closable, .miniaturizable, .resizable],
+    backing: .buffered,
+    defer: false
+)
+WindowPresentation.configure(window)
 
 let checks = [
     NavigationPolicy.keepsInApp(URL(string: "https://my.personastack.ai/user/personas")!),
@@ -9,6 +18,10 @@ let checks = [
     NotificationBridge.isNewConcernEvent(["version": "1", "event": "created"]),
     !NotificationBridge.isNewConcernEvent(["version": "1", "event": "created", "message": "private"]),
     !NotificationBridge.isNewConcernEvent(["version": "2", "event": "created"]),
+    window.titleVisibility == .hidden,
+    window.titlebarAppearsTransparent,
+    window.styleMask.contains(.fullSizeContentView),
+    window.toolbar == nil,
 ]
 
 guard checks.allSatisfy({ $0 }) else {

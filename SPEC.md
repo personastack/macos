@@ -29,7 +29,7 @@ PersonaStack for macOS presents `https://my.personastack.ai` in a dedicated nati
 
 ## Version 0.1.4 behavior
 
-- Use a hidden native title bar so hosted content fills the window beneath the standard close, minimize, and full-screen controls.
+- Use a transparent full-size native title bar so hosted content fills the window beneath the standard close, minimize, and full-screen controls.
 
 ## Distribution
 
