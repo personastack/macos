@@ -2,7 +2,7 @@
 
 ## Purpose
 
-PersonaStack for macOS presents the LAN `my.personastack.ai` surface at `http://personastack-ai.lan` in a dedicated native macOS application window.
+PersonaStack for macOS presents a selected PersonaStack web surface in a dedicated native macOS application window.
 
 ## Authority
 
@@ -12,7 +12,9 @@ PersonaStack for macOS presents the LAN `my.personastack.ai` surface at `http://
 
 ## Version 0.1.0 behavior
 
-- Start at `/user/personas` on `personastack-ai.lan`.
+- Start at `/user/personas` on `https://my.personastack.ai` by default.
+- Accept `--personastack-url <http-or-https-url>` at startup to override the initial URL for testing.
+- Keep user-selected navigation on the override host in the app. Keep native bridge events restricted to approved PersonaStack hosts.
 - Persist site data in the app's default WebKit data store.
 - Keep Personastack-origin navigation in the app.
 - Open user-selected external links and new windows in the default browser.

@@ -2,11 +2,11 @@
 
 All notable changes follow semantic versioning.
 
-## [0.1.8] - 2026-09-15
+## [0.1.9] - 2026-09-15
 
 ### Changed
 
-- Open the LAN PersonaStack app at `personastack-ai.lan` for desktop testing.
+- Add `--personastack-url` for an arbitrary test-server override. Production remains the default.
 
 ## [0.1.7] - 2026-09-15
 

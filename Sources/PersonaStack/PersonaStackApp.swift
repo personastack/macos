@@ -6,9 +6,11 @@ import WebKit
 
 @main
 struct PersonaStackApp: App {
+    private let launchURL = LaunchConfiguration.url()
+
     var body: some Scene {
         WindowGroup("PersonaStack") {
-            PersonaStackWebView(url: NavigationPolicy.defaultURL)
+            PersonaStackWebView(url: launchURL)
                 .frame(minWidth: 1024, minHeight: 700)
                 .background(WindowPresentationConfigurator())
                 .ignoresSafeArea(.container, edges: .top)
@@ -40,7 +42,7 @@ struct PersonaStackWebView: NSViewRepresentable {
     let url: URL
 
     func makeCoordinator() -> Coordinator {
-        Coordinator()
+        Coordinator(appURL: url)
     }
 
     func makeNSView(context: Context) -> WKWebView {
@@ -64,8 +66,10 @@ struct PersonaStackWebView: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler, UNUserNotificationCenterDelegate {
         weak var webView: WKWebView?
+        let appURL: URL
 
-        override init() {
+        init(appURL: URL) {
+            self.appURL = appURL
             super.init()
             UNUserNotificationCenter.current().delegate = self
         }
@@ -111,7 +115,8 @@ struct PersonaStackWebView: NSViewRepresentable {
 
             if navigationAction.targetFrame == nil || NavigationPolicy.shouldOpenInDefaultBrowser(
                 url,
-                linkWasUserActivated: navigationAction.navigationType == .linkActivated
+                linkWasUserActivated: navigationAction.navigationType == .linkActivated,
+                appURL: appURL
             ) {
                 NSWorkspace.shared.open(url)
                 return .cancel
