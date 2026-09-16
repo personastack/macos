@@ -2,6 +2,12 @@
 
 All notable changes follow semantic versioning.
 
+## [0.1.5] - 2026-09-15
+
+### Added
+
+- Publish each desktop installer to the PersonaStack Homebrew tap and update the `personastack` cask.
+
 ## [0.1.4] - 2026-09-15
 
 ### Changed

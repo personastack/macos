@@ -33,4 +33,4 @@ PersonaStack for macOS presents `https://my.personastack.ai` in a dedicated nati
 
 ## Distribution
 
-Version 0.1.0 is an unsigned universal macOS disk image. A GitHub release publishes the immutable `PersonaStack-<version>-unsigned.dmg` installer for each `v*` tag.
+Each semantic version is an unsigned universal macOS disk image. A private GitHub release retains the immutable `PersonaStack-<version>-unsigned.dmg` installer. The release workflow publishes the same DMG to the public `personastack/homebrew-tap` GitHub release and updates the `personastack` cask. Homebrew installs it with `brew install --cask personastack/tap/personastack`.

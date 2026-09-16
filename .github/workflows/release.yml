@@ -24,3 +24,33 @@ jobs:
           else
             gh release create "$GITHUB_REF_NAME" artifacts/*.dmg --generate-notes --title "PersonaStack $GITHUB_REF_NAME"
           fi
+      - name: Publish Homebrew installer release
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN is required to publish the Homebrew installer." >&2
+            exit 1
+          fi
+          if gh release view "$GITHUB_REF_NAME" --repo personastack/homebrew-tap >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" artifacts/*.dmg --repo personastack/homebrew-tap --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" artifacts/*.dmg --repo personastack/homebrew-tap --generate-notes --title "PersonaStack $GITHUB_REF_NAME"
+          fi
+      - name: Publish Homebrew cask
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          tap_dir=$(mktemp -d)
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/personastack/homebrew-tap.git" "$tap_dir"
+          ./scripts/render-homebrew-cask.sh "${GITHUB_REF_NAME#v}" artifacts/*.dmg "$tap_dir/Casks/personastack.rb"
+          cd "$tap_dir"
+          git add Casks/personastack.rb
+          if git diff --cached --quiet; then
+            echo "Homebrew cask already current."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "feat: update PersonaStack cask ${GITHUB_REF_NAME#v}"
+          git push origin HEAD:main

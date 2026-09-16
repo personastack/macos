@@ -8,7 +8,13 @@ While the app is running, new concerns raise a native macOS notification. macOS 
 
 ## Install
 
-Download `PersonaStack-<version>-unsigned.dmg` from the matching GitHub release. Open the disk image. Drag `PersonaStack.app` into Applications. macOS will require a Gatekeeper override because the first release is intentionally unsigned.
+Install the current release with Homebrew:
+
+```sh
+brew install --cask personastack/tap/personastack
+```
+
+Homebrew downloads the matching `PersonaStack-<version>-unsigned.dmg`. You can also download the installer from the matching GitHub release. macOS will require a Gatekeeper override because the app is intentionally unsigned.
 
 ## Use
 
@@ -37,7 +43,7 @@ swift run PersonaStackPolicyCheck
 
 ## Release
 
-Tag a semantic version such as `v0.1.0`. The release workflow builds an unsigned disk image and attaches it to the GitHub release.
+Tag a semantic version such as `v0.1.0`. The release workflow builds the unsigned disk image, attaches it to the private GitHub release, publishes it to the public Homebrew tap release, and updates the cask. The repository needs a `HOMEBREW_TAP_TOKEN` secret with write access to `personastack/homebrew-tap`.
 
 ## Security boundary
 
