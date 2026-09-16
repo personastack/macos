@@ -4,6 +4,8 @@ PersonaStack for macOS is the native desktop client for [my.personastack.ai](htt
 
 The app opens the existing hosted PersonaStack control panel in a dedicated macOS window. It keeps the website's authentication, sessions, OAuth callbacks, uploads, downloads, realtime updates, and product behavior intact. It does not duplicate product state or call PersonaStack internal services.
 
+While the app is running, new concerns raise a native macOS notification. macOS asks for notification permission on first launch. The bridge sends no concern text, IDs, or account data to the app.
+
 ## Install
 
 Download `PersonaStack-<version>-unsigned.dmg` from the matching GitHub release. Open the disk image. Drag `PersonaStack.app` into Applications. macOS will require a Gatekeeper override because the first release is intentionally unsigned.
@@ -39,4 +41,4 @@ Tag a semantic version such as `v0.1.0`. The release workflow builds an unsigned
 
 ## Security boundary
 
-The app is a presentation shell. `my.personastack.ai` remains the browser-facing authority. `personastack-api` remains the authority for identity, authorization, and product state. The app has no native JavaScript bridge, no bundled credentials, and no direct access to PersonaStack APIs or datastores.
+The app is a presentation shell. `my.personastack.ai` remains the browser-facing authority. `personastack-api` remains the authority for identity, authorization, and product state. The app accepts one origin-checked native bridge event for generic concern notifications. It has no bundled credentials or direct access to PersonaStack APIs or datastores.

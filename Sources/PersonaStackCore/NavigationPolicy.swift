@@ -4,9 +4,11 @@ public enum NavigationPolicy {
     public static let appHosts: Set<String> = ["my.personastack.ai", "personastack.ai"]
 
     public static func keepsInApp(_ url: URL) -> Bool {
-        guard let host = url.host?.lowercased() else {
-            return false
-        }
+        isAppHost(url.host)
+    }
+
+    public static func isAppHost(_ host: String?) -> Bool {
+        guard let host = host?.lowercased() else { return false }
         return appHosts.contains(host) || host.hasSuffix(".personastack.ai")
     }
 

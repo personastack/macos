@@ -6,6 +6,9 @@ let checks = [
     NavigationPolicy.keepsInApp(URL(string: "https://personastack.ai/privacy")!),
     NavigationPolicy.shouldOpenInDefaultBrowser(URL(string: "https://example.com/docs")!, linkWasUserActivated: true),
     !NavigationPolicy.shouldOpenInDefaultBrowser(URL(string: "https://accounts.google.com/o/oauth2/auth")!, linkWasUserActivated: false),
+    NotificationBridge.isNewConcernEvent(["version": "1", "event": "created"]),
+    !NotificationBridge.isNewConcernEvent(["version": "1", "event": "created", "message": "private"]),
+    !NotificationBridge.isNewConcernEvent(["version": "2", "event": "created"]),
 ]
 
 guard checks.allSatisfy({ $0 }) else {

@@ -2,6 +2,13 @@
 
 All notable changes follow semantic versioning.
 
+## [0.1.3] - 2026-09-15
+
+### Added
+
+- Native macOS notifications for new PersonaStack concerns while the app is running.
+- An origin-checked, schema-checked WebKit bridge that carries no concern content or identifiers.
+
 ## [0.1.2] - 2026-09-15
 
 ### Fixed
