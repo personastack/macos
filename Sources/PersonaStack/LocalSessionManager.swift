@@ -46,7 +46,11 @@ final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
         do {
             let command = try LocalSessionCommand.parse(message.body)
             Task {
-                do { replyHandler(try await apply(command, page: page), nil) }
+                do {
+                    let response = try await apply(command, page: page)
+                    logger.notice("local session \(Self.actionName(command), privacy: .public) completed")
+                    replyHandler(response, nil)
+                }
                 catch {
                     let failure = error as? LocalSessionError ?? .invalidRequest
                     logger.error("local session \(Self.actionName(command), privacy: .public) failed: \(failure.rawValue, privacy: .public)")
