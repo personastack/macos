@@ -11,7 +11,7 @@ struct PersonaStackApp: App {
     var body: some Scene {
         WindowGroup("PersonaStack") {
             PersonaStackWebView(url: launchURL)
-                .frame(minWidth: 1465, minHeight: 700)
+                .frame(minWidth: 1172, minHeight: 700)
                 .background(WindowPresentationConfigurator())
         }
         .defaultSize(width: 1440, height: 960)
