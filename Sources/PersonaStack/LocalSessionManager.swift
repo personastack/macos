@@ -1,10 +1,12 @@
 import AppKit
+import OSLog
 import PersonaStackCore
 import WebKit
 
 @MainActor
 final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
     static let shared = LocalSessionManager()
+    private let logger = Logger(subsystem: "ai.personastack.desktop", category: "local-session")
     private final class Page {
         let appURL: URL
         var pending = LocalSessionPendingRequests()
@@ -38,15 +40,23 @@ final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
                                replyHandler: @escaping @MainActor @Sendable (Any?, String?) -> Void) {
         guard let view = message.webView, let page = pages.object(forKey: view),
               ChatWindowManager.trusted(message, base: page.appURL) else {
+            logger.error("local session bridge rejected an untrusted request")
             replyHandler(nil, LocalSessionError.invalidRequest.rawValue); return
         }
         do {
             let command = try LocalSessionCommand.parse(message.body)
             Task {
                 do { replyHandler(try await apply(command, page: page), nil) }
-                catch { replyHandler(nil, (error as? LocalSessionError ?? .invalidRequest).rawValue) }
+                catch {
+                    let failure = error as? LocalSessionError ?? .invalidRequest
+                    logger.error("local session \(Self.actionName(command), privacy: .public) failed: \(failure.rawValue, privacy: .public)")
+                    replyHandler(nil, failure.rawValue)
+                }
             }
-        } catch { replyHandler(nil, LocalSessionError.invalidRequest.rawValue) }
+        } catch {
+            logger.error("local session bridge rejected an invalid request")
+            replyHandler(nil, LocalSessionError.invalidRequest.rawValue)
+        }
     }
 
     private func apply(_ command: LocalSessionCommand, page: Page) async throws -> [String: Any] {
@@ -102,5 +112,14 @@ final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
 
     private func preferenceKey(_ url: URL) -> String {
         "localSession.harness." + (url.scheme ?? "") + "://" + (url.host ?? "") + ":" + String(url.port ?? 443)
+    }
+
+    private static func actionName(_ command: LocalSessionCommand) -> String {
+        switch command {
+        case .state: return "state"
+        case .select: return "select_harness"
+        case .prepare: return "prepare"
+        case .launch: return "launch"
+        }
     }
 }
