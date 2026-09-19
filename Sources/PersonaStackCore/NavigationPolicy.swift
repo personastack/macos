@@ -28,12 +28,24 @@ public enum NavigationPolicy {
 
 public enum LaunchConfiguration {
     public static func url(arguments: [String] = CommandLine.arguments) -> URL {
-        guard let flagIndex = arguments.firstIndex(of: "--personastack-url"),
-              arguments.indices.contains(flagIndex + 1),
-              let url = URL(string: arguments[flagIndex + 1]),
+        url(
+            arguments: arguments,
+            packagedDefaultURL: Bundle.main.object(forInfoDictionaryKey: "PersonaStackDefaultURL") as? String
+        )
+    }
+
+    public static func url(arguments: [String], packagedDefaultURL: String?) -> URL {
+        let overrideURL = arguments.firstIndex(of: "--personastack-url")
+            .flatMap { arguments.indices.contains($0 + 1) ? validHTTPURL(arguments[$0 + 1]) : nil }
+        return overrideURL ?? validHTTPURL(packagedDefaultURL) ?? NavigationPolicy.defaultURL
+    }
+
+    private static func validHTTPURL(_ rawValue: String?) -> URL? {
+        guard let rawValue,
+              let url = URL(string: rawValue),
               ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
               url.host != nil else {
-            return NavigationPolicy.defaultURL
+            return nil
         }
         return url
     }

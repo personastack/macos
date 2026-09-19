@@ -12,7 +12,7 @@ PersonaStack for macOS presents a selected PersonaStack web surface in a dedicat
 
 ## Version 0.1.0 behavior
 
-- Start at `/user/personas` on `https://my.personastack.ai` by default.
+- Start at the valid HTTP(S) URL in the packaged `PersonaStackDefaultURL` value. Public packages default to `https://my.personastack.ai/user/personas`. An absent or invalid packaged value falls back to that production URL.
 - Accept `--personastack-url <http-or-https-url>` at startup to override the initial URL for testing.
 - Keep user-selected navigation on the override host in the app. Keep native bridge events restricted to approved PersonaStack hosts.
 - Persist site data in the app's default WebKit data store.

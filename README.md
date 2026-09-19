@@ -18,7 +18,7 @@ Homebrew downloads the matching `PersonaStack-<version>-unsigned.dmg`. You can a
 
 ## Use
 
-Open PersonaStack from Applications. Sign in at `my.personastack.ai` as usual. For a test target, launch it with `open -a PersonaStack --args --personastack-url https://personastack.ericgreer.info/`. The app stores website session data in its own persistent macOS WebKit data store.
+Open PersonaStack from Applications. Public packages open `my.personastack.ai` by default. To package a local LAN build, run `PERSONASTACK_DEFAULT_URL=https://personastack.ericgreer.info/user/personas ./scripts/package-macos.sh`. For a one-off target, launch it with `open -a PersonaStack --args --personastack-url https://personastack.ericgreer.info/`. The app stores website session data in its own persistent macOS WebKit data store.
 
 User-selected external links open in the default browser. Existing top-level OAuth redirects remain in the app so the current `my.personastack.ai` callback flows continue to work.
 

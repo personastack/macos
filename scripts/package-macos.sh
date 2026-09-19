@@ -4,6 +4,7 @@ set -eu
 root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 version=${VERSION:-0.1.0}
 configuration=${CONFIGURATION:-release}
+default_url=${PERSONASTACK_DEFAULT_URL:-https://my.personastack.ai/user/personas}
 artifact_dir="$root_dir/artifacts"
 bundle_dir="$root_dir/build/PersonaStack.app"
 staging_dir="$root_dir/build/dmg-root"
@@ -42,6 +43,7 @@ cp "$root_dir/Resources/AppIcon.icns" "$bundle_dir/Contents/Resources/AppIcon.ic
 chmod 755 "$bundle_dir/Contents/MacOS/PersonaStack"
 chmod 755 "$bundle_dir/Contents/MacOS/PersonaStackLocalSession"
 plutil -replace CFBundleShortVersionString -string "$version" "$bundle_dir/Contents/Info.plist"
+plutil -replace PersonaStackDefaultURL -string "$default_url" "$bundle_dir/Contents/Info.plist"
 
 cp -R "$bundle_dir" "$staging_dir/"
 mkdir -p "$artifact_dir"

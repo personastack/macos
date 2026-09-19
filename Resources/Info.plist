@@ -28,5 +28,7 @@
   <string>Record audio attachments when you choose the microphone in persona chat.</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
+  <key>PersonaStackDefaultURL</key>
+  <string>https://my.personastack.ai/user/personas</string>
 </dict>
 </plist>

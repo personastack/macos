@@ -17,7 +17,12 @@ let checks = [
     webConfiguration.applicationNameForUserAgent == "PersonaStackDesktop/1",
     NavigationPolicy.keepsInApp(URL(string: "https://my.personastack.ai/user/personas")!),
     LaunchConfiguration.url(arguments: ["PersonaStack"]) == NavigationPolicy.defaultURL,
+    LaunchConfiguration.url(
+        arguments: ["PersonaStack"],
+        packagedDefaultURL: "https://personastack.ericgreer.info/user/personas"
+    ).host == "personastack.ericgreer.info",
     LaunchConfiguration.url(arguments: ["PersonaStack", "--personastack-url", "https://personastack.ericgreer.info/user/personas"]).host == "personastack.ericgreer.info",
+    LaunchConfiguration.url(arguments: ["PersonaStack"], packagedDefaultURL: "file:///tmp/test") == NavigationPolicy.defaultURL,
     LaunchConfiguration.url(arguments: ["PersonaStack", "--personastack-url", "file:///tmp/test"]) == NavigationPolicy.defaultURL,
     NavigationPolicy.keepsInApp(URL(string: "https://test.example/user/personas")!, appURL: URL(string: "https://test.example")!),
     NavigationPolicy.isGoogleOAuthURL(URL(string: "https://accounts.google.com/gsi/select")!),
