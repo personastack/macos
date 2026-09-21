@@ -34,6 +34,33 @@ struct ChatWindowTests {
         #expect(!ChatWindowCommand.permitsBridge(scheme: "https", host: "my.personastack.ai", port: 0, mainFrame: true, appURL: URL(string: "https://my.personastack.ai:444")!))
     }
 
+    @Test func testStrictStackPopoutCommandAndURL() throws {
+        let base = try #require(URL(string: "https://my.personastack.ai/user/stacks/settings?stack_id=other#hash"))
+        #expect(StackWindowCommand.parse(["version": "1", "action": "open_stack_view", "stack_id": "stack-1", "view": "graph"]) == .open(.graph, "stack-1"))
+        #expect(StackWindowCommand.parse(["version": "1", "action": "open_stack_view", "stack_id": "stack-1", "view": "graph", "extra": "bad"]) == nil)
+        #expect(StackWindowCommand.parse(["version": "1", "action": "open_stack_view", "stack_id": "../../evil", "view": "stream"]) == nil)
+        #expect(StackWindowCommand.popoutURL(appURL: base, stackID: "stack-1", view: .stream)?.absoluteString == "https://my.personastack.ai/user/stacks/desktop-popout?stack_id=stack-1&view=stream")
+    }
+
+    @MainActor
+    @Test func testStackPopoutWindowsAreBorderlessAndDeduplicated() throws {
+        _ = NSApplication.shared
+        let manager = StackWindowManager(loadPages: false)
+        let base = try #require(URL(string: "https://example.invalid"))
+        manager.apply(.open(.graph, "stack-1"), base: base)
+        let graph = try #require(manager.window(for: .graph, stackID: "stack-1"))
+        #expect(graph.window.styleMask.contains([.titled, .miniaturizable, .resizable, .closable]))
+        #expect(!graph.window.isOpaque)
+        #expect(graph.window.backgroundColor == .clear)
+        manager.apply(.open(.graph, "stack-1"), base: base)
+        #expect(manager.window(for: .graph, stackID: "stack-1") === graph)
+        manager.apply(.open(.stream, "stack-1"), base: base)
+        #expect(manager.window(for: .stream, stackID: "stack-1") !== graph)
+        manager.invalidateSession()
+        #expect(manager.window(for: .graph, stackID: "stack-1") == nil)
+        #expect(manager.window(for: .stream, stackID: "stack-1") == nil)
+    }
+
     @MainActor
     @Test func testWindowIsOrdinaryTransparentAndDisposesOnce() {
         _ = NSApplication.shared

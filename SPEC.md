@@ -47,6 +47,13 @@ PersonaStack for macOS presents a selected PersonaStack web surface in a dedicat
 - Run focused native checks with `swift test --disable-xctest`. Tests use Swift Testing and in-process AppKit windows without network loads.
 - Explicit hosted/native acceptance uses the sibling web repository: build its TypeScript assets, then run `node scripts/desktop-chat-fixture.mjs`. Set `PERSONASTACK_CHAT_FIXTURE_URL` to its printed loopback URL and run `swift test --disable-xctest --filter HostedChatSmokeTests` in this repository. The fixture uses fake messages. This lane is skipped by ordinary tests and never contacts the PersonaStack API.
 
+## Stack pop-outs
+
+- Only the desktop app exposes pop-out controls on Stack Settings. A strict main-frame `personastackStack` bridge accepts version `1` `open_stack_view` messages with one validated `stack_id` and either `graph` or `stream` view.
+- Each view and stack pair has at most one ordinary, resizable, Dock-miniaturizable, visually borderless native window. It loads `/user/stacks/desktop-popout?stack_id=…&view=…` through the shared WebKit data store. Native code never reads stack content or calls PersonaStack APIs.
+- The graph page and native canvas are transparent. It renders only the existing shared graph personas, integration circles, connection lines, and motion. The stream keeps its existing hosted card surface.
+- Windows are ephemeral and close on login/logout invalidation, failed or denied hosted navigation, WebKit termination, or normal window close. They are not restored across app launches.
+
 ## Local persona sessions
 
 - Only registered main application web views expose the reply-capable `personastackLocalSession` bridge. Validate exact configured origin, scheme, port, and main frame. Floating chats and OAuth popups cannot launch sessions.
