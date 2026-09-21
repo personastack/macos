@@ -13,16 +13,17 @@ final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
         init(_ appURL: URL) { self.appURL = appURL }
     }
     private let pages = NSMapTable<WKWebView, Page>.weakToStrongObjects()
+    private var configuringProfiles = Set<String>()
     private let preferences: UserDefaults
     private let probe: @Sendable (LocalSessionHarness) throws -> LocalSessionHarnessProbe
-    private let install: @MainActor (LocalSessionBundle, URL, UUID, LocalSessionHarnessProbe) throws -> LocalSessionInstalledFiles
-    private let terminal: @MainActor (URL) async throws -> Void
+    private let preflight: @Sendable (LocalSessionHarness, LocalSessionHarnessProbe) throws -> Void
+    private let install: @Sendable (LocalSessionBundle, URL, UUID, LocalSessionHarnessProbe) throws -> LocalSessionInstalledFiles
 
     init(preferences: UserDefaults = .standard,
          probe: @escaping @Sendable (LocalSessionHarness) throws -> LocalSessionHarnessProbe = { try LocalSessionProbe.inspect($0) },
-         install: @escaping @MainActor (LocalSessionBundle, URL, UUID, LocalSessionHarnessProbe) throws -> LocalSessionInstalledFiles = LocalSessionManager.installFiles,
-         terminal: @escaping @MainActor (URL) async throws -> Void = LocalSessionManager.openTerminal) {
-        self.preferences = preferences; self.probe = probe; self.install = install; self.terminal = terminal
+         preflight: @escaping @Sendable (LocalSessionHarness, LocalSessionHarnessProbe) throws -> Void = LocalSessionManager.preflightFiles,
+         install: @escaping @Sendable (LocalSessionBundle, URL, UUID, LocalSessionHarnessProbe) throws -> LocalSessionInstalledFiles = LocalSessionManager.installFiles) {
+        self.preferences = preferences; self.probe = probe; self.preflight = preflight; self.install = install
         super.init()
     }
 
@@ -81,37 +82,36 @@ final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
             guard page.pending.scope == scope else { throw LocalSessionError.staleRequest }
             let generation = page.pending.generation
             let probe = self.probe
-            _ = try await Task.detached { try probe(harness) }.value
+            let installation = try await Task.detached { try probe(harness) }.value
+            let preflight = self.preflight
+            _ = try await Task.detached { try preflight(harness, installation) }.value
             guard page.pending.scope == scope, page.pending.generation == generation else { throw LocalSessionError.staleRequest }
             let id = try page.pending.prepare(persona: persona, harness: harness)
             return ["ok": true, "pending_id": id.uuidString]
-        case .launch(let scope, let id, let data):
+        case .configure(let scope, let id, let data):
             let bundle = try LocalSessionBundle.decode(data, appURL: page.appURL)
             try page.pending.consume(id, scope: scope, bundle: bundle)
             let generation = page.pending.generation
             let probe = self.probe
             let installation = try await Task.detached { try probe(bundle.harness) }.value
             guard page.pending.scope == scope, page.pending.generation == generation else { throw LocalSessionError.staleRequest }
-            let files = try install(bundle, page.appURL, id, installation)
-            try await terminal(files.launcher)
+            let profileKey = installation.profile.resolvingSymlinksInPath().standardizedFileURL.path
+            guard configuringProfiles.insert(profileKey).inserted else { throw LocalSessionError.staleRequest }
+            defer { configuringProfiles.remove(profileKey) }
+            let install = self.install
+            let appURL = page.appURL
+            _ = try await Task.detached { try install(bundle, appURL, id, installation) }.value
             return ["ok": true]
         }
     }
 
-    private static func installFiles(_ bundle: LocalSessionBundle, appURL: URL, id: UUID, installation: LocalSessionHarnessProbe) throws -> LocalSessionInstalledFiles {
-        guard let helper = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("PersonaStackLocalSession"),
-              FileManager.default.isExecutableFile(atPath: helper.path) else { throw LocalSessionError.terminalUnavailable }
-        return try LocalSessionFiles().install(bundle: bundle, appURL: appURL, home: installation.home,
-            profile: installation.profile, sessionID: id, executable: installation.executable, helper: helper, loginShell: installation.shell)
+    nonisolated private static func installFiles(_ bundle: LocalSessionBundle, appURL: URL, id: UUID, installation: LocalSessionHarnessProbe) throws -> LocalSessionInstalledFiles {
+        return try LocalSessionFiles().configure(bundle: bundle, appURL: appURL, home: installation.home,
+            profile: installation.profile, sessionID: id, executable: installation.executable, loginShell: installation.shell, harnessEnvironment: installation.environment)
     }
 
-    private static func openTerminal(_ command: URL) async throws {
-        guard let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") else {
-            throw LocalSessionError.terminalUnavailable
-        }
-        do {
-            _ = try await NSWorkspace.shared.open([command], withApplicationAt: terminal, configuration: NSWorkspace.OpenConfiguration())
-        } catch { throw LocalSessionError.terminalUnavailable }
+    nonisolated private static func preflightFiles(_ harness: LocalSessionHarness, installation: LocalSessionHarnessProbe) throws {
+        try LocalSessionFiles().preflight(harness, probe: installation)
     }
 
     private func preferenceKey(_ url: URL) -> String {
@@ -123,7 +123,7 @@ final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
         case .state: return "state"
         case .select: return "select_harness"
         case .prepare: return "prepare"
-        case .launch: return "launch"
+        case .configure: return "configure"
         }
     }
 }

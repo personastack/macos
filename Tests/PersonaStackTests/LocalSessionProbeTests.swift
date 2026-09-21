@@ -12,7 +12,7 @@ struct LocalSessionProbeTests {
         let bin = home.appendingPathComponent("bin")
         try manager.createDirectory(at: bin, withIntermediateDirectories: false)
         let cli = bin.appendingPathComponent("codex")
-        try Data("#!/bin/sh\ncase \"$1\" in --version) printf 'codex-cli 0.154.0\\n';; --help) printf '%s\\n' '--cd --config';; *) exit 1;; esac\n".utf8).write(to: cli)
+        try Data("#!/bin/sh\ncase \"$1:$2:$3\" in --version::) printf 'codex-cli 0.154.0\\n';; --help::) printf '%s\\n' 'plugin';; plugin:--help:) printf '%s\\n' 'add';; plugin:marketplace:--help) printf '%s\\n' 'add list';; *) exit 1;; esac\n".utf8).write(to: cli)
         try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: cli.path)
         try Data("export PATH=\"$HOME/bin:/usr/bin:/bin\"\nexport CODEX_HOME=\"$HOME/custom-codex\"\nexport CLAUDE_CONFIG_DIR=\"$HOME/custom-claude\"\n".utf8).write(to: home.appendingPathComponent(".zshrc"))
         try Data("setenv PATH \"$HOME/bin:/usr/bin:/bin\"\nsetenv CODEX_HOME \"$HOME/custom-codex\"\nsetenv CLAUDE_CONFIG_DIR \"$HOME/custom-claude\"\n".utf8).write(to: home.appendingPathComponent(".tcshrc"))
@@ -23,12 +23,12 @@ struct LocalSessionProbeTests {
     }
 
     @Test func localSessionProbeRequiresKnownBaselineAndAdditiveFlags() throws {
-        try LocalSessionProbe.validateCapabilities(.codex, version: "codex-cli 0.154.0", help: "--cd --config")
-        try LocalSessionProbe.validateCapabilities(.claudeCode, version: "2.1.152 (Claude Code)", help: "--plugin-dir --mcp-config --append-system-prompt-file")
+        try LocalSessionProbe.validateCapabilities(.codex, version: "codex-cli 0.154.0", help: "plugin", pluginHelp: "add", marketplaceHelp: "add list")
+        try LocalSessionProbe.validateCapabilities(.claudeCode, version: "2.1.152 (Claude Code)", help: "plugin", pluginHelp: "install", marketplaceHelp: "add list")
         for version in ["codex-cli 0.153.0", "invalid"] {
-            #expect(throws: LocalSessionError.outdatedHarness) { try LocalSessionProbe.validateCapabilities(.codex, version: version, help: "--cd --config") }
+            #expect(throws: LocalSessionError.outdatedHarness) { try LocalSessionProbe.validateCapabilities(.codex, version: version, help: "plugin", pluginHelp: "add", marketplaceHelp: "add list") }
         }
-        #expect(throws: LocalSessionError.outdatedHarness) { try LocalSessionProbe.validateCapabilities(.claudeCode, version: "2.2.0", help: "--mcp-config") }
+        #expect(throws: LocalSessionError.outdatedHarness) { try LocalSessionProbe.validateCapabilities(.claudeCode, version: "2.2.0", help: "plugin", pluginHelp: "install", marketplaceHelp: "") }
     }
 
     @Test func localSessionProbeSeparatesShellNoiseAndProfilePaths() throws {

@@ -6,6 +6,11 @@ public struct LocalSessionHarnessProbe: Sendable {
     public let home: URL
     public let profile: URL
     public let shell: URL
+    public let environment: [String: String]
+
+    public init(executable: URL, home: URL, profile: URL, shell: URL, environment: [String: String] = ProcessInfo.processInfo.environment) {
+        self.executable = executable; self.home = home; self.profile = profile; self.shell = shell; self.environment = environment
+    }
 }
 
 public enum LocalSessionProbe {
@@ -34,14 +39,16 @@ public enum LocalSessionProbe {
         environment["CLAUDE_CONFIG_DIR"] = fields[3]; environment["PATH"] = fields[4]
         try checkExecutable(harness, executable: executable, environment: environment)
         return LocalSessionHarnessProbe(executable: executable, home: URL(fileURLWithPath: fields[1]),
-                                       profile: URL(fileURLWithPath: harness == .codex ? fields[2] : fields[3]), shell: selectedShell)
+                                       profile: URL(fileURLWithPath: harness == .codex ? fields[2] : fields[3]), shell: selectedShell, environment: environment)
     }
 
     public static func checkExecutable(_ harness: LocalSessionHarness, executable: URL, environment: [String: String]) throws {
         guard FileManager.default.isExecutableFile(atPath: executable.path) else { throw LocalSessionError.missingHarness }
         let version = try run(executable: executable, arguments: ["--version"], environment: environment)
         let help = try run(executable: executable, arguments: ["--help"], environment: environment)
-        try validateCapabilities(harness, version: version, help: help)
+        let pluginHelp = try run(executable: executable, arguments: ["plugin", "--help"], environment: environment)
+        let marketplaceHelp = try run(executable: executable, arguments: ["plugin", "marketplace", "--help"], environment: environment)
+        try validateCapabilities(harness, version: version, help: help, pluginHelp: pluginHelp, marketplaceHelp: marketplaceHelp)
     }
 
     static func parseEnvironment(_ output: String, marker: String) throws -> [String] {
@@ -55,13 +62,14 @@ public enum LocalSessionProbe {
         return fields
     }
 
-    public static func validateCapabilities(_ harness: LocalSessionHarness, version: String, help: String) throws {
+    public static func validateCapabilities(_ harness: LocalSessionHarness, version: String, help: String,
+                                            pluginHelp: String, marketplaceHelp: String) throws {
         let minimum = harness == .codex ? [0, 154, 0] : [2, 1, 152]
         guard let range = version.range(of: "[0-9]+\\.[0-9]+\\.[0-9]+", options: .regularExpression) else { throw LocalSessionError.outdatedHarness }
         let numbers = version[range].split(separator: ".").compactMap { Int($0) }
         guard numbers.count == 3, !numbers.lexicographicallyPrecedes(minimum) else { throw LocalSessionError.outdatedHarness }
-        let flags = harness == .codex ? ["--cd", "--config"] : ["--plugin-dir", "--mcp-config", "--append-system-prompt-file"]
-        guard flags.allSatisfy({ help.contains($0) }) else { throw LocalSessionError.outdatedHarness }
+        guard help.contains("plugin"), pluginHelp.contains(harness == .codex ? "add" : "install"),
+              marketplaceHelp.contains("add"), marketplaceHelp.contains("list") else { throw LocalSessionError.outdatedHarness }
     }
 
     /// Synchronous only on a background task or the standalone helper. Never logs output.

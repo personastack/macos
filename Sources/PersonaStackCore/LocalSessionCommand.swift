@@ -4,11 +4,11 @@ public enum LocalSessionCommand {
     case state(scope: String)
     case select(scope: String, harness: LocalSessionHarness)
     case prepare(scope: String, persona: String, harness: LocalSessionHarness)
-    case launch(scope: String, pendingID: UUID, bundle: Data)
+    case configure(scope: String, pendingID: UUID, bundle: Data)
 
     public var scope: String {
         switch self {
-        case .state(let scope), .select(let scope, _), .prepare(let scope, _, _), .launch(let scope, _, _): return scope
+        case .state(let scope), .select(let scope, _), .prepare(let scope, _, _), .configure(let scope, _, _): return scope
         }
     }
 
@@ -21,12 +21,12 @@ public enum LocalSessionCommand {
         func keys(_ extras: Set<String>) -> Bool { Set(object.keys) == Set(["version", "action", "scope"]).union(extras) }
         if action == "state", keys([]) { return .state(scope: scope) }
         guard !scope.isEmpty else { throw LocalSessionError.invalidRequest }
-        if action == "launch", keys(["pending_id", "bundle"]),
+        if action == "configure", keys(["pending_id", "bundle"]),
            let id = object["pending_id"] as? String, let uuid = UUID(uuidString: id),
            let bundle = object["bundle"] as? [String: Any], JSONSerialization.isValidJSONObject(bundle) {
             let data = try JSONSerialization.data(withJSONObject: bundle)
             guard data.count <= LocalSessionBundle.maxWireBytes else { throw LocalSessionError.invalidBundle }
-            return .launch(scope: scope, pendingID: uuid, bundle: data)
+            return .configure(scope: scope, pendingID: uuid, bundle: data)
         }
         guard let raw = object["harness"] as? String, let harness = LocalSessionHarness(rawValue: raw) else {
             throw LocalSessionError.invalidRequest

@@ -16,7 +16,6 @@ public enum LocalSessionError: String, Error, LocalizedError, Sendable {
     case unsafeFiles = "PersonaStack cannot safely install the local session files."
     case missingHarness = "Install the selected CLI, then try again."
     case outdatedHarness = "Update the selected CLI, then try again."
-    case terminalUnavailable = "The session could not open in Terminal. Try again."
     public var errorDescription: String? { rawValue }
 }
 

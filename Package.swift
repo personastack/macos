@@ -7,7 +7,6 @@ let package = Package(
     products: [
         .executable(name: "PersonaStack", targets: ["PersonaStack"]),
         .executable(name: "PersonaStackPolicyCheck", targets: ["PersonaStackPolicyCheck"]),
-        .executable(name: "PersonaStackLocalSession", targets: ["PersonaStackLocalSession"]),
     ],
     dependencies: [
         .package(url: "https://github.com/jpsim/Yams.git", exact: "6.2.2"),
@@ -16,7 +15,6 @@ let package = Package(
         .target(name: "PersonaStackCore", dependencies: ["Yams"]),
         .executableTarget(name: "PersonaStack", dependencies: ["PersonaStackCore"]),
         .executableTarget(name: "PersonaStackPolicyCheck", dependencies: ["PersonaStackCore"]),
-        .executableTarget(name: "PersonaStackLocalSession", dependencies: ["PersonaStackCore"]),
         .testTarget(name: "PersonaStackTests", dependencies: ["PersonaStackCore", "PersonaStack"], resources: [.copy("Fixtures/local-session.json")]),
     ]
 )
