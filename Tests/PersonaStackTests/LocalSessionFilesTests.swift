@@ -89,10 +89,14 @@ struct LocalSessionFilesTests {
         let result = try configure(harness, home: root, recorder: recorder)
         let pluginRoot = result.directory.appendingPathComponent("marketplace/plugins")
         let plugin = try #require(FileManager.default.contentsOfDirectory(at: pluginRoot, includingPropertiesForKeys: nil).first)
-        let mcp = try String(contentsOf: plugin.appendingPathComponent(".mcp.json"), encoding: .utf8)
-        #expect(mcp.contains("Bearer "))
-        #expect(mcp.contains("personastack_local"))
-        #expect(mcp.contains("https://mcp.personastack.ai"))
+        let mcp = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: plugin.appendingPathComponent(".mcp.json"))) as? [String: Any])
+        let servers: [String: Any]
+        if harness == .codex { servers = try #require(mcp["mcpServers"] as? [String: Any]) }
+        else { servers = mcp }
+        let server = try #require(servers["personastack_local"] as? [String: Any])
+        let headers = try #require(server["headers"] as? [String: String])
+        #expect((headers["Authorization"] ?? "").hasPrefix("Bearer "))
+        #expect(server["url"] as? String == "https://mcp.personastack.ai/v1/mcp")
         #expect(FileManager.default.fileExists(atPath: result.pluginManifest.path))
         #expect(FileManager.default.fileExists(atPath: plugin.appendingPathComponent("skills/personastack/SKILL.md").path))
         #expect(result.skillDirectories.count == 2)
