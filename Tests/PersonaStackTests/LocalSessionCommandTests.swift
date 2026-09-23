@@ -8,6 +8,19 @@ struct LocalSessionCommandTests {
         _ = try LocalSessionCommand.parse(["version": "1", "action": "select_harness", "scope": "account/workspace", "harness": "claude_code"])
         let valid = ["version": "1", "action": "prepare", "scope": "account/workspace", "harness": "codex", "persona_id": "persona-a"]
         _ = try LocalSessionCommand.parse(valid)
+        let fixtureURL = try #require(Bundle.module.url(forResource: "local-session", withExtension: "json"))
+        let bundle = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: fixtureURL)) as? [String: Any])
+        let configure: [String: Any] = ["version": "1", "action": "configure", "scope": "account/workspace",
+                                        "pending_id": UUID().uuidString, "bundle": bundle]
+        if case .configure(_, _, _) = try LocalSessionCommand.parse(configure) {} else {
+            Issue.record("Expected a valid API-produced bundle in the configure command")
+        }
+        var legacyLaunch = configure
+        legacyLaunch["action"] = "launch"
+        #expect(throws: LocalSessionError.invalidRequest) { try LocalSessionCommand.parse(legacyLaunch) }
+        var extraField = configure
+        extraField["unexpected"] = true
+        #expect(throws: LocalSessionError.invalidRequest) { try LocalSessionCommand.parse(extraField) }
         for (key, value) in [("version", "2"), ("scope", ""), ("harness", "unknown"), ("persona_id", "../bad"), ("command", "anything")] {
             var invalid = valid
             invalid[key] = value

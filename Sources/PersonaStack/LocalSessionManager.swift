@@ -69,7 +69,7 @@ final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
         switch command {
         case .state(let scope):
             page.pending.sync(scope)
-            var response: [String: Any] = ["ok": true, "version": "1"]
+            var response: [String: Any] = ["ok": true, "version": "2"]
             if let raw = preferences.string(forKey: key), let harness = LocalSessionHarness(rawValue: raw) {
                 response["harness"] = harness.rawValue
             }

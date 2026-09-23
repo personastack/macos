@@ -36,6 +36,7 @@ struct LocalSessionManagerTests {
         let view = WKWebView()
         manager.register(view, appURL: fixture.appURL)
         let firstState = try await manager.apply(.state(scope: "account/workspace"), view: view)
+        #expect(firstState["version"] as? String == "2")
         #expect(firstState["harness"] == nil)
         _ = try await manager.apply(.select(scope: "account/workspace", harness: .codex), view: view)
         #expect(try await manager.apply(.state(scope: "account/workspace"), view: view)["harness"] as? String == "codex")
