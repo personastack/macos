@@ -54,6 +54,13 @@ PersonaStack for macOS presents a selected PersonaStack web surface in a dedicat
 - The graph page and native canvas are transparent. It renders only the existing shared graph personas, integration circles, connection lines, and motion. The stream keeps its existing hosted card surface.
 - Windows are ephemeral and close on login/logout invalidation, failed or denied hosted navigation, WebKit termination, or normal window close. They are not restored across app launches.
 
+## Persona activity pop-out
+
+- Only the macOS app exposes the pop-out control in the Persona Settings Live activity toolbar. It sends a strict version `1` `open_persona_activity` message with one validated `persona_id` through the registered main-frame `personastackStack` bridge.
+- Open one ordinary native window per persona at `/user/personas/activity/desktop-popout?persona_id=…` in the shared WebKit data store. The authenticated hosted page subscribes to the existing authorized persona console stream and uses the same transcript renderer as Persona Settings.
+- Native code handles window presentation only. It never reads or relays persona activity data. Persona authorization and stream access remain owned by the hosted web/API path.
+- Persona activity windows are ephemeral and close on session invalidation, failed or denied hosted navigation, WebKit termination, or normal window close.
+
 ## Local persona sessions
 
 - Only registered main application web views expose the reply-capable `personastackLocalSession` bridge. Validate exact configured origin, scheme, port, and main frame. Floating chats and OAuth popups cannot launch sessions.

@@ -42,6 +42,15 @@ struct ChatWindowTests {
         #expect(StackWindowCommand.popoutURL(appURL: base, stackID: "stack-1", view: .stream)?.absoluteString == "https://my.personastack.ai/user/stacks/desktop-popout?stack_id=stack-1&view=stream")
     }
 
+    @Test func testStrictPersonaActivityPopoutCommandAndURL() throws {
+        let base = try #require(URL(string: "https://my.personastack.ai/user/personas/persona-1"))
+        #expect(StackWindowCommand.parse(["version": "1", "action": "open_persona_activity", "persona_id": "persona-1"]) == .openPersonaActivity("persona-1"))
+        #expect(StackWindowCommand.parse(["version": "1", "action": "open_persona_activity", "persona_id": "../bad"]) == nil)
+        #expect(StackWindowCommand.parse(["version": "1", "action": "open_persona_activity", "persona_id": "persona-1", "extra": true]) == nil)
+        #expect(StackWindowCommand.personaActivityURL(appURL: base, personaID: "persona-1")?.absoluteString == "https://my.personastack.ai/user/personas/activity/desktop-popout?persona_id=persona-1")
+        #expect(StackWindowCommand.personaActivityURL(appURL: base, personaID: "a&other=1") == nil)
+    }
+
     @MainActor
     @Test func testStackPopoutWindowsAreBorderlessAndDeduplicated() throws {
         _ = NSApplication.shared
@@ -56,9 +65,14 @@ struct ChatWindowTests {
         #expect(manager.window(for: .graph, stackID: "stack-1") === graph)
         manager.apply(.open(.stream, "stack-1"), base: base)
         #expect(manager.window(for: .stream, stackID: "stack-1") !== graph)
+        manager.apply(.openPersonaActivity("persona-1"), base: base)
+        let activity = try #require(manager.window(forPersonaActivity: "persona-1"))
+        manager.apply(.openPersonaActivity("persona-1"), base: base)
+        #expect(manager.window(forPersonaActivity: "persona-1") === activity)
         manager.invalidateSession()
         #expect(manager.window(for: .graph, stackID: "stack-1") == nil)
         #expect(manager.window(for: .stream, stackID: "stack-1") == nil)
+        #expect(manager.window(forPersonaActivity: "persona-1") == nil)
     }
 
     @MainActor

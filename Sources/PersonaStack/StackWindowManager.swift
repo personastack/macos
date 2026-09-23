@@ -20,24 +20,35 @@ final class StackWindowManager: NSObject, WKScriptMessageHandlerWithReply {
     }
 
     func window(for view: StackWindowView, stackID: String) -> StackPopoutWindow? { windows[key(view, stackID: stackID)] }
+    func window(forPersonaActivity personaID: String) -> StackPopoutWindow? { windows["persona-activity:\(personaID)"] }
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage,
                                replyHandler: @escaping @MainActor @Sendable (Any?, String?) -> Void) {
         guard let webView = message.webView, let base = mainViews.object(forKey: webView) as URL?,
               ChatWindowManager.trusted(message, base: base), let command = StackWindowCommand.parse(message.body) else {
-            replyHandler(nil, "Invalid desktop stack request."); return
+            replyHandler(nil, "Invalid desktop pop-out request."); return
         }
         apply(command, base: base)
         replyHandler(["ok": true], nil)
     }
 
     func apply(_ command: StackWindowCommand, base: URL) {
-        let (view, stackID): (StackWindowView, String)
-        switch command { case .open(let requestedView, let requestedStackID): view = requestedView; stackID = requestedStackID }
-        let windowKey = key(view, stackID: stackID)
+        let windowKey: String
+        let url: URL?
+        let transparent: Bool
+        switch command {
+        case .open(let view, let stackID):
+            windowKey = key(view, stackID: stackID)
+            url = StackWindowCommand.popoutURL(appURL: base, stackID: stackID, view: view)
+            transparent = view == .graph
+        case .openPersonaActivity(let personaID):
+            windowKey = "persona-activity:\(personaID)"
+            url = StackWindowCommand.personaActivityURL(appURL: base, personaID: personaID)
+            transparent = false
+        }
         if let existing = windows[windowKey] { existing.focus(); return }
-        guard let url = StackWindowCommand.popoutURL(appURL: base, stackID: stackID, view: view) else { return }
-        let popout = StackPopoutWindow(url: url, transparent: view == .graph, loadPage: loadPages) { [weak self] in self?.windows.removeValue(forKey: windowKey) }
+        guard let url else { return }
+        let popout = StackPopoutWindow(url: url, transparent: transparent, loadPage: loadPages) { [weak self] in self?.windows.removeValue(forKey: windowKey) }
         windows[windowKey] = popout
         popout.focus()
     }
