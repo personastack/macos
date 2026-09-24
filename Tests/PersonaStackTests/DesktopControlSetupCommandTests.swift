@@ -25,3 +25,16 @@ import Testing
         }
     }
 }
+
+@Test func desktopControlSetupScopeFencesPendingWorkAfterWorkspaceChange() throws {
+    var scope = DesktopControlSetupScope()
+    scope.synchronize("workspace-a-session")
+    let pendingGeneration = scope.generation
+    try scope.require("workspace-a-session", generation: pendingGeneration)
+
+    scope.synchronize("workspace-b-session")
+    #expect(throws: DesktopControlEnrollmentError.invalidRequest) {
+        try scope.require("workspace-a-session", generation: pendingGeneration)
+    }
+    try scope.require("workspace-b-session", generation: scope.generation)
+}

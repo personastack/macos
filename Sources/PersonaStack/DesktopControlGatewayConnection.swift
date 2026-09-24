@@ -148,7 +148,7 @@ actor DesktopControlGatewayConnection {
         }
     }
 
-    private static func validCommand(_ frame: DesktopControlFrame, installationID: String) -> Bool {
+    static func validCommand(_ frame: DesktopControlFrame, installationID: String) -> Bool {
         guard let target = frame.target, let requestID = frame.requestID, !requestID.isEmpty,
               target.installationID == installationID,
               !target.workspaceID.isEmpty, !target.configID.isEmpty, !target.personaID.isEmpty,

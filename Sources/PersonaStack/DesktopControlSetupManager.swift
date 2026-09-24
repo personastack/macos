@@ -4,6 +4,23 @@ import ServiceManagement
 import PersonaStackCore
 import WebKit
 
+struct DesktopControlSetupScope {
+    private(set) var value = ""
+    private(set) var generation = UUID()
+
+    mutating func synchronize(_ value: String) {
+        guard self.value != value else { return }
+        self.value = value
+        generation = UUID()
+    }
+
+    func require(_ value: String, generation expectedGeneration: UUID? = nil) throws {
+        guard self.value == value, expectedGeneration == nil || generation == expectedGeneration else {
+            throw DesktopControlEnrollmentError.invalidRequest
+        }
+    }
+}
+
 enum DesktopControlSetupCommand: Equatable {
     case sync(scope: String)
     case state(scope: String)
@@ -51,8 +68,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
 
     private final class Page {
         let appURL: URL
-        var scope = ""
-        var generation = UUID()
+        var setupScope = DesktopControlSetupScope()
 
         init(appURL: URL) { self.appURL = appURL }
     }
@@ -99,13 +115,10 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
     private func apply(_ command: DesktopControlSetupCommand, page: Page) async throws -> [String: Any] {
         switch command {
         case .sync(let scope):
-            if page.scope != scope {
-                page.scope = scope
-                page.generation = UUID()
-            }
+            page.setupScope.synchronize(scope)
             return ["ok": true, "version": "1"]
         case .state(let scope):
-            try requireCurrentScope(scope, page: page)
+            try page.setupScope.require(scope)
             let installation = try KeychainDesktopControlCredentialStore().load()
             return [
                 "ok": true,
@@ -115,8 +128,8 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
                 "relay_paused": runtime.paused,
             ]
         case .prepare(let scope, let ticket):
-            try requireCurrentScope(scope, page: page)
-            let generation = page.generation
+            let generation = page.setupScope.generation
+            try page.setupScope.require(scope, generation: generation)
             var runtimeGeneration = try runtime.beginResume()
             do {
                 try await runtime.resume(generation: runtimeGeneration)
@@ -178,13 +191,11 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
     }
 
     private func requireCurrentScope(_ scope: String, page: Page) throws {
-        try requireCurrentScope(scope, generation: page.generation, page: page)
+        try requireCurrentScope(scope, generation: page.setupScope.generation, page: page)
     }
 
     private func requireCurrentScope(_ scope: String, generation: UUID, page: Page) throws {
-        guard page.scope == scope, page.generation == generation else {
-            throw DesktopControlEnrollmentError.invalidRequest
-        }
+        try page.setupScope.require(scope, generation: generation)
     }
 
     private func requireCurrentLifecycle(_ generation: UUID) throws {
