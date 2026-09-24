@@ -270,10 +270,14 @@ public actor DesktopFileSystem {
         let descriptor = path.withCString { Darwin.open($0, flags | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK) }
         guard descriptor >= 0 else { throw operationError(errno, fallback: .notRegularFile) }
         var info = stat()
-        guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
+        guard fstat(descriptor, &info) == 0 else {
             let failure = errno
             _ = Darwin.close(descriptor)
             throw operationError(failure, fallback: .notRegularFile)
+        }
+        guard (info.st_mode & S_IFMT) == S_IFREG else {
+            _ = Darwin.close(descriptor)
+            throw DesktopFileSystemError.notRegularFile
         }
         return descriptor
     }
