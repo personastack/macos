@@ -78,6 +78,8 @@ PersonaStack for macOS presents a selected PersonaStack web surface in a dedicat
 
 Each semantic version is an unsigned universal macOS disk image. A private GitHub release retains the immutable `PersonaStack-<version>-unsigned.dmg` installer. The release workflow copies the same DMG into a versioned public `personastack/homebrew-tap` Git tag and updates the `personastack` cask. Homebrew installs it with `brew install --cask personastack/tap/personastack`.
 
+For local package validation, `scripts/package-macos.sh` accepts `PERSONASTACK_CODESIGN_IDENTITY`. A named keychain identity signs the app bundle and verifies it before image creation. `-` performs an ad-hoc signature experiment and gives the artifact an `adhoc` suffix. Ad-hoc identity is not proof of stable TCC attribution, Login Item approval, or a distributable signed build. The public release workflow remains unsigned until its signing and notarization credentials are configured.
+
 ## Desktop Control relay
 
 - A desktop-only hosted CTA starts a strict main-frame native setup bridge. It validates the configured app origin and frame, accepts only typed setup/status actions, rejects unknown fields, and never treats a workspace, installation ID, `ready` flag, path, shell command, or URL from JavaScript as authorization.

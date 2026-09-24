@@ -5,6 +5,7 @@ root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 version=${VERSION:-0.1.0}
 configuration=${CONFIGURATION:-release}
 default_url=${PERSONASTACK_DEFAULT_URL:-https://my.personastack.ai/user/personas}
+signing_identity=${PERSONASTACK_CODESIGN_IDENTITY:-}
 artifact_dir="$root_dir/artifacts"
 bundle_dir="$root_dir/build/PersonaStack.app"
 staging_dir="$root_dir/build/dmg-root"
@@ -39,7 +40,19 @@ chmod 755 "$bundle_dir/Contents/MacOS/PersonaStack"
 plutil -replace CFBundleShortVersionString -string "$version" "$bundle_dir/Contents/Info.plist"
 plutil -replace PersonaStackDefaultURL -string "$default_url" "$bundle_dir/Contents/Info.plist"
 
+artifact_suffix=unsigned
+if [ -n "$signing_identity" ]; then
+  if [ "$signing_identity" = "-" ]; then
+    artifact_suffix=adhoc
+    codesign --force --options runtime --identifier ai.personastack.desktop --sign "$signing_identity" "$bundle_dir"
+  else
+    artifact_suffix=signed
+    codesign --force --options runtime --timestamp --identifier ai.personastack.desktop --sign "$signing_identity" "$bundle_dir"
+  fi
+  codesign --verify --deep --strict --verbose=2 "$bundle_dir"
+fi
+
 cp -R "$bundle_dir" "$staging_dir/"
 mkdir -p "$artifact_dir"
-hdiutil create -volname "PersonaStack" -srcfolder "$staging_dir" -ov -format UDZO "$artifact_dir/PersonaStack-$version-unsigned.dmg" >/dev/null
-printf '%s\n' "$artifact_dir/PersonaStack-$version-unsigned.dmg"
+hdiutil create -volname "PersonaStack" -srcfolder "$staging_dir" -ov -format UDZO "$artifact_dir/PersonaStack-$version-$artifact_suffix.dmg" >/dev/null
+printf '%s\n' "$artifact_dir/PersonaStack-$version-$artifact_suffix.dmg"
