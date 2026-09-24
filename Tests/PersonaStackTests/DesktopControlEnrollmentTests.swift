@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import PersonaStackCore
 @testable import PersonaStack
 
 private actor EnrollmentTransportFixture: DesktopControlEnrollmentTransport {
@@ -173,4 +174,30 @@ private final class EnrollmentCredentialStoreFixture: DesktopControlCredentialSt
     let body = try #require(requests.first?.body)
     let payload = try #require(JSONSerialization.jsonObject(with: body) as? [String: String])
     #expect(payload == ["installation_id": "install-1"])
+}
+
+@Test func revocationUsesTheConfiguredPersonaStackServiceOrigin() async throws {
+    let credential = Data(repeating: 0x66, count: 32).base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "=", with: "")
+    let data = try JSONSerialization.data(withJSONObject: [
+        "installation_id": "install-1",
+        "machine_credential": credential,
+        "gateway_websocket_url": "wss://cluster-agent.example.test/v1/desktop-control/ws",
+    ])
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: data)
+    let transport = EnrollmentTransportFixture(response: Data(), status: 204)
+    let client = DesktopControlEnrollmentClient(transport: transport, credentials: EnrollmentCredentialStoreFixture())
+    let serviceURL = LaunchConfiguration.url(
+        arguments: ["PersonaStack", "--personastack-url", "https://lan.example.test/user/personas"],
+        packagedDefaultURL: "https://my.personastack.ai/user/personas"
+    )
+
+    try await client.revokeRemote(installation: installation, appURL: serviceURL)
+
+    let requests = await transport.recordedRequests()
+    #expect(requests.count == 1)
+    #expect(requests.first?.url.absoluteString == "https://lan.example.test/v1/desktop-control/revoke")
+    #expect(requests.first?.bearer == credential)
 }

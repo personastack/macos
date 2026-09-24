@@ -166,7 +166,11 @@ actor DesktopControlEnrollmentClient {
         self.credentials = credentials
     }
 
-    func enroll(ticket: String, appURL: URL) async throws -> DesktopControlInstallation {
+    func enroll(
+        ticket: String,
+        appURL: URL,
+        commitCredential: (@MainActor @Sendable (DesktopControlInstallation) throws -> Void)? = nil
+    ) async throws -> DesktopControlInstallation {
         if let existing = try credentials.load() { return existing }
         guard !ticket.isEmpty, ticket.utf8.count <= 512,
               let endpoint = Self.enrollmentURL(appURL) else {
@@ -178,7 +182,8 @@ actor DesktopControlEnrollmentClient {
             throw DesktopControlEnrollmentError.rejected
         }
         let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: data)
-        try credentials.save(installation)
+        if let commitCredential { try await commitCredential(installation) }
+        else { try credentials.save(installation) }
         return installation
     }
 

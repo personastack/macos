@@ -13,6 +13,7 @@ public enum CuaMCPProxyError: Error, Equatable {
     case invalidToolCatalog
     case permissionsRequired
     case functionalProbeFailed
+    case serviceRunning
 }
 
 extension CuaMCPProxyError: LocalizedError {
@@ -22,6 +23,8 @@ extension CuaMCPProxyError: LocalizedError {
             return "Grant Accessibility and Screen Recording to CuaDriver.app, then retry setup."
         case .functionalProbeFailed:
             return "CuaDriver.app did not return a usable screenshot and accessibility snapshot. Check its permissions and retry."
+        case .serviceRunning:
+            return "Quit CuaDriver.app, then retry Desktop Control repair. PersonaStack will not terminate CuaDriver.app or replace its managed files while it is running."
         default:
             return "The local Cua service could not complete its setup check. Retry setup or repair Cua."
         }

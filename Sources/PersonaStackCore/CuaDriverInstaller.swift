@@ -83,7 +83,10 @@ public actor CuaDriverInstaller {
         self.session = session
     }
 
-    public func validateOrInstall(repair: Bool = false) async throws -> CuaDriverInstallation {
+    public func validateOrInstall(
+        repair: Bool = false,
+        commitManagedInstall: (@MainActor @Sendable (URL, URL, Bool) throws -> Void)? = nil
+    ) async throws -> CuaDriverInstallation {
         let installRoot = supportDirectory.appendingPathComponent("CuaDriver-\(CuaDriverCompatibility.version)", isDirectory: true)
         let replacingManagedInstall = fileManager.fileExists(atPath: installRoot.path)
         if fileManager.fileExists(atPath: installRoot.path) {
@@ -120,8 +123,12 @@ public actor CuaDriverInstaller {
         let ownership = InstallOwnership(version: CuaDriverCompatibility.version, archiveSHA256: CuaDriverCompatibility.archiveSHA256)
         let ownershipData = try JSONEncoder().encode(ownership)
         try ownershipData.write(to: payload.appendingPathComponent(Self.ownershipFile), options: .atomic)
-        if replacingManagedInstall { try fileManager.removeItem(at: installRoot) }
-        try fileManager.moveItem(at: payload, to: installRoot)
+        if let commitManagedInstall {
+            try await commitManagedInstall(installRoot, payload, replacingManagedInstall)
+        } else {
+            if replacingManagedInstall { try fileManager.removeItem(at: installRoot) }
+            try fileManager.moveItem(at: payload, to: installRoot)
+        }
         return CuaDriverInstallation(
             applicationURL: installRoot.appendingPathComponent("CuaDriver.app", isDirectory: true),
             executableURL: installRoot.appendingPathComponent("cua-driver"),

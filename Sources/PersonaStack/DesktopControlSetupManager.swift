@@ -117,29 +117,54 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         case .prepare(let scope, let ticket):
             try requireCurrentScope(scope, page: page)
             let generation = page.generation
+            var runtimeGeneration = try runtime.beginResume()
             do {
-                try await runtime.resume()
+                try await runtime.resume(generation: runtimeGeneration)
             } catch {
                 try requireCurrentScope(scope, generation: generation, page: page)
-                try await runtime.repair()
+                try requireCurrentLifecycle(runtimeGeneration)
+                guard DesktopControlRuntime.shouldForceRepair(after: error) else { throw error }
+                runtimeGeneration = try await runtime.repair(resumeRelay: true, expectedGeneration: runtimeGeneration)
             }
             try requireCurrentScope(scope, generation: generation, page: page)
+            try requireCurrentLifecycle(runtimeGeneration)
             do { try SMAppService.mainApp.register() }
             catch { throw DesktopControlEnrollmentError.serviceRegistrationFailed }
             try requireCurrentScope(scope, generation: generation, page: page)
+            try requireCurrentLifecycle(runtimeGeneration)
             let saved = try KeychainDesktopControlCredentialStore().load()
             let installation: DesktopControlInstallation
             if let saved {
                 installation = saved
                 try await enrollment.reportReady(installation: installation, appURL: page.appURL)
+                try requireCurrentScope(scope, generation: generation, page: page)
+                try requireCurrentLifecycle(runtimeGeneration)
                 try await enrollment.attach(ticket: ticket, installation: installation, appURL: page.appURL)
+                try requireCurrentScope(scope, generation: generation, page: page)
+                try requireCurrentLifecycle(runtimeGeneration)
             } else {
-                installation = try await enrollment.enroll(ticket: ticket, appURL: page.appURL)
+                let enrollmentRuntimeGeneration = runtimeGeneration
+                installation = try await enrollment.enroll(
+                    ticket: ticket,
+                    appURL: page.appURL,
+                    commitCredential: { [weak self] installation in
+                        guard let self else { throw CancellationError() }
+                        try self.requireCurrentScope(scope, generation: generation, page: page)
+                        try self.requireCurrentLifecycle(enrollmentRuntimeGeneration)
+                        try KeychainDesktopControlCredentialStore().save(installation)
+                    }
+                )
+                try requireCurrentScope(scope, generation: generation, page: page)
+                try requireCurrentLifecycle(runtimeGeneration)
                 try await enrollment.reportReady(installation: installation, appURL: page.appURL)
+                try requireCurrentScope(scope, generation: generation, page: page)
+                try requireCurrentLifecycle(runtimeGeneration)
             }
             try requireCurrentScope(scope, generation: generation, page: page)
-            await runtime.connect(installation: installation)
+            try requireCurrentLifecycle(runtimeGeneration)
+            await runtime.connect(installation: installation, expectedGeneration: runtimeGeneration)
             try requireCurrentScope(scope, generation: generation, page: page)
+            try requireCurrentLifecycle(runtimeGeneration)
             UserDefaults.standard.set(true, forKey: "desktopControlRelayEnabled")
             UserDefaults.standard.set(false, forKey: "desktopControlRelayPaused")
             return [
@@ -160,5 +185,9 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         guard page.scope == scope, page.generation == generation else {
             throw DesktopControlEnrollmentError.invalidRequest
         }
+    }
+
+    private func requireCurrentLifecycle(_ generation: UUID) throws {
+        guard runtime.isCurrentLifecycle(generation) else { throw CancellationError() }
     }
 }

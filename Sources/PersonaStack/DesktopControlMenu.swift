@@ -63,29 +63,50 @@ struct DesktopControlMenu: View {
     private func toggleRelay() async {
         loginItemError = ""
         if relayEnabled && !relayPaused {
-            await DesktopControlRuntime.shared.pause()
-            relayPaused = true
+            let runtime = DesktopControlRuntime.shared
+            guard let generation = runtime.beginPause() else { return }
+            await runtime.pause(generation: generation)
+            guard runtime.isCurrentLifecycle(generation) else { return }
+            relayPaused = runtime.paused
             return
         }
+        let runtime = DesktopControlRuntime.shared
+        var generation: UUID?
         do {
-            try await DesktopControlRuntime.shared.resume()
+            let current = try runtime.beginResume()
+            generation = current
+            try await runtime.resume(generation: current)
+            guard runtime.isCurrentLifecycle(current) else { return }
             relayEnabled = true
             relayPaused = false
+        } catch is CancellationError {
+            return
         } catch {
+            guard let generation, runtime.isCurrentLifecycle(generation) else { return }
             loginItemError = "Cua service could not start: \(error.localizedDescription)"
-            relayEnabled = false
+            relayEnabled = runtime.hasActiveInstallation
+            relayPaused = runtime.paused
         }
     }
 
     @MainActor
     private func repairCua() async {
         loginItemError = ""
+        let runtime = DesktopControlRuntime.shared
+        var generation: UUID?
         do {
-            try await DesktopControlRuntime.shared.repair()
-            relayPaused = false
+            let current = try runtime.beginRepair()
+            generation = current
+            try await runtime.repair(generation: current)
+            guard runtime.isCurrentLifecycle(current) else { return }
+        } catch is CancellationError {
+            return
         } catch {
+            guard let generation, runtime.isCurrentLifecycle(generation) else { return }
             loginItemError = "Cua service could not be repaired: \(error.localizedDescription)"
         }
+        guard let generation, runtime.isCurrentLifecycle(generation) else { return }
+        relayPaused = runtime.paused
     }
 
     @MainActor
@@ -112,12 +133,21 @@ struct DesktopControlMenu: View {
     @MainActor
     private func disconnectRelay() async {
         loginItemError = ""
+        let runtime = DesktopControlRuntime.shared
+        var generation: UUID?
         do {
-            try await DesktopControlRuntime.shared.disconnect()
+            let current = try runtime.beginDisconnect()
+            generation = current
+            try await runtime.disconnect(generation: current)
+            guard runtime.isCurrentLifecycle(current) else { return }
             relayEnabled = false
             relayPaused = false
+        } catch is CancellationError {
+            return
         } catch {
-            if DesktopControlRuntime.shared.gatewayConnected {
+            guard let generation, runtime.isCurrentLifecycle(generation) else { return }
+            if runtime.hasActiveInstallation {
+                relayEnabled = true
                 relayPaused = true
             } else {
                 relayEnabled = false
@@ -126,4 +156,5 @@ struct DesktopControlMenu: View {
             loginItemError = error.localizedDescription
         }
     }
+
 }
