@@ -34,11 +34,18 @@ final class DesktopControlRuntime {
     private(set) var paused = false
     private(set) var readiness = "unknown"
 
-    init(installer: any DesktopControlDriverInstalling = CuaDriverInstaller(),
-         credentials: any DesktopControlCredentialStoring = KeychainDesktopControlCredentialStore()) {
+    private init(installer: any DesktopControlDriverInstalling = CuaDriverInstaller(),
+                 credentials: any DesktopControlCredentialStoring = KeychainDesktopControlCredentialStore()) {
         self.installer = installer
         self.credentials = credentials
     }
+
+#if DEBUG
+    static func makeForTesting(installer: any DesktopControlDriverInstalling,
+                               credentials: any DesktopControlCredentialStoring) -> DesktopControlRuntime {
+        DesktopControlRuntime(installer: installer, credentials: credentials)
+    }
+#endif
 
     func beginResume() throws -> UUID {
         guard !disconnecting else { throw CancellationError() }

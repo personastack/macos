@@ -29,7 +29,7 @@ private struct EmptyDesktopControlCredentialStore: DesktopControlCredentialStori
 
 @Test @MainActor func repairDoesNotForceReinstallWhenCuaNeedsPermission() async throws {
     let installer = DesktopControlInstallerFixture(errors: [CuaMCPProxyError.permissionsRequired])
-    let runtime = DesktopControlRuntime(installer: installer, credentials: EmptyDesktopControlCredentialStore())
+    let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: EmptyDesktopControlCredentialStore())
 
     await #expect(throws: CuaMCPProxyError.permissionsRequired) {
         try await runtime.repair()
@@ -41,7 +41,7 @@ private struct EmptyDesktopControlCredentialStore: DesktopControlCredentialStori
 
 @Test @MainActor func repairAllowsOnlyOneForcedInstallAfterRetryableFailure() async throws {
     let installer = DesktopControlInstallerFixture(errors: [CuaDriverInstallError.invalidLayout, CuaDriverInstallError.invalidLayout])
-    let runtime = DesktopControlRuntime(installer: installer, credentials: EmptyDesktopControlCredentialStore())
+    let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: EmptyDesktopControlCredentialStore())
 
     await #expect(throws: CuaDriverInstallError.invalidLayout) {
         try await runtime.repair()
@@ -51,12 +51,12 @@ private struct EmptyDesktopControlCredentialStore: DesktopControlCredentialStori
     #expect(runtime.readiness == "cua_unavailable")
 }
 
-@Test @MainActor func setupBridgeAllowsPermissionRetryWithoutForcingInstall() async throws {
+@Test @MainActor func setupPrepareAcceptsRepeatedPermissionRetryAttemptsWithoutForcedInstall() async throws {
     let installer = DesktopControlInstallerFixture(errors: [
         CuaMCPProxyError.permissionsRequired,
         CuaMCPProxyError.permissionsRequired,
     ])
-    let runtime = DesktopControlRuntime(installer: installer, credentials: EmptyDesktopControlCredentialStore())
+    let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: EmptyDesktopControlCredentialStore())
     let manager = DesktopControlSetupManager(runtime: runtime)
     let page = DesktopControlSetupManager.Page(appURL: URL(string: "https://personastack.ai")!)
     page.setupScope.synchronize("workspace-setup-session")
