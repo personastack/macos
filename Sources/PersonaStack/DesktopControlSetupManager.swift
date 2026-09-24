@@ -4,6 +4,30 @@ import ServiceManagement
 import PersonaStackCore
 import WebKit
 
+@MainActor
+protocol DesktopControlSetupRuntime: AnyObject {
+    var gatewayConnected: Bool { get }
+    var paused: Bool { get }
+    func isCuaReady() -> Bool
+    func beginResume() throws -> UUID
+    func resume(generation: UUID) async throws
+    func repair(resumeRelay: Bool, expectedGeneration: UUID?) async throws -> UUID
+    func isCurrentLifecycle(_ generation: UUID) -> Bool
+    func connect(installation: DesktopControlInstallation, expectedGeneration: UUID?) async
+}
+
+protocol DesktopControlSetupEnrollment: Sendable {
+    func enroll(
+        ticket: String,
+        appURL: URL,
+        commitCredential: (@MainActor @Sendable (DesktopControlInstallation) throws -> Void)?
+    ) async throws -> DesktopControlInstallation
+    func reportReady(installation: DesktopControlInstallation, appURL: URL) async throws
+    func attach(ticket: String, installation: DesktopControlInstallation, appURL: URL) async throws
+}
+
+extension DesktopControlEnrollmentClient: DesktopControlSetupEnrollment {}
+
 struct DesktopControlSetupScope {
     private(set) var value = ""
     private(set) var generation = UUID()
@@ -75,11 +99,24 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
 
     private let logger = Logger(subsystem: "ai.personastack.desktop", category: "desktop-control-setup")
     private let pages = NSMapTable<WKWebView, Page>.weakToStrongObjects()
-    private let enrollment = DesktopControlEnrollmentClient()
-    private let runtime: DesktopControlRuntime
+    private let enrollment: any DesktopControlSetupEnrollment
+    private let credentials: any DesktopControlCredentialStoring
+    private let registerLoginItem: @MainActor () throws -> Void
+    private let preferences: UserDefaults
+    private let runtime: any DesktopControlSetupRuntime
 
-    init(runtime: DesktopControlRuntime = .shared) {
+    init(
+        runtime: any DesktopControlSetupRuntime = DesktopControlRuntime.shared,
+        enrollment: any DesktopControlSetupEnrollment = DesktopControlEnrollmentClient(),
+        credentials: any DesktopControlCredentialStoring = KeychainDesktopControlCredentialStore(),
+        preferences: UserDefaults = .standard,
+        registerLoginItem: @escaping @MainActor () throws -> Void = { try SMAppService.mainApp.register() }
+    ) {
         self.runtime = runtime
+        self.enrollment = enrollment
+        self.credentials = credentials
+        self.preferences = preferences
+        self.registerLoginItem = registerLoginItem
         super.init()
     }
 
@@ -94,7 +131,12 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             replyHandler(nil, DesktopControlEnrollmentError.invalidRequest.localizedDescription)
             return
         }
-        guard let command = try? DesktopControlSetupCommand.parse(message.body) else {
+        dispatch(message.body, page: page, replyHandler: replyHandler)
+    }
+
+    func dispatch(_ body: Any, page: Page,
+                  replyHandler: @escaping @MainActor @Sendable (Any?, String?) -> Void) {
+        guard let command = try? DesktopControlSetupCommand.parse(body) else {
             replyHandler(nil, DesktopControlEnrollmentError.invalidRequest.localizedDescription)
             return
         }
@@ -119,7 +161,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             return ["ok": true, "version": "1"]
         case .state(let scope):
             try page.setupScope.require(scope)
-            let installation = try KeychainDesktopControlCredentialStore().load()
+            let installation = try credentials.load()
             return [
                 "ok": true,
                 "installation_id": installation?.installationID as Any? ?? NSNull(),
@@ -141,11 +183,11 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             }
             try requireCurrentScope(scope, generation: generation, page: page)
             try requireCurrentLifecycle(runtimeGeneration)
-            do { try SMAppService.mainApp.register() }
+            do { try registerLoginItem() }
             catch { throw DesktopControlEnrollmentError.serviceRegistrationFailed }
             try requireCurrentScope(scope, generation: generation, page: page)
             try requireCurrentLifecycle(runtimeGeneration)
-            let saved = try KeychainDesktopControlCredentialStore().load()
+            let saved = try credentials.load()
             let installation: DesktopControlInstallation
             if let saved {
                 installation = saved
@@ -178,8 +220,8 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             await runtime.connect(installation: installation, expectedGeneration: runtimeGeneration)
             try requireCurrentScope(scope, generation: generation, page: page)
             try requireCurrentLifecycle(runtimeGeneration)
-            UserDefaults.standard.set(true, forKey: "desktopControlRelayEnabled")
-            UserDefaults.standard.set(false, forKey: "desktopControlRelayPaused")
+            preferences.set(true, forKey: "desktopControlRelayEnabled")
+            preferences.set(false, forKey: "desktopControlRelayPaused")
             return [
                 "ok": true,
                 "installation_id": installation.installationID,

@@ -12,7 +12,7 @@ protocol DesktopControlDriverInstalling: Sendable {
 extension CuaDriverInstaller: DesktopControlDriverInstalling {}
 
 @MainActor
-final class DesktopControlRuntime {
+final class DesktopControlRuntime: DesktopControlSetupRuntime {
     static let shared = DesktopControlRuntime()
 
     private let installer: any DesktopControlDriverInstalling
