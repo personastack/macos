@@ -16,30 +16,37 @@ final class DesktopControlRuntime {
     private(set) var gatewayConnected = false
     private(set) var tools: Set<String> = []
     private(set) var paused = false
+    private var readiness = "unknown"
 
     private init() {}
 
     func resume() async throws {
         if proxy == nil {
-            let installation = try await installer.validateOrInstall()
-            let application = try await launchCuaService(at: installation.applicationURL)
-            cuaApplication = application
-
-            let candidate = CuaMCPProxy(executableURL: installation.executableURL)
             do {
-                _ = try await candidate.start()
-                let catalog = try await candidate.listTools()
-                tools = try await candidate.validateToolCatalog(catalog)
-                try await verifyCuaReadiness(candidate)
-                proxy = candidate
+                let installation = try await installer.validateOrInstall()
+                let application = try await launchCuaService(at: installation.applicationURL)
+                cuaApplication = application
+
+                let candidate = CuaMCPProxy(executableURL: installation.executableURL)
+                do {
+                    _ = try await candidate.start()
+                    let catalog = try await candidate.listTools()
+                    tools = try await candidate.validateToolCatalog(catalog)
+                    try await verifyCuaReadiness(candidate)
+                    proxy = candidate
+                } catch {
+                    await candidate.stop()
+                    application.terminate()
+                    cuaApplication = nil
+                    throw error
+                }
             } catch {
-                await candidate.stop()
-                application.terminate()
-                cuaApplication = nil
+                await publishReadinessFailure(error)
                 throw error
             }
         }
         paused = false
+        readiness = "ready"
         if let saved = try? KeychainDesktopControlCredentialStore().load() {
             await gateway?.setReadiness("ready")
             beginReconnectLoop(for: saved)
@@ -48,6 +55,7 @@ final class DesktopControlRuntime {
 
     func startPaused() async throws {
         paused = true
+        readiness = "paused"
         guard let installation = try KeychainDesktopControlCredentialStore().load() else { return }
         activeInstallation = installation
         if await gateway?.isConnected() == true {
@@ -60,6 +68,7 @@ final class DesktopControlRuntime {
 
     func pause() async {
         paused = true
+        readiness = "paused"
         await gateway?.setReadiness("paused")
         await executor.close()
         executor = DesktopControlCommandExecutor()
@@ -165,7 +174,7 @@ final class DesktopControlRuntime {
     }
 
     private func establishConnection(_ installation: DesktopControlInstallation) async throws {
-        guard paused || isCuaReady() else { throw CuaMCPProxyError.notStarted }
+        guard paused || isCuaReady() || readiness != "ready" else { throw CuaMCPProxyError.notStarted }
         if let gateway {
             await gateway.stop()
         }
@@ -179,9 +188,7 @@ final class DesktopControlRuntime {
         )
         do {
             try await connection.connect()
-            if paused {
-                await connection.setReadiness("paused")
-            }
+            await connection.setReadiness(readiness)
             gateway = connection
             activeInstallation = installation
             gatewayConnected = true
@@ -196,10 +203,40 @@ final class DesktopControlRuntime {
         gatewayConnected = false
     }
 
+    private func publishReadinessFailure(_ error: Error) async {
+        readiness = Self.readiness(for: error)
+        guard let installation = try? KeychainDesktopControlCredentialStore().load() else { return }
+        activeInstallation = installation
+        if await gateway?.isConnected() != true {
+            do { try await establishConnection(installation) }
+            catch {
+                gatewayConnected = false
+                return
+            }
+        }
+        await gateway?.setReadiness(readiness)
+        beginReconnectLoop(for: installation)
+    }
+
+    static func readiness(for error: Error) -> String {
+        guard let error = error as? CuaMCPProxyError else { return "cua_unavailable" }
+        switch error {
+        case .permissionsRequired:
+            return "permission_required"
+        case .functionalProbeFailed:
+            return "cua_unavailable"
+        default:
+            return "cua_unavailable"
+        }
+    }
+
     private func handle(_ frame: DesktopControlFrame,
                         onChunk: @escaping @Sendable (DesktopControlFrame) async throws -> Void) async -> DesktopControlFrame {
         guard !paused else {
             return Self.failure(for: frame, code: "desktop_paused", message: "Desktop Control is paused on this Mac.")
+        }
+        guard readiness == "ready" else {
+            return Self.failure(for: frame, code: readiness, message: "Desktop Control needs attention on this Mac. Review the connection status in PersonaStack Desktop.")
         }
         guard let activeInstallation, frame.target?.installationID == activeInstallation.installationID else {
             return Self.failure(for: frame, code: "desktop_executor_unavailable")

@@ -57,7 +57,7 @@ actor DesktopControlGatewayConnection {
     func isConnected() -> Bool { connected }
 
     func setReadiness(_ value: String) async {
-        guard value == "ready" || value == "paused" else { return }
+        guard ["unknown", "ready", "permission_required", "cua_unavailable", "paused", "locked", "upgrade_required"].contains(value) else { return }
         readiness = value
         guard connected else { return }
         do {
