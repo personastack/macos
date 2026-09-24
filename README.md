@@ -39,7 +39,7 @@ PersonaStack disables Cua telemetry and automatic update checks for driver proce
 ./scripts/package-macos.sh
 ```
 
-For local signing-path checks, set `PERSONASTACK_CODESIGN_IDENTITY` to a signing identity in the current keychain. A value of `-` creates an ad-hoc signed DMG for a one-build experiment. A named identity creates a signed DMG. Ad-hoc signing is not a stable TCC or release identity. The tagged release workflow still publishes the unsigned DMG until its signing and notarization credentials are configured.
+For local signing-path checks, set `PERSONASTACK_CODESIGN_IDENTITY` to a signing identity in the current keychain. A value of `-` creates a DMG containing an ad-hoc signed app bundle for a one-build experiment. A named identity creates a DMG with a signed app bundle. Ad-hoc signing is not a stable TCC or release identity. The tagged release workflow still publishes the unsigned DMG until its signing and notarization credentials are configured.
 
 The installer appears in `artifacts/`. Set `VERSION=0.1.0` to choose its version.
 
