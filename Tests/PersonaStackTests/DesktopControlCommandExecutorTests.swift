@@ -105,6 +105,35 @@ struct DesktopControlCommandExecutorTests {
     }
 
     @Test
+    func shellStartAndExpiredHandleFailuresAreActionable() async throws {
+        let executor = DesktopControlCommandExecutor()
+        let owner = target(persona: "persona-1")
+        let acquired = await executor.handle(command("desktop_control_acquire", owner, requestID: "acquire-shell-error"), proxy: nil)
+        guard case .object(let lease)? = acquired.result,
+              case .string(let token)? = lease["control_token"] else {
+            Issue.record("control token missing")
+            return
+        }
+
+        let start = command("desktop_control_execute", owner, requestID: "invalid-shell-cwd",
+                            arguments: .object(["control_token": .string(token), "command": .string("true"),
+                                                "working_directory": .string("/path/that/does/not/exist")]))
+        let startResponse = await executor.handle(start, proxy: nil)
+        #expect(startResponse.type == "failure")
+        #expect(startResponse.errorCode == "desktop_process_working_directory_invalid")
+        #expect(startResponse.errorMessage?.contains("existing directory") == true)
+
+        let status = command("desktop_control_exec_status", owner, requestID: "expired-process-handle",
+                             arguments: .object(["control_token": .string(token),
+                                                 "execution_id": .string("00000000-0000-0000-0000-000000000000")]))
+        let statusResponse = await executor.handle(status, proxy: nil)
+        #expect(statusResponse.type == "failure")
+        #expect(statusResponse.errorCode == "desktop_process_handle_expired")
+        #expect(statusResponse.errorMessage?.contains("Start a new command") == true)
+        await executor.close()
+    }
+
+    @Test
     func shellOutputIsForwardedAndRetainedForNonStreamingCallers() async throws {
         let executor = DesktopControlCommandExecutor()
         let owner = target(persona: "persona-1")
@@ -120,10 +149,10 @@ struct DesktopControlCommandExecutorTests {
         let collector = DesktopControlFrameCollector()
         let result = await executor.handle(execution, proxy: nil) { frame in await collector.append(frame) }
         let streamed = await collector.frames()
-        #expect(result.type == "result")
-        #expect(!streamed.isEmpty)
+        #expect(result.type == "result", "\(result.errorCode ?? "no code"): \(result.errorMessage ?? "no message")")
+        #expect(!streamed.isEmpty, "The command completed without forwarding any stdout or stderr chunks.")
         #expect(streamed.allSatisfy { $0.type == "result_chunk" && $0.requestID == "exec-stream" && $0.streamID == "exec-stream" })
-        #expect(streamed.compactMap(\.sequence) == Array(1...UInt64(streamed.count)))
+        #expect(streamed.enumerated().allSatisfy { $0.element.sequence == UInt64($0.offset + 1) })
         guard case .object(let payload)? = result.result,
               case .array(let chunks)? = payload["chunks"] else {
             Issue.record("terminal shell payload missing chunks")

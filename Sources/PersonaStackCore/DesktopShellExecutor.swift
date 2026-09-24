@@ -40,6 +40,7 @@ public struct DesktopProcessRead: Sendable {
 public enum DesktopShellError: Error, Equatable {
     case invalidCommand
     case invalidWorkingDirectory
+    case permissionDenied
     case tooManyProcesses
     case missingExecution
     case invalidInput
@@ -87,10 +88,13 @@ public actor DesktopShellExecutor {
 
     public func start(command: String, workingDirectory: String, timeout: TimeInterval = 300) async throws -> DesktopProcessRead {
         guard !command.isEmpty, command.utf8.count <= Self.maximumCommandBytes else { throw DesktopShellError.invalidCommand }
+        guard workingDirectory.hasPrefix("/") else {
+            throw DesktopShellError.invalidWorkingDirectory
+        }
+        let accessResult = workingDirectory.withCString { Darwin.access($0, X_OK) }
+        guard accessResult == 0 else { throw Self.directoryError(errno: errno) }
         var isDirectory: ObjCBool = false
-        guard workingDirectory.hasPrefix("/"),
-              FileManager.default.fileExists(atPath: workingDirectory, isDirectory: &isDirectory),
-              isDirectory.boolValue else {
+        guard FileManager.default.fileExists(atPath: workingDirectory, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw DesktopShellError.invalidWorkingDirectory
         }
         pruneCompletedSessions()
@@ -405,10 +409,16 @@ public actor DesktopShellExecutor {
                 posix_spawn(&pid, "/bin/zsh", &actions, &attributes, argvBuffer.baseAddress, envBuffer.baseAddress)
             }
         }
-        guard result == 0 else { throw DesktopShellError.invalidCommand }
+        guard result == 0 else {
+            throw result == EACCES || result == EPERM ? DesktopShellError.permissionDenied : DesktopShellError.invalidCommand
+        }
         spawned = true
         _ = fcntl(input[1], F_SETNOSIGPIPE, 1)
         return (pid, input[1], output[0], error[0])
+    }
+
+    static func directoryError(errno: Int32) -> DesktopShellError {
+        errno == EACCES || errno == EPERM ? .permissionDenied : .invalidWorkingDirectory
     }
 
     private static func wait(_ pid: pid_t, on executor: DesktopShellExecutor, id: UUID) {

@@ -109,6 +109,8 @@ final class DesktopControlCommandExecutor {
             return Self.failure(frame, error.code, error.localizedDescription)
         } catch let error as DesktopFileSystemError {
             return Self.failure(frame, error.desktopControlCode, error.desktopControlMessage)
+        } catch let error as DesktopShellError {
+            return Self.failure(frame, error.desktopControlCode, error.desktopControlMessage)
         } catch {
             if frame.operation == "desktop_control_file" {
                 let nsError = error as NSError
@@ -401,6 +403,39 @@ private extension DesktopFileSystemError {
         case .searchIncomplete: "The file search exceeded its scan limit. Narrow the search to a smaller folder."
         case .invalidPath, .notRegularFile, .notDirectory, .contentTooLarge, .destinationExists:
             "PersonaStack Desktop could not complete this file operation. Check the path, file type, and operation limits."
+        }
+    }
+}
+
+private extension DesktopShellError {
+    var desktopControlCode: String {
+        switch self {
+        case .permissionDenied: "desktop_process_permission_denied"
+        case .invalidWorkingDirectory: "desktop_process_working_directory_invalid"
+        case .tooManyProcesses: "desktop_process_limit"
+        case .missingExecution: "desktop_process_handle_expired"
+        case .invalidInput: "desktop_process_input_invalid"
+        case .cancellationUnconfirmed: "desktop_process_cancel_unconfirmed"
+        case .invalidCommand: "desktop_process_start_failed"
+        }
+    }
+
+    var desktopControlMessage: String {
+        switch self {
+        case .permissionDenied:
+            "macOS denied access to the command working directory or process. Choose a location or command your macOS account can access."
+        case .invalidWorkingDirectory:
+            "The command working directory is missing or is not an accessible directory. Choose an existing directory on the target Mac."
+        case .tooManyProcesses:
+            "The desktop already has the maximum number of managed commands running. Finish or cancel one before starting another."
+        case .missingExecution:
+            "This command session is no longer available. Start a new command and use its current execution ID."
+        case .invalidInput:
+            "The command input is invalid or exceeds the supported size. Send a smaller input chunk."
+        case .cancellationUnconfirmed:
+            "The desktop could not confirm that the command stopped. Check its status before retrying work."
+        case .invalidCommand:
+            "The desktop could not start the command. Check the working directory and try again."
         }
     }
 }

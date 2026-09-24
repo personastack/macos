@@ -86,6 +86,9 @@ struct DesktopShellExecutorTests {
     @Test func commandValidatesWorkingDirectoryAndInputBounds() async throws {
         let executor = DesktopShellExecutor()
         #expect(DesktopShellExecutor.maximumTimeout == 30 * 60)
+        #expect(DesktopShellExecutor.directoryError(errno: EACCES) == .permissionDenied)
+        #expect(DesktopShellExecutor.directoryError(errno: EPERM) == .permissionDenied)
+        #expect(DesktopShellExecutor.directoryError(errno: ENOENT) == .invalidWorkingDirectory)
         await #expect(throws: DesktopShellError.invalidWorkingDirectory) {
             try await executor.start(command: "true", workingDirectory: "relative")
         }
