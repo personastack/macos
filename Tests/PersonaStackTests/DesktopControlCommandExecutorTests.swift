@@ -14,6 +14,26 @@ private actor DesktopControlFrameCollector {
     func frames() -> [DesktopControlFrame] { stored }
 }
 
+private actor DesktopControlCallbackGate {
+    private var enteredContinuation: CheckedContinuation<Void, Never>?
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private var entered = false
+
+    func suspend() async {
+        entered = true
+        enteredContinuation?.resume()
+        enteredContinuation = nil
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func isEntered() -> Bool { entered }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
 @Suite(.serialized)
 @MainActor
 struct DesktopControlCommandExecutorTests {
@@ -163,6 +183,110 @@ struct DesktopControlCommandExecutorTests {
     }
 
     @Test
+    func foreignInstallationCannotUseAnotherInstallationFileHandle() async throws {
+        let executor = DesktopControlCommandExecutor()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("desktop-control-foreign-install-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let protectedFile = directory.appendingPathComponent("private.txt")
+        let forbiddenWrite = directory.appendingPathComponent("foreign.txt")
+        try Data("authorized contents".utf8).write(to: protectedFile)
+
+        let owner = target(persona: "persona-1")
+        let acquired = await executor.handle(command("desktop_control_acquire", owner, requestID: "foreign-acquire"), proxy: nil)
+        guard case .object(let lease)? = acquired.result,
+              case .string(let token)? = lease["control_token"] else {
+            Issue.record("control token missing")
+            await executor.close()
+            return
+        }
+        let opened = await executor.handle(command("desktop_control_file", owner, requestID: "foreign-open",
+                                                   arguments: .object(["action": .string("open"), "path": .string(protectedFile.path), "control_token": .string(token)])), proxy: nil)
+        guard case .object(let openedFile)? = opened.result,
+              case .string(let handle)? = openedFile["handle"] else {
+            Issue.record("file handle missing")
+            await executor.close()
+            return
+        }
+
+        let foreignOwner = target(persona: "persona-1", installation: "install-foreign")
+        let foreignRead = await executor.handle(command("desktop_control_file", foreignOwner, requestID: "foreign-read",
+                                                         arguments: .object(["action": .string("read"), "control_token": .string(token),
+                                                                             "handle": .string(handle), "offset": .number(0)])), proxy: nil)
+        #expect(foreignRead.type == "failure")
+        #expect(foreignRead.errorCode == "desktop_control_required")
+        #expect(try Data(contentsOf: protectedFile) == Data("authorized contents".utf8))
+
+        let foreignWrite = await executor.handle(command("desktop_control_file", foreignOwner, requestID: "foreign-file-write",
+                                                          arguments: .object(["action": .string("write"), "control_token": .string(token),
+                                                                              "path": .string(forbiddenWrite.path), "content_base64": .string("Zm9yZWlnbg=="),
+                                                                              "mode": .string("create")])), proxy: nil)
+        #expect(foreignWrite.type == "failure")
+        #expect(foreignWrite.errorCode == "desktop_control_required")
+        #expect(!FileManager.default.fileExists(atPath: forbiddenWrite.path))
+
+        let foreignExecute = await executor.handle(command("desktop_control_execute", foreignOwner, requestID: "foreign-write",
+                                                           arguments: .object(["control_token": .string(token),
+                                                                              "command": .string("touch '\(forbiddenWrite.path)'"),
+                                                                              "working_directory": .string(directory.path)])), proxy: nil)
+        #expect(foreignExecute.type == "failure")
+        #expect(foreignExecute.errorCode == "desktop_control_required")
+        #expect(!FileManager.default.fileExists(atPath: forbiddenWrite.path))
+        await executor.close()
+    }
+
+    @Test
+    func configRevocationStopsAnActiveOutputStreamBeforeItCanContinue() async throws {
+        let executor = DesktopControlCommandExecutor()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("desktop-control-stream-revoke-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let afterRevoke = directory.appendingPathComponent("continued.txt")
+        let owner = target(persona: "persona-1", workspace: "workspace-a", config: "config-a", configVersion: 1)
+        let acquired = await executor.handle(command("desktop_control_acquire", owner, requestID: "stream-acquire"), proxy: nil)
+        guard case .object(let lease)? = acquired.result,
+              case .string(let token)? = lease["control_token"] else {
+            Issue.record("control token missing")
+            await executor.close()
+            return
+        }
+
+        let gate = DesktopControlCallbackGate()
+        let runningCommand = Task {
+            await executor.handle(command("desktop_control_execute", owner, requestID: "stream-command",
+                                          arguments: .object(["control_token": .string(token),
+                                                              "command": .string("printf 'stream-ready'; sleep 2; touch '\(afterRevoke.path)'"),
+                                                              "working_directory": .string(directory.path),
+                                                              "timeout_seconds": .number(10)])), proxy: nil) { _ in
+                await gate.suspend()
+            }
+        }
+
+        for _ in 0..<30 {
+            if await gate.isEntered() { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        guard await gate.isEntered() else {
+            Issue.record("command output did not reach the suspended stream callback")
+            await gate.release()
+            _ = await runningCommand.value
+            await executor.close()
+            return
+        }
+
+        let revokeTarget = DesktopControlTarget(installationID: "install-1", workspaceID: "workspace-a", configID: "config-a",
+                                                personaID: "", runID: "", generation: 0, configVersion: 2)
+        let revoked = await executor.handle(command("desktop_control_revoke_config", revokeTarget, requestID: "stream-revoke"), proxy: nil)
+        #expect(revoked.type == "result", "\(revoked.errorCode ?? "no code"): \(revoked.errorMessage ?? "no message")")
+        await gate.release()
+        let streamResult = await runningCommand.value
+        #expect(streamResult.type == "failure")
+        #expect(streamResult.errorCode == "desktop_control_config_revoked")
+        #expect(!FileManager.default.fileExists(atPath: afterRevoke.path))
+        await executor.close()
+    }
+
+    @Test
     func fileOperationsRequireTheCurrentControlToken() async {
         let executor = DesktopControlCommandExecutor()
         let read = command("desktop_control_file", target(persona: "persona-1"), requestID: "read-1",
@@ -265,8 +389,9 @@ struct DesktopControlCommandExecutorTests {
         await executor.close()
     }
 
-    private func target(persona: String, workspace: String = "workspace-1", config: String = "config-1", configVersion: Int64? = nil) -> DesktopControlTarget {
-        DesktopControlTarget(installationID: "install-1", workspaceID: workspace, configID: config,
+    private func target(persona: String, workspace: String = "workspace-1", config: String = "config-1", configVersion: Int64? = nil,
+                        installation: String = "install-1") -> DesktopControlTarget {
+        DesktopControlTarget(installationID: installation, workspaceID: workspace, configID: config,
                              personaID: persona, runID: "run-1", generation: 1, configVersion: configVersion)
     }
 

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Testing
 @testable import PersonaStackCore
@@ -179,5 +180,34 @@ struct DesktopShellExecutorTests {
         }
         #expect(result.state == .cancelled)
         await executor.closeAll()
+    }
+
+    @Test func closeAllStopsDisownedChildAfterItsShellLeaderExits() async throws {
+        let executor = DesktopShellExecutor()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("desktop-shell-disowned-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let childMarker = directory.appendingPathComponent("child-survived.txt")
+        let leaderPIDFile = directory.appendingPathComponent("leader.pid")
+        _ = try await executor.start(
+            command: "printf '%s' $PPID > '\(leaderPIDFile.path)'; (sleep 2; touch '\(childMarker.path)') & disown; printf 'leader-exited'",
+            workingDirectory: directory.path,
+            timeout: 10
+        )
+        let leaderPIDText = try String(contentsOf: leaderPIDFile, encoding: .utf8)
+        guard let leaderPIDValue = Int32(leaderPIDText) else {
+            Issue.record("shell leader PID was not recorded: \(leaderPIDText)")
+            await executor.closeAll()
+            return
+        }
+        let leaderPID = pid_t(leaderPIDValue)
+        let leaderExitDeadline = ContinuousClock.now + .seconds(2)
+        while Darwin.kill(leaderPID, 0) == 0 && ContinuousClock.now < leaderExitDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(Darwin.kill(leaderPID, 0) == -1 && errno == ESRCH, "shell leader was still running before group cleanup")
+        #expect(await executor.closeAll())
+        try await Task.sleep(for: .seconds(2.2))
+        #expect(!FileManager.default.fileExists(atPath: childMarker.path))
     }
 }

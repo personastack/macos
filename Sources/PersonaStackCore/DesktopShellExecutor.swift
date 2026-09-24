@@ -72,6 +72,7 @@ public actor DesktopShellExecutor {
         var signal: Int32?
         var outputReaders = 2
         var processTerminated = false
+        var processGroupCleanupConfirmed = false
         var terminalState: DesktopProcessState?
         var requestedTerminalState: DesktopProcessState?
         var queuedInputBytes = 0
@@ -169,17 +170,30 @@ public actor DesktopShellExecutor {
 
     public func cancel(id: UUID) async throws {
         guard var session = sessions[id] else { throw DesktopShellError.missingExecution }
-        guard !session.processTerminated else { return }
+        if session.processTerminated {
+            guard session.processGroupCleanupConfirmed else { throw DesktopShellError.cancellationUnconfirmed }
+            return
+        }
         if !Self.processGroupExists(session.processID) { return }
         session.requestedTerminalState = .cancelled
         sessions[id] = session
         _ = kill(-session.processID, SIGTERM)
         try? await Task.sleep(for: .milliseconds(250))
-        if Self.processGroupExists(session.processID) {
-            _ = kill(-session.processID, SIGKILL)
+        guard let current = sessions[id] else { throw DesktopShellError.missingExecution }
+        if current.processTerminated {
+            guard current.processGroupCleanupConfirmed else { throw DesktopShellError.cancellationUnconfirmed }
+            return
+        }
+        if Self.processGroupExists(current.processID) {
+            _ = kill(-current.processID, SIGKILL)
         }
         try? await Task.sleep(for: .milliseconds(100))
-        if Self.processGroupExists(session.processID) {
+        guard let latest = sessions[id] else { throw DesktopShellError.missingExecution }
+        if latest.processTerminated {
+            guard latest.processGroupCleanupConfirmed else { throw DesktopShellError.cancellationUnconfirmed }
+            return
+        }
+        if Self.processGroupExists(latest.processID) {
             throw DesktopShellError.cancellationUnconfirmed
         }
     }
@@ -194,8 +208,8 @@ public actor DesktopShellExecutor {
 
     @discardableResult
     public func closeAll() async -> Bool {
-        let running = sessions.filter { !$0.value.processTerminated }.map(\.key)
-        for id in running {
+        let groupsToStop = sessions.filter { !$0.value.processTerminated }.map(\.key)
+        for id in groupsToStop {
             do { try await cancel(id: id) }
             catch { /* The process-group check below is authoritative. */ }
         }
@@ -204,11 +218,15 @@ public actor DesktopShellExecutor {
             sessions[id] = session
         }
         for _ in 0..<35 {
-            let unsettled = sessions.values.contains { $0.state == .running || Self.processGroupExists($0.processID) }
+            let unsettled = sessions.values.contains {
+                $0.state == .running || ($0.processTerminated && !$0.processGroupCleanupConfirmed)
+            }
             if !unsettled { break }
             try? await Task.sleep(for: .milliseconds(100))
         }
-        let unsettled = sessions.values.filter { $0.state == .running || Self.processGroupExists($0.processID) }
+        let unsettled = sessions.values.filter {
+            $0.state == .running || ($0.processTerminated && !$0.processGroupCleanupConfirmed)
+        }
         guard unsettled.isEmpty else {
             return false
         }
@@ -233,20 +251,24 @@ public actor DesktopShellExecutor {
         sessions[id] = session
     }
 
-    private func finish(_ id: UUID, waitStatus: Int32) {
+    private func finish(_ id: UUID, waitStatus: Int32?) {
         guard var session = sessions[id] else { return }
-        if session.terminalState == nil {
+        if let waitStatus, session.terminalState == nil {
             let signal = waitStatus & 0x7f
             session.terminalState = session.requestedTerminalState ?? (signal == 0 ? .exited : .cancelled)
             session.exitCode = signal == 0 ? (waitStatus >> 8) & 0xff : nil
             session.signal = signal == 0 ? nil : signal
+        } else if waitStatus == nil {
+            session.processGroupCleanupConfirmed = false
         }
         Self.finishIfDrained(&session)
         sessions[id] = session
     }
 
-    private func markLeaderExited(_ id: UUID) {
-        guard var session = sessions[id], !session.processTerminated else { return }
+    private func markLeaderExited(_ id: UUID, processGroupCleanupConfirmed: Bool) {
+        guard let current = sessions[id], !current.processTerminated else { return }
+        var session = current
+        session.processGroupCleanupConfirmed = processGroupCleanupConfirmed
         session.processTerminated = true
         session.readerDrainDeadline = ContinuousClock.now + .seconds(2)
         sessions[id] = session
@@ -423,11 +445,21 @@ public actor DesktopShellExecutor {
     private static func wait(_ pid: pid_t, on executor: DesktopShellExecutor, id: UUID) {
         Task.detached(priority: .utility) {
             var info = siginfo_t()
-            while waitid(P_PID, id_t(pid), &info, WEXITED | WNOWAIT) == -1 && errno == EINTR {}
-            await executor.markLeaderExited(id)
+            var waitResult = waitid(P_PID, id_t(pid), &info, WEXITED | WNOWAIT)
+            while waitResult == -1 && errno == EINTR {
+                waitResult = waitid(P_PID, id_t(pid), &info, WEXITED | WNOWAIT)
+            }
+            var cleanupConfirmed = false
+            if waitResult == 0 {
+                cleanupConfirmed = await stopLiveProcesses(inProcessGroup: pid)
+            }
+            await executor.markLeaderExited(id, processGroupCleanupConfirmed: cleanupConfirmed)
             var status: Int32 = 0
-            while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
-            await executor.finish(id, waitStatus: status)
+            var reapResult = waitpid(pid, &status, 0)
+            while reapResult == -1 && errno == EINTR {
+                reapResult = waitpid(pid, &status, 0)
+            }
+            await executor.finish(id, waitStatus: reapResult == pid ? status : nil)
         }
     }
 
@@ -444,6 +476,51 @@ public actor DesktopShellExecutor {
     private static func processGroupExists(_ processID: pid_t) -> Bool {
         if kill(-processID, 0) == 0 { return true }
         return errno == EPERM
+    }
+
+    private static func stopLiveProcesses(inProcessGroup processGroupID: pid_t) async -> Bool {
+        var signalSent = false
+        var consecutiveEmptySnapshots = 0
+        let deadline = ContinuousClock.now + .seconds(1)
+        while ContinuousClock.now < deadline {
+            switch hasLiveProcess(inProcessGroup: processGroupID) {
+            case .some(false):
+                consecutiveEmptySnapshots += 1
+                if consecutiveEmptySnapshots == 2 { return true }
+            case .some(true):
+                consecutiveEmptySnapshots = 0
+                if !signalSent {
+                    let result = kill(-processGroupID, SIGKILL)
+                    guard result == 0 || errno == ESRCH else { return false }
+                    signalSent = true
+                }
+            case nil:
+                consecutiveEmptySnapshots = 0
+            }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        return false
+    }
+
+    private static func hasLiveProcess(inProcessGroup processGroupID: pid_t) -> Bool? {
+        var processIDs = [pid_t](repeating: 0, count: 256)
+        let bufferSize = Int32(processIDs.count * MemoryLayout<pid_t>.stride)
+        let bytes = processIDs.withUnsafeMutableBufferPointer {
+            proc_listpgrppids(processGroupID, $0.baseAddress, bufferSize)
+        }
+        guard bytes >= 0, Int(bytes) < processIDs.count else { return nil }
+        let count = Int(bytes)
+        for processID in processIDs.prefix(count) {
+            var info = proc_bsdinfo()
+            let infoBytes = proc_pidinfo(processID, PROC_PIDTBSDINFO, 0, &info,
+                                         Int32(MemoryLayout<proc_bsdinfo>.size))
+            if infoBytes == 0 && errno == ESRCH { continue }
+            guard infoBytes == MemoryLayout<proc_bsdinfo>.size,
+                  info.pbi_pid == UInt32(processID),
+                  info.pbi_pgid == UInt32(processGroupID) else { return nil }
+            if info.pbi_status != UInt32(SZOMB) { return true }
+        }
+        return false
     }
 
     private func finishInputWrite(_ id: UUID, byteCount: Int) {
