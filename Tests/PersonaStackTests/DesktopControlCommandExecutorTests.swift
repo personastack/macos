@@ -60,6 +60,109 @@ struct DesktopControlCommandExecutorTests {
     }
 
     @Test
+    func configRevocationClosesOnlyItsHandlesAndFencesOlderCommands() async throws {
+        let executor = DesktopControlCommandExecutor()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("desktop-control-revoke-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileA = directory.appendingPathComponent("a.txt")
+        let fileB = directory.appendingPathComponent("b.txt")
+        try Data("A".utf8).write(to: fileA)
+        try Data("B".utf8).write(to: fileB)
+
+        let ownerA = target(persona: "persona-a", workspace: "workspace-a", config: "config-a", configVersion: 1)
+        let acquiredA = await executor.handle(command("desktop_control_acquire", ownerA, requestID: "acquire-a"), proxy: nil)
+        guard case .object(let leaseA)? = acquiredA.result,
+              case .string(let tokenA)? = leaseA["control_token"] else {
+            Issue.record("config A control token missing")
+            await executor.close()
+            return
+        }
+
+        let openA = command("desktop_control_file", ownerA, requestID: "open-a",
+                            arguments: .object(["action": .string("open"), "path": .string(fileA.path), "control_token": .string(tokenA)]))
+        let openAResult = await executor.handle(openA, proxy: nil)
+        guard case .object(let openedA)? = openAResult.result,
+              case .string(let handleA)? = openedA["handle"] else {
+            Issue.record("config A file handle missing")
+            await executor.close()
+            return
+        }
+
+        let executeA = command("desktop_control_execute", ownerA, requestID: "execute-a",
+                               arguments: .object(["control_token": .string(tokenA), "command": .string("sleep 30"),
+                                                   "working_directory": .string("/tmp"), "timeout_seconds": .number(60)]))
+        let executeAResult = await executor.handle(executeA, proxy: nil)
+        guard case .object(let processA)? = executeAResult.result,
+              case .string(let executionID)? = processA["execution_id"] else {
+            Issue.record("config A process handle missing: \(executeAResult.errorCode ?? "no error code")")
+            await executor.close()
+            return
+        }
+
+        let revokeA = DesktopControlTarget(installationID: "install-1", workspaceID: "workspace-a", configID: "config-a",
+                                           personaID: "", runID: "", generation: 0, configVersion: 2)
+        let ownerB = target(persona: "persona-b", workspace: "workspace-b", config: "config-b", configVersion: 1)
+        let revocationTask = Task {
+            await executor.handle(command("desktop_control_revoke_config", revokeA, requestID: "revoke-a"), proxy: nil)
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        let acquireDuringCleanup = await executor.handle(command("desktop_control_acquire", ownerB, requestID: "acquire-b-during-cleanup"), proxy: nil)
+        #expect(acquireDuringCleanup.errorCode == "desktop_control_revocation_in_progress")
+
+        let revoked = await revocationTask.value
+        #expect(revoked.type == "result", "\(revoked.errorCode ?? "no error code"): \(revoked.errorMessage ?? "")")
+
+        let staleAcquire = await executor.handle(command("desktop_control_acquire", ownerA, requestID: "stale-acquire-a"), proxy: nil)
+        #expect(staleAcquire.type == "failure")
+        #expect(staleAcquire.errorCode == "desktop_control_config_revoked")
+
+        let acquiredB = await executor.handle(command("desktop_control_acquire", ownerB, requestID: "acquire-b"), proxy: nil)
+        guard case .object(let leaseB)? = acquiredB.result,
+              case .string(let tokenB)? = leaseB["control_token"] else {
+            Issue.record("config B control token missing")
+            await executor.close()
+            return
+        }
+        let openB = command("desktop_control_file", ownerB, requestID: "open-b",
+                            arguments: .object(["action": .string("open"), "path": .string(fileB.path), "control_token": .string(tokenB)]))
+        let openBResult = await executor.handle(openB, proxy: nil)
+        guard case .object(let openedB)? = openBResult.result,
+              case .string(let handleB)? = openedB["handle"] else {
+            Issue.record("config B file handle missing")
+            await executor.close()
+            return
+        }
+
+        let repeatedRevocation = await executor.handle(command("desktop_control_revoke_config", revokeA, requestID: "revoke-a-again"), proxy: nil)
+        #expect(repeatedRevocation.type == "result")
+        let readB = command("desktop_control_file", ownerB, requestID: "read-b",
+                            arguments: .object(["action": .string("read"), "control_token": .string(tokenB),
+                                                "handle": .string(handleB), "offset": .number(0)]))
+        #expect((await executor.handle(readB, proxy: nil)).type == "result")
+
+        let releaseB = command("desktop_control_release", ownerB, requestID: "release-b",
+                               arguments: .object(["control_token": .string(tokenB)]))
+        #expect((await executor.handle(releaseB, proxy: nil)).type == "result")
+        let reenabledA = target(persona: "persona-a", workspace: "workspace-a", config: "config-a", configVersion: 3)
+        let acquiredReenabledA = await executor.handle(command("desktop_control_acquire", reenabledA, requestID: "acquire-a-v3"), proxy: nil)
+        guard case .object(let leaseA3)? = acquiredReenabledA.result,
+              case .string(let tokenA3)? = leaseA3["control_token"] else {
+            Issue.record("new config version could not acquire after re-enable")
+            await executor.close()
+            return
+        }
+        let closedFileA = command("desktop_control_file", reenabledA, requestID: "read-closed-file-a",
+                                 arguments: .object(["action": .string("read"), "control_token": .string(tokenA3),
+                                                     "handle": .string(handleA), "offset": .number(0)]))
+        #expect((await executor.handle(closedFileA, proxy: nil)).errorCode == "desktop_file_handle_expired")
+        let closedProcessA = command("desktop_control_exec_status", reenabledA, requestID: "status-closed-process-a",
+                                     arguments: .object(["control_token": .string(tokenA3), "execution_id": .string(executionID)]))
+        #expect((await executor.handle(closedProcessA, proxy: nil)).errorCode == "desktop_process_handle_expired")
+        await executor.close()
+    }
+
+    @Test
     func fileOperationsRequireTheCurrentControlToken() async {
         let executor = DesktopControlCommandExecutor()
         let read = command("desktop_control_file", target(persona: "persona-1"), requestID: "read-1",
@@ -162,9 +265,9 @@ struct DesktopControlCommandExecutorTests {
         await executor.close()
     }
 
-    private func target(persona: String) -> DesktopControlTarget {
-        DesktopControlTarget(installationID: "install-1", workspaceID: "workspace-1", configID: "config-1",
-                             personaID: persona, runID: "run-1", generation: 1)
+    private func target(persona: String, workspace: String = "workspace-1", config: String = "config-1", configVersion: Int64? = nil) -> DesktopControlTarget {
+        DesktopControlTarget(installationID: "install-1", workspaceID: workspace, configID: config,
+                             personaID: persona, runID: "run-1", generation: 1, configVersion: configVersion)
     }
 
     private func command(_ operation: String, _ target: DesktopControlTarget, requestID: String,

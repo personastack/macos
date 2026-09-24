@@ -39,6 +39,28 @@ import Testing
                                          operation: "desktop_control_status", arguments: nil,
                                          deadlineAt: Date().addingTimeInterval(30))
     #expect(!DesktopControlGatewayConnection.validCommand(incomplete, installationID: "install-1"))
+
+    let revokeTarget = DesktopControlTarget(installationID: "install-1", workspaceID: "workspace-1",
+                                            configID: "config-1", personaID: "", runID: "", generation: 0,
+                                            configVersion: 2)
+    let revoke = DesktopControlFrame(type: "command", requestID: "revoke-1", target: revokeTarget,
+                                     operation: "desktop_control_revoke_config", arguments: .object([:]),
+                                     deadlineAt: Date().addingTimeInterval(30))
+    #expect(DesktopControlGatewayConnection.validCommand(revoke, installationID: "install-1"))
+    let unversionedRevoke = DesktopControlTarget(installationID: "install-1", workspaceID: "workspace-1",
+                                                 configID: "config-1", personaID: "", runID: "", generation: 0)
+    let invalidRevoke = DesktopControlFrame(type: "command", requestID: "revoke-2", target: unversionedRevoke,
+                                            operation: "desktop_control_revoke_config", arguments: .object([:]),
+                                            deadlineAt: Date().addingTimeInterval(30))
+    #expect(!DesktopControlGatewayConnection.validCommand(invalidRevoke, installationID: "install-1"))
+}
+
+@Test func desktopControlGatewayReservesOneCommandSlotForConfigRevocation() {
+    #expect(DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_status", activeCount: 30))
+    #expect(!DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_status", activeCount: 31))
+    #expect(DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_revoke_config", activeCount: 31))
+    #expect(!DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_revoke_config", activeCount: 32))
+    #expect(!DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_revoke_config", activeCount: -1))
 }
 
 @Test func desktopControlProtocolRejectsMalformedFramesAndTimestamps() {

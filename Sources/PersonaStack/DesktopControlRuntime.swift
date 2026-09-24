@@ -497,6 +497,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                                   disconnecting: disconnecting) else {
             return Self.failure(for: frame, code: "desktop_connection_stale", message: "The desktop connection changed before this command could run. Retry only after checking whether the previous action completed.")
         }
+        if frame.operation == "desktop_control_revoke_config" {
+            guard let activeInstallation, frame.target?.installationID == activeInstallation.installationID else {
+                return Self.failure(for: frame, code: "desktop_executor_unavailable")
+            }
+            return await executor.handle(frame, proxy: proxy, onChunk: onChunk)
+        }
         guard !paused else {
             return Self.failure(for: frame, code: "desktop_paused", message: "Desktop Control is paused on this Mac.")
         }

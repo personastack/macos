@@ -175,11 +175,11 @@ public actor DesktopShellExecutor {
         sessions[id] = session
         _ = kill(-session.processID, SIGTERM)
         try? await Task.sleep(for: .milliseconds(250))
-        if let current = sessions[id], !current.processTerminated, Self.processGroupExists(current.processID) {
-            _ = kill(-current.processID, SIGKILL)
+        if Self.processGroupExists(session.processID) {
+            _ = kill(-session.processID, SIGKILL)
         }
         try? await Task.sleep(for: .milliseconds(100))
-        if let current = sessions[id], !current.processTerminated, Self.processGroupExists(current.processID) {
+        if Self.processGroupExists(session.processID) {
             throw DesktopShellError.cancellationUnconfirmed
         }
     }
@@ -195,22 +195,21 @@ public actor DesktopShellExecutor {
     @discardableResult
     public func closeAll() async -> Bool {
         let running = sessions.filter { !$0.value.processTerminated }.map(\.key)
-        var cancellationConfirmed = true
         for id in running {
             do { try await cancel(id: id) }
-            catch { cancellationConfirmed = false }
+            catch { /* The process-group check below is authoritative. */ }
         }
         for (id, var session) in Array(sessions) where session.state == .running {
             session.forceCloseReaders = true
             sessions[id] = session
         }
-        for _ in 0..<15 {
+        for _ in 0..<35 {
             let unsettled = sessions.values.contains { $0.state == .running || Self.processGroupExists($0.processID) }
             if !unsettled { break }
             try? await Task.sleep(for: .milliseconds(100))
         }
-        guard cancellationConfirmed,
-              !sessions.values.contains(where: { $0.state == .running || Self.processGroupExists($0.processID) }) else {
+        let unsettled = sessions.values.filter { $0.state == .running || Self.processGroupExists($0.processID) }
+        guard unsettled.isEmpty else {
             return false
         }
         for (id, session) in Array(sessions) {

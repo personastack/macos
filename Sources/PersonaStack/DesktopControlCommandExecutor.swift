@@ -12,8 +12,15 @@ final class DesktopControlCommandExecutor {
         let generation: Int64
     }
 
+    private struct ConfigScope: Hashable {
+        let installationID: String
+        let workspaceID: String
+        let configID: String
+    }
+
     private struct Lease {
         let owner: Owner
+        let configVersion: Int64
         let token: String
         let started: ContinuousClock.Instant
         var lastActivity: ContinuousClock.Instant
@@ -22,8 +29,10 @@ final class DesktopControlCommandExecutor {
     private let files = DesktopFileSystem()
     private let shell = DesktopShellExecutor()
     private var lease: Lease?
+    private var revokedConfigVersions: [ConfigScope: Int64] = [:]
     private var closed = false
     private var unavailable = false
+    private var revocationInProgress = false
     private var expiryTask: Task<Void, Never>?
 
     init() {
@@ -52,19 +61,38 @@ final class DesktopControlCommandExecutor {
 
     func handle(_ frame: DesktopControlFrame, proxy: CuaMCPProxy?,
                 onChunk: (@Sendable (DesktopControlFrame) async throws -> Void)?) async -> DesktopControlFrame {
-        guard !closed, !unavailable, let requestID = frame.requestID, let target = frame.target else {
+        guard let requestID = frame.requestID, let target = frame.target else {
+            return Self.failure(frame, "desktop_executor_unavailable", "The desktop control service is paused or recovering.")
+        }
+        if frame.operation == "desktop_control_revoke_config" {
+            guard let version = target.configVersion, version > 0,
+                  !target.installationID.isEmpty, !target.workspaceID.isEmpty, !target.configID.isEmpty,
+                  target.personaID.isEmpty, target.runID.isEmpty, target.generation == 0 else {
+                return Self.failure(frame, "invalid_arguments", "The Desktop Control revocation scope is invalid.")
+            }
+            return await revokeConfig(frame, scope: Self.scope(target), version: version)
+        }
+        guard !revocationInProgress else {
+            return Self.failure(frame, "desktop_control_revocation_in_progress", "Another Desktop Control configuration is being cleaned up. Retry after it finishes.")
+        }
+        guard !closed, !unavailable else {
             return Self.failure(frame, "desktop_executor_unavailable", "The desktop control service is paused or recovering.")
         }
         let owner = Owner(installationID: target.installationID, workspaceID: target.workspaceID,
                           configID: target.configID, personaID: target.personaID, runID: target.runID,
                           generation: target.generation)
+        let scope = Self.scope(target)
+        let configVersion = target.configVersion ?? 0
+        guard isConfigVersionAuthorized(scope, configVersion) else {
+            return Self.failure(frame, "desktop_control_config_revoked", "This Desktop Control configuration is disabled or no longer authorized.")
+        }
         do {
             let result: Any
             switch frame.operation {
             case "desktop_control_status":
                 result = ["available": true, "busy": validLease() != nil]
             case "desktop_control_acquire":
-                result = try await acquire(owner)
+                result = try await acquire(owner, scope: scope, configVersion: configVersion)
             case "desktop_control_release":
                 try await requireLease(owner, arguments: frame.arguments, renew: false)
                 await files.closeAll()
@@ -100,8 +128,10 @@ final class DesktopControlCommandExecutor {
                 throw CommandError.invalidArguments
             }
             if let onChunk {
-                try await Self.forwardShellChunks(result, requestID: requestID, onChunk: onChunk)
+                try await forwardShellChunks(result, requestID: requestID, scope: scope,
+                                             configVersion: configVersion, onChunk: onChunk)
             }
+            guard isConfigVersionAuthorized(scope, configVersion) else { throw CommandError.configurationRevoked }
             let data = try JSONSerialization.data(withJSONObject: result, options: [.fragmentsAllowed])
             let value = try JSONDecoder().decode(DesktopControlJSONValue.self, from: data)
             return DesktopControlFrame(type: "result", requestID: requestID, result: value)
@@ -143,12 +173,13 @@ final class DesktopControlCommandExecutor {
         return mode == "append" || mode == "create"
     }
 
-    private static func forwardShellChunks(_ result: Any, requestID: String,
-                                           onChunk: @Sendable (DesktopControlFrame) async throws -> Void) async throws {
+    private func forwardShellChunks(_ result: Any, requestID: String, scope: ConfigScope, configVersion: Int64,
+                                    onChunk: @Sendable (DesktopControlFrame) async throws -> Void) async throws {
         guard let value = result as? [String: Any],
               value["execution_id"] is String,
               let chunks = value["chunks"] as? [[String: Any]] else { return }
         for (index, chunk) in chunks.enumerated() {
+            guard isConfigVersionAuthorized(scope, configVersion) else { throw CommandError.configurationRevoked }
             guard let channel = chunk["stream"] as? String,
                   channel == "stdout" || channel == "stderr",
                   let encoded = chunk["data_base64"] as? String,
@@ -159,7 +190,7 @@ final class DesktopControlCommandExecutor {
         }
     }
 
-    private func acquire(_ owner: Owner) async throws -> [String: Any] {
+    private func acquire(_ owner: Owner, scope: ConfigScope, configVersion: Int64) async throws -> [String: Any] {
         if let active = validLease() {
             guard active.owner == owner else { throw CommandError.busy }
             var renewed = active
@@ -168,10 +199,44 @@ final class DesktopControlCommandExecutor {
             return ["control_token": active.token, "expires_in_seconds": 90]
         }
         if lease != nil, !(await clearExpiredLease()) { throw CommandError.executorUnavailable }
+        guard isConfigVersionAuthorized(scope, configVersion) else { throw CommandError.configurationRevoked }
         let token = UUID().uuidString.lowercased()
         let now = ContinuousClock.now
-        lease = Lease(owner: owner, token: token, started: now, lastActivity: now)
+        lease = Lease(owner: owner, configVersion: configVersion, token: token, started: now, lastActivity: now)
         return ["control_token": token, "expires_in_seconds": 90]
+    }
+
+    private func revokeConfig(_ frame: DesktopControlFrame, scope: ConfigScope, version: Int64) async -> DesktopControlFrame {
+        guard !revocationInProgress else {
+            return Self.failure(frame, "desktop_control_revocation_in_progress", "Another Desktop Control configuration is being cleaned up. Retry after it finishes.")
+        }
+        revocationInProgress = true
+        defer { revocationInProgress = false }
+        revokedConfigVersions[scope] = max(revokedConfigVersions[scope] ?? 0, version)
+        if let lease, Self.scope(lease.owner) == scope, lease.configVersion <= version {
+            self.lease = nil
+            await files.closeAll()
+            guard await shell.closeAll() else {
+                unavailable = true
+                return Self.failure(frame, "desktop_control_revoke_incomplete", "The Mac could not confirm that every command process stopped.")
+            }
+        }
+        return DesktopControlFrame(type: "result", requestID: frame.requestID,
+                                   result: .object(["revoked": .bool(true)]))
+    }
+
+    private func isConfigVersionAuthorized(_ scope: ConfigScope, _ version: Int64) -> Bool {
+        guard version >= 0 else { return false }
+        guard let revokedVersion = revokedConfigVersions[scope] else { return true }
+        return version > revokedVersion
+    }
+
+    private static func scope(_ target: DesktopControlTarget) -> ConfigScope {
+        ConfigScope(installationID: target.installationID, workspaceID: target.workspaceID, configID: target.configID)
+    }
+
+    private static func scope(_ owner: Owner) -> ConfigScope {
+        ConfigScope(installationID: owner.installationID, workspaceID: owner.workspaceID, configID: owner.configID)
     }
 
     private func validLease() -> Lease? {
@@ -358,12 +423,13 @@ final class DesktopControlCommandExecutor {
 }
 
 private enum CommandError: Error, LocalizedError {
-    case invalidArguments, busy, controlRequired, commandFailed, executorUnavailable
+    case invalidArguments, busy, controlRequired, configurationRevoked, commandFailed, executorUnavailable
     var code: String {
         switch self {
         case .invalidArguments: "invalid_arguments"
         case .busy: "desktop_busy"
         case .controlRequired: "desktop_control_required"
+        case .configurationRevoked: "desktop_control_config_revoked"
         case .commandFailed: "desktop_command_failed"
         case .executorUnavailable: "desktop_executor_unavailable"
         }
@@ -373,6 +439,7 @@ private enum CommandError: Error, LocalizedError {
         case .invalidArguments: "The desktop command arguments are invalid."
         case .busy: "The desktop is controlled by another active persona."
         case .controlRequired: "Acquire desktop control before using this tool."
+        case .configurationRevoked: "This Desktop Control configuration is disabled or no longer authorized."
         case .commandFailed: "The desktop command failed."
         case .executorUnavailable: "The previous desktop command is still stopping. Retry after the desktop service recovers."
         }

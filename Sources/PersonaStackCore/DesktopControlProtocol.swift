@@ -39,14 +39,17 @@ public struct DesktopControlTarget: Codable, Equatable, Sendable {
     public let personaID: String
     public let runID: String
     public let generation: Int64
+    public let configVersion: Int64?
 
-    public init(installationID: String, workspaceID: String, configID: String, personaID: String, runID: String, generation: Int64) {
+    public init(installationID: String, workspaceID: String, configID: String, personaID: String, runID: String, generation: Int64,
+                configVersion: Int64? = nil) {
         self.installationID = installationID
         self.workspaceID = workspaceID
         self.configID = configID
         self.personaID = personaID
         self.runID = runID
         self.generation = generation
+        self.configVersion = configVersion
     }
 
     enum CodingKeys: String, CodingKey {
@@ -55,6 +58,7 @@ public struct DesktopControlTarget: Codable, Equatable, Sendable {
         case configID = "config_id"
         case personaID = "persona_id"
         case runID = "run_id"
+        case configVersion = "config_version"
         case generation
     }
 }

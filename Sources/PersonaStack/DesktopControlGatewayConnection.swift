@@ -13,6 +13,9 @@ enum DesktopControlGatewayConnectionError: Error, Equatable {
 }
 
 actor DesktopControlGatewayConnection {
+    private static let maximumInFlightCommands = 32
+    private static let reservedRevocationCommands = 1
+
     private let installation: DesktopControlInstallation
     private let handler: DesktopControlCommandHandler
     private let onDisconnect: DesktopControlDisconnectHandler
@@ -20,6 +23,7 @@ actor DesktopControlGatewayConnection {
     private var socket: URLSessionWebSocketTask?
     private var reader: Task<Void, Never>?
     private var heartbeats: Task<Void, Never>?
+    private var commandTasks: [String: Task<Void, Never>] = [:]
     private var connected = false
     private var readiness = "ready"
 
@@ -70,6 +74,8 @@ actor DesktopControlGatewayConnection {
     func stop() {
         reader?.cancel()
         heartbeats?.cancel()
+        for task in commandTasks.values { task.cancel() }
+        commandTasks.removeAll()
         reader = nil
         heartbeats = nil
         connected = false
@@ -91,20 +97,19 @@ actor DesktopControlGatewayConnection {
                     guard Self.validCommand(frame, installationID: installation.installationID) else {
                         throw DesktopControlGatewayConnectionError.invalidFrame
                     }
-                    let response = await handler(frame) { [weak self] chunk in
-                        guard let self,
-                              chunk.type == "result_chunk",
-                              chunk.requestID == frame.requestID else {
-                            throw DesktopControlGatewayConnectionError.invalidFrame
-                        }
-                        try await self.send(chunk)
-                    }
-                    guard let requestID = frame.requestID,
-                          response.requestID == requestID,
-                          response.type == "result" || response.type == "failure" else {
+                    guard let requestID = frame.requestID, commandTasks[requestID] == nil else {
                         throw DesktopControlGatewayConnectionError.invalidFrame
                     }
-                    try await send(response)
+                    guard Self.hasCapacity(for: frame.operation, activeCount: commandTasks.count) else {
+                        try await send(DesktopControlFrame(
+                            type: "failure",
+                            requestID: requestID,
+                            errorCode: "desktop_command_capacity",
+                            errorMessage: "The desktop is handling other commands. Retry after one finishes."
+                        ))
+                        continue
+                    }
+                    commandTasks[requestID] = Task { await processCommand(frame) }
                 default:
                     throw DesktopControlGatewayConnectionError.invalidFrame
                 }
@@ -113,6 +118,23 @@ actor DesktopControlGatewayConnection {
                 return
             }
         }
+    }
+
+    private func processCommand(_ frame: DesktopControlFrame) async {
+        guard let requestID = frame.requestID else { return }
+        defer { commandTasks[requestID] = nil }
+        let response = await handler(frame) { [weak self] chunk in
+            try Task.checkCancellation()
+            guard let self, chunk.type == "result_chunk", chunk.requestID == requestID else {
+                throw DesktopControlGatewayConnectionError.invalidFrame
+            }
+            try await self.send(chunk)
+        }
+        guard !Task.isCancelled, connected,
+              response.requestID == requestID,
+              response.type == "result" || response.type == "failure" else { return }
+        do { try await send(response) }
+        catch { await disconnected() }
     }
 
     private func heartbeatLoop() async {
@@ -151,10 +173,20 @@ actor DesktopControlGatewayConnection {
     static func validCommand(_ frame: DesktopControlFrame, installationID: String) -> Bool {
         guard let target = frame.target, let requestID = frame.requestID, !requestID.isEmpty,
               target.installationID == installationID,
-              !target.workspaceID.isEmpty, !target.configID.isEmpty, !target.personaID.isEmpty,
-              !target.runID.isEmpty, target.generation > 0,
-              frame.operation != nil, frame.arguments != nil,
+              !target.workspaceID.isEmpty, !target.configID.isEmpty, frame.arguments != nil,
               let deadline = frame.deadlineAt, deadline > Date() else { return false }
+        if frame.operation == "desktop_control_revoke_config" {
+            return (target.configVersion ?? 0) > 0 && target.personaID.isEmpty && target.runID.isEmpty && target.generation == 0
+        }
+        guard !target.personaID.isEmpty, !target.runID.isEmpty, target.generation > 0,
+              (target.configVersion ?? 0) >= 0 else { return false }
+        guard frame.operation != nil else { return false }
         return true
+    }
+
+    static func hasCapacity(for operation: String?, activeCount: Int) -> Bool {
+        guard activeCount >= 0, activeCount < maximumInFlightCommands else { return false }
+        if operation == "desktop_control_revoke_config" { return true }
+        return activeCount < maximumInFlightCommands - reservedRevocationCommands
     }
 }
