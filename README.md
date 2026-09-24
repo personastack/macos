@@ -29,6 +29,10 @@ The WebKit user agent includes `PersonaStackDesktop/1` so the shared web sidebar
 - macOS 14 Sonoma or later
 - Internet access to `my.personastack.ai` or LAN access to `personastack.ericgreer.info`
 
+Desktop Control installs the pinned MIT-licensed Cua Driver v0.28.2 into PersonaStack's Application Support directory. It preserves the upstream MIT notice as `LICENSE-CuaDriver-MIT.txt` beside the managed driver. Cua Driver requires macOS 14 or later.
+
+PersonaStack disables Cua telemetry and automatic update checks for driver processes it launches. These process-level overrides do not change a shared Cua preference file. A Cua service already running outside PersonaStack keeps its own settings.
+
 ## Build an unsigned installer
 
 ```sh

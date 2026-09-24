@@ -46,6 +46,7 @@ final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
         }
         do {
             let command = try LocalSessionCommand.parse(message.body)
+            logger.notice("local session \(Self.actionName(command), privacy: .public) started")
             Task {
                 do {
                     let response = try await apply(command, page: page)
@@ -59,7 +60,7 @@ final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
                 }
             }
         } catch {
-            logger.error("local session bridge rejected an invalid request")
+            logger.error("local session bridge rejected \(Self.actionName(message.body), privacy: .public) request: invalidRequest")
             replyHandler(nil, LocalSessionError.invalidRequest.rawValue)
         }
     }
@@ -82,25 +83,35 @@ final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
             guard page.pending.scope == scope else { throw LocalSessionError.staleRequest }
             let generation = page.pending.generation
             let probe = self.probe
+            logger.notice("local session prepare CLI probe started")
             let installation = try await Task.detached { try probe(harness) }.value
+            logger.notice("local session prepare CLI probe completed")
             let preflight = self.preflight
+            logger.notice("local session prepare plugin preflight started")
             _ = try await Task.detached { try preflight(harness, installation) }.value
+            logger.notice("local session prepare plugin preflight completed")
             guard page.pending.scope == scope, page.pending.generation == generation else { throw LocalSessionError.staleRequest }
             let id = try page.pending.prepare(persona: persona, harness: harness)
             return ["ok": true, "pending_id": id.uuidString]
         case .configure(let scope, let id, let data):
+            logger.notice("local session configure bundle validation started")
             let bundle = try LocalSessionBundle.decode(data, appURL: page.appURL)
+            logger.notice("local session configure bundle validation completed")
             try page.pending.consume(id, scope: scope, bundle: bundle)
             let generation = page.pending.generation
             let probe = self.probe
+            logger.notice("local session configure CLI probe started")
             let installation = try await Task.detached { try probe(bundle.harness) }.value
+            logger.notice("local session configure CLI probe completed")
             guard page.pending.scope == scope, page.pending.generation == generation else { throw LocalSessionError.staleRequest }
             let profileKey = installation.profile.resolvingSymlinksInPath().standardizedFileURL.path
             guard configuringProfiles.insert(profileKey).inserted else { throw LocalSessionError.staleRequest }
             defer { configuringProfiles.remove(profileKey) }
             let install = self.install
             let appURL = page.appURL
+            logger.notice("local session configure plugin installation started")
             _ = try await Task.detached { try install(bundle, appURL, id, installation) }.value
+            logger.notice("local session configure plugin installation completed")
             return ["ok": true]
         }
     }
@@ -124,6 +135,15 @@ final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
         case .select: return "select_harness"
         case .prepare: return "prepare"
         case .configure: return "configure"
+        }
+    }
+
+    private static func actionName(_ body: Any) -> String {
+        guard let object = body as? [String: Any], let action = object["action"] as? String else { return "unknown" }
+        switch action {
+        case "state", "select_harness", "prepare", "configure": return action
+        case "launch": return "legacy_launch"
+        default: return "unknown"
         }
     }
 }

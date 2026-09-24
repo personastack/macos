@@ -1,6 +1,7 @@
 import CryptoKit
 import Darwin
 import Foundation
+import OSLog
 
 public struct LocalSessionInstalledFiles: Sendable {
     public let directory: URL
@@ -86,6 +87,7 @@ public struct LocalSessionFiles {
     private let manager: FileManager
     private let commandRunner: CommandRunner
     private let commandOutputReader: CommandOutputReader
+    private let logger = Logger(subsystem: "ai.personastack.desktop", category: "local-session")
     public init(manager: FileManager = .default) {
         self.manager = manager
         self.commandRunner = Self.run
@@ -137,11 +139,14 @@ public struct LocalSessionFiles {
         let pluginName = "personastack-local-" + profileKey
         let plugins = try directories(["Library", "Application Support", "PersonaStack", "LocalHarnessPlugins", harness, profileKey], below: root)
         let activeURL = plugins.appendingPathComponent("active.json")
+        logger.notice("local session plugin ownership validation started")
         let previous = try activeOwnership(at: activeURL, under: plugins, harness: harness, profile: profilePath, marketplace: marketplaceName, plugin: pluginName)
+        logger.notice("local session plugin ownership validation completed")
         if previous == nil {
             let environment = pluginEnvironment(harness: bundle.harness, home: root, profile: profile, inherited: harnessEnvironment)
+            logger.notice("local session initial marketplace preflight started")
             switch try marketplaceRegistration(bundle.harness, executable: executable, environment: environment, marketplace: marketplaceName, expectedRoot: nil) {
-            case .missing: break
+            case .missing: logger.notice("local session initial marketplace preflight completed")
             case .matches, .mismatch: throw LocalSessionError.unsafeFiles
             }
         }
@@ -280,39 +285,50 @@ public struct LocalSessionFiles {
         let environment = pluginEnvironment(harness: harness, home: home, profile: profile, inherited: harnessEnvironment)
         if let previous {
             let activeMarketplace = URL(fileURLWithPath: previous.source).appendingPathComponent("marketplace")
+            logger.notice("local session previous marketplace validation started")
             switch try marketplaceRegistration(harness, executable: executable, environment: environment, marketplace: previous.marketplace,
                                                expectedRoot: activeMarketplace) {
             case .mismatch: throw LocalSessionError.unsafeFiles
-            case .missing: break
+            case .missing: logger.notice("local session previous marketplace validation completed")
             case .matches:
+                logger.notice("local session previous marketplace validation completed")
                 let installed = try verifyInstalledPlugin(harness, executable: executable, profile: profile, marketplace: activeMarketplace,
-                                                          environment: environment, ownership: previous, allowMissing: true, hardenCache: false)
+                                                          environment: environment, ownership: previous, allowMissing: true)
                 let identifier = previous.plugin + "@" + previous.marketplace
                 let remove = harness == .codex ? ["plugin", "remove", identifier] : ["plugin", "uninstall", identifier, "--scope", "user"]
                 if installed {
                     willMutate()
+                    logger.notice("local session previous plugin removal started")
                     try commandRunner(executable, remove, environment, true)
+                    logger.notice("local session previous plugin removal completed")
                 }
                 willMutate()
+                logger.notice("local session previous marketplace removal started")
                 try commandRunner(executable, ["plugin", "marketplace", "remove", previous.marketplace], environment, true)
+                logger.notice("local session previous marketplace removal completed")
             }
         }
         willMutate()
+        logger.notice("local session marketplace add started")
         try commandRunner(executable, ["plugin", "marketplace", "add", marketplace.path], environment, false)
+        logger.notice("local session marketplace add completed")
         marketplaceRegistered()
         let install = harness == .codex ? ["plugin", "add", ownership.plugin, "--marketplace", ownership.marketplace] : ["plugin", "install", ownership.plugin + "@" + ownership.marketplace, "--scope", "user"]
         willMutate()
+        logger.notice("local session plugin manager install started")
         try commandRunner(executable, install, environment, false)
+        logger.notice("local session plugin manager install completed")
         _ = try verifyInstalledPlugin(harness, executable: executable, profile: profile, marketplace: marketplace, environment: environment,
-                                      ownership: ownership, allowMissing: false, hardenCache: true)
+                                      ownership: ownership, allowMissing: false)
     }
 
     private func verifyInstalledPlugin(_ harness: LocalSessionHarness, executable: URL, profile: URL, marketplace: URL,
                                        environment: [String: String], ownership: LocalHarnessPluginOwnership,
-                                       allowMissing: Bool, hardenCache: Bool) throws -> Bool {
+                                       allowMissing: Bool) throws -> Bool {
         let result = try commandOutputReader(executable, ["plugin", "list", "--available", "--json"], environment)
         let value = try JSONSerialization.jsonObject(with: Data(result.utf8))
         guard let object = value as? [String: Any], let records = object["installed"] as? [[String: Any]] else { throw LocalSessionError.unsafeFiles }
+        logger.notice("local session plugin registry parsed")
         let identifier = ownership.plugin + "@" + ownership.marketplace
         let expectedSource = marketplace.appendingPathComponent("plugins/" + ownership.plugin).standardizedFileURL.path
         let record: [String: Any]
@@ -322,9 +338,12 @@ public struct LocalSessionFiles {
                 throw LocalSessionError.unsafeFiles
             }
             guard value["enabled"] as? Bool == true,
-                  let source = value["source"] as? [String: Any], source["path"] as? String == expectedSource,
+                  let source = value["source"] as? [String: Any],
+                  let sourcePath = source["path"] as? String,
+                  sameDirectory(sourcePath, as: URL(fileURLWithPath: expectedSource)),
                   let marketplaceSource = value["marketplaceSource"] as? [String: Any],
-                  marketplaceSource["source"] as? String == marketplace.standardizedFileURL.path else { throw LocalSessionError.unsafeFiles }
+                  let marketplacePath = marketplaceSource["source"] as? String,
+                  sameDirectory(marketplacePath, as: marketplace.standardizedFileURL) else { throw LocalSessionError.unsafeFiles }
             record = value
         } else {
             guard let value = records.first(where: { $0["id"] as? String == identifier }) else {
@@ -335,6 +354,7 @@ public struct LocalSessionFiles {
                   value["scope"] as? String == "user" else { throw LocalSessionError.unsafeFiles }
             record = value
         }
+        logger.notice("local session plugin identity verified")
         let cache: URL
         if harness == .codex {
             guard let version = record["version"] as? String, !version.isEmpty else { throw LocalSessionError.unsafeFiles }
@@ -347,13 +367,16 @@ public struct LocalSessionFiles {
         let rawCache = cache.standardizedFileURL
         let normalizedCache = rawCache.resolvingSymlinksInPath().standardizedFileURL
         guard rawCache.path.hasPrefix(cacheRoot.path + "/"), normalizedCache == rawCache else { throw LocalSessionError.unsafeFiles }
+        logger.notice("local session plugin cache path verified")
         let source = marketplace.appendingPathComponent("plugins/" + ownership.plugin)
-        try hardenInstalledPlugin(at: normalizedCache, expectedDigest: try contentDigest(source, requirePrivateModes: true, excludeOwnershipMarker: false), harden: hardenCache)
+        logger.notice("local session plugin cache verification started")
+        try hardenInstalledPlugin(at: normalizedCache, expectedDigest: try contentDigest(source, requirePrivateModes: true, excludeOwnershipMarker: false))
+        logger.notice("local session plugin cache verification completed")
         return true
     }
 
     /// CLI caches can copy the bearer-bearing file with broad modes. Tighten only the verified managed cache.
-    private func hardenInstalledPlugin(at root: URL, expectedDigest: String, harden: Bool) throws {
+    private func hardenInstalledPlugin(at root: URL, expectedDigest: String) throws {
         let rootValues = try root.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         guard rootValues.isDirectory == true, rootValues.isSymbolicLink != true else { throw LocalSessionError.unsafeFiles }
         guard let enumerator = manager.enumerator(atPath: root.path) else { throw LocalSessionError.unsafeFiles }
@@ -367,7 +390,7 @@ public struct LocalSessionFiles {
         guard try contentDigest(root, requirePrivateModes: false, excludeOwnershipMarker: false) == expectedDigest else { throw LocalSessionError.unsafeFiles }
         for path in paths {
             let values = try path.resourceValues(forKeys: [.isDirectoryKey])
-            if harden { try manager.setAttributes([.posixPermissions: values.isDirectory == true ? 0o700 : 0o600], ofItemAtPath: path.path) }
+            try manager.setAttributes([.posixPermissions: values.isDirectory == true ? 0o700 : 0o600], ofItemAtPath: path.path)
             try requirePrivate(path, directory: values.isDirectory == true)
         }
     }
@@ -375,8 +398,10 @@ public struct LocalSessionFiles {
     /// Refuse to remove a profile-specific name after a user has repointed it elsewhere.
     private func marketplaceRegistration(_ harness: LocalSessionHarness, executable: URL, environment: [String: String], marketplace: String,
                                          expectedRoot: URL?) throws -> LocalMarketplaceRegistration {
+        logger.notice("local session marketplace registry query started")
         let result = try commandOutputReader(executable, ["plugin", "marketplace", "list", "--json"], environment)
         let value = try JSONSerialization.jsonObject(with: Data(result.utf8))
+        logger.notice("local session marketplace registry query completed")
         let records: [[String: Any]]
         if harness == .codex {
             guard let object = value as? [String: Any], let values = object["marketplaces"] as? [[String: Any]] else { return .mismatch }
@@ -388,8 +413,19 @@ public struct LocalSessionFiles {
         guard let record = records.first(where: { $0["name"] as? String == marketplace }) else { return .missing }
         guard let expectedRoot else { return .mismatch }
         let path = harness == .codex ? record["root"] as? String : record["path"] as? String
-        guard URL(fileURLWithPath: path ?? "").standardizedFileURL.path == expectedRoot.standardizedFileURL.path else { return .mismatch }
+        guard let path, sameDirectory(path, as: expectedRoot) else { return .mismatch }
         return .matches
+    }
+
+    /// CLIs may canonicalize a source path differently from Foundation. Accept aliases only
+    /// when the reported absolute path names the exact same directory on disk.
+    private func sameDirectory(_ path: String, as expected: URL) -> Bool {
+        guard path.hasPrefix("/"), expected.isFileURL else { return false }
+        var actual = stat()
+        var target = stat()
+        guard stat(path, &actual) == 0, stat(expected.path, &target) == 0 else { return false }
+        return (actual.st_mode & S_IFMT) == S_IFDIR && (target.st_mode & S_IFMT) == S_IFDIR &&
+            actual.st_dev == target.st_dev && actual.st_ino == target.st_ino
     }
 
     private func pluginEnvironment(harness: LocalSessionHarness, home: URL, profile: URL, inherited: [String: String]) -> [String: String] {

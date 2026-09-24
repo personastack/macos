@@ -7,6 +7,7 @@ private final class LocalSessionCommandRecorder: @unchecked Sendable {
     var calls: [[String]] = []
     var failedPluginAdds = 0
     var marketplace = ""
+    var marketplaceAlias = ""
 }
 
 struct LocalSessionFilesTests {
@@ -27,7 +28,8 @@ struct LocalSessionFilesTests {
         return value
     }
 
-    private func configure(_ harness: LocalSessionHarness, home: URL, recorder: LocalSessionCommandRecorder) throws -> LocalSessionInstalledFiles {
+    private func configure(_ harness: LocalSessionHarness, home: URL, recorder: LocalSessionCommandRecorder,
+                           reportCodexPathAliases: Bool = false) throws -> LocalSessionInstalledFiles {
         let executable = home.appendingPathComponent("cli")
         try Data("#!/bin/sh\nexit 0\n".utf8).write(to: executable)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
@@ -44,6 +46,11 @@ struct LocalSessionFilesTests {
             if Array(arguments.prefix(3)) == ["plugin", "marketplace", "add"] {
                 guard let added = arguments.last else { throw LocalSessionError.unsafeFiles }
                 recorder.marketplace = added
+                if reportCodexPathAliases && harness == .codex {
+                    let alias = home.appendingPathComponent("marketplace-alias", isDirectory: true)
+                    try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: URL(fileURLWithPath: added))
+                    recorder.marketplaceAlias = alias.path
+                }
             }
             if Array(arguments.prefix(2)) == ["plugin", "remove"] || Array(arguments.prefix(2)) == ["plugin", "uninstall"] {
                 try? FileManager.default.removeItem(at: profile.appendingPathComponent("plugins/cache/" + marketplaceName + "/" + pluginName + "/1.0.0"))
@@ -59,9 +66,10 @@ struct LocalSessionFilesTests {
                 let cache = profile.appendingPathComponent("plugins/cache/" + marketplaceName + "/" + pluginName + "/1.0.0")
                 let record: [String: Any]
                 if harness == .codex {
+                    let sourceRoot = recorder.marketplaceAlias.isEmpty ? recorder.marketplace : recorder.marketplaceAlias
                     record = ["pluginId": pluginName + "@" + marketplaceName, "version": "1.0.0", "enabled": true,
-                              "source": ["path": URL(fileURLWithPath: recorder.marketplace).appendingPathComponent("plugins/" + pluginName).path],
-                              "marketplaceSource": ["source": recorder.marketplace]]
+                              "source": ["path": URL(fileURLWithPath: sourceRoot).appendingPathComponent("plugins/" + pluginName).path],
+                              "marketplaceSource": ["source": sourceRoot]]
                 } else {
                     record = ["id": pluginName + "@" + marketplaceName, "version": "1.0.0", "enabled": true, "scope": "user", "installPath": cache.path]
                 }
@@ -107,6 +115,17 @@ struct LocalSessionFilesTests {
         #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("CLAUDE.md").path))
     }
 
+    @Test func configureAcceptsCodexFilesystemAliasesForOwnedPluginPaths() throws {
+        let root = try home()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let recorder = LocalSessionCommandRecorder()
+        let result = try configure(.codex, home: root, recorder: recorder, reportCodexPathAliases: true)
+
+        #expect(FileManager.default.fileExists(atPath: result.pluginManifest.path))
+        #expect(recorder.marketplaceAlias.isEmpty == false)
+        #expect(recorder.calls.count == 2)
+    }
+
     @Test func configureRejectsAnUnownedMarketplaceBeforeAnyPluginCommand() throws {
         let root = try home()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -137,6 +156,34 @@ struct LocalSessionFilesTests {
         #expect(!FileManager.default.fileExists(atPath: first.directory.path))
         #expect(FileManager.default.fileExists(atPath: second.directory.path))
         #expect(recorder.calls.suffix(4).map { Array($0.prefix(2)) } == [["plugin", "remove"], ["plugin", "marketplace"], ["plugin", "marketplace"], ["plugin", "add"]])
+    }
+
+    @Test func configureRepairsPrivateModesOnPreviouslyVerifiedPluginCache() throws {
+        let root = try home()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let recorder = LocalSessionCommandRecorder()
+        let first = try configure(.codex, home: root, recorder: recorder)
+        let profile = root.appendingPathComponent("profile")
+        let profileKey = SHA256.hash(data: Data(profile.path.utf8)).prefix(16).map { String(format: "%02x", $0) }.joined()
+        let plugin = "personastack-local-" + profileKey
+        let cache = profile.appendingPathComponent("plugins/cache/personastack-desktop-" + profileKey + "/" + plugin + "/1.0.0")
+        let enumerator = try #require(FileManager.default.enumerator(at: cache, includingPropertiesForKeys: [.isDirectoryKey]))
+        var cachedPaths = [cache]
+        for case let path as URL in enumerator { cachedPaths.append(path) }
+        for path in cachedPaths {
+            let isDirectory = try path.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true
+            try FileManager.default.setAttributes([.posixPermissions: isDirectory ? 0o755 : 0o644], ofItemAtPath: path.path)
+        }
+
+        let second = try configure(.codex, home: root, recorder: recorder)
+        #expect(!FileManager.default.fileExists(atPath: first.directory.path))
+        #expect(FileManager.default.fileExists(atPath: second.directory.path))
+        for path in cachedPaths {
+            let isDirectory = try path.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true
+            let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
+            let mode = (attributes[.posixPermissions] as? NSNumber)?.intValue
+            #expect(mode == (isDirectory ? 0o700 : 0o600))
+        }
     }
 
     @Test func configureRefusesToRemoveModifiedPersonaStackSource() throws {

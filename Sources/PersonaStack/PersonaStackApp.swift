@@ -8,14 +8,36 @@ import WebKit
 struct PersonaStackApp: App {
     private let launchURL = LaunchConfiguration.url()
 
+    init() {
+        guard UserDefaults.standard.bool(forKey: "desktopControlRelayEnabled") else { return }
+        NSApp.setActivationPolicy(.accessory)
+        let paused = UserDefaults.standard.bool(forKey: "desktopControlRelayPaused")
+        Task { @MainActor in
+            do {
+                if paused {
+                    try await DesktopControlRuntime.shared.startPaused()
+                } else {
+                    try await DesktopControlRuntime.shared.resume()
+                }
+            } catch {
+                UserDefaults.standard.set(error.localizedDescription, forKey: "desktopControlRelayError")
+            }
+        }
+    }
+
     var body: some Scene {
-        WindowGroup("PersonaStack") {
+        WindowGroup("PersonaStack", id: "personastack-main") {
             PersonaStackWebView(url: launchURL)
                 .frame(minWidth: 1172, minHeight: 700)
                 .background(WindowPresentationConfigurator())
         }
         .defaultSize(width: 1440, height: 960)
         .windowStyle(.hiddenTitleBar)
+
+        MenuBarExtra("PersonaStack Desktop", systemImage: "cursorarrow.motionlines") {
+            DesktopControlMenu()
+        }
+        .menuBarExtraStyle(.menu)
     }
 }
 
@@ -53,6 +75,7 @@ struct PersonaStackWebView: NSViewRepresentable {
         configuration.userContentController.addScriptMessageHandler(ChatWindowManager.shared, contentWorld: .page, name: "personastackChat")
         configuration.userContentController.addScriptMessageHandler(StackWindowManager.shared, contentWorld: .page, name: "personastackStack")
         configuration.userContentController.addScriptMessageHandler(LocalSessionManager.shared, contentWorld: .page, name: "personastackLocalSession")
+        configuration.userContentController.addScriptMessageHandler(DesktopControlSetupManager.shared, contentWorld: .page, name: "personastackDesktopControl")
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.allowsBackForwardNavigationGestures = true
@@ -62,6 +85,7 @@ struct PersonaStackWebView: NSViewRepresentable {
         ChatWindowManager.shared.register(webView, appURL: url)
         StackWindowManager.shared.register(webView, appURL: url)
         LocalSessionManager.shared.register(webView, appURL: url)
+        DesktopControlSetupManager.shared.register(webView, appURL: url)
         context.coordinator.requestNotificationAuthorization()
         context.coordinator.start(url)
         return webView
