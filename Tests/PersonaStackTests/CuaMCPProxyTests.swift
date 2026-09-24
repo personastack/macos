@@ -6,9 +6,19 @@ import Testing
 struct CuaMCPProxyTests {
     @Test
     func initializesListsAndCallsOnlyApprovedTools() async throws {
+        let stoppedMarker = FileManager.default.temporaryDirectory.appendingPathComponent("cua-proxy-stopped-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: stoppedMarker) }
         let script = #"""
         #!/usr/bin/python3
-        import json, sys
+        import atexit, json, signal, sys
+        def record_exit():
+            with open("\#(stoppedMarker.path)", "w") as marker:
+                marker.write("stopped")
+        atexit.register(record_exit)
+        def stop_handler(*_):
+            record_exit()
+            raise SystemExit(0)
+        signal.signal(signal.SIGTERM, stop_handler)
         for line in sys.stdin:
             request = json.loads(line)
             method = request.get("method")
@@ -29,22 +39,28 @@ struct CuaMCPProxyTests {
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
         let proxy = CuaMCPProxy(executableURL: url)
 
-        let initialize = try await proxy.start()
-        let initializeObject = try #require(JSONSerialization.jsonObject(with: initialize) as? [String: Any])
-        #expect(initializeObject["result"] != nil)
-        let serverInfo = try #require((initializeObject["result"] as? [String: Any])?["serverInfo"] as? [String: Any])
-        #expect(serverInfo["telemetry"] as? String == "0")
-        #expect(serverInfo["update_check"] as? String == "false")
-        let listed = try await proxy.listTools()
-        let toolNames = try await proxy.validateToolCatalog(listed)
-        #expect(toolNames.contains("get_desktop_state"))
-        let args = Data(#"{"include_screenshots":false}"#.utf8)
-        let called = try await proxy.callTool(name: "get_desktop_state", argumentsJSON: args)
-        #expect(String(decoding: called, as: UTF8.self).contains("get_desktop_state"))
-        await #expect(throws: CuaMCPProxyError.invalidToolName) {
-            try await proxy.callTool(name: "permissions", argumentsJSON: Data("{}".utf8))
+        do {
+            let initialize = try await proxy.start()
+            let initializeObject = try #require(JSONSerialization.jsonObject(with: initialize) as? [String: Any])
+            #expect(initializeObject["result"] != nil)
+            let serverInfo = try #require((initializeObject["result"] as? [String: Any])?["serverInfo"] as? [String: Any])
+            #expect(serverInfo["telemetry"] as? String == "0")
+            #expect(serverInfo["update_check"] as? String == "false")
+            let listed = try await proxy.listTools()
+            let toolNames = try await proxy.validateToolCatalog(listed)
+            #expect(toolNames.contains("get_desktop_state"))
+            let args = Data(#"{"include_screenshots":false}"#.utf8)
+            let called = try await proxy.callTool(name: "get_desktop_state", argumentsJSON: args)
+            #expect(String(decoding: called, as: UTF8.self).contains("get_desktop_state"))
+            await #expect(throws: CuaMCPProxyError.invalidToolName) {
+                try await proxy.callTool(name: "permissions", argumentsJSON: Data("{}".utf8))
+            }
+            await proxy.stop()
+            #expect(FileManager.default.fileExists(atPath: stoppedMarker.path))
+        } catch {
+            await proxy.stop()
+            throw error
         }
-        await proxy.stop()
     }
 
     private func executableScript(_ body: String) throws -> URL {

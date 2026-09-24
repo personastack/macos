@@ -3,6 +3,24 @@ import Testing
 @testable import PersonaStackCore
 
 struct DesktopFileSystemTests {
+    @Test func openFileHandleLimitIsEnforcedAndHandlesCanBeReleased() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("handle-limit.txt")
+        try Data("open".utf8).write(to: file)
+        let fs = DesktopFileSystem()
+        var handles: [UUID] = []
+        for _ in 0..<DesktopFileSystem.maxOpenFiles {
+            handles.append(try await fs.open(path: file.path).id)
+        }
+
+        await #expect(throws: DesktopFileSystemError.tooManyOpenFiles) {
+            try await fs.open(path: file.path)
+        }
+        for handle in handles { try await fs.close(id: handle) }
+        #expect(try await fs.open(path: file.path).firstRead.content == Data("open".utf8))
+    }
+
     @Test func openReturnsContentAndPaginatesReads() async throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }

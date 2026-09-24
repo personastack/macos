@@ -68,6 +68,8 @@ private final class EnrollmentCredentialStoreFixture: DesktopControlCredentialSt
     let installation = try await client.enroll(ticket: "setup-ticket-1", appURL: appURL)
     #expect(installation.installationID == "install-1")
     #expect(try credentials.load() == installation)
+    #expect(String(describing: installation).contains("<redacted>"))
+    #expect(!String(reflecting: installation).contains(credential))
 
     let repeated = try await client.enroll(ticket: "different-ticket", appURL: appURL)
     #expect(repeated == installation)

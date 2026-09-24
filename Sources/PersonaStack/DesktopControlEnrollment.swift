@@ -45,6 +45,14 @@ struct DesktopControlInstallation: Codable, Equatable, Sendable {
     }
 }
 
+extension DesktopControlInstallation: CustomStringConvertible, CustomDebugStringConvertible {
+    var description: String {
+        "DesktopControlInstallation(installationID: \(installationID), machineCredential: <redacted>, gatewayWebsocketURL: \(gatewayWebsocketURL))"
+    }
+
+    var debugDescription: String { description }
+}
+
 enum DesktopControlEnrollmentError: Error, Equatable {
     case invalidRequest
     case rejected

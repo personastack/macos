@@ -40,6 +40,22 @@ struct DesktopShellExecutorTests {
         await executor.closeAll()
     }
 
+    @Test func managedProcessLimitIsEnforced() async throws {
+        let executor = DesktopShellExecutor()
+        do {
+            for _ in 0..<DesktopShellExecutor.maximumProcesses {
+                _ = try await executor.start(command: "read answer", workingDirectory: "/tmp")
+            }
+            await #expect(throws: DesktopShellError.tooManyProcesses) {
+                try await executor.start(command: "true", workingDirectory: "/tmp")
+            }
+            #expect(await executor.closeAll())
+        } catch {
+            _ = await executor.closeAll()
+            throw error
+        }
+    }
+
     @Test func commandPreservesNoNewlineOutputAcrossSplitUTF8Writes() async throws {
         let executor = DesktopShellExecutor()
         let started = try await executor.start(command: "printf '\\342'; sleep 0.2; printf '\\202\\254'", workingDirectory: "/tmp")
