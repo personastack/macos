@@ -366,7 +366,11 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                     guard !self.disconnecting else { return }
                     do {
                         try await self.establishConnection(installation, generation: generation)
-                    } catch {}
+                    } catch {
+                        if Self.readiness(for: error) == "upgrade_required" {
+                            self.readiness = "upgrade_required"
+                        }
+                    }
                 }
                 do { try await Task.sleep(for: .seconds(5)) }
                 catch { return }
@@ -396,7 +400,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let connectionID = UUID()
         let connection = DesktopControlGatewayConnection(
             installation: installation,
-            onDisconnect: { [weak self] in await self?.gatewayDisconnected(connectionID: connectionID) },
+            onDisconnect: { [weak self] error in await self?.gatewayDisconnected(connectionID: connectionID, error: error) },
             diagnosticsProvider: { [weak self] in
                 guard let self else {
                     return DesktopControlDiagnostics(activeProcesses: 0, openFileHandles: 0,
@@ -432,10 +436,11 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         }
     }
 
-    private func gatewayDisconnected(connectionID: UUID) {
+    private func gatewayDisconnected(connectionID: UUID, error: DesktopControlGatewayConnectionError?) {
         guard gatewayConnectionID == connectionID else { return }
         gatewayAttemptID = UUID()
         gatewayConnected = false
+        if error == .upgradeRequired { readiness = "upgrade_required" }
     }
 
     private func requireCurrentLifecycle(_ generation: UUID) throws {
@@ -474,6 +479,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     static func readiness(for error: Error) -> String {
+        if let gatewayError = error as? DesktopControlGatewayConnectionError, gatewayError == .upgradeRequired {
+            return "upgrade_required"
+        }
         guard let error = error as? CuaMCPProxyError else { return "cua_unavailable" }
         switch error {
         case .permissionsRequired:

@@ -2,13 +2,14 @@ import Foundation
 import PersonaStackCore
 
 typealias DesktopControlCommandHandler = @Sendable (DesktopControlFrame, @escaping @Sendable (DesktopControlFrame) async throws -> Void) async -> DesktopControlFrame
-typealias DesktopControlDisconnectHandler = @Sendable () async -> Void
+typealias DesktopControlDisconnectHandler = @Sendable (DesktopControlGatewayConnectionError?) async -> Void
 typealias DesktopControlDiagnosticsProvider = @Sendable () async -> DesktopControlDiagnostics
 
 enum DesktopControlGatewayConnectionError: Error, Equatable {
     case alreadyConnected
     case invalidURL
     case rejected
+    case upgradeRequired
     case invalidFrame
     case socketUnavailable
 }
@@ -32,7 +33,7 @@ actor DesktopControlGatewayConnection {
 
     init(installation: DesktopControlInstallation,
          session: URLSession = .shared,
-         onDisconnect: @escaping DesktopControlDisconnectHandler = {},
+         onDisconnect: @escaping DesktopControlDisconnectHandler = { _ in },
          diagnosticsProvider: @escaping DesktopControlDiagnosticsProvider = { DesktopControlDiagnostics(activeProcesses: 0, openFileHandles: 0, bufferedOutputBytes: 0, outputGapsTotal: 0) },
          handler: @escaping DesktopControlCommandHandler) {
         self.installation = installation
@@ -53,7 +54,7 @@ actor DesktopControlGatewayConnection {
         do {
             let first = try await task.receive()
             let ready = try DesktopControlFrameCodec.decode(Self.data(from: first))
-            guard ready.version == 1, ready.type == "ready" else { throw DesktopControlGatewayConnectionError.rejected }
+            if let error = Self.handshakeError(for: ready) { throw error }
             diagnosticsSupported = ready.diagnosticsSupported == true
             connected = true
             reader = Task { await receiveLoop() }
@@ -95,10 +96,16 @@ actor DesktopControlGatewayConnection {
                 guard let socket else { throw DesktopControlGatewayConnectionError.socketUnavailable }
                 let message = try await socket.receive()
                 let frame = try DesktopControlFrameCodec.decode(Self.data(from: message))
-                guard frame.version == 1 else { throw DesktopControlGatewayConnectionError.invalidFrame }
+                if frame.version != 1 {
+                    await disconnected(error: .upgradeRequired)
+                    return
+                }
                 switch frame.type {
                 case "heartbeat":
                     continue
+                case "failure" where frame.errorCode == "upgrade_required":
+                    await disconnected(error: .upgradeRequired)
+                    return
                 case "command":
                     guard Self.validCommand(frame, installationID: installation.installationID) else {
                         throw DesktopControlGatewayConnectionError.invalidFrame
@@ -120,7 +127,7 @@ actor DesktopControlGatewayConnection {
                     throw DesktopControlGatewayConnectionError.invalidFrame
                 }
             } catch {
-                await disconnected()
+                await disconnected(error: error as? DesktopControlGatewayConnectionError)
                 return
             }
         }
@@ -168,10 +175,16 @@ actor DesktopControlGatewayConnection {
         try await socket.send(.string(text))
     }
 
-    private func disconnected() async {
+    private func disconnected(error: DesktopControlGatewayConnectionError? = nil) async {
         guard connected else { return }
         stop()
-        await onDisconnect()
+        await onDisconnect(error)
+    }
+
+    static func handshakeError(for frame: DesktopControlFrame) -> DesktopControlGatewayConnectionError? {
+        if frame.type == "failure", frame.errorCode == "upgrade_required" { return .upgradeRequired }
+        if frame.version != 1 { return .upgradeRequired }
+        return frame.type == "ready" ? nil : .rejected
     }
 
     private static func data(from message: URLSessionWebSocketTask.Message) throws -> Data {

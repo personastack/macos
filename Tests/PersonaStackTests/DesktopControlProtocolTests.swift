@@ -67,6 +67,15 @@ import Testing
     #expect(!DesktopControlGatewayConnection.validCommand(invalidRevoke, installationID: "install-1"))
 }
 
+@Test func desktopControlGatewayHandshakeRequiresACompatibleProtocol() {
+    #expect(DesktopControlGatewayConnection.handshakeError(for: DesktopControlFrame(type: "ready")) == nil)
+    #expect(DesktopControlGatewayConnection.handshakeError(for: DesktopControlFrame(version: 2, type: "ready")) == .upgradeRequired)
+    #expect(DesktopControlGatewayConnection.handshakeError(for: DesktopControlFrame(
+        type: "failure", errorCode: "upgrade_required"
+    )) == .upgradeRequired)
+    #expect(DesktopControlGatewayConnection.handshakeError(for: DesktopControlFrame(type: "failure")) == .rejected)
+}
+
 @Test func desktopControlGatewayReservesOneCommandSlotForConfigRevocation() {
     #expect(DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_status", activeCount: 30))
     #expect(!DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_status", activeCount: 31))
