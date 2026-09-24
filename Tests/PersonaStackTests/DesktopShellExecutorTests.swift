@@ -40,6 +40,36 @@ struct DesktopShellExecutorTests {
         await executor.closeAll()
     }
 
+    @Test func commandPreservesNoNewlineOutputAcrossSplitUTF8Writes() async throws {
+        let executor = DesktopShellExecutor()
+        let started = try await executor.start(command: "printf '\\342'; sleep 0.2; printf '\\202\\254'", workingDirectory: "/tmp")
+        var result = started
+        var chunks = started.chunks
+        while result.state == .running {
+            result = try await executor.read(id: started.executionID, after: result.nextCursor, wait: .seconds(2))
+            chunks.append(contentsOf: result.chunks)
+        }
+        let output = Data(chunks.filter { $0.stream == .stdout }.flatMap(\.data))
+        #expect(output == Data([0xE2, 0x82, 0xAC]))
+        await executor.closeAll()
+    }
+
+    @Test func closingStdinDeliversEOFToTheRunningProcess() async throws {
+        let executor = DesktopShellExecutor()
+        let started = try await executor.start(command: "cat >/dev/null; printf 'stdin-closed'", workingDirectory: "/tmp")
+        #expect(started.state == .running)
+        try await executor.write(id: started.executionID, input: .close)
+        var result = try await executor.read(id: started.executionID, after: 0, wait: .seconds(3))
+        var chunks = result.chunks
+        while result.state == .running {
+            result = try await executor.read(id: started.executionID, after: result.nextCursor, wait: .seconds(3))
+            chunks.append(contentsOf: result.chunks)
+        }
+        #expect(result.state == .exited)
+        #expect(chunks.map { String(decoding: $0.data, as: UTF8.self) }.joined().contains("stdin-closed"))
+        await executor.closeAll()
+    }
+
     @Test func cancellingManagedProcessStopsIt() async throws {
         let executor = DesktopShellExecutor()
         let started = try await executor.start(command: "sleep 20", workingDirectory: "/tmp")
