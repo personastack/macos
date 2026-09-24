@@ -107,9 +107,38 @@ final class DesktopControlCommandExecutor {
             return DesktopControlFrame(type: "result", requestID: requestID, result: value)
         } catch let error as CommandError {
             return Self.failure(frame, error.code, error.localizedDescription)
+        } catch let error as DesktopFileSystemError {
+            return Self.failure(frame, error.desktopControlCode, error.desktopControlMessage)
         } catch {
+            if frame.operation == "desktop_control_file" {
+                let nsError = error as NSError
+                if Self.isPermissionDenied(nsError) {
+                    return Self.failure(frame, "desktop_file_permission_denied",
+                                        "macOS denied this file operation for PersonaStack Desktop. Choose a file or folder your macOS account can access.")
+                }
+                if Self.mayHavePartialWrite(frame.arguments) {
+                    return Self.failure(frame, "desktop_file_write_outcome_unknown",
+                                        "The file may have changed before the write stopped. Read it again before retrying.")
+                }
+                return Self.failure(frame, "desktop_file_operation_failed",
+                                    "PersonaStack Desktop could not complete this file operation.")
+            }
             return Self.failure(frame, "desktop_command_failed", "The desktop command failed.")
         }
+    }
+
+    static func isPermissionDenied(_ error: NSError) -> Bool {
+        if error.domain == NSCocoaErrorDomain {
+            return error.code == NSFileReadNoPermissionError || error.code == NSFileWriteNoPermissionError
+        }
+        return error.domain == NSPOSIXErrorDomain && (error.code == Int(EACCES) || error.code == Int(EPERM))
+    }
+
+    static func mayHavePartialWrite(_ arguments: DesktopControlJSONValue?) -> Bool {
+        guard let values = Self.object(arguments), values["action"] as? String == "write" else { return false }
+        if values["offset"] != nil { return true }
+        guard let mode = values["mode"] as? String else { return false }
+        return mode == "append" || mode == "create"
     }
 
     private static func forwardShellChunks(_ result: Any, requestID: String,
@@ -344,6 +373,34 @@ private enum CommandError: Error, LocalizedError {
         case .controlRequired: "Acquire desktop control before using this tool."
         case .commandFailed: "The desktop command failed."
         case .executorUnavailable: "The previous desktop command is still stopping. Retry after the desktop service recovers."
+        }
+    }
+}
+
+private extension DesktopFileSystemError {
+    var desktopControlCode: String {
+        switch self {
+        case .permissionDenied: "desktop_file_permission_denied"
+        case .missingHandle: "desktop_file_handle_expired"
+        case .invalidRange: "desktop_file_range_invalid"
+        case .tooManyOpenFiles: "desktop_file_handle_limit"
+        case .patchMismatch: "desktop_file_changed"
+        case .searchIncomplete: "desktop_file_search_incomplete"
+        case .invalidPath, .notRegularFile, .notDirectory, .contentTooLarge, .destinationExists:
+            "desktop_file_operation_failed"
+        }
+    }
+
+    var desktopControlMessage: String {
+        switch self {
+        case .permissionDenied: "macOS denied this file operation for PersonaStack Desktop. Choose a file or folder your macOS account can access."
+        case .missingHandle: "This file handle expired. Open the file again before reading it."
+        case .invalidRange: "The requested file range is outside the supported limit."
+        case .tooManyOpenFiles: "Too many files are open for this desktop control session. Close a file handle and retry."
+        case .patchMismatch: "The file changed or the expected text did not match. Read the current file before editing it again."
+        case .searchIncomplete: "The file search exceeded its scan limit. Narrow the search to a smaller folder."
+        case .invalidPath, .notRegularFile, .notDirectory, .contentTooLarge, .destinationExists:
+            "PersonaStack Desktop could not complete this file operation. Check the path, file type, and operation limits."
         }
     }
 }

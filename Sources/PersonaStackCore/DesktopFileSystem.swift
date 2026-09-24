@@ -12,6 +12,7 @@ public enum DesktopFileSystemError: Error, Equatable {
     case destinationExists
     case patchMismatch
     case searchIncomplete
+    case permissionDenied
 }
 
 public struct DesktopFileEntry: Sendable, Equatable {
@@ -75,7 +76,9 @@ public actor DesktopFileSystem {
         let url = input.resolvingSymlinksInPath().standardizedFileURL
         guard Self.kind(at: url) == .directory else { throw DesktopFileSystemError.notDirectory }
         guard offset <= Self.maxDirectoryScanEntries else { throw DesktopFileSystemError.invalidRange }
-        guard let directory = opendir(url.path) else { throw DesktopFileSystemError.notDirectory }
+        guard let directory = opendir(url.path) else {
+            throw Self.operationError(errno, fallback: .notDirectory)
+        }
         defer { closedir(directory) }
         var position = 0
         var entries: [DesktopFileEntry] = []
@@ -132,9 +135,7 @@ public actor DesktopFileSystem {
         guard openFiles.count < Self.maxOpenFiles else { throw DesktopFileSystemError.tooManyOpenFiles }
         guard let input = Self.url(path) else { throw DesktopFileSystemError.invalidPath }
         let resolved = input.resolvingSymlinksInPath().standardizedFileURL
-        guard let descriptor = Self.openRegularFile(resolved.path, flags: O_RDONLY) else {
-            throw DesktopFileSystemError.notRegularFile
-        }
+        let descriptor = try Self.openRegularFile(resolved.path, flags: O_RDONLY)
         var info = stat()
         guard fstat(descriptor, &info) == 0 else { _ = Darwin.close(descriptor); throw DesktopFileSystemError.notRegularFile }
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
@@ -169,7 +170,8 @@ public actor DesktopFileSystem {
         guard let url = Self.url(path) else { throw DesktopFileSystemError.invalidPath }
         if let offset {
             guard mode == .replace else { throw DesktopFileSystemError.invalidRange }
-            guard mode != .create, let descriptor = Self.openRegularFile(url.path, flags: O_WRONLY) else { throw DesktopFileSystemError.notRegularFile }
+            guard mode != .create else { throw DesktopFileSystemError.invalidRange }
+            let descriptor = try Self.openRegularFile(url.path, flags: O_WRONLY)
             let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
             try handle.seek(toOffset: offset)
             try handle.write(contentsOf: content)
@@ -178,7 +180,7 @@ public actor DesktopFileSystem {
             switch mode {
             case .create:
                 let descriptor = url.path.withCString { Darwin.open($0, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR) }
-                guard descriptor >= 0 else { throw errno == EEXIST ? DesktopFileSystemError.destinationExists : DesktopFileSystemError.invalidPath }
+                guard descriptor >= 0 else { throw Self.operationError(errno, fallback: .invalidPath, exists: .destinationExists) }
                 let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
                 try handle.write(contentsOf: content)
                 try handle.close()
@@ -187,7 +189,7 @@ public actor DesktopFileSystem {
                 try Self.replacePreservingMetadata(content, at: url)
             case .append:
                 let descriptor = url.path.withCString { Darwin.open($0, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR) }
-                guard descriptor >= 0 else { throw DesktopFileSystemError.notRegularFile }
+                guard descriptor >= 0 else { throw Self.operationError(errno, fallback: .notRegularFile) }
                 var info = stat()
                 guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { _ = Darwin.close(descriptor); throw DesktopFileSystemError.notRegularFile }
                 let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
@@ -200,9 +202,8 @@ public actor DesktopFileSystem {
     }
 
     public func patch(path: String, expected: String, replacement: String) throws -> DesktopFileEntry {
-        guard let url = Self.url(path), let descriptor = Self.openRegularFile(url.path, flags: O_RDONLY) else {
-            throw DesktopFileSystemError.patchMismatch
-        }
+        guard let url = Self.url(path) else { throw DesktopFileSystemError.invalidPath }
+        let descriptor = try Self.openRegularFile(url.path, flags: O_RDONLY)
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         var openedInfo = stat()
         guard fstat(descriptor, &openedInfo) == 0, openedInfo.st_size <= 4 * 1024 * 1024,
@@ -265,12 +266,23 @@ public actor DesktopFileSystem {
         return .other
     }
 
-    private static func openRegularFile(_ path: String, flags: Int32) -> Int32? {
+    private static func openRegularFile(_ path: String, flags: Int32) throws -> Int32 {
         let descriptor = path.withCString { Darwin.open($0, flags | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK) }
-        guard descriptor >= 0 else { return nil }
+        guard descriptor >= 0 else { throw operationError(errno, fallback: .notRegularFile) }
         var info = stat()
-        guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { _ = Darwin.close(descriptor); return nil }
+        guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
+            let failure = errno
+            _ = Darwin.close(descriptor)
+            throw operationError(failure, fallback: .notRegularFile)
+        }
         return descriptor
+    }
+
+    private static func operationError(_ code: Int32, fallback: DesktopFileSystemError,
+                                       exists: DesktopFileSystemError? = nil) -> DesktopFileSystemError {
+        if code == EACCES || code == EPERM { return .permissionDenied }
+        if code == EEXIST, let exists { return exists }
+        return fallback
     }
 
     private static func entry(_ url: URL) -> DesktopFileEntry {
@@ -281,7 +293,7 @@ public actor DesktopFileSystem {
     }
 
     private static func file(_ url: URL, contains needle: String) throws -> Bool {
-        guard let descriptor = openRegularFile(url.path, flags: O_RDONLY) else { return false }
+        let descriptor = try openRegularFile(url.path, flags: O_RDONLY)
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         defer { try? handle.close() }
         let needleData = Data(needle.utf8)

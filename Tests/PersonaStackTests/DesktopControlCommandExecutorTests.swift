@@ -71,6 +71,40 @@ struct DesktopControlCommandExecutorTests {
     }
 
     @Test
+    func expiredFileHandlesReturnAnActionableFailure() async throws {
+        let executor = DesktopControlCommandExecutor()
+        let owner = target(persona: "persona-1")
+        let acquired = await executor.handle(command("desktop_control_acquire", owner, requestID: "acquire-file"), proxy: nil)
+        guard case .object(let lease)? = acquired.result,
+              case .string(let token)? = lease["control_token"] else {
+            Issue.record("control token missing")
+            return
+        }
+
+        let read = command("desktop_control_file", owner, requestID: "read-expired",
+                           arguments: .object(["action": .string("read"), "control_token": .string(token),
+                                               "handle": .string("00000000-0000-0000-0000-000000000000"), "offset": .number(0)]))
+        let response = await executor.handle(read, proxy: nil)
+
+        #expect(response.type == "failure")
+        #expect(response.errorCode == "desktop_file_handle_expired")
+        #expect(response.errorMessage?.contains("Open the file again") == true)
+        await executor.close()
+    }
+
+    @Test
+    func filesystemPermissionAndPartialWriteClassifiersAreSpecific() {
+        #expect(DesktopControlCommandExecutor.isPermissionDenied(NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoPermissionError)))
+        #expect(DesktopControlCommandExecutor.isPermissionDenied(NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES))))
+        #expect(!DesktopControlCommandExecutor.isPermissionDenied(NSError(domain: NSCocoaErrorDomain, code: NSFileNoSuchFileError)))
+
+        #expect(DesktopControlCommandExecutor.mayHavePartialWrite(.object(["action": .string("write"), "mode": .string("append")])))
+        #expect(DesktopControlCommandExecutor.mayHavePartialWrite(.object(["action": .string("write"), "mode": .string("replace"), "offset": .number(12)])))
+        #expect(!DesktopControlCommandExecutor.mayHavePartialWrite(.object(["action": .string("write"), "mode": .string("replace")])))
+        #expect(!DesktopControlCommandExecutor.mayHavePartialWrite(.object(["action": .string("patch")])))
+    }
+
+    @Test
     func shellOutputIsForwardedAndRetainedForNonStreamingCallers() async throws {
         let executor = DesktopControlCommandExecutor()
         let owner = target(persona: "persona-1")

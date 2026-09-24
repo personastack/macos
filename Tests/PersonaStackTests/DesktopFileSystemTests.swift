@@ -46,6 +46,15 @@ struct DesktopFileSystemTests {
         await #expect(throws: DesktopFileSystemError.invalidPath) { try await fs.metadata(path: root.appendingPathComponent("missing").path) }
     }
 
+    @Test func directoryPermissionDenialIsPreservedForDesktopDiagnostics() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path); try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: root.path)
+        let fs = DesktopFileSystem()
+
+        await #expect(throws: DesktopFileSystemError.permissionDenied) { try await fs.list(path: root.path) }
+    }
+
     @Test func directoryOperationsResolveExplicitSymlinkRoots() async throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
