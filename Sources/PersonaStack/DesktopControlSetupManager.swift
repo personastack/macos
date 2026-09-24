@@ -66,7 +66,7 @@ enum DesktopControlSetupCommand: Equatable {
 final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithReply {
     static let shared = DesktopControlSetupManager()
 
-    private final class Page {
+    final class Page {
         let appURL: URL
         var setupScope = DesktopControlSetupScope()
 
@@ -112,7 +112,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         }
     }
 
-    private func apply(_ command: DesktopControlSetupCommand, page: Page) async throws -> [String: Any] {
+    func apply(_ command: DesktopControlSetupCommand, page: Page) async throws -> [String: Any] {
         switch command {
         case .sync(let scope):
             page.setupScope.synchronize(scope)

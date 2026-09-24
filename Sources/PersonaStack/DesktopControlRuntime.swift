@@ -2,11 +2,21 @@ import AppKit
 import Foundation
 import PersonaStackCore
 
+protocol DesktopControlDriverInstalling: Sendable {
+    func validateOrInstall(
+        repair: Bool,
+        commitManagedInstall: (@MainActor @Sendable (URL, URL, Bool) throws -> Void)?
+    ) async throws -> CuaDriverInstallation
+}
+
+extension CuaDriverInstaller: DesktopControlDriverInstalling {}
+
 @MainActor
 final class DesktopControlRuntime {
     static let shared = DesktopControlRuntime()
 
-    private let installer = CuaDriverInstaller()
+    private let installer: any DesktopControlDriverInstalling
+    private let credentials: any DesktopControlCredentialStoring
     private var cuaApplication: NSRunningApplication?
     private var proxy: CuaMCPProxy?
     private var startingProxy: CuaMCPProxy?
@@ -22,9 +32,13 @@ final class DesktopControlRuntime {
     private(set) var gatewayConnected = false
     private(set) var tools: Set<String> = []
     private(set) var paused = false
-    private var readiness = "unknown"
+    private(set) var readiness = "unknown"
 
-    private init() {}
+    init(installer: any DesktopControlDriverInstalling = CuaDriverInstaller(),
+         credentials: any DesktopControlCredentialStoring = KeychainDesktopControlCredentialStore()) {
+        self.installer = installer
+        self.credentials = credentials
+    }
 
     func beginResume() throws -> UUID {
         guard !disconnecting else { throw CancellationError() }
@@ -134,7 +148,7 @@ final class DesktopControlRuntime {
         try requireCurrentLifecycle(generation)
         paused = startPaused
         readiness = startPaused ? "paused" : "ready"
-        if let saved = try? KeychainDesktopControlCredentialStore().load() {
+        if let saved = try? credentials.load() {
             await gateway?.setReadiness(readiness)
             try requireCurrentLifecycle(generation)
             beginReconnectLoop(for: saved)
@@ -147,7 +161,7 @@ final class DesktopControlRuntime {
         let generation = lifecycleGeneration
         paused = true
         readiness = "paused"
-        guard let installation = try KeychainDesktopControlCredentialStore().load() else { return }
+        guard let installation = try credentials.load() else { return }
         activeInstallation = installation
         let connected = await gateway?.isConnected() == true
         try requireCurrentLifecycle(generation)
@@ -237,7 +251,7 @@ final class DesktopControlRuntime {
         let installation: DesktopControlInstallation?
         let credentialLoadError: Error?
         do {
-            installation = try KeychainDesktopControlCredentialStore().load()
+            installation = try credentials.load()
             credentialLoadError = nil
         } catch {
             installation = nil
@@ -246,7 +260,7 @@ final class DesktopControlRuntime {
         activeInstallation = installation
         await stopLocalControl(generation: generation)
         guard disconnecting, generation == lifecycleGeneration else { return }
-        let enrollment = DesktopControlEnrollmentClient(credentials: KeychainDesktopControlCredentialStore())
+        let enrollment = DesktopControlEnrollmentClient(credentials: credentials)
         if let installation {
             do {
                 try await enrollment.revokeRemote(installation: installation, appURL: LaunchConfiguration.url())
@@ -268,7 +282,7 @@ final class DesktopControlRuntime {
         gatewayConnected = false
         activeInstallation = nil
         if let credentialLoadError { throw credentialLoadError }
-        if installation != nil { try KeychainDesktopControlCredentialStore().delete() }
+        if installation != nil { try credentials.delete() }
         paused = false
     }
 
@@ -426,7 +440,7 @@ final class DesktopControlRuntime {
     private func publishReadinessFailure(_ error: Error, generation: UUID) async {
         guard generation == lifecycleGeneration else { return }
         readiness = Self.readiness(for: error)
-        guard let installation = try? KeychainDesktopControlCredentialStore().load() else { return }
+        guard let installation = try? credentials.load() else { return }
         guard generation == lifecycleGeneration else { return }
         activeInstallation = installation
         let connected = await gateway?.isConnected() == true
