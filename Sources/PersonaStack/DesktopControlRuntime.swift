@@ -21,9 +21,24 @@ final class DesktopControlRuntime {
     private init() {}
 
     func resume() async throws {
+        try await startCua(repairOnValidationFailure: false)
+    }
+
+    func repair() async throws {
+        await pause()
+        try await startCua(repairOnValidationFailure: true)
+    }
+
+    private func startCua(repairOnValidationFailure: Bool) async throws {
         if proxy == nil {
             do {
-                let installation = try await installer.validateOrInstall()
+                let installation: CuaDriverInstallation
+                do {
+                    installation = try await installer.validateOrInstall()
+                } catch {
+                    guard repairOnValidationFailure else { throw error }
+                    installation = try await installer.validateOrInstall(repair: true)
+                }
                 let application = try await launchCuaService(at: installation.applicationURL)
                 cuaApplication = application
 

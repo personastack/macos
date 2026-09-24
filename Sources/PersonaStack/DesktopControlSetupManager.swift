@@ -117,7 +117,12 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         case .prepare(let scope, let ticket):
             try requireCurrentScope(scope, page: page)
             let generation = page.generation
-            try await runtime.resume()
+            do {
+                try await runtime.resume()
+            } catch {
+                try requireCurrentScope(scope, generation: generation, page: page)
+                try await runtime.repair()
+            }
             try requireCurrentScope(scope, generation: generation, page: page)
             do { try SMAppService.mainApp.register() }
             catch { throw DesktopControlEnrollmentError.serviceRegistrationFailed }

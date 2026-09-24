@@ -15,6 +15,11 @@ struct DesktopControlMenu: View {
             .foregroundStyle(relayEnabled ? .green : .secondary)
         Divider()
         if relayEnabled {
+            Button("Repair Cua Service") {
+                Task { await repairCua() }
+            }
+        }
+        if relayEnabled {
             Button(relayPaused ? "Resume Remote Control" : "Pause Remote Control") {
                 Task { await toggleRelay() }
             }
@@ -69,6 +74,17 @@ struct DesktopControlMenu: View {
         } catch {
             loginItemError = "Cua service could not start: \(error.localizedDescription)"
             relayEnabled = false
+        }
+    }
+
+    @MainActor
+    private func repairCua() async {
+        loginItemError = ""
+        do {
+            try await DesktopControlRuntime.shared.repair()
+            relayPaused = false
+        } catch {
+            loginItemError = "Cua service could not be repaired: \(error.localizedDescription)"
         }
     }
 
