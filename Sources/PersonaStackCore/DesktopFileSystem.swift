@@ -63,6 +63,8 @@ public actor DesktopFileSystem {
 
     public init() {}
 
+    public func openHandleCount() -> Int { openFiles.count }
+
     public func metadata(path: String) throws -> DesktopFileEntry {
         guard let url = Self.url(path) else { throw DesktopFileSystemError.invalidPath }
         var info = stat()

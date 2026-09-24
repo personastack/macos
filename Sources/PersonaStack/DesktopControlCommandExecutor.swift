@@ -45,6 +45,15 @@ final class DesktopControlCommandExecutor {
         }
     }
 
+    func diagnostics() async -> DesktopControlDiagnostics {
+        let shellState = await shell.diagnostics()
+        let handleCount = await files.openHandleCount()
+        return DesktopControlDiagnostics(activeProcesses: shellState.activeProcesses,
+                                         openFileHandles: handleCount,
+                                         bufferedOutputBytes: shellState.bufferedOutputBytes,
+                                         outputGapsTotal: shellState.outputGapsTotal)
+    }
+
     func close() async {
         guard !closed else { return }
         closed = true

@@ -13,11 +13,13 @@ struct DesktopFileSystemTests {
         for _ in 0..<DesktopFileSystem.maxOpenFiles {
             handles.append(try await fs.open(path: file.path).id)
         }
+        #expect(await fs.openHandleCount() == DesktopFileSystem.maxOpenFiles)
 
         await #expect(throws: DesktopFileSystemError.tooManyOpenFiles) {
             try await fs.open(path: file.path)
         }
         for handle in handles { try await fs.close(id: handle) }
+        #expect(await fs.openHandleCount() == 0)
         #expect(try await fs.open(path: file.path).firstRead.content == Data("open".utf8))
     }
 

@@ -80,12 +80,15 @@ public struct DesktopControlFrame: Codable, Equatable, Sendable {
     public let streamData: Data?
     public let lastHeartbeat: Date?
     public let readiness: String?
+    public let diagnosticsSupported: Bool?
+    public let diagnostics: DesktopControlDiagnostics?
 
     public init(version: Int = 1, type: String, requestID: String? = nil, target: DesktopControlTarget? = nil,
                 operation: String? = nil, arguments: DesktopControlJSONValue? = nil, deadlineAt: Date? = nil,
                 result: DesktopControlJSONValue? = nil, errorCode: String? = nil, errorMessage: String? = nil,
                 streamID: String? = nil, sequence: UInt64? = nil, streamChannel: String? = nil,
-                streamData: Data? = nil, lastHeartbeat: Date? = nil, readiness: String? = nil) {
+                streamData: Data? = nil, lastHeartbeat: Date? = nil, readiness: String? = nil,
+                diagnosticsSupported: Bool? = nil, diagnostics: DesktopControlDiagnostics? = nil) {
         self.version = version
         self.type = type
         self.requestID = requestID
@@ -102,6 +105,8 @@ public struct DesktopControlFrame: Codable, Equatable, Sendable {
         self.streamData = streamData
         self.lastHeartbeat = lastHeartbeat
         self.readiness = readiness
+        self.diagnosticsSupported = diagnosticsSupported
+        self.diagnostics = diagnostics
     }
 
     enum CodingKeys: String, CodingKey {
@@ -117,6 +122,29 @@ public struct DesktopControlFrame: Codable, Equatable, Sendable {
         case streamData = "stream_data"
         case lastHeartbeat = "last_heartbeat"
         case readiness
+        case diagnosticsSupported = "diagnostics_supported"
+        case diagnostics
+    }
+}
+
+public struct DesktopControlDiagnostics: Codable, Equatable, Sendable {
+    public let activeProcesses: Int
+    public let openFileHandles: Int
+    public let bufferedOutputBytes: Int
+    public let outputGapsTotal: UInt64
+
+    public init(activeProcesses: Int, openFileHandles: Int, bufferedOutputBytes: Int, outputGapsTotal: UInt64) {
+        self.activeProcesses = activeProcesses
+        self.openFileHandles = openFileHandles
+        self.bufferedOutputBytes = bufferedOutputBytes
+        self.outputGapsTotal = outputGapsTotal
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case activeProcesses = "active_processes"
+        case openFileHandles = "open_file_handles"
+        case bufferedOutputBytes = "buffered_output_bytes"
+        case outputGapsTotal = "output_gaps_total"
     }
 }
 

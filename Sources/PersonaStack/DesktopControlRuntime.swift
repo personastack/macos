@@ -397,6 +397,13 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let connection = DesktopControlGatewayConnection(
             installation: installation,
             onDisconnect: { [weak self] in await self?.gatewayDisconnected(connectionID: connectionID) },
+            diagnosticsProvider: { [weak self] in
+                guard let self else {
+                    return DesktopControlDiagnostics(activeProcesses: 0, openFileHandles: 0,
+                                                     bufferedOutputBytes: 0, outputGapsTotal: 0)
+                }
+                return await self.executor.diagnostics()
+            },
             handler: { [weak self] frame, onChunk in
                 guard let self else { return Self.failure(for: frame, code: "desktop_executor_unavailable") }
                 return await self.handle(frame, connectionID: connectionID, onChunk: onChunk)

@@ -37,6 +37,12 @@ public struct DesktopProcessRead: Sendable {
     public let signal: Int32?
 }
 
+public struct DesktopShellDiagnostics: Sendable, Equatable {
+    public let activeProcesses: Int
+    public let bufferedOutputBytes: Int
+    public let outputGapsTotal: UInt64
+}
+
 public enum DesktopShellError: Error, Equatable {
     case invalidCommand
     case invalidWorkingDirectory
@@ -84,8 +90,17 @@ public actor DesktopShellExecutor {
     }
 
     private var sessions: [UUID: Session] = [:]
+    private var outputGapsTotal: UInt64 = 0
 
     public init() {}
+
+    public func diagnostics() -> DesktopShellDiagnostics {
+        DesktopShellDiagnostics(
+            activeProcesses: sessions.values.filter { $0.state == .running }.count,
+            bufferedOutputBytes: sessions.values.reduce(0) { $0 + $1.bufferedBytes },
+            outputGapsTotal: outputGapsTotal
+        )
+    }
 
     public func start(command: String, workingDirectory: String, timeout: TimeInterval = 300) async throws -> DesktopProcessRead {
         guard !command.isEmpty, command.utf8.count <= Self.maximumCommandBytes else { throw DesktopShellError.invalidCommand }
@@ -245,9 +260,12 @@ public actor DesktopShellExecutor {
         session.totalBytes += UInt64(data.count)
         session.bufferedBytes += data.count
         session.chunks.append(chunk)
+        var droppedOutput = false
         while session.bufferedBytes > Self.maximumBufferedBytesPerProcess, !session.chunks.isEmpty {
             session.bufferedBytes -= session.chunks.removeFirst().data.count
+            droppedOutput = true
         }
+        if droppedOutput { outputGapsTotal += 1 }
         sessions[id] = session
     }
 

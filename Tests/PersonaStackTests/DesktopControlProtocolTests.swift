@@ -20,6 +20,18 @@ import Testing
     #expect(object["last_heartbeat"] as? String != nil)
     #expect(object["readiness"] as? String == "paused")
     #expect(object["lastHeartbeat"] == nil)
+
+    let oldGatewayReady = try DesktopControlFrameCodec.decode(Data(#"{"version":1,"type":"ready"}"#.utf8))
+    #expect(oldGatewayReady.diagnosticsSupported == nil)
+    let diagnosticHeartbeat = DesktopControlFrame(type: "heartbeat", diagnostics: DesktopControlDiagnostics(
+        activeProcesses: 2, openFileHandles: 3, bufferedOutputBytes: 4096, outputGapsTotal: 1
+    ))
+    let diagnosticObject = try #require(JSONSerialization.jsonObject(with: DesktopControlFrameCodec.encode(diagnosticHeartbeat)) as? [String: Any])
+    let diagnosticPayload = try #require(diagnosticObject["diagnostics"] as? [String: Any])
+    #expect(diagnosticPayload["active_processes"] as? Int == 2)
+    #expect(diagnosticPayload["open_file_handles"] as? Int == 3)
+    #expect(diagnosticPayload["buffered_output_bytes"] as? Int == 4096)
+    #expect(diagnosticPayload["output_gaps_total"] as? Int == 1)
 }
 
 @Test func desktopControlGatewayRejectsInvalidOrStaleRelayCommands() throws {

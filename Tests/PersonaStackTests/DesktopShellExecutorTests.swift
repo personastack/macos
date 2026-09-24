@@ -128,6 +128,8 @@ struct DesktopShellExecutorTests {
         #expect(observedGap)
         #expect(final.earliestCursor > 1)
         #expect(final.chunks.reduce(0) { $0 + $1.data.count } <= DesktopShellExecutor.maximumReadBytes)
+        let diagnostics = await executor.diagnostics()
+        #expect(diagnostics.outputGapsTotal > 0)
         await executor.closeAll()
     }
 

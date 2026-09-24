@@ -3,6 +3,7 @@ import PersonaStackCore
 
 typealias DesktopControlCommandHandler = @Sendable (DesktopControlFrame, @escaping @Sendable (DesktopControlFrame) async throws -> Void) async -> DesktopControlFrame
 typealias DesktopControlDisconnectHandler = @Sendable () async -> Void
+typealias DesktopControlDiagnosticsProvider = @Sendable () async -> DesktopControlDiagnostics
 
 enum DesktopControlGatewayConnectionError: Error, Equatable {
     case alreadyConnected
@@ -19,6 +20,7 @@ actor DesktopControlGatewayConnection {
     private let installation: DesktopControlInstallation
     private let handler: DesktopControlCommandHandler
     private let onDisconnect: DesktopControlDisconnectHandler
+    private let diagnosticsProvider: DesktopControlDiagnosticsProvider
     private let session: URLSession
     private var socket: URLSessionWebSocketTask?
     private var reader: Task<Void, Never>?
@@ -26,14 +28,17 @@ actor DesktopControlGatewayConnection {
     private var commandTasks: [String: Task<Void, Never>] = [:]
     private var connected = false
     private var readiness = "ready"
+    private var diagnosticsSupported = false
 
     init(installation: DesktopControlInstallation,
          session: URLSession = .shared,
          onDisconnect: @escaping DesktopControlDisconnectHandler = {},
+         diagnosticsProvider: @escaping DesktopControlDiagnosticsProvider = { DesktopControlDiagnostics(activeProcesses: 0, openFileHandles: 0, bufferedOutputBytes: 0, outputGapsTotal: 0) },
          handler: @escaping DesktopControlCommandHandler) {
         self.installation = installation
         self.session = session
         self.onDisconnect = onDisconnect
+        self.diagnosticsProvider = diagnosticsProvider
         self.handler = handler
     }
 
@@ -49,6 +54,7 @@ actor DesktopControlGatewayConnection {
             let first = try await task.receive()
             let ready = try DesktopControlFrameCodec.decode(Self.data(from: first))
             guard ready.version == 1, ready.type == "ready" else { throw DesktopControlGatewayConnectionError.rejected }
+            diagnosticsSupported = ready.diagnosticsSupported == true
             connected = true
             reader = Task { await receiveLoop() }
             heartbeats = Task { await heartbeatLoop() }
@@ -65,7 +71,7 @@ actor DesktopControlGatewayConnection {
         readiness = value
         guard connected else { return }
         do {
-            try await send(DesktopControlFrame(type: "heartbeat", lastHeartbeat: Date(), readiness: value))
+            try await send(await heartbeatFrame())
         } catch {
             await disconnected()
         }
@@ -141,12 +147,18 @@ actor DesktopControlGatewayConnection {
         while !Task.isCancelled, connected {
             do {
                 try await Task.sleep(for: .seconds(15))
-                try await send(DesktopControlFrame(type: "heartbeat", lastHeartbeat: Date(), readiness: readiness))
+                try await send(await heartbeatFrame())
             } catch {
                 await disconnected()
                 return
             }
         }
+    }
+
+    private func heartbeatFrame() async -> DesktopControlFrame {
+        let diagnostics = diagnosticsSupported ? await diagnosticsProvider() : nil
+        return DesktopControlFrame(type: "heartbeat", lastHeartbeat: Date(), readiness: readiness,
+                                   diagnostics: diagnostics)
     }
 
     private func send(_ frame: DesktopControlFrame) async throws {
