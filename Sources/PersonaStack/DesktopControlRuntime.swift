@@ -61,7 +61,11 @@ final class DesktopControlRuntime {
         if await gateway?.isConnected() == true {
             await gateway?.setReadiness("paused")
         } else {
-            try await establishConnection(installation)
+            do {
+                try await establishConnection(installation)
+            } catch {
+                gatewayConnected = false
+            }
         }
         beginReconnectLoop(for: installation)
     }
