@@ -689,7 +689,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         }
         guard let proxy else { return }
         do {
-            try await verifyCuaReadiness(proxy, generation: generation, prompt: false)
+            try await verifyCuaReadiness(proxy, generation: generation)
             guard self.lockGeneration == lockGeneration, sessionLock.allowsControl,
                   generation == lifecycleGeneration, !paused, !executorCleanupFailed else { return }
             readiness = "ready"
@@ -923,7 +923,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private func readinessAfterGuiFailure(generation: UUID) async -> String {
         guard generation == lifecycleGeneration, isCuaReady(), let proxy else { return "cua_unavailable" }
         do {
-            try await verifyCuaPermissions(proxy, generation: generation, prompt: false, timeout: 5)
+            try await verifyCuaPermissions(proxy, generation: generation, timeout: 5)
             return generation == lifecycleGeneration
                 ? Self.reconciledGuiReadiness(permissionProbeSucceeded: true, failureReadiness: "cua_unavailable")
                 : readiness
@@ -978,8 +978,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         }
     }
 
-    private func verifyCuaReadiness(_ candidate: CuaMCPProxy, generation: UUID, prompt: Bool = true) async throws {
-        try await verifyCuaPermissions(candidate, generation: generation, prompt: prompt)
+    private func verifyCuaReadiness(_ candidate: CuaMCPProxy, generation: UUID) async throws {
+        try await verifyCuaPermissions(candidate, generation: generation)
 
         // Permission setup remains available while the initial lock state is
         // unknown. Actual screen probes wait for an observed unlock.
@@ -1009,10 +1009,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func verifyCuaPermissions(_ candidate: CuaMCPProxy, generation: UUID,
-                                      prompt: Bool, timeout: Int32 = 60) async throws {
+                                      timeout: Int32 = 60) async throws {
         let permissions = try await candidate.callTool(
             name: "check_permissions",
-            argumentsJSON: Data((prompt ? #"{"prompt":true,"probe_direct_capture":false}"# : #"{"prompt":false,"probe_direct_capture":false}"#).utf8),
+            argumentsJSON: CuaDriverCompatibility.permissionProbeArgumentsJSON,
             timeout: timeout
         )
         try requireCurrentLifecycle(generation)

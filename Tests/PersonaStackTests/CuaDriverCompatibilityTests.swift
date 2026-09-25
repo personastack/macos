@@ -15,6 +15,8 @@ struct CuaDriverCompatibilityTests {
             "CUA_DRIVER_RS_TELEMETRY_ENABLED": "0",
             "CUA_DRIVER_RS_UPDATE_CHECK": "false",
         ])
+        let probe = try JSONSerialization.jsonObject(with: CuaDriverCompatibility.permissionProbeArgumentsJSON) as? [String: Bool]
+        #expect(probe == ["prompt": false, "probe_direct_capture": false])
         #expect(CuaDriverCompatibility.processEnvironment(from: [
             "HOME": "/tmp/profile",
             "PERSONASTACK_MACHINE_TOKEN": "do-not-forward",

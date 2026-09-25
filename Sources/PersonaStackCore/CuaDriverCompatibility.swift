@@ -11,6 +11,9 @@ public enum CuaDriverCompatibility {
         "CUA_DRIVER_RS_TELEMETRY_ENABLED": "0",
         "CUA_DRIVER_RS_UPDATE_CHECK": "false",
     ]
+    // Cua refuses OS permission prompts from an MCP client. Its signed app
+    // owns onboarding; the embedded proxy only reads the daemon's TCC state.
+    public static let permissionProbeArgumentsJSON = Data(#"{"prompt":false,"probe_direct_capture":false}"#.utf8)
     private static let inheritedEnvironmentKeys: Set<String> = [
         "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
     ]
