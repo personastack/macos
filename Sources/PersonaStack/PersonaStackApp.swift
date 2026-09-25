@@ -10,7 +10,7 @@ struct PersonaStackApp: App {
 
     init() {
         guard UserDefaults.standard.bool(forKey: "desktopControlRelayEnabled") else { return }
-        NSApp.setActivationPolicy(.accessory)
+        NSApplication.shared.setActivationPolicy(.accessory)
         let paused = UserDefaults.standard.bool(forKey: "desktopControlRelayPaused")
         Task { @MainActor in
             _ = MainWebViewHost.shared

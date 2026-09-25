@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import os
 import PersonaStackCore
 
 protocol DesktopControlDriverInstalling: Sendable {
@@ -14,6 +15,7 @@ extension CuaDriverInstaller: DesktopControlDriverInstalling {}
 @MainActor
 final class DesktopControlRuntime: DesktopControlSetupRuntime {
     static let shared = DesktopControlRuntime(relayStateReader: DesktopControlEnrollmentClient())
+    private let logger = Logger(subsystem: "ai.personastack.desktop", category: "desktop-control-relay")
 
     private let sessionLock = DesktopControlSessionLock()
     private var lockGeneration = UUID()
@@ -412,7 +414,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         }
         do {
             try await establishConnection(installation, generation: generation)
-        } catch {}
+        } catch {
+            let failure = error as NSError
+            logger.error("gateway connection failed: \(failure.domain, privacy: .public) code \(failure.code, privacy: .public)")
+        }
         guard generation == lifecycleGeneration, !disconnecting else { return }
         beginReconnectLoop(for: installation)
     }
@@ -551,6 +556,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                     do {
                         try await self.establishConnection(installation, generation: generation)
                     } catch {
+                        let failure = error as NSError
+                        self.logger.error("gateway reconnect failed: \(failure.domain, privacy: .public) code \(failure.code, privacy: .public)")
                         if Self.readiness(for: error) == "upgrade_required" {
                             self.readiness = "upgrade_required"
                         }
