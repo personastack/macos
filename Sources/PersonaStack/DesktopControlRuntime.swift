@@ -135,13 +135,15 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     func resumeForSetup(generation: UUID) async throws {
         try requireCurrentLifecycle(generation)
         guard !disconnecting else { throw CancellationError() }
-        try confirmForegroundSetupSession()
+        try confirmForegroundSession()
         try requireCurrentLifecycle(generation)
         setupMayRunUnconfigured = true
         try await startCua(forceRepairInstall: false, startPaused: false, generation: generation)
     }
 
-    private func confirmForegroundSetupSession() throws {
+    var requiresForegroundSessionConfirmation: Bool { sessionLock.state == .unknown }
+
+    func confirmForegroundSession() throws {
         if sessionLock.state == .locked {
             throw DesktopControlEnrollmentError.nativeCapabilitiesUnavailable
         }
@@ -434,7 +436,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     var sessionRecoveryMessage: String? {
         switch sessionLock.state {
-        case .unknown: "Lock and unlock this Mac once to enable remote control."
+        case .unknown: "Confirm this Mac is unlocked to enable remote control."
         case .locked: "Unlock this Mac to enable remote control."
         case .unlocked: nil
         }

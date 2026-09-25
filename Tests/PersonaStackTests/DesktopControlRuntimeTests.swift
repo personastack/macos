@@ -158,6 +158,36 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     #expect(lock.allowsControl)
 }
 
+@Test @MainActor func restartConfirmationRequiresForegroundApprovalAndNeverOverridesLock() throws {
+    let denied = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []),
+        credentials: EmptyDesktopControlCredentialStore(),
+        confirmForegroundSetup: { false }
+    )
+    #expect(denied.requiresForegroundSessionConfirmation)
+    #expect(throws: CancellationError.self) { try denied.confirmForegroundSession() }
+    #expect(denied.requiresForegroundSessionConfirmation)
+
+    let approved = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []),
+        credentials: EmptyDesktopControlCredentialStore(),
+        confirmForegroundSetup: { true }
+    )
+    try approved.confirmForegroundSession()
+    #expect(!approved.requiresForegroundSessionConfirmation)
+    #expect(approved.sessionRecoveryMessage == nil)
+
+    let locked = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []),
+        credentials: EmptyDesktopControlCredentialStore(),
+        sessionLockState: .locked,
+        confirmForegroundSetup: { true }
+    )
+    #expect(!locked.requiresForegroundSessionConfirmation)
+    #expect(throws: DesktopControlEnrollmentError.self) { try locked.confirmForegroundSession() }
+    #expect(locked.sessionRecoveryMessage == "Unlock this Mac to enable remote control.")
+}
+
 @Test @MainActor func repairAllowsOnlyOneForcedInstallAfterRetryableFailure() async throws {
     let installer = DesktopControlInstallerFixture(errors: [CuaDriverInstallError.invalidLayout, CuaDriverInstallError.invalidLayout])
     let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: EmptyDesktopControlCredentialStore())

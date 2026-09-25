@@ -19,6 +19,17 @@ struct DesktopControlMenu: View {
                 Task { await repairCua() }
             }
         }
+        if relayEnabled && DesktopControlRuntime.shared.requiresForegroundSessionConfirmation {
+            Button("Confirm This Mac Is Unlocked") {
+                do {
+                    try DesktopControlRuntime.shared.confirmForegroundSession()
+                } catch is CancellationError {
+                    return
+                } catch {
+                    loginItemError = error.localizedDescription
+                }
+            }
+        }
         if relayEnabled {
             Button(relayPaused ? "Resume Remote Control" : "Pause Remote Control") {
                 Task { await toggleRelay() }
