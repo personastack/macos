@@ -125,16 +125,13 @@ protocol DesktopControlCredentialStoring: Sendable {
 enum DesktopControlEnvironment {
     private static let gatewayPath = "/v1/desktop-control/ws"
 
+    static func supportsAppOrigin(_ appURL: URL) -> Bool {
+        guard let origin = try? origin(appURL) else { return false }
+        return expectedGateway(for: origin) != nil
+    }
+
     static func allowsGateway(_ gatewayURL: URL, for origin: String) -> Bool {
-        let expected: (scheme: String, host: String)
-        switch origin {
-        case "https://my.personastack.ai":
-            expected = ("wss", "cluster-agent.personastack.ai")
-        case "http://my.personastack.lan":
-            expected = ("ws", "cluster-agent.personastack.lan")
-        default:
-            return false
-        }
+        guard let expected = expectedGateway(for: origin) else { return false }
         guard let parts = URLComponents(url: gatewayURL, resolvingAgainstBaseURL: false) else { return false }
         let defaultPort = expected.scheme == "wss" ? 443 : 80
         return parts.scheme?.lowercased() == expected.scheme
@@ -142,6 +139,14 @@ enum DesktopControlEnvironment {
             && (parts.port == nil || parts.port == defaultPort)
             && parts.user == nil && parts.password == nil
             && parts.path == gatewayPath && parts.query == nil && parts.fragment == nil
+    }
+
+    private static func expectedGateway(for origin: String) -> (scheme: String, host: String)? {
+        switch origin {
+        case "https://my.personastack.ai": ("wss", "cluster-agent.personastack.ai")
+        case "https://personastack.ericgreer.info": ("ws", "cluster-agent.personastack.lan")
+        default: nil
+        }
     }
 
     static func origin(_ appURL: URL) throws -> String {
@@ -304,6 +309,9 @@ actor DesktopControlEnrollmentClient: DesktopControlRelayStateReading {
         appURL: URL,
         commitCredential: (@MainActor @Sendable (DesktopControlInstallation) throws -> Void)? = nil
     ) async throws -> DesktopControlInstallation {
+        guard DesktopControlEnvironment.supportsAppOrigin(appURL) else {
+            throw DesktopControlEnrollmentError.invalidRequest
+        }
         let credentials = credentials ?? KeychainDesktopControlCredentialStore(appURL: appURL)
         if let existing = try credentials.load() {
             try existing.requireEnvironment(appURL)

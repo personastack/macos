@@ -92,7 +92,7 @@ private final class LegacyKeychainFixture: DesktopControlKeychainAccess, @unchec
 @Test func scopedKeychainItemMustMatchItsOriginBeforeUse() throws {
     let keychain = LegacyKeychainFixture()
     let service = "test.desktop-control"
-    let lanURL = URL(string: "http://my.personastack.lan")!
+    let lanURL = URL(string: "https://personastack.ericgreer.info")!
     var lanInstallation = try JSONDecoder().decode(
         DesktopControlInstallation.self,
         from: legacyInstallationData(gateway: "ws://cluster-agent.personastack.lan/v1/desktop-control/ws"))
@@ -137,7 +137,7 @@ private func legacyInstallationData(gateway: String) throws -> Data {
     try keychain.write(legacyData, service: service, account: "installation")
     let production = KeychainDesktopControlCredentialStore(
         service: service, appURL: URL(string: "https://my.personastack.ai")!, keychain: keychain)
-    let lanURL = URL(string: "http://my.personastack.lan")!
+    let lanURL = URL(string: "https://personastack.ericgreer.info")!
     let lan = KeychainDesktopControlCredentialStore(service: service, appURL: lanURL, keychain: keychain)
 
     #expect(try production.load() == nil)
@@ -263,14 +263,14 @@ private func legacyInstallationData(gateway: String) throws -> Data {
     var installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: encodedInstallation)
     let transport = EnrollmentTransportFixture(response: Data(), status: 204)
     let client = DesktopControlEnrollmentClient(transport: transport, credentials: EnrollmentCredentialStoreFixture())
-    let appURL = URL(string: "http://my.personastack.lan/user/personas")!
+    let appURL = URL(string: "https://personastack.ericgreer.info/user/personas")!
 
     try installation.bindEnvironment(appURL)
     try await client.reportReady(installation: installation, appURL: appURL)
 
     let requests = await transport.recordedRequests()
     #expect(requests.count == 1)
-    #expect(requests.first?.url.absoluteString == "http://my.personastack.lan/v1/desktop-control/ready")
+    #expect(requests.first?.url.absoluteString == "https://personastack.ericgreer.info/v1/desktop-control/ready")
     #expect(requests.first?.bearer == credential)
     let body = try #require(requests.first?.body)
     let payload = try #require(JSONSerialization.jsonObject(with: body) as? [String: String])
@@ -322,7 +322,7 @@ private func legacyInstallationData(gateway: String) throws -> Data {
     ])
     var installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
     try installation.bindEnvironment(URL(string: "https://my.personastack.ai")!)
-    let appURL = URL(string: "http://my.personastack.lan")!
+    let appURL = URL(string: "https://personastack.ericgreer.info")!
     let transport = EnrollmentTransportFixture(response: Data("{}".utf8), status: 204)
     let client = DesktopControlEnrollmentClient(transport: transport)
 
@@ -404,7 +404,7 @@ private func legacyInstallationData(gateway: String) throws -> Data {
     let transport = EnrollmentTransportFixture(response: Data(), status: 204)
     let client = DesktopControlEnrollmentClient(transport: transport, credentials: EnrollmentCredentialStoreFixture())
     let serviceURL = LaunchConfiguration.url(
-        arguments: ["PersonaStack", "--personastack-url", "http://my.personastack.lan/user/personas"],
+        arguments: ["PersonaStack", "--personastack-url", "https://personastack.ericgreer.info/user/personas"],
         packagedDefaultURL: "https://my.personastack.ai/user/personas"
     )
 
@@ -413,7 +413,7 @@ private func legacyInstallationData(gateway: String) throws -> Data {
 
     let requests = await transport.recordedRequests()
     #expect(requests.count == 1)
-    #expect(requests.first?.url.absoluteString == "http://my.personastack.lan/v1/desktop-control/revoke")
+    #expect(requests.first?.url.absoluteString == "https://personastack.ericgreer.info/v1/desktop-control/revoke")
     #expect(requests.first?.bearer == credential)
 }
 
@@ -425,12 +425,36 @@ private func legacyInstallationData(gateway: String) throws -> Data {
         "gateway_websocket_url": "ws://cluster-agent.personastack.lan/v1/desktop-control/ws",
     ])
     var installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: data)
-    try installation.bindEnvironment(URL(string: "http://my.personastack.lan")!)
+    try installation.bindEnvironment(URL(string: "https://personastack.ericgreer.info")!)
     let production = URL(string: "https://my.personastack.ai")!
     await #expect(throws: DesktopControlEnrollmentError.invalidRequest) { try await client.reportReady(installation: installation, appURL: production) }
     await #expect(throws: DesktopControlEnrollmentError.invalidRequest) { try await client.attach(ticket: "ticket", installation: installation, appURL: production) }
     await #expect(throws: DesktopControlEnrollmentError.invalidRequest) { try await client.revokeRemote(installation: installation, appURL: production) }
     #expect(await transport.recordedRequests().isEmpty)
-    #expect(KeychainDesktopControlCredentialStore(appURL: production).account != KeychainDesktopControlCredentialStore(appURL: URL(string: "http://my.personastack.lan")!).account)
+    #expect(KeychainDesktopControlCredentialStore(appURL: production).account != KeychainDesktopControlCredentialStore(appURL: URL(string: "https://personastack.ericgreer.info")!).account)
     #expect(try DesktopControlEnvironment.origin(URL(string: "https://MY.personastack.ai:443/user/personas")!) == "https://my.personastack.ai")
+}
+
+@Test func desktopControlAcceptsCanonicalLANOriginAndRejectsRetiredOrigin() {
+    let gateway = URL(string: "ws://cluster-agent.personastack.lan/v1/desktop-control/ws")!
+    #expect(DesktopControlEnvironment.allowsGateway(gateway, for: "https://personastack.ericgreer.info"))
+    #expect(!DesktopControlEnvironment.allowsGateway(gateway, for: "http://my.personastack.lan"))
+    #expect(!DesktopControlEnvironment.allowsGateway(gateway, for: "http://personastack.ericgreer.info"))
+    #expect(!DesktopControlEnvironment.allowsGateway(gateway, for: "https://my.personastack.ai"))
+}
+
+@Test func retiredLANOriginCannotSendAnEnrollmentTicket() async {
+    let transport = EnrollmentTransportFixture(response: Data())
+    let client = DesktopControlEnrollmentClient(
+        transport: transport,
+        credentials: EnrollmentCredentialStoreFixture()
+    )
+
+    await #expect(throws: DesktopControlEnrollmentError.invalidRequest) {
+        try await client.enroll(
+            ticket: "setup-ticket",
+            appURL: URL(string: "http://my.personastack.lan/user/personas")!
+        )
+    }
+    #expect(await transport.recordedRequests().isEmpty)
 }
