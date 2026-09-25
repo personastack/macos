@@ -38,6 +38,8 @@ let checks = [
     window.titlebarAppearsTransparent,
     window.styleMask.contains(.fullSizeContentView),
     window.toolbar == nil,
+    window.backgroundColor == WindowPresentation.canvasColor,
+    window.appearance?.name == .darkAqua,
 ]
 
 guard checks.allSatisfy({ $0 }) else {

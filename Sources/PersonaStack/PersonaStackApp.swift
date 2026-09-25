@@ -30,6 +30,7 @@ struct PersonaStackApp: App {
         Window("PersonaStack", id: "personastack-main") {
             PersonaStackWebView(url: launchURL)
                 .frame(minWidth: 1172, minHeight: 700)
+                .background(Color(nsColor: WindowPresentation.canvasColor).ignoresSafeArea())
                 .background(WindowPresentationConfigurator())
         }
         .defaultSize(width: 1440, height: 960)
