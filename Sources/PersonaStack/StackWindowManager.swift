@@ -42,7 +42,7 @@ final class StackWindowManager: NSObject, WKScriptMessageHandlerWithReply {
             windowKey = key(view, stackID: stackID)
             url = StackWindowCommand.popoutURL(appURL: base, stackID: stackID, view: view)
             transparent = view == .graph
-            showsWindowChrome = false
+            showsWindowChrome = view == .stream
         case .openPersonaActivity(let personaID):
             windowKey = "persona-activity:\(personaID)"
             url = StackWindowCommand.personaActivityURL(appURL: base, personaID: personaID)
@@ -190,6 +190,10 @@ final class StackPopoutWindowChrome: NSView {
 
     override var mouseDownCanMoveWindow: Bool { true }
 
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
+    }
+
     override init(frame frameRect: NSRect) {
         let symbol = NSImage(
             systemSymbolName: "xmark",
@@ -199,11 +203,11 @@ final class StackPopoutWindowChrome: NSView {
         closeButton = NSButton(image: symbol, target: nil, action: nil)
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.backgroundColor = NSColor(calibratedWhite: 0.04, alpha: 1).cgColor
+        layer?.backgroundColor = NSColor(srgbRed: 18.0 / 255, green: 18.0 / 255, blue: 42.0 / 255, alpha: 1).cgColor
         closeButton.translatesAutoresizingMaskIntoConstraints = false
         closeButton.isBordered = false
         closeButton.imagePosition = .imageOnly
-        closeButton.contentTintColor = .secondaryLabelColor
+        closeButton.contentTintColor = .white
         closeButton.toolTip = "Close"
         closeButton.setAccessibilityLabel("Close window")
         addSubview(closeButton)
