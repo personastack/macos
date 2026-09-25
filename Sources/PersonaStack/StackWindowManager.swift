@@ -36,19 +36,29 @@ final class StackWindowManager: NSObject, WKScriptMessageHandlerWithReply {
         let windowKey: String
         let url: URL?
         let transparent: Bool
+        let showsWindowChrome: Bool
         switch command {
         case .open(let view, let stackID):
             windowKey = key(view, stackID: stackID)
             url = StackWindowCommand.popoutURL(appURL: base, stackID: stackID, view: view)
             transparent = view == .graph
+            showsWindowChrome = false
         case .openPersonaActivity(let personaID):
             windowKey = "persona-activity:\(personaID)"
             url = StackWindowCommand.personaActivityURL(appURL: base, personaID: personaID)
             transparent = false
+            showsWindowChrome = true
         }
         if let existing = windows[windowKey] { existing.focus(); return }
         guard let url else { return }
-        let popout = StackPopoutWindow(url: url, transparent: transparent, loadPage: loadPages) { [weak self] in self?.windows.removeValue(forKey: windowKey) }
+        let popout = StackPopoutWindow(
+            url: url,
+            transparent: transparent,
+            showsWindowChrome: showsWindowChrome,
+            loadPage: loadPages
+        ) { [weak self] in
+            self?.windows.removeValue(forKey: windowKey)
+        }
         windows[windowKey] = popout
         popout.focus()
     }
@@ -60,17 +70,25 @@ final class StackWindowManager: NSObject, WKScriptMessageHandlerWithReply {
 final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate {
     let window: NSWindow
     let webView: WKWebView
+    let windowChrome: StackPopoutWindowChrome?
     private let url: URL
     private let onClose: () -> Void
     private var disposed = false
 
-    init(url: URL, transparent: Bool, loadPage: Bool = true, onClose: @escaping () -> Void) {
+    init(
+        url: URL,
+        transparent: Bool,
+        showsWindowChrome: Bool = false,
+        loadPage: Bool = true,
+        onClose: @escaping () -> Void
+    ) {
         self.url = url
         self.onClose = onClose
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
         configuration.applicationNameForUserAgent = "PersonaStackDesktop/1"
         webView = WKWebView(frame: .zero, configuration: configuration)
+        windowChrome = showsWindowChrome ? StackPopoutWindowChrome(frame: .zero) : nil
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 700),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                           backing: .buffered, defer: false)
@@ -88,7 +106,28 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         // The hosted graph page and the public under-page color provide the
         // transparent canvas. Do not use private WebKit drawing controls.
         _ = transparent
-        window.contentView = webView
+        if let windowChrome {
+            let contentView = NSView(frame: .zero)
+            webView.translatesAutoresizingMaskIntoConstraints = false
+            windowChrome.translatesAutoresizingMaskIntoConstraints = false
+            contentView.addSubview(webView)
+            contentView.addSubview(windowChrome)
+            NSLayoutConstraint.activate([
+                windowChrome.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+                windowChrome.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+                windowChrome.topAnchor.constraint(equalTo: contentView.topAnchor),
+                windowChrome.heightAnchor.constraint(equalToConstant: 36),
+                webView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+                webView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+                webView.topAnchor.constraint(equalTo: windowChrome.bottomAnchor),
+                webView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            ])
+            windowChrome.closeButton.target = self
+            windowChrome.closeButton.action = #selector(closeWindow)
+            window.contentView = contentView
+        } else {
+            window.contentView = webView
+        }
         window.delegate = self
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -99,6 +138,10 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     func focus() {
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func closeWindow() {
+        window.performClose(nil)
     }
 
     func dispose() {
@@ -139,4 +182,40 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { dispose() }
+}
+
+@MainActor
+final class StackPopoutWindowChrome: NSView {
+    let closeButton: NSButton
+
+    override var mouseDownCanMoveWindow: Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        let symbol = NSImage(
+            systemSymbolName: "xmark",
+            accessibilityDescription: "Close window"
+        ) ?? NSImage()
+        symbol.isTemplate = true
+        closeButton = NSButton(image: symbol, target: nil, action: nil)
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(calibratedWhite: 0.04, alpha: 1).cgColor
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        closeButton.isBordered = false
+        closeButton.imagePosition = .imageOnly
+        closeButton.contentTintColor = .secondaryLabelColor
+        closeButton.toolTip = "Close"
+        closeButton.setAccessibilityLabel("Close window")
+        addSubview(closeButton)
+        NSLayoutConstraint.activate([
+            closeButton.widthAnchor.constraint(equalToConstant: 28),
+            closeButton.heightAnchor.constraint(equalToConstant: 28),
+            closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
 }
