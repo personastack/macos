@@ -136,9 +136,11 @@ public actor CuaMCPProxy {
         let id = requestID
         let wire = "{\"jsonrpc\":\"2.0\",\"id\":\(id),\"method\":\"\(method)\",\"params\":\(parameters)}\n"
         guard let bytes = wire.data(using: .utf8) else { throw CuaMCPProxyError.invalidArguments }
-        do { try input.fileHandleForWriting.write(contentsOf: bytes) }
-        catch { throw CuaMCPProxyError.processExited }
-        do { return try readResponse(id: id, timeout: timeout) }
+        let deadline = Date().addingTimeInterval(TimeInterval(timeout))
+        do {
+            try writeInput(bytes, deadline: deadline)
+            return try readResponse(id: id, deadline: deadline)
+        }
         catch {
             stop()
             throw error
@@ -149,13 +151,54 @@ public actor CuaMCPProxy {
         guard started, process.isRunning else { throw CuaMCPProxyError.notStarted }
         try verifyDaemonIdentity()
         let wire = "{\"jsonrpc\":\"2.0\",\"method\":\"\(method)\"}\n"
-        do { try input.fileHandleForWriting.write(contentsOf: Data(wire.utf8)) }
-        catch { throw CuaMCPProxyError.processExited }
+        try writeInput(Data(wire.utf8), deadline: Date().addingTimeInterval(15))
     }
 
-    private func readResponse(id: Int64, timeout: Int32) throws -> Data {
+    private func writeInput(_ bytes: Data, deadline: Date) throws {
+        let descriptor = input.fileHandleForWriting.fileDescriptor
+        let flags = Darwin.fcntl(descriptor, F_GETFL)
+        guard flags >= 0,
+              Darwin.fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0,
+              Darwin.fcntl(descriptor, F_SETNOSIGPIPE, 1) == 0 else {
+            throw CuaMCPProxyError.processExited
+        }
+        try bytes.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var offset = 0
+            while offset < raw.count {
+                if interruption.isInterrupted { throw CuaMCPProxyError.interrupted }
+                let remaining = deadline.timeIntervalSinceNow
+                guard remaining > 0 else { throw CuaMCPProxyError.timeout }
+                var descriptors = [
+                    pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0),
+                    pollfd(fd: interruption.readDescriptor, events: Int16(POLLIN), revents: 0)
+                ]
+                let milliseconds = Int32(max(1, min(remaining * 1000, Double(Int32.max))))
+                let ready = descriptors.withUnsafeMutableBufferPointer {
+                    Darwin.poll($0.baseAddress, nfds_t($0.count), milliseconds)
+                }
+                if interruption.isInterrupted { throw CuaMCPProxyError.interrupted }
+                if ready == 0 { throw CuaMCPProxyError.timeout }
+                if ready < 0 {
+                    if errno == EINTR { continue }
+                    throw CuaMCPProxyError.processExited
+                }
+                if descriptors[0].revents & Int16(POLLOUT) == 0 {
+                    throw CuaMCPProxyError.processExited
+                }
+                let count = Darwin.write(descriptor, base.advanced(by: offset), raw.count - offset)
+                if count < 0 {
+                    if errno == EINTR || errno == EAGAIN { continue }
+                    throw CuaMCPProxyError.processExited
+                }
+                guard count > 0 else { throw CuaMCPProxyError.processExited }
+                offset += count
+            }
+        }
+    }
+
+    private func readResponse(id: Int64, deadline: Date) throws -> Data {
         let descriptor = output.fileHandleForReading.fileDescriptor
-        let deadline = Date().addingTimeInterval(TimeInterval(timeout))
         while true {
             if interruption.isInterrupted { throw CuaMCPProxyError.interrupted }
             if let line = takeBufferedLine() {

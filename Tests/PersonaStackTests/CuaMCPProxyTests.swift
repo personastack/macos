@@ -6,6 +6,52 @@ import Testing
 @Suite
 struct CuaMCPProxyTests {
     @Test
+    func fullChildStdinIsInterruptibleAndBounded() async throws {
+        for interruptWrite in [true, false] {
+            let marker = FileManager.default.temporaryDirectory.appendingPathComponent("cua-proxy-idle-child-\(UUID().uuidString)")
+            let script = #"""
+            #!/usr/bin/python3
+            import json, time, sys
+            for line in sys.stdin:
+                request = json.loads(line)
+                if request.get("method") == "initialize":
+                    result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.28.2"}}
+                    print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
+                elif request.get("method") == "notifications/initialized":
+                    with open("\#(marker.path)", "w") as output:
+                        output.write("idle")
+                    time.sleep(4)
+                    break
+            """#
+            let executable = try executableScript(script)
+            defer {
+                try? FileManager.default.removeItem(at: marker)
+                try? FileManager.default.removeItem(at: executable.deletingLastPathComponent())
+            }
+            let proxy = CuaMCPProxy(executableURL: executable)
+            _ = try await proxy.start()
+            let readyDeadline = Date().addingTimeInterval(2)
+            while !FileManager.default.fileExists(atPath: marker.path), Date() < readyDeadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            #expect(FileManager.default.fileExists(atPath: marker.path))
+            let arguments = Data("{\"padding\":\"\(String(repeating: "x", count: 1024 * 1024))\"}".utf8)
+            let call = Task { try await proxy.callTool(name: "click", argumentsJSON: arguments, timeout: 1) }
+            try await Task.sleep(for: .milliseconds(100))
+            let started = Date()
+            if interruptWrite {
+                proxy.interrupt()
+                await #expect(throws: CuaMCPProxyError.interrupted) { try await call.value }
+                #expect(Date().timeIntervalSince(started) < 1)
+            } else {
+                await #expect(throws: CuaMCPProxyError.timeout) { try await call.value }
+                #expect(Date().timeIntervalSince(started) < 2)
+            }
+            await proxy.stop()
+        }
+    }
+
+    @Test
     func interruptionWakesAnInFlightGuiCallWithoutStoppingTheDaemon() async throws {
         let marker = FileManager.default.temporaryDirectory.appendingPathComponent("cua-proxy-call-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: marker) }

@@ -256,7 +256,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     let acquire = DesktopControlFrame(type: "command", requestID: "acquire-idle-failure", target: owner,
                                       operation: "desktop_control_acquire", arguments: .object([:]))
     #expect((await executor.handle(acquire, proxy: nil)).type == "result")
-    await executor.failNextCleanupForTesting()
+    executor.failNextCleanupForTesting()
     let runtime = DesktopControlRuntime.makeForTesting(
         installer: DesktopControlInstallerFixture(errors: []),
         credentials: SavedDesktopControlCredentialStore(installation: installation),
