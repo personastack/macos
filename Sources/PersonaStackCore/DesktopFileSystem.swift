@@ -12,6 +12,8 @@ public enum DesktopFileSystemError: Error, Equatable {
     case destinationExists
     case patchMismatch
     case searchIncomplete
+    case searchContinuationExpired
+    case tooManySearches
     case permissionDenied
 }
 
@@ -21,6 +23,7 @@ public struct DesktopFileEntry: Sendable, Equatable {
     public let kind: Kind
     public let size: UInt64
     public let modifiedAt: Date?
+    public let symlinkTarget: String?
 
     public enum Kind: String, Sendable, Equatable {
         case file
@@ -35,6 +38,20 @@ public struct DesktopFilePage: Sendable {
     public let nextOffset: Int?
 }
 
+public struct DesktopFileSearchMatch: Sendable {
+    public let entry: DesktopFileEntry
+    public let matchedLines: [Int]
+    public let contentScanTruncated: Bool
+}
+
+public struct DesktopFileSearchPage: Sendable {
+    public let matches: [DesktopFileSearchMatch]
+    public let continuation: String?
+    public let incompleteContentPaths: [String]
+
+    public var isComplete: Bool { continuation == nil && incompleteContentPaths.isEmpty }
+}
+
 public struct DesktopFileRead: Sendable {
     public let path: String
     public let offset: UInt64
@@ -42,6 +59,9 @@ public struct DesktopFileRead: Sendable {
     public let nextOffset: UInt64
     public let endOfFile: Bool
     public let changedSinceOpen: Bool
+    public let lineStart: Int?
+    public let nextLine: Int?
+    public let truncated: Bool
 }
 
 /// Per-control-session access to files on the logged-in macOS user account.
@@ -57,9 +77,25 @@ public actor DesktopFileSystem {
         let handle: FileHandle
         let originalSize: UInt64
         let originalModification: timespec
+        let alignUTF8: Bool
+    }
+
+    private struct SearchState {
+        let root: URL
+        let nameContains: String?
+        let nameGlob: String?
+        let contentContains: String?
+        var pendingDirectories: [URL]
+        var currentEntries: [URL] = []
+        var currentIndex = 0
+        var currentDirectory: UnsafeMutablePointer<DIR>? = nil
+        var currentDirectoryURL: URL? = nil
+        var incompleteContentPaths: Set<String> = []
+        var lastAccess: TimeInterval
     }
 
     private var openFiles: [UUID: OpenFile] = [:]
+    private var searches: [UUID: SearchState] = [:]
 
     public init() {}
 
@@ -68,7 +104,7 @@ public actor DesktopFileSystem {
     public func metadata(path: String) throws -> DesktopFileEntry {
         guard let url = Self.url(path) else { throw DesktopFileSystemError.invalidPath }
         var info = stat()
-        guard lstat(url.path, &info) == 0 else { throw DesktopFileSystemError.invalidPath }
+        guard lstat(url.path, &info) == 0 else { throw Self.operationError(errno, fallback: .invalidPath) }
         return Self.entry(url)
     }
 
@@ -76,7 +112,9 @@ public actor DesktopFileSystem {
         guard offset >= 0, (1...Self.maxPageSize).contains(limit),
               let input = Self.url(path) else { throw DesktopFileSystemError.notDirectory }
         let url = input.resolvingSymlinksInPath().standardizedFileURL
-        guard Self.kind(at: url) == .directory else { throw DesktopFileSystemError.notDirectory }
+        guard try Self.kindForOperation(at: url, fallback: .notDirectory) == .directory else {
+            throw DesktopFileSystemError.notDirectory
+        }
         guard offset <= Self.maxDirectoryScanEntries else { throw DesktopFileSystemError.invalidRange }
         guard let directory = opendir(url.path) else {
             throw Self.operationError(errno, fallback: .notDirectory)
@@ -100,40 +138,118 @@ public actor DesktopFileSystem {
         return DesktopFilePage(entries: entries, nextOffset: hasMore ? offset + entries.count : nil)
     }
 
-    public func search(root: String, nameContains: String? = nil, contentContains: String? = nil,
-                       limit: Int = 100, timeLimit: TimeInterval = 2) throws -> [DesktopFileEntry] {
+    public func search(root: String, nameContains: String? = nil, nameGlob: String? = nil,
+                       contentContains: String? = nil, limit: Int = 100,
+                       continuation: String? = nil, timeLimit: TimeInterval = 2) throws -> DesktopFileSearchPage {
         guard (1...Self.maxPageSize).contains(limit),
-              (nameContains?.isEmpty == false || contentContains?.isEmpty == false),
+              (nameContains?.isEmpty == false || nameGlob?.isEmpty == false || contentContains?.isEmpty == false),
               let inputURL = Self.url(root) else {
             throw DesktopFileSystemError.notDirectory
         }
         let rootURL = inputURL.resolvingSymlinksInPath().standardizedFileURL
-        guard Self.kind(at: rootURL) == .directory else { throw DesktopFileSystemError.notDirectory }
+        guard try Self.kindForOperation(at: rootURL, fallback: .notDirectory) == .directory else {
+            throw DesktopFileSystemError.notDirectory
+        }
         let deadline = ProcessInfo.processInfo.systemUptime + min(max(timeLimit, 0.05), 10)
-        var pending = [rootURL]
-        var found: [DesktopFileEntry] = []
-        while let directory = pending.popLast(), found.count < limit,
-              ProcessInfo.processInfo.systemUptime < deadline {
-            guard let scan = Self.directoryEntries(directory, limit: 10_000) else { continue }
-            guard !scan.truncated else { throw DesktopFileSystemError.searchIncomplete }
-            let children = scan.entries
-            for child in children {
-                if ProcessInfo.processInfo.systemUptime >= deadline { break }
-                let kind = Self.kind(at: child)
-                if kind == .directory { pending.append(child) }
-                if let nameContains, child.lastPathComponent.localizedCaseInsensitiveContains(nameContains) {
-                    found.append(Self.entry(child))
-                } else if let contentContains, kind == .file,
-                          try Self.file(child, contains: contentContains) {
-                    found.append(Self.entry(child))
+        let now = ProcessInfo.processInfo.systemUptime
+        let expiredSearches = searches.filter { now - $0.value.lastAccess >= 120 }
+        for search in expiredSearches.values {
+            if let directory = search.currentDirectory { closedir(directory) }
+        }
+        searches = searches.filter { now - $0.value.lastAccess < 120 }
+        let searchID: UUID
+        var state: SearchState
+        if let continuation {
+            guard let parsed = UUID(uuidString: continuation), let saved = searches[parsed],
+                  saved.root == rootURL, saved.nameContains == nameContains,
+                  saved.nameGlob == nameGlob, saved.contentContains == contentContains else {
+                throw DesktopFileSystemError.searchContinuationExpired
+            }
+            searches.removeValue(forKey: parsed)
+            searchID = parsed
+            state = saved
+        } else {
+            guard searches.count < 32 else { throw DesktopFileSystemError.tooManySearches }
+            searchID = UUID()
+            state = SearchState(root: rootURL, nameContains: nameContains, nameGlob: nameGlob,
+                                contentContains: contentContains, pendingDirectories: [rootURL], lastAccess: now)
+        }
+        state.lastAccess = now
+        var retainSearchState = false
+        defer {
+            if !retainSearchState, let directory = state.currentDirectory { closedir(directory) }
+        }
+        var matches: [DesktopFileSearchMatch] = []
+        while matches.count < limit, ProcessInfo.processInfo.systemUptime < deadline {
+            if let directory = state.currentDirectory {
+                errno = 0
+                if let item = readdir(directory) {
+                    let name = withUnsafePointer(to: item.pointee.d_name) { pointer in
+                        pointer.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX) + 1) { String(cString: $0) }
+                    }
+                    if name == "." || name == ".." { continue }
+                    guard state.currentEntries.count < Self.maxDirectoryScanEntries else {
+                        throw DesktopFileSystemError.searchIncomplete
+                    }
+                    guard let directoryURL = state.currentDirectoryURL else {
+                        throw DesktopFileSystemError.searchIncomplete
+                    }
+                    state.currentEntries.append(directoryURL.appendingPathComponent(name))
+                    continue
                 }
-                if found.count == limit { break }
+                let readError = errno
+                closedir(directory)
+                state.currentDirectory = nil
+                state.currentDirectoryURL = nil
+                guard readError == 0 else { throw Self.operationError(readError, fallback: .notDirectory) }
+                state.currentEntries.sort { $0.path < $1.path }
+                state.currentIndex = 0
+                continue
+            }
+            if state.currentIndex >= state.currentEntries.count {
+                guard let directory = state.pendingDirectories.popLast() else { break }
+                state.currentEntries = []
+                state.currentIndex = 0
+                guard let openedDirectory = opendir(directory.path) else {
+                    throw Self.operationError(errno, fallback: .notDirectory)
+                }
+                state.currentDirectory = openedDirectory
+                state.currentDirectoryURL = directory
+                continue
+            }
+            let child = state.currentEntries[state.currentIndex]
+            state.currentIndex += 1
+            let kind = Self.kind(at: child)
+            if kind == .directory { state.pendingDirectories.append(child) }
+            let nameMatches = state.nameContains.map { child.lastPathComponent.localizedCaseInsensitiveContains($0) } ?? false
+            let globMatches = state.nameGlob.map { Self.matchesGlob($0, child.lastPathComponent) } ?? false
+            var matchedLines: [Int] = []
+            var contentScanTruncated = false
+            if let contentContains, kind == .file {
+                let content = try Self.fileLines(child, containing: contentContains)
+                matchedLines = content.lines
+                contentScanTruncated = content.truncated
+                if content.truncated { state.incompleteContentPaths.insert(child.path) }
+            }
+            if nameMatches || globMatches || !matchedLines.isEmpty {
+                matches.append(DesktopFileSearchMatch(entry: Self.entry(child), matchedLines: matchedLines,
+                                                      contentScanTruncated: contentScanTruncated))
             }
         }
-        return found
+        let isComplete = state.currentDirectory == nil && state.currentIndex >= state.currentEntries.count && state.pendingDirectories.isEmpty
+        if isComplete {
+            searches.removeValue(forKey: searchID)
+            return DesktopFileSearchPage(matches: matches, continuation: nil,
+                                         incompleteContentPaths: state.incompleteContentPaths.sorted())
+        }
+        searches[searchID] = state
+        retainSearchState = true
+        return DesktopFileSearchPage(matches: matches, continuation: searchID.uuidString,
+                                     incompleteContentPaths: state.incompleteContentPaths.sorted())
     }
 
-    public func open(path: String) throws -> (id: UUID, path: String, size: UInt64, firstRead: DesktopFileRead) {
+    public func open(path: String) throws -> (id: UUID, path: String, size: UInt64, modifiedAt: Date,
+                                               revision: String, firstRead: DesktopFileRead) {
         guard openFiles.count < Self.maxOpenFiles else { throw DesktopFileSystemError.tooManyOpenFiles }
         guard let input = Self.url(path) else { throw DesktopFileSystemError.invalidPath }
         let resolved = input.resolvingSymlinksInPath().standardizedFileURL
@@ -142,16 +258,29 @@ public actor DesktopFileSystem {
         guard fstat(descriptor, &info) == 0 else { _ = Darwin.close(descriptor); throw DesktopFileSystemError.notRegularFile }
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         let id = UUID()
-        openFiles[id] = OpenFile(path: resolved, handle: handle, originalSize: UInt64(info.st_size), originalModification: info.st_mtimespec)
-        let initial = try read(id: id, offset: 0, length: Self.maxReadBytes)
-        return (id, resolved.path, UInt64(info.st_size), initial)
+        let modifiedAt = Date(timeIntervalSince1970: TimeInterval(info.st_mtimespec.tv_sec)
+                              + TimeInterval(info.st_mtimespec.tv_nsec) / 1_000_000_000)
+        let revision = "\(UInt64(info.st_size)):\(info.st_mtimespec.tv_sec):\(info.st_mtimespec.tv_nsec)"
+        let alignUTF8 = try Self.looksLikeUTF8Text(handle)
+        openFiles[id] = OpenFile(path: resolved, handle: handle, originalSize: UInt64(info.st_size),
+                                 originalModification: info.st_mtimespec, alignUTF8: alignUTF8)
+        let initial = try read(id: id, offset: 0, length: Self.maxReadBytes, alignUTF8: true)
+        return (id, resolved.path, UInt64(info.st_size), modifiedAt, revision, initial)
     }
 
     public func read(id: UUID, offset: UInt64, length: Int = 256 * 1024) throws -> DesktopFileRead {
         guard let file = openFiles[id] else { throw DesktopFileSystemError.missingHandle }
+        return try read(id: id, offset: offset, length: length, alignUTF8: file.alignUTF8)
+    }
+
+    private func read(id: UUID, offset: UInt64, length: Int, alignUTF8: Bool) throws -> DesktopFileRead {
+        guard let file = openFiles[id] else { throw DesktopFileSystemError.missingHandle }
         guard length >= 0, length <= Self.maxReadBytes else { throw DesktopFileSystemError.invalidRange }
         try file.handle.seek(toOffset: offset)
-        let data = try file.handle.read(upToCount: length) ?? Data()
+        let rawData = try file.handle.read(upToCount: length) ?? Data()
+        let alignedCount = alignUTF8 && file.alignUTF8 ? Self.utf8AlignedPrefixLength(rawData) : rawData.count
+        // An invalid or truncated text-looking file must still make byte-range progress.
+        let data = Data(rawData.prefix(alignedCount == 0 && !rawData.isEmpty ? rawData.count : alignedCount))
         let next = offset + UInt64(data.count)
         var info = stat()
         let hasInfo = fstat(file.handle.fileDescriptor, &info) == 0
@@ -159,7 +288,74 @@ public actor DesktopFileSystem {
         let modified = hasInfo ? info.st_mtimespec : file.originalModification
         return DesktopFileRead(path: file.path.path, offset: offset, content: data, nextOffset: next,
                                endOfFile: data.isEmpty || next >= (currentSize ?? next),
-                               changedSinceOpen: currentSize != file.originalSize || modified.tv_sec != file.originalModification.tv_sec || modified.tv_nsec != file.originalModification.tv_nsec)
+                               changedSinceOpen: currentSize != file.originalSize || modified.tv_sec != file.originalModification.tv_sec || modified.tv_nsec != file.originalModification.tv_nsec,
+                               lineStart: offset == 0 ? 1 : nil, nextLine: nil, truncated: false)
+    }
+
+    public func readLines(id: UUID, startLine: Int, lineCount: Int,
+                          length: Int = DesktopFileSystem.maxReadBytes) throws -> DesktopFileRead {
+        guard openFiles[id] != nil else { throw DesktopFileSystemError.missingHandle }
+        guard startLine >= 1, (1...10_000).contains(lineCount), (1...Self.maxReadBytes).contains(length) else {
+            throw DesktopFileSystemError.invalidRange
+        }
+        let startOffset = try lineStartOffset(id: id, line: startLine)
+        let byteRead = try read(id: id, offset: startOffset, length: length, alignUTF8: true)
+        var newlineCount = 0
+        var lineBoundary: Int?
+        for (index, byte) in byteRead.content.enumerated() where byte == 10 {
+            newlineCount += 1
+            if newlineCount == lineCount {
+                lineBoundary = index
+                break
+            }
+        }
+        let data: Data
+        let nextOffset: UInt64
+        let nextLine: Int
+        let truncated: Bool
+        let endOfFile: Bool
+        if let lineBoundary {
+            data = Data(byteRead.content.prefix(lineBoundary + 1))
+            nextOffset = startOffset + UInt64(lineBoundary + 1)
+            nextLine = startLine + lineCount
+            truncated = false
+            endOfFile = nextOffset >= byteRead.nextOffset && byteRead.endOfFile
+        } else {
+            data = byteRead.content
+            nextOffset = byteRead.nextOffset
+            let newlineCount = data.reduce(into: 0) { count, byte in if byte == 10 { count += 1 } }
+            let finalLineCount = byteRead.endOfFile && !data.isEmpty && data.last != 10 ? 1 : 0
+            let completeLines = newlineCount + finalLineCount
+            nextLine = startLine + completeLines
+            truncated = !byteRead.endOfFile && newlineCount < lineCount
+            endOfFile = byteRead.endOfFile
+        }
+        return DesktopFileRead(path: byteRead.path, offset: startOffset, content: data, nextOffset: nextOffset,
+                               endOfFile: endOfFile, changedSinceOpen: byteRead.changedSinceOpen,
+                               lineStart: startLine, nextLine: nextLine, truncated: truncated)
+    }
+
+    private func lineStartOffset(id: UUID, line: Int) throws -> UInt64 {
+        guard let file = openFiles[id] else { throw DesktopFileSystemError.missingHandle }
+        try file.handle.seek(toOffset: 0)
+        var currentLine = 1
+        var offset: UInt64 = 0
+        while currentLine < line {
+            let chunk = try file.handle.read(upToCount: 64 * 1024) ?? Data()
+            if chunk.isEmpty { return offset }
+            let newlines = chunk.indices.filter { chunk[$0] == 10 }
+            if !newlines.isEmpty {
+                if currentLine + newlines.count >= line {
+                    let target = newlines[line - currentLine - 1]
+                    return offset + UInt64(target) + 1
+                }
+                currentLine += newlines.count
+                offset += UInt64(chunk.count)
+            } else {
+                offset += UInt64(chunk.count)
+            }
+        }
+        return offset
     }
 
     public func close(id: UUID) throws {
@@ -187,7 +383,9 @@ public actor DesktopFileSystem {
                 try handle.write(contentsOf: content)
                 try handle.close()
             case .replace:
-                guard Self.kind(at: url) == .file else { throw DesktopFileSystemError.notRegularFile }
+                var info = stat()
+                guard lstat(url.path, &info) == 0 else { throw Self.operationError(errno, fallback: .invalidPath) }
+                guard (info.st_mode & S_IFMT) == S_IFREG else { throw DesktopFileSystemError.notRegularFile }
                 try Self.replacePreservingMetadata(content, at: url)
             case .append:
                 let descriptor = url.path.withCString { Darwin.open($0, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR) }
@@ -236,14 +434,18 @@ public actor DesktopFileSystem {
     public func remove(path: String) throws {
         guard let url = Self.url(path), url.path != "/" else { throw DesktopFileSystemError.invalidPath }
         var info = stat()
-        guard lstat(url.path, &info) == 0 else { throw DesktopFileSystemError.invalidPath }
+        guard lstat(url.path, &info) == 0 else { throw Self.operationError(errno, fallback: .invalidPath) }
         let result = (info.st_mode & S_IFMT) == S_IFDIR ? rmdir(url.path) : unlink(url.path)
-        guard result == 0 else { throw DesktopFileSystemError.invalidPath }
+        guard result == 0 else { throw Self.operationError(errno, fallback: .invalidPath) }
     }
 
     public func closeAll() {
         for file in openFiles.values { try? file.handle.close() }
         openFiles.removeAll()
+        for search in searches.values {
+            if let directory = search.currentDirectory { closedir(directory) }
+        }
+        searches.removeAll()
     }
 
     private static func url(_ path: String) -> URL? {
@@ -254,6 +456,17 @@ public actor DesktopFileSystem {
     private static func kind(at url: URL) -> DesktopFileEntry.Kind {
         var info = stat()
         guard lstat(url.path, &info) == 0 else { return .other }
+        switch info.st_mode & S_IFMT {
+        case S_IFLNK: return .symlink
+        case S_IFDIR: return .directory
+        case S_IFREG: return .file
+        default: return .other
+        }
+    }
+
+    private static func kindForOperation(at url: URL, fallback: DesktopFileSystemError) throws -> DesktopFileEntry.Kind {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { throw operationError(errno, fallback: fallback) }
         switch info.st_mode & S_IFMT {
         case S_IFLNK: return .symlink
         case S_IFDIR: return .directory
@@ -295,32 +508,93 @@ public actor DesktopFileSystem {
         let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey])
         let kind = kind(at: url)
         return DesktopFileEntry(path: url.standardizedFileURL.path, name: url.lastPathComponent, kind: kind,
-                                size: UInt64(values?.fileSize ?? 0), modifiedAt: values?.contentModificationDate)
+                                size: UInt64(values?.fileSize ?? 0), modifiedAt: values?.contentModificationDate,
+                                symlinkTarget: kind == .symlink ? symlinkTarget(url) : nil)
     }
 
-    private static func file(_ url: URL, contains needle: String) throws -> Bool {
+    private static func symlinkTarget(_ url: URL) -> String? {
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+        let count = url.path.withCString { readlink($0, &buffer, buffer.count - 1) }
+        guard count > 0 else { return nil }
+        let raw = String(decoding: buffer.prefix(count).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        let target = raw.hasPrefix("/") ? URL(fileURLWithPath: raw) : url.deletingLastPathComponent().appendingPathComponent(raw)
+        let resolved = target.resolvingSymlinksInPath().standardizedFileURL
+        return resolved.path
+    }
+
+    private static func matchesGlob(_ pattern: String, _ name: String) -> Bool {
+        pattern.withCString { patternPointer in
+            name.withCString { namePointer in fnmatch(patternPointer, namePointer, 0) == 0 }
+        }
+    }
+
+    private static func isReadableText(_ data: Data) -> Bool {
+        guard !data.contains(0), let text = String(data: data, encoding: .utf8) else { return false }
+        return text.unicodeScalars.allSatisfy { scalar in
+            !CharacterSet.controlCharacters.contains(scalar) || scalar == "\n" || scalar == "\r" || scalar == "\t"
+        }
+    }
+
+    private static func looksLikeUTF8Text(_ handle: FileHandle) throws -> Bool {
+        try handle.seek(toOffset: 0)
+        let sample = try handle.read(upToCount: Self.maxReadBytes + 3) ?? Data()
+        try handle.seek(toOffset: 0)
+        return isReadableText(sample)
+    }
+
+    private static func utf8AlignedPrefixLength(_ data: Data) -> Int {
+        guard String(data: data, encoding: .utf8) == nil else { return data.count }
+        for suffixLength in 1...min(3, data.count) {
+            let prefix = data.prefix(data.count - suffixLength)
+            let suffix = Data(data.suffix(suffixLength))
+            guard String(data: prefix, encoding: .utf8) != nil, isIncompleteUTF8Suffix(suffix) else { continue }
+            return data.count - suffixLength
+        }
+        return data.count
+    }
+
+    private static func isIncompleteUTF8Suffix(_ suffix: Data) -> Bool {
+        guard let lead = suffix.first else { return false }
+        let expectedLength: Int
+        switch lead {
+        case 0xC2...0xDF: expectedLength = 2
+        case 0xE0...0xEF: expectedLength = 3
+        case 0xF0...0xF4: expectedLength = 4
+        default: return false
+        }
+        guard suffix.count < expectedLength,
+              suffix.dropFirst().allSatisfy({ $0 >= 0x80 && $0 <= 0xBF }) else { return false }
+        if suffix.count > 1 {
+            let second = suffix[suffix.index(after: suffix.startIndex)]
+            if lead == 0xE0 && second < 0xA0 { return false }
+            if lead == 0xED && second > 0x9F { return false }
+            if lead == 0xF0 && second < 0x90 { return false }
+            if lead == 0xF4 && second > 0x8F { return false }
+        }
+        return true
+    }
+
+    private static func fileLines(_ url: URL, containing needle: String) throws -> (lines: [Int], truncated: Bool) {
         let descriptor = try openRegularFile(url.path, flags: O_RDONLY)
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         defer { try? handle.close() }
-        let needleData = Data(needle.utf8)
-        guard !needleData.isEmpty else { return false }
-        var tail = Data()
-        var remaining = 4 * 1024 * 1024
-        while remaining > 0 {
-            let chunk = try handle.read(upToCount: min(64 * 1024, remaining)) ?? Data()
-            if chunk.isEmpty { return false }
-            remaining -= chunk.count
-            tail.append(chunk)
-            if tail.range(of: needleData) != nil { return true }
-            if tail.count > needleData.count { tail.removeFirst(tail.count - needleData.count + 1) }
+        let maxBytes = 4 * 1024 * 1024
+        let data = try readBounded(handle, limit: maxBytes + 1)
+        let truncated = data.count > maxBytes
+        guard let text = String(data: data.prefix(maxBytes), encoding: .utf8), !needle.isEmpty else {
+            return ([], truncated)
         }
-        return false
+        let lines = text.components(separatedBy: .newlines).enumerated().compactMap { index, line in
+            line.localizedCaseInsensitiveContains(needle) ? index + 1 : nil
+        }
+        return (Array(lines.prefix(100)), truncated)
     }
 
-    private static func directoryEntries(_ url: URL, limit: Int) -> (entries: [URL], truncated: Bool)? {
-        guard let directory = opendir(url.path) else { return nil }
+    private static func directoryEntries(_ url: URL, limit: Int) throws -> (entries: [URL], truncated: Bool) {
+        guard let directory = opendir(url.path) else { throw operationError(errno, fallback: .notDirectory) }
         defer { closedir(directory) }
         var result: [URL] = []
+        errno = 0
         while let item = readdir(directory) {
             let name = withUnsafePointer(to: item.pointee.d_name) { pointer in
                 pointer.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX) + 1) { String(cString: $0) }
@@ -329,6 +603,7 @@ public actor DesktopFileSystem {
             if result.count == limit { return (result, true) }
             result.append(url.appendingPathComponent(name))
         }
+        if errno != 0 { throw operationError(errno, fallback: .notDirectory) }
         return (result, false)
     }
 
@@ -344,11 +619,13 @@ public actor DesktopFileSystem {
 
     private static func replacePreservingMetadata(_ content: Data, at url: URL, expected: stat? = nil) throws {
         var original = expected ?? stat()
-        if expected == nil, lstat(url.path, &original) != 0 { throw DesktopFileSystemError.invalidPath }
+        if expected == nil, lstat(url.path, &original) != 0 {
+            throw operationError(errno, fallback: .invalidPath)
+        }
         guard (original.st_mode & S_IFMT) == S_IFREG else { throw DesktopFileSystemError.notRegularFile }
         let temporary = url.deletingLastPathComponent().appendingPathComponent(".personastack-\(UUID().uuidString).tmp")
         let descriptor = temporary.path.withCString { Darwin.open($0, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR) }
-        guard descriptor >= 0 else { throw DesktopFileSystemError.invalidPath }
+        guard descriptor >= 0 else { throw operationError(errno, fallback: .invalidPath) }
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         do {
             try handle.write(contentsOf: content)
@@ -356,14 +633,15 @@ public actor DesktopFileSystem {
             let copied = url.path.withCString { source in
                 temporary.path.withCString { destination in copyfile(source, destination, nil, copyfile_flags_t(COPYFILE_METADATA)) }
             }
-            guard copied == 0 else { throw DesktopFileSystemError.invalidPath }
+            guard copied == 0 else { throw operationError(errno, fallback: .invalidPath) }
             var current = stat()
-            guard lstat(url.path, &current) == 0, current.st_ino == original.st_ino, current.st_dev == original.st_dev,
+            guard lstat(url.path, &current) == 0 else { throw operationError(errno, fallback: .patchMismatch) }
+            guard current.st_ino == original.st_ino, current.st_dev == original.st_dev,
                   current.st_mtimespec.tv_sec == original.st_mtimespec.tv_sec,
                   current.st_mtimespec.tv_nsec == original.st_mtimespec.tv_nsec else { throw DesktopFileSystemError.patchMismatch }
             // This final identity check narrows, but cannot eliminate, a concurrent external edit race.
             let result = temporary.path.withCString { source in url.path.withCString { destination in rename(source, destination) } }
-            guard result == 0 else { throw DesktopFileSystemError.invalidPath }
+            guard result == 0 else { throw operationError(errno, fallback: .invalidPath) }
         } catch {
             try? handle.close()
             _ = temporary.path.withCString { unlink($0) }

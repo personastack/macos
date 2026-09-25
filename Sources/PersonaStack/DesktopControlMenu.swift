@@ -55,6 +55,7 @@ struct DesktopControlMenu: View {
         if !relayEnabled { return "Relay paused" }
         if relayPaused { return "Remote control paused. Connection active." }
         let runtime = DesktopControlRuntime.shared
+        if let message = runtime.sessionRecoveryMessage { return message }
         if !runtime.isCuaReady() { return "Cua service needs attention" }
         return runtime.gatewayConnected ? "Connected to PersonaStack" : "Waiting for PersonaStack connection"
     }

@@ -14,6 +14,8 @@ public enum CuaMCPProxyError: Error, Equatable {
     case permissionsRequired
     case functionalProbeFailed
     case serviceRunning
+    case serviceMismatch
+    case interrupted
 }
 
 extension CuaMCPProxyError: LocalizedError {
@@ -25,6 +27,8 @@ extension CuaMCPProxyError: LocalizedError {
             return "CuaDriver.app did not return a usable screenshot and accessibility snapshot. Check its permissions and retry."
         case .serviceRunning:
             return "Quit CuaDriver.app, then retry Desktop Control repair. PersonaStack will not terminate CuaDriver.app or replace its managed files while it is running."
+        case .serviceMismatch:
+            return "CuaDriver.app does not own the selected local service. Quit the other Cua service, then retry Desktop Control setup."
         default:
             return "The local Cua service could not complete its setup check. Retry setup or repair Cua."
         }
@@ -34,21 +38,30 @@ extension CuaMCPProxyError: LocalizedError {
 /// Owns one Cua stdio MCP proxy process. Only reviewed Cua tool names can be called.
 public actor CuaMCPProxy {
     private let executableURL: URL
+    private let socketURL: URL?
+    private let expectedDaemonPID: Int32?
     private let process = Process()
     private let input = Pipe()
     private let output = Pipe()
     private var bufferedOutput = Data()
     private var requestID: Int64 = 0
     private var started = false
+    private let interruption = CuaProxyInterruption()
 
-    public init(executableURL: URL) {
+    public init(executableURL: URL, socketURL: URL? = nil, expectedDaemonPID: Int32? = nil) {
         self.executableURL = executableURL
+        self.socketURL = socketURL
+        self.expectedDaemonPID = expectedDaemonPID
     }
 
     public func start() throws -> Data {
         guard !started else { throw CuaMCPProxyError.alreadyStarted }
+        try verifyDaemonIdentity()
         process.executableURL = executableURL
-        process.arguments = ["mcp"]
+        // Pinned Cua v0.28.2 otherwise auto-launches an app by name if its
+        // selected socket disappears. The proxy-only embedded flag disables
+        // that fallback; the already-running signed app remains the GUI owner.
+        process.arguments = ["mcp"] + (socketURL.map { ["--socket", $0.path, "--embedded"] } ?? [])
         process.environment = Self.allowedChildEnvironment()
         process.standardInput = input
         process.standardOutput = output
@@ -87,12 +100,18 @@ public actor CuaMCPProxy {
         return names.intersection(CuaDriverCompatibility.exposedTools)
     }
 
-    public func callTool(name: String, argumentsJSON: Data) throws -> Data {
+    public func callTool(name: String, argumentsJSON: Data, timeout: Int32 = 60) throws -> Data {
         guard CuaDriverCompatibility.exposedTools.contains(name) else { throw CuaMCPProxyError.invalidToolName }
         guard let arguments = try? JSONSerialization.jsonObject(with: argumentsJSON),
               arguments is [String: Any] else { throw CuaMCPProxyError.invalidArguments }
         let params = try JSONSerialization.data(withJSONObject: ["name": name, "arguments": arguments])
-        return try request(method: "tools/call", parameters: String(decoding: params, as: UTF8.self), timeout: 60)
+        return try request(method: "tools/call", parameters: String(decoding: params, as: UTF8.self), timeout: timeout)
+    }
+
+    /// Wake a blocked tool call without waiting for this actor's synchronous read.
+    /// This only stops our stdio proxy. It never signals the Cua service.
+    nonisolated public func interrupt() {
+        interruption.interrupt()
     }
 
     public func stop() {
@@ -106,7 +125,13 @@ public actor CuaMCPProxy {
     }
 
     private func request(method: String, parameters: String, timeout: Int32) throws -> Data {
+        if interruption.isInterrupted { throw CuaMCPProxyError.interrupted }
         guard started, process.isRunning else { throw CuaMCPProxyError.notStarted }
+        do { try verifyDaemonIdentity() }
+        catch {
+            stop()
+            throw error
+        }
         requestID += 1
         let id = requestID
         let wire = "{\"jsonrpc\":\"2.0\",\"id\":\(id),\"method\":\"\(method)\",\"params\":\(parameters)}\n"
@@ -122,6 +147,7 @@ public actor CuaMCPProxy {
 
     private func sendNotification(method: String) throws {
         guard started, process.isRunning else { throw CuaMCPProxyError.notStarted }
+        try verifyDaemonIdentity()
         let wire = "{\"jsonrpc\":\"2.0\",\"method\":\"\(method)\"}\n"
         do { try input.fileHandleForWriting.write(contentsOf: Data(wire.utf8)) }
         catch { throw CuaMCPProxyError.processExited }
@@ -131,6 +157,7 @@ public actor CuaMCPProxy {
         let descriptor = output.fileHandleForReading.fileDescriptor
         let deadline = Date().addingTimeInterval(TimeInterval(timeout))
         while true {
+            if interruption.isInterrupted { throw CuaMCPProxyError.interrupted }
             if let line = takeBufferedLine() {
                 guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
                     throw CuaMCPProxyError.invalidResponse
@@ -141,9 +168,15 @@ public actor CuaMCPProxy {
             }
             let remaining = deadline.timeIntervalSinceNow
             guard remaining > 0 else { throw CuaMCPProxyError.timeout }
-            var pollDescriptor = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
+            var pollDescriptors = [
+                pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0),
+                pollfd(fd: interruption.readDescriptor, events: Int16(POLLIN), revents: 0)
+            ]
             let milliseconds = Int32(max(1, min(remaining * 1000, Double(Int32.max))))
-            let pollResult = Darwin.poll(&pollDescriptor, 1, milliseconds)
+            let pollResult = pollDescriptors.withUnsafeMutableBufferPointer {
+                Darwin.poll($0.baseAddress, nfds_t($0.count), milliseconds)
+            }
+            if interruption.isInterrupted { throw CuaMCPProxyError.interrupted }
             if pollResult == 0 { throw CuaMCPProxyError.timeout }
             if pollResult < 0 {
                 if errno == EINTR { continue }
@@ -170,5 +203,80 @@ public actor CuaMCPProxy {
 
     private static func allowedChildEnvironment() -> [String: String] {
         CuaDriverCompatibility.processEnvironment(from: ProcessInfo.processInfo.environment)
+    }
+
+    private func verifyDaemonIdentity() throws {
+        guard let expectedDaemonPID else { return }
+        guard let socketURL, CuaSocketIdentity.peerPID(at: socketURL) == expectedDaemonPID else {
+            throw CuaMCPProxyError.serviceMismatch
+        }
+    }
+}
+
+private final class CuaProxyInterruption: @unchecked Sendable {
+    private let lock = NSLock()
+    private let wake = Pipe()
+    private var interrupted = false
+
+    init() {
+        _ = Darwin.fcntl(wake.fileHandleForWriting.fileDescriptor, F_SETFL, O_NONBLOCK)
+    }
+
+    var readDescriptor: Int32 { wake.fileHandleForReading.fileDescriptor }
+
+    var isInterrupted: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return interrupted
+    }
+
+    func interrupt() {
+        lock.lock()
+        let shouldWake = !interrupted
+        interrupted = true
+        lock.unlock()
+        guard shouldWake else { return }
+        var byte: UInt8 = 1
+        _ = Darwin.write(wake.fileHandleForWriting.fileDescriptor, &byte, 1)
+    }
+}
+
+/// Read the kernel-reported PID of the process serving one Unix socket.
+/// A socket filename or Cua's shared PID file is not an ownership proof.
+public enum CuaSocketIdentity {
+    public static func peerPID(at socketURL: URL) -> Int32? {
+        guard socketURL.isFileURL else { return nil }
+        var address = sockaddr_un()
+        address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        address.sun_family = sa_family_t(AF_UNIX)
+        let path = socketURL.path.utf8CString
+        let capacity = MemoryLayout.size(ofValue: address.sun_path)
+        guard path.count <= capacity else { return nil }
+        withUnsafeMutableBytes(of: &address.sun_path) { buffer in
+            for (index, byte) in path.enumerated() { buffer[index] = UInt8(bitPattern: byte) }
+        }
+        let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { return nil }
+        defer { _ = Darwin.close(descriptor) }
+        guard Darwin.fcntl(descriptor, F_SETFL, O_NONBLOCK) == 0 else { return nil }
+        let connected = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        if connected != 0 {
+            guard errno == EINPROGRESS else { return nil }
+            var pending = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
+            guard Darwin.poll(&pending, 1, 100) > 0 else { return nil }
+            var connectError: Int32 = 0
+            var errorLength = socklen_t(MemoryLayout<Int32>.size)
+            guard Darwin.getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &connectError, &errorLength) == 0,
+                  connectError == 0 else { return nil }
+        }
+        var pid: pid_t = 0
+        var length = socklen_t(MemoryLayout<pid_t>.size)
+        guard Darwin.getsockopt(descriptor, SOL_LOCAL, LOCAL_PEERPID, &pid, &length) == 0,
+              length == MemoryLayout<pid_t>.size, pid > 0 else { return nil }
+        return pid
     }
 }

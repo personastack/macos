@@ -2,6 +2,23 @@ import Darwin
 import Foundation
 import Dispatch
 
+private final class DesktopShellInputCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    func isCancelled() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+}
+
 public enum DesktopProcessState: String, Sendable {
     case running
     case exited
@@ -69,6 +86,7 @@ public actor DesktopShellExecutor {
         let processID: pid_t
         let stdin: FileHandle
         let inputQueue: DispatchQueue
+        let inputCancellation: DesktopShellInputCancellation
         var chunks: [DesktopOutputChunk] = []
         var bufferedBytes = 0
         var totalBytes: UInt64 = 0
@@ -82,6 +100,8 @@ public actor DesktopShellExecutor {
         var terminalState: DesktopProcessState?
         var requestedTerminalState: DesktopProcessState?
         var queuedInputBytes = 0
+        var pendingInputOperations = 0
+        var inputClosed = false
         var readerDrainDeadline: ContinuousClock.Instant?
         var forceCloseReaders = false
         var incompleteOutput = false
@@ -122,6 +142,7 @@ public actor DesktopShellExecutor {
         let child = try Self.spawn(command: command, workingDirectory: workingDirectory)
         var session = Session(processID: child.pid, stdin: FileHandle(fileDescriptor: child.stdin, closeOnDealloc: true),
                               inputQueue: DispatchQueue(label: "ai.personastack.desktop.shell.input.\(id.uuidString)"),
+                              inputCancellation: DesktopShellInputCancellation(),
                               startedAt: .now)
         session.deadlineTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(boundedTimeout))
@@ -156,25 +177,38 @@ public actor DesktopShellExecutor {
         switch input {
         case .data(let data):
             guard !data.isEmpty, data.count <= Self.maximumInputBytes else { throw DesktopShellError.invalidInput }
-            guard var session = sessions[id], session.terminalState == nil,
+            guard var session = sessions[id], session.terminalState == nil, !session.inputClosed,
                   session.queuedInputBytes + data.count <= Self.maximumQueuedInputBytes else { throw DesktopShellError.invalidInput }
             session.queuedInputBytes += data.count
+            session.pendingInputOperations += 1
             sessions[id] = session
             let inputQueue = session.inputQueue
-            let inputHandle = session.stdin
+            let inputDescriptor = session.stdin.fileDescriptor
+            let inputCancellation = session.inputCancellation
             try await withCheckedThrowingContinuation { continuation in
                 inputQueue.async {
-                    do { try inputHandle.write(contentsOf: data); continuation.resume() }
+                    do {
+                        try Self.writeInput(data, descriptor: inputDescriptor, cancellation: inputCancellation)
+                        continuation.resume()
+                    }
                     catch { continuation.resume(throwing: DesktopShellError.invalidInput) }
                     Task { await self.finishInputWrite(id, byteCount: data.count) }
                 }
             }
         case .close:
-            guard let session = sessions[id], session.terminalState == nil else { throw DesktopShellError.missingExecution }
+            guard var session = sessions[id], session.terminalState == nil, !session.inputClosed else {
+                throw DesktopShellError.missingExecution
+            }
+            session.inputClosed = true
+            session.pendingInputOperations += 1
+            sessions[id] = session
+            let stdin = session.stdin
+            let inputQueue = session.inputQueue
             try await withCheckedThrowingContinuation { continuation in
-                session.inputQueue.async {
-                    do { try session.stdin.close(); continuation.resume() }
+                inputQueue.async {
+                    do { try stdin.close(); continuation.resume() }
                     catch { continuation.resume(throwing: DesktopShellError.invalidInput) }
+                    Task { await self.finishInputOperation(id) }
                 }
             }
         case .interrupt:
@@ -185,6 +219,8 @@ public actor DesktopShellExecutor {
 
     public func cancel(id: UUID) async throws {
         guard var session = sessions[id] else { throw DesktopShellError.missingExecution }
+        session.inputCancellation.cancel()
+        sessions[id] = session
         if session.processTerminated {
             guard session.processGroupCleanupConfirmed else { throw DesktopShellError.cancellationUnconfirmed }
             return
@@ -202,15 +238,16 @@ public actor DesktopShellExecutor {
         if Self.processGroupExists(current.processID) {
             _ = kill(-current.processID, SIGKILL)
         }
-        try? await Task.sleep(for: .milliseconds(100))
-        guard let latest = sessions[id] else { throw DesktopShellError.missingExecution }
-        if latest.processTerminated {
-            guard latest.processGroupCleanupConfirmed else { throw DesktopShellError.cancellationUnconfirmed }
-            return
+        let cleanupDeadline = ContinuousClock.now + .seconds(3.5)
+        while ContinuousClock.now < cleanupDeadline {
+            guard let latest = sessions[id] else { throw DesktopShellError.missingExecution }
+            if latest.processTerminated {
+                guard latest.processGroupCleanupConfirmed else { throw DesktopShellError.cancellationUnconfirmed }
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(25))
         }
-        if Self.processGroupExists(latest.processID) {
-            throw DesktopShellError.cancellationUnconfirmed
-        }
+        throw DesktopShellError.cancellationUnconfirmed
     }
 
     public func status(id: UUID) throws -> DesktopProcessRead {
@@ -223,6 +260,8 @@ public actor DesktopShellExecutor {
 
     @discardableResult
     public func closeAll() async -> Bool {
+        for session in sessions.values { session.inputCancellation.cancel() }
+        requestStopAll()
         let groupsToStop = sessions.filter { !$0.value.processTerminated }.map(\.key)
         for id in groupsToStop {
             do { try await cancel(id: id) }
@@ -232,7 +271,7 @@ public actor DesktopShellExecutor {
             session.forceCloseReaders = true
             sessions[id] = session
         }
-        for _ in 0..<35 {
+        for _ in 0..<40 {
             let unsettled = sessions.values.contains {
                 $0.state == .running || ($0.processTerminated && !$0.processGroupCleanupConfirmed)
             }
@@ -253,6 +292,33 @@ public actor DesktopShellExecutor {
         return true
     }
 
+    public func requestStopAll() {
+        for session in sessions.values { session.inputCancellation.cancel() }
+        let processGroups = sessions.compactMap { id, session -> (UUID, pid_t)? in
+            guard !session.processTerminated else { return nil }
+            return (id, session.processID)
+        }
+        for (id, processID) in processGroups {
+            guard var session = sessions[id], session.processID == processID else { continue }
+            session.requestedTerminalState = .cancelled
+            session.inputCancellation.cancel()
+            sessions[id] = session
+            _ = kill(-processID, SIGTERM)
+        }
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(250))
+            await self?.forceStopUnsettledProcesses(processGroups)
+        }
+    }
+
+    private func forceStopUnsettledProcesses(_ processGroups: [(UUID, pid_t)]) {
+        for (id, processID) in processGroups {
+            guard let session = sessions[id], session.processID == processID,
+                  !session.processTerminated, Self.processGroupExists(processID) else { continue }
+            _ = kill(-processID, SIGKILL)
+        }
+    }
+
     private func append(_ data: Data, stream: DesktopOutputChunk.Stream, id: UUID) {
         guard var session = sessions[id], !data.isEmpty else { return }
         session.nextSequence += 1
@@ -271,6 +337,7 @@ public actor DesktopShellExecutor {
 
     private func finish(_ id: UUID, waitStatus: Int32?) {
         guard var session = sessions[id] else { return }
+        session.inputCancellation.cancel()
         if let waitStatus, session.terminalState == nil {
             let signal = waitStatus & 0x7f
             session.terminalState = session.requestedTerminalState ?? (signal == 0 ? .exited : .cancelled)
@@ -317,6 +384,7 @@ public actor DesktopShellExecutor {
         guard var session = sessions[id], session.state == .running, !session.processTerminated else { return }
         session.requestedTerminalState = .timedOut
         session.terminalState = .timedOut
+        session.inputCancellation.cancel()
         sessions[id] = session
         _ = kill(-session.processID, SIGTERM)
         try? await Task.sleep(for: .milliseconds(250))
@@ -402,6 +470,10 @@ public actor DesktopShellExecutor {
                 }
             }
         }
+        let inputFlags = fcntl(input[1], F_GETFL)
+        guard inputFlags >= 0, fcntl(input[1], F_SETFL, inputFlags | O_NONBLOCK) == 0 else {
+            throw DesktopShellError.invalidCommand
+        }
 
         var actions: posix_spawn_file_actions_t? = nil
         guard posix_spawn_file_actions_init(&actions) == 0 else { throw DesktopShellError.invalidCommand }
@@ -486,7 +558,8 @@ public actor DesktopShellExecutor {
     }
 
     private func pruneCompletedSessions() {
-        let completed = sessions.filter { $0.value.state != .running }.sorted { $0.value.startedAt < $1.value.startedAt }
+        let completed = sessions.filter { $0.value.state != .running && $0.value.pendingInputOperations == 0 }
+            .sorted { $0.value.startedAt < $1.value.startedAt }
         let excess = max(0, sessions.count - Self.maximumRetainedSessions + 1)
         for (id, _) in completed.prefix(excess) { sessions.removeValue(forKey: id) }
     }
@@ -499,7 +572,7 @@ public actor DesktopShellExecutor {
     private static func stopLiveProcesses(inProcessGroup processGroupID: pid_t) async -> Bool {
         var signalSent = false
         var consecutiveEmptySnapshots = 0
-        let deadline = ContinuousClock.now + .seconds(1)
+        let deadline = ContinuousClock.now + .seconds(3)
         while ContinuousClock.now < deadline {
             switch hasLiveProcess(inProcessGroup: processGroupID) {
             case .some(false):
@@ -544,7 +617,37 @@ public actor DesktopShellExecutor {
     private func finishInputWrite(_ id: UUID, byteCount: Int) {
         guard var session = sessions[id] else { return }
         session.queuedInputBytes = max(0, session.queuedInputBytes - byteCount)
+        session.pendingInputOperations = max(0, session.pendingInputOperations - 1)
         sessions[id] = session
+    }
+
+    private func finishInputOperation(_ id: UUID) {
+        guard var session = sessions[id] else { return }
+        session.pendingInputOperations = max(0, session.pendingInputOperations - 1)
+        sessions[id] = session
+    }
+
+    private static func writeInput(_ data: Data, descriptor: Int32,
+                                   cancellation: DesktopShellInputCancellation) throws {
+        try data.withUnsafeBytes { buffer in
+            guard let baseAddress = buffer.baseAddress else { throw DesktopShellError.invalidInput }
+            var offset = 0
+            while offset < data.count {
+                guard !cancellation.isCancelled() else { throw DesktopShellError.invalidInput }
+                let written = Darwin.write(descriptor, baseAddress.advanced(by: offset), data.count - offset)
+                if written > 0 {
+                    offset += written
+                    continue
+                }
+                if written < 0, errno == EINTR { continue }
+                if written < 0, errno == EAGAIN || errno == EWOULDBLOCK {
+                    var state = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
+                    _ = poll(&state, 1, 100)
+                    continue
+                }
+                throw DesktopShellError.invalidInput
+            }
+        }
     }
 
     private func closeInput(_ session: Session, id: UUID) async {

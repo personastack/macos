@@ -13,6 +13,7 @@ struct PersonaStackApp: App {
         NSApp.setActivationPolicy(.accessory)
         let paused = UserDefaults.standard.bool(forKey: "desktopControlRelayPaused")
         Task { @MainActor in
+            _ = MainWebViewHost.shared
             do {
                 if paused {
                     try await DesktopControlRuntime.shared.startPaused()
@@ -26,7 +27,7 @@ struct PersonaStackApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("PersonaStack", id: "personastack-main") {
+        Window("PersonaStack", id: "personastack-main") {
             PersonaStackWebView(url: launchURL)
                 .frame(minWidth: 1172, minHeight: 700)
                 .background(WindowPresentationConfigurator())
@@ -38,6 +39,73 @@ struct PersonaStackApp: App {
             DesktopControlMenu()
         }
         .menuBarExtraStyle(.menu)
+    }
+}
+
+/// The shell owns the authenticated concern stream for the app lifetime. A
+/// hidden window retains its WebView when the visible window is closed.
+@MainActor
+final class MainWebViewHost {
+    static let shared = MainWebViewHost(appURL: LaunchConfiguration.url())
+
+    let webView: WKWebView
+    let coordinator: PersonaStackWebView.Coordinator
+    private let backgroundWindow: NSWindow
+    private let requestNotifications: Bool
+    private var notificationAuthorizationRequested = false
+
+    init(appURL: URL, loadPage: Bool = true,
+         requestNotifications: Bool = true,
+         coordinator suppliedCoordinator: PersonaStackWebView.Coordinator? = nil) {
+        let coordinator = suppliedCoordinator ?? PersonaStackWebView.Coordinator(appURL: appURL)
+        let configuration = WKWebViewConfiguration()
+        WindowPresentation.configureWebView(configuration)
+        configuration.websiteDataStore = .default()
+        configuration.preferences.isFraudulentWebsiteWarningEnabled = true
+        configuration.userContentController.add(coordinator, name: "personastackConcern")
+        configuration.userContentController.addScriptMessageHandler(ChatWindowManager.shared, contentWorld: .page, name: "personastackChat")
+        configuration.userContentController.addScriptMessageHandler(StackWindowManager.shared, contentWorld: .page, name: "personastackStack")
+        configuration.userContentController.addScriptMessageHandler(LocalSessionManager.shared, contentWorld: .page, name: "personastackLocalSession")
+        configuration.userContentController.addScriptMessageHandler(DesktopControlSetupManager.shared, contentWorld: .page, name: "personastackDesktopControl")
+
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.allowsBackForwardNavigationGestures = true
+        webView.navigationDelegate = coordinator
+        webView.uiDelegate = coordinator
+        coordinator.webView = webView
+        ChatWindowManager.shared.register(webView, appURL: appURL)
+        StackWindowManager.shared.register(webView, appURL: appURL)
+        LocalSessionManager.shared.register(webView, appURL: appURL)
+        DesktopControlSetupManager.shared.register(webView, appURL: appURL)
+
+        let backgroundWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1, height: 1),
+                                        styleMask: .borderless, backing: .buffered, defer: false)
+        backgroundWindow.isReleasedWhenClosed = false
+        backgroundWindow.contentView = webView
+        self.coordinator = coordinator
+        self.webView = webView
+        self.backgroundWindow = backgroundWindow
+        self.requestNotifications = requestNotifications
+        if loadPage { coordinator.start(appURL) }
+    }
+
+    func attach(to container: NSView) {
+        guard webView.superview !== container else { return }
+        backgroundWindow.contentView = NSView(frame: backgroundWindow.contentView?.bounds ?? .zero)
+        webView.removeFromSuperview()
+        webView.frame = container.bounds
+        webView.autoresizingMask = [.width, .height]
+        container.addSubview(webView)
+        if requestNotifications && !notificationAuthorizationRequested {
+            notificationAuthorizationRequested = true
+            coordinator.requestNotificationAuthorization()
+        }
+    }
+
+    func park(from container: NSView) {
+        guard webView.superview === container else { return }
+        webView.removeFromSuperview()
+        backgroundWindow.contentView = webView
     }
 }
 
@@ -63,50 +131,52 @@ struct PersonaStackWebView: NSViewRepresentable {
     let url: URL
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(appURL: url)
+        MainWebViewHost.shared.coordinator
     }
 
-    func makeNSView(context: Context) -> WKWebView {
-        let configuration = WKWebViewConfiguration()
-        WindowPresentation.configureWebView(configuration)
-        configuration.websiteDataStore = .default()
-        configuration.preferences.isFraudulentWebsiteWarningEnabled = true
-        configuration.userContentController.add(context.coordinator, name: "personastackConcern")
-        configuration.userContentController.addScriptMessageHandler(ChatWindowManager.shared, contentWorld: .page, name: "personastackChat")
-        configuration.userContentController.addScriptMessageHandler(StackWindowManager.shared, contentWorld: .page, name: "personastackStack")
-        configuration.userContentController.addScriptMessageHandler(LocalSessionManager.shared, contentWorld: .page, name: "personastackLocalSession")
-        configuration.userContentController.addScriptMessageHandler(DesktopControlSetupManager.shared, contentWorld: .page, name: "personastackDesktopControl")
-
-        let webView = WKWebView(frame: .zero, configuration: configuration)
-        webView.allowsBackForwardNavigationGestures = true
-        webView.navigationDelegate = context.coordinator
-        webView.uiDelegate = context.coordinator
-        context.coordinator.webView = webView
-        ChatWindowManager.shared.register(webView, appURL: url)
-        StackWindowManager.shared.register(webView, appURL: url)
-        LocalSessionManager.shared.register(webView, appURL: url)
-        DesktopControlSetupManager.shared.register(webView, appURL: url)
-        context.coordinator.requestNotificationAuthorization()
-        context.coordinator.start(url)
-        return webView
+    func makeNSView(context: Context) -> NSView {
+        let container = NSView(frame: .zero)
+        MainWebViewHost.shared.attach(to: container)
+        return container
     }
 
-    func updateNSView(_ webView: WKWebView, context: Context) {}
+    func updateNSView(_ container: NSView, context: Context) {
+        MainWebViewHost.shared.attach(to: container)
+    }
+
+    static func dismantleNSView(_ container: NSView, coordinator: Coordinator) {
+        MainWebViewHost.shared.park(from: container)
+    }
 
     @MainActor
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler, UNUserNotificationCenterDelegate {
         weak var webView: WKWebView?
         let appURL: URL
+        private let scheduleNotification: (UNNotificationRequest) -> Void
         private var popupWindows: [ObjectIdentifier: NSWindow] = [:]
 
-        init(appURL: URL) {
+        init(
+            appURL: URL,
+            configureNotificationCenter: @escaping (UNUserNotificationCenterDelegate) -> Void = { delegate in
+                UNUserNotificationCenter.current().delegate = delegate
+            },
+            scheduleNotification: @escaping (UNNotificationRequest) -> Void = { request in
+                UNUserNotificationCenter.current().add(request)
+            }
+        ) {
             self.appURL = appURL
+            self.scheduleNotification = scheduleNotification
             super.init()
-            UNUserNotificationCenter.current().delegate = self
+            configureNotificationCenter(self)
         }
 
         func start(_ url: URL) {
             webView?.load(URLRequest(url: url))
+        }
+
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            guard webView === self.webView else { return }
+            start(appURL)
         }
 
         func requestNotificationAuthorization() {
@@ -114,10 +184,19 @@ struct PersonaStackWebView: NSViewRepresentable {
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-            guard message.name == "personastackConcern",
-                  message.frameInfo.isMainFrame,
-                  NavigationPolicy.isAppHost(message.frameInfo.securityOrigin.host),
-                  NotificationBridge.isNewConcernEvent(message.body) else {
+            handleConcernMessage(
+                name: message.name,
+                isMainFrame: message.frameInfo.isMainFrame,
+                host: message.frameInfo.securityOrigin.host,
+                body: message.body
+            )
+        }
+
+        func handleConcernMessage(name: String, isMainFrame: Bool, host: String?, body: Any) {
+            guard name == "personastackConcern",
+                  isMainFrame,
+                  NavigationPolicy.isAppHost(host),
+                  NotificationBridge.isNewConcernEvent(body) else {
                 return
             }
             postConcernNotification()
@@ -136,12 +215,17 @@ struct PersonaStackWebView: NSViewRepresentable {
             content.body = "A new concern needs attention."
             content.sound = .default
             let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-            UNUserNotificationCenter.current().add(request)
+            scheduleNotification(request)
         }
 
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
             guard let url = navigationAction.request.url else {
                 return .cancel
+            }
+
+            if webView === self.webView, navigationAction.targetFrame?.isMainFrame == true,
+               NavigationPolicy.isAppHost(url.host) {
+                DesktopControlSetupManager.shared.invalidate(webView)
             }
 
             if webView === self.webView, navigationAction.targetFrame?.isMainFrame == true,

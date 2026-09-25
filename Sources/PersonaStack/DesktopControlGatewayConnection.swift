@@ -4,6 +4,8 @@ import PersonaStackCore
 typealias DesktopControlCommandHandler = @Sendable (DesktopControlFrame, @escaping @Sendable (DesktopControlFrame) async throws -> Void) async -> DesktopControlFrame
 typealias DesktopControlDisconnectHandler = @Sendable (DesktopControlGatewayConnectionError?) async -> Void
 typealias DesktopControlDiagnosticsProvider = @Sendable () async -> DesktopControlDiagnostics
+typealias DesktopControlReadinessProvider = @Sendable () async -> String?
+typealias DesktopControlConfigRevocationHandler = @Sendable () async -> Void
 
 enum DesktopControlGatewayConnectionError: Error, Equatable {
     case alreadyConnected
@@ -22,6 +24,8 @@ actor DesktopControlGatewayConnection {
     private let handler: DesktopControlCommandHandler
     private let onDisconnect: DesktopControlDisconnectHandler
     private let diagnosticsProvider: DesktopControlDiagnosticsProvider
+    private let readinessProvider: DesktopControlReadinessProvider
+    private let afterConfigRevocation: DesktopControlConfigRevocationHandler
     private let session: URLSession
     private var socket: URLSessionWebSocketTask?
     private var reader: Task<Void, Never>?
@@ -35,16 +39,23 @@ actor DesktopControlGatewayConnection {
          session: URLSession = .shared,
          onDisconnect: @escaping DesktopControlDisconnectHandler = { _ in },
          diagnosticsProvider: @escaping DesktopControlDiagnosticsProvider = { DesktopControlDiagnostics(activeProcesses: 0, openFileHandles: 0, bufferedOutputBytes: 0, outputGapsTotal: 0) },
+         readinessProvider: @escaping DesktopControlReadinessProvider = { nil },
+         afterConfigRevocation: @escaping DesktopControlConfigRevocationHandler = {},
          handler: @escaping DesktopControlCommandHandler) {
         self.installation = installation
         self.session = session
         self.onDisconnect = onDisconnect
         self.diagnosticsProvider = diagnosticsProvider
+        self.readinessProvider = readinessProvider
+        self.afterConfigRevocation = afterConfigRevocation
         self.handler = handler
     }
 
     func connect() async throws {
         guard !connected, socket == nil else { throw DesktopControlGatewayConnectionError.alreadyConnected }
+        guard (try? installation.requireBoundGateway()) != nil else {
+            throw DesktopControlGatewayConnectionError.invalidURL
+        }
         var request = URLRequest(url: installation.gatewayWebsocketURL, timeoutInterval: 15)
         request.setValue(installation.installationID, forHTTPHeaderField: "X-Desktop-Control-Installation-ID")
         request.setValue("Bearer \(installation.machineCredential)", forHTTPHeaderField: "Authorization")
@@ -148,6 +159,17 @@ actor DesktopControlGatewayConnection {
               response.type == "result" || response.type == "failure" else { return }
         do { try await send(response) }
         catch { await disconnected() }
+        if Self.shouldReconcileAfterConfigRevocation(frame, response: response), connected {
+            await afterConfigRevocation()
+        }
+    }
+
+    static func shouldReconcileAfterConfigRevocation(_ frame: DesktopControlFrame,
+                                                     response: DesktopControlFrame) -> Bool {
+        guard frame.operation == "desktop_control_revoke_config",
+              response.type == "result", response.errorCode == nil,
+              case .object(let result)? = response.result else { return false }
+        return result["revoked"] == .bool(true)
     }
 
     private func heartbeatLoop() async {
@@ -164,6 +186,10 @@ actor DesktopControlGatewayConnection {
 
     private func heartbeatFrame() async -> DesktopControlFrame {
         let diagnostics = diagnosticsSupported ? await diagnosticsProvider() : nil
+        if let currentReadiness = await readinessProvider(),
+           ["unknown", "ready", "permission_required", "cua_unavailable", "paused", "locked", "upgrade_required"].contains(currentReadiness) {
+            readiness = currentReadiness
+        }
         return DesktopControlFrame(type: "heartbeat", lastHeartbeat: Date(), readiness: readiness,
                                    diagnostics: diagnostics)
     }
@@ -203,6 +229,9 @@ actor DesktopControlGatewayConnection {
         if frame.operation == "desktop_control_revoke_config" {
             return (target.configVersion ?? 0) > 0 && target.personaID.isEmpty && target.runID.isEmpty && target.generation == 0
         }
+        if frame.operation == "desktop_control_revoke_binding" {
+            return (target.configVersion ?? 0) > 0 && !target.personaID.isEmpty && target.runID.isEmpty && target.generation > 0
+        }
         guard !target.personaID.isEmpty, !target.runID.isEmpty, target.generation > 0,
               (target.configVersion ?? 0) >= 0 else { return false }
         guard frame.operation != nil else { return false }
@@ -211,7 +240,7 @@ actor DesktopControlGatewayConnection {
 
     static func hasCapacity(for operation: String?, activeCount: Int) -> Bool {
         guard activeCount >= 0, activeCount < maximumInFlightCommands else { return false }
-        if operation == "desktop_control_revoke_config" { return true }
+        if operation == "desktop_control_revoke_config" || operation == "desktop_control_revoke_binding" { return true }
         return activeCount < maximumInFlightCommands - reservedRevocationCommands
     }
 }

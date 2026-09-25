@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 public struct CuaProcessResult: Equatable, Sendable {
@@ -18,7 +19,13 @@ public protocol CuaProcessRunning: Sendable {
 }
 
 public struct SystemCuaProcessRunner: CuaProcessRunning {
-    public init() {}
+    private let timeout: TimeInterval
+    private let outputLimit: Int
+
+    public init(timeout: TimeInterval = 30, outputLimit: Int = 1024 * 1024) {
+        self.timeout = timeout
+        self.outputLimit = outputLimit
+    }
 
     public func run(_ executable: URL, arguments: [String]) throws -> CuaProcessResult {
         let process = Process()
@@ -31,10 +38,96 @@ public struct SystemCuaProcessRunner: CuaProcessRunning {
         process.standardOutput = stdout
         process.standardError = stderr
         try process.run()
-        let output = stdout.fileHandleForReading.readDataToEndOfFile()
-        let error = stderr.fileHandleForReading.readDataToEndOfFile()
+
+        // Both pipes must drain while the process runs. A full stderr pipe otherwise
+        // blocks a CLI whose stdout is still being read by the installer.
+        let output = BoundedProcessOutput(limit: outputLimit)
+        let error = BoundedProcessOutput(limit: outputLimit)
+        let readers = DispatchGroup()
+        for (handle, collector) in [(stdout.fileHandleForReading, output), (stderr.fileHandleForReading, error)] {
+            readers.enter()
+            DispatchQueue.global(qos: .utility).async {
+                defer { readers.leave() }
+                collector.drain(handle)
+            }
+        }
+
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        while process.isRunning && ProcessInfo.processInfo.systemUptime < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        if process.isRunning {
+            process.terminate()
+            let grace = ProcessInfo.processInfo.systemUptime + 0.5
+            while process.isRunning && ProcessInfo.processInfo.systemUptime < grace {
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+            if process.isRunning {
+                _ = Darwin.kill(process.processIdentifier, SIGKILL)
+                let killGrace = ProcessInfo.processInfo.systemUptime + 0.5
+                while process.isRunning && ProcessInfo.processInfo.systemUptime < killGrace {
+                    Thread.sleep(forTimeInterval: 0.02)
+                }
+            }
+            if !process.isRunning { process.waitUntilExit() }
+            throw CuaDriverInstallError.processFailed("Cua validation command timed out")
+        }
         process.waitUntilExit()
-        return CuaProcessResult(status: process.terminationStatus, stdout: output, stderr: error)
+        guard readers.wait(timeout: .now() + 1) == .success else {
+            throw CuaDriverInstallError.processFailed("Cua validation output did not close")
+        }
+        guard !output.readFailed && !error.readFailed else {
+            throw CuaDriverInstallError.processFailed("Cua validation output could not be read")
+        }
+        guard !output.exceededLimit && !error.exceededLimit else {
+            throw CuaDriverInstallError.processFailed("Cua validation output exceeded limit")
+        }
+        return CuaProcessResult(status: process.terminationStatus, stdout: output.data, stderr: error.data)
+    }
+}
+
+private final class BoundedProcessOutput: @unchecked Sendable {
+    private let lock = NSLock()
+    private let limit: Int
+    private var bytes = Data()
+    private var overflow = false
+    private var failed = false
+
+    init(limit: Int) { self.limit = max(0, limit) }
+
+    var data: Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return bytes
+    }
+
+    var exceededLimit: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return overflow
+    }
+
+    var readFailed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return failed
+    }
+
+    func drain(_ handle: FileHandle) {
+        defer { try? handle.close() }
+        do {
+            while let chunk = try handle.read(upToCount: 8192), !chunk.isEmpty {
+                lock.lock()
+                let remaining = max(0, limit - bytes.count)
+                if remaining > 0 { bytes.append(chunk.prefix(remaining)) }
+                if chunk.count > remaining { overflow = true }
+                lock.unlock()
+            }
+        } catch {
+            lock.lock()
+            failed = true
+            lock.unlock()
+        }
     }
 }
 
@@ -62,25 +155,31 @@ public struct CuaDriverInstallation: Equatable, Sendable {
     }
 }
 
-/// Installs only the pinned Cua Driver release into PersonaStack-owned Application Support.
-/// Existing unmanaged locations are never inspected or replaced.
+/// Reuses a compatible signed Cua Driver app, or installs the pinned release into
+/// PersonaStack-owned Application Support. Unmanaged apps are never modified.
 public actor CuaDriverInstaller {
     private let supportDirectory: URL
     private let fileManager: FileManager
     private let processRunner: any CuaProcessRunning
     private let session: URLSession
+    private let externalApplicationURLs: [URL]
 
     public init(
         supportDirectory: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("PersonaStack/DesktopControl", isDirectory: true),
         fileManager: FileManager = .default,
         processRunner: any CuaProcessRunning = SystemCuaProcessRunner(),
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        externalApplicationURLs: [URL]? = nil
     ) {
         self.supportDirectory = supportDirectory
         self.fileManager = fileManager
         self.processRunner = processRunner
         self.session = session
+        self.externalApplicationURLs = externalApplicationURLs ?? [
+            URL(fileURLWithPath: "/Applications/CuaDriver.app", isDirectory: true),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications/CuaDriver.app", isDirectory: true),
+        ]
     }
 
     public func validateOrInstall(
@@ -91,6 +190,11 @@ public actor CuaDriverInstaller {
         let replacingManagedInstall = fileManager.fileExists(atPath: installRoot.path)
         if fileManager.fileExists(atPath: installRoot.path) {
             if !repair, let existing = try? validate(at: installRoot) { return existing }
+        }
+        for application in externalApplicationURLs where fileManager.fileExists(atPath: application.path) {
+            if let existing = try? validateExternalApplication(at: application) { return existing }
+        }
+        if replacingManagedInstall {
             guard isPersonaStackManaged(installRoot) else { throw CuaDriverInstallError.invalidLayout }
         }
 
@@ -141,6 +245,15 @@ public actor CuaDriverInstaller {
         let application = root.appendingPathComponent("CuaDriver.app", isDirectory: true)
         let executable = root.appendingPathComponent("cua-driver")
         guard fileManager.fileExists(atPath: application.path), fileManager.isExecutableFile(atPath: executable.path) else {
+            throw CuaDriverInstallError.invalidLayout
+        }
+        try verifySignature(application)
+        return try validate(applicationURL: application, executableURL: executable)
+    }
+
+    private func validateExternalApplication(at application: URL) throws -> CuaDriverInstallation {
+        let executable = application.appendingPathComponent("Contents/MacOS/cua-driver")
+        guard fileManager.isExecutableFile(atPath: executable.path) else {
             throw CuaDriverInstallError.invalidLayout
         }
         try verifySignature(application)

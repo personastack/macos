@@ -3,6 +3,13 @@ import Foundation
 import Testing
 @testable import PersonaStackCore
 
+private actor DesktopShellCloseSignal {
+    private var signalled = false
+
+    func signal() { signalled = true }
+    func isSignalled() -> Bool { signalled }
+}
+
 struct DesktopShellExecutorTests {
     @Test func commandReturnsOutputBeforeExitAndPreservesStream() async throws {
         let executor = DesktopShellExecutor()
@@ -87,6 +94,16 @@ struct DesktopShellExecutorTests {
         await executor.closeAll()
     }
 
+    @Test func closingStdinRejectsLaterWrites() async throws {
+        let executor = DesktopShellExecutor()
+        let started = try await executor.start(command: "cat >/dev/null; sleep 0.2", workingDirectory: "/tmp")
+        try await executor.write(id: started.executionID, input: .close)
+        await #expect(throws: DesktopShellError.invalidInput) {
+            try await executor.write(id: started.executionID, input: .data(Data("too late".utf8)))
+        }
+        await executor.closeAll()
+    }
+
     @Test func cancellingManagedProcessStopsIt() async throws {
         let executor = DesktopShellExecutor()
         let started = try await executor.start(command: "sleep 20", workingDirectory: "/tmp")
@@ -117,15 +134,18 @@ struct DesktopShellExecutorTests {
     @Test func outputRingReportsWhenTheReaderFallsBehind() async throws {
         let executor = DesktopShellExecutor()
         let started = try await executor.start(command: "head -c 5000000 /dev/zero", workingDirectory: "/tmp", timeout: 10)
-        var final = try await executor.read(id: started.executionID, after: 0, wait: .seconds(1))
+        var status = try await executor.status(id: started.executionID)
         let deadline = ContinuousClock.now + .seconds(10)
-        var observedGap = final.outputGap
-        while final.state == .running && ContinuousClock.now < deadline {
-            final = try await executor.read(id: started.executionID, after: final.nextCursor, wait: .milliseconds(500))
-            observedGap = observedGap || final.outputGap
+        // Deliberately leave cursor zero behind while the producer fills the ring.
+        // Advancing the cursor during production can keep up and legitimately
+        // report no gap, which does not exercise this behavior.
+        while status.state == .running && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+            status = try await executor.status(id: started.executionID)
         }
-        #expect(final.state == .exited)
-        #expect(observedGap)
+        #expect(status.state == .exited)
+        let final = try await executor.read(id: started.executionID, after: 0)
+        #expect(final.outputGap)
         #expect(final.earliestCursor > 1)
         #expect(final.chunks.reduce(0) { $0 + $1.data.count } <= DesktopShellExecutor.maximumReadBytes)
         let diagnostics = await executor.diagnostics()
@@ -211,5 +231,105 @@ struct DesktopShellExecutorTests {
         #expect(await executor.closeAll())
         try await Task.sleep(for: .seconds(2.2))
         #expect(!FileManager.default.fileExists(atPath: childMarker.path))
+    }
+
+    @Test func closeAllDoesNotWaitBehindWritesHeldByDetachedChild() async throws {
+        let executor = DesktopShellExecutor()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("desktop-shell-held-stdin-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let script = directory.appendingPathComponent("hold-stdin.py")
+        let childPIDFile = directory.appendingPathComponent("child.pid")
+        let releaseFile = directory.appendingPathComponent("release")
+        let scriptContents = """
+        import os, time
+        child = os.fork()
+        if child:
+            os._exit(0)
+        os.setsid()
+        with open(\(String(reflecting: childPIDFile.path)), "w") as handle:
+            handle.write(str(os.getpid()))
+        while not os.path.exists(\(String(reflecting: releaseFile.path))):
+            time.sleep(0.02)
+        """
+        try scriptContents.write(to: script, atomically: true, encoding: .utf8)
+        let started = try await executor.start(command: "/usr/bin/python3 '\(script.path)'", workingDirectory: directory.path)
+        let childDeadline = ContinuousClock.now + .seconds(2)
+        while !FileManager.default.fileExists(atPath: childPIDFile.path), ContinuousClock.now < childDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(FileManager.default.fileExists(atPath: childPIDFile.path))
+
+        let writers = (0..<4).map { _ in
+            Task { try await executor.write(id: started.executionID,
+                                            input: .data(Data(repeating: 97, count: DesktopShellExecutor.maximumInputBytes))) }
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        let completed = DesktopShellCloseSignal()
+        let closeTask = Task {
+            let result = await executor.closeAll()
+            await completed.signal()
+            return result
+        }
+        let closeDeadline = ContinuousClock.now + .seconds(3)
+        while !(await completed.isSignalled()), ContinuousClock.now < closeDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let returnedBeforeRelease = await completed.isSignalled()
+        try Data().write(to: releaseFile)
+        #expect(returnedBeforeRelease)
+        #expect(await closeTask.value)
+        for writer in writers { _ = try? await writer.value }
+    }
+
+    @Test func shellExitCancelsWritesHeldByDetachedChild() async throws {
+        let executor = DesktopShellExecutor()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("desktop-shell-exit-held-stdin-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let script = directory.appendingPathComponent("hold-stdin.py")
+        let childPIDFile = directory.appendingPathComponent("child.pid")
+        let scriptContents = """
+        import os, time
+        child = os.fork()
+        if child:
+            os._exit(0)
+        os.setsid()
+        with open(\(String(reflecting: childPIDFile.path)), "w") as handle:
+            handle.write(str(os.getpid()))
+        while True:
+            time.sleep(0.02)
+        """
+        try scriptContents.write(to: script, atomically: true, encoding: .utf8)
+        let started = try await executor.start(command: "/usr/bin/python3 '\(script.path)'", workingDirectory: directory.path)
+        let childDeadline = ContinuousClock.now + .seconds(2)
+        while !FileManager.default.fileExists(atPath: childPIDFile.path), ContinuousClock.now < childDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(FileManager.default.fileExists(atPath: childPIDFile.path))
+        guard let childPIDText = try? String(contentsOf: childPIDFile, encoding: .utf8),
+              let childPID = Int32(childPIDText) else {
+            Issue.record("detached child PID was not readable")
+            await executor.closeAll()
+            return
+        }
+        defer { _ = Darwin.kill(childPID, SIGKILL) }
+        let writers = (0..<4).map { _ in
+            Task { try await executor.write(id: started.executionID,
+                                            input: .data(Data(repeating: 97, count: DesktopShellExecutor.maximumInputBytes))) }
+        }
+        var result = try await executor.status(id: started.executionID)
+        let terminalDeadline = ContinuousClock.now + .seconds(3)
+        while result.state == .running && ContinuousClock.now < terminalDeadline {
+            result = try await executor.read(id: started.executionID, after: 0, wait: .milliseconds(100))
+        }
+        #expect(result.state != .running)
+        for writer in writers {
+            do {
+                try await writer.value
+                Issue.record("stdin write unexpectedly succeeded after its shell exited")
+            } catch {}
+        }
+        #expect(await executor.closeAll())
     }
 }

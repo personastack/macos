@@ -84,6 +84,19 @@ import Testing
     #expect(!DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_revoke_config", activeCount: -1))
 }
 
+@Test func configRevocationStopsIdleRelayOnlyAfterConfirmedCleanup() {
+    let revoke = DesktopControlFrame(type: "command", requestID: "revoke-1", operation: "desktop_control_revoke_config")
+    let success = DesktopControlFrame(type: "result", requestID: "revoke-1", result: .object(["revoked": .bool(true)]))
+    let failed = DesktopControlFrame(type: "failure", requestID: "revoke-1", errorCode: "desktop_control_revoke_incomplete")
+    let malformed = DesktopControlFrame(type: "result", requestID: "revoke-1", result: .object(["revoked": .bool(false)]))
+    let ordinary = DesktopControlFrame(type: "command", requestID: "ordinary-1", operation: "desktop_control_status")
+
+    #expect(DesktopControlGatewayConnection.shouldReconcileAfterConfigRevocation(revoke, response: success))
+    #expect(!DesktopControlGatewayConnection.shouldReconcileAfterConfigRevocation(revoke, response: failed))
+    #expect(!DesktopControlGatewayConnection.shouldReconcileAfterConfigRevocation(revoke, response: malformed))
+    #expect(!DesktopControlGatewayConnection.shouldReconcileAfterConfigRevocation(ordinary, response: success))
+}
+
 @Test func desktopControlProtocolRejectsMalformedFramesAndTimestamps() {
     let cases = [
         Data("{".utf8),
