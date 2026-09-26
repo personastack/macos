@@ -31,6 +31,8 @@ struct DesktopControlMenu: View {
             .onReceive(status.objectWillChange) { _ in
                 let savedRepairError = UserDefaults.standard.string(forKey: "desktopControlRepairError") ?? ""
                 if repairError != savedRepairError { repairError = savedRepairError }
+                let savedLoginItemError = UserDefaults.standard.string(forKey: "desktopControlLoginItemError") ?? ""
+                if loginItemError != savedLoginItemError { loginItemError = savedLoginItemError }
             }
         Divider()
         if relayEnabled {

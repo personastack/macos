@@ -1042,9 +1042,14 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     static func clearRecoveredRepairError(preferences: UserDefaults, readiness: String, cuaReady: Bool) {
-        guard readiness == "ready", cuaReady,
-              preferences.string(forKey: "desktopControlRepairError")?.isEmpty == false else { return }
-        preferences.set("", forKey: "desktopControlRepairError")
+        guard readiness == "ready", cuaReady else { return }
+        if preferences.string(forKey: "desktopControlRepairError")?.isEmpty == false {
+            preferences.set("", forKey: "desktopControlRepairError")
+        }
+        if preferences.string(forKey: "desktopControlLoginItemError")?
+            .hasPrefix("Cua service could not be repaired:") == true {
+            preferences.set("", forKey: "desktopControlLoginItemError")
+        }
     }
 
     static func shouldProbeGuiRecovery(readiness: String, paused: Bool, unlocked: Bool, cuaReady: Bool) -> Bool {
