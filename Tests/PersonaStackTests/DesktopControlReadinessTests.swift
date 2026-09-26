@@ -129,6 +129,23 @@ import PersonaStackCore
 }
 
 @MainActor
+@Test func recoveredCuaServiceClearsOnlyItsRepairError() throws {
+    let suite = "DesktopControlRepairErrorTests.\(UUID().uuidString)"
+    let preferences = try #require(UserDefaults(suiteName: suite))
+    defer { preferences.removePersistentDomain(forName: suite) }
+    preferences.set("Cua service could not be repaired", forKey: "desktopControlRepairError")
+    preferences.set("Login item failed", forKey: "desktopControlLoginItemError")
+
+    DesktopControlRuntime.clearRecoveredRepairError(preferences: preferences, readiness: "cua_unavailable", cuaReady: true)
+    #expect(preferences.string(forKey: "desktopControlRepairError") != "")
+    DesktopControlRuntime.clearRecoveredRepairError(preferences: preferences, readiness: "ready", cuaReady: false)
+    #expect(preferences.string(forKey: "desktopControlRepairError") != "")
+    DesktopControlRuntime.clearRecoveredRepairError(preferences: preferences, readiness: "ready", cuaReady: true)
+    #expect(preferences.string(forKey: "desktopControlRepairError") == "")
+    #expect(preferences.string(forKey: "desktopControlLoginItemError") == "Login item failed")
+}
+
+@MainActor
 @Test func desktopRuntimeKeepsOneLoadedInstallationForItsLifecycle() throws {
     let payload = Data(#"{"installation_id":"install-cache","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://gateway.test/v1/desktop-control/ws"}"#.utf8)
     let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)

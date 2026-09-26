@@ -1037,7 +1037,14 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             readiness = "cua_unavailable"
             return readiness
         }
+        Self.clearRecoveredRepairError(preferences: preferences, readiness: readiness, cuaReady: true)
         return readiness
+    }
+
+    static func clearRecoveredRepairError(preferences: UserDefaults, readiness: String, cuaReady: Bool) {
+        guard readiness == "ready", cuaReady,
+              preferences.string(forKey: "desktopControlRepairError")?.isEmpty == false else { return }
+        preferences.set("", forKey: "desktopControlRepairError")
     }
 
     static func shouldProbeGuiRecovery(readiness: String, paused: Bool, unlocked: Bool, cuaReady: Bool) -> Bool {

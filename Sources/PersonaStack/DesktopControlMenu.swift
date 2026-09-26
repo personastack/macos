@@ -8,6 +8,7 @@ struct DesktopControlMenu: View {
     @AppStorage("desktopControlRelayPaused") private var relayPaused = false
     @AppStorage("desktopControlRelayError") private var relayError = ""
     @AppStorage("desktopControlLoginItemError") private var loginItemError = ""
+    @AppStorage("desktopControlRepairError") private var repairError = ""
 
     var body: some View {
         Text("Desktop Control")
@@ -58,6 +59,11 @@ struct DesktopControlMenu: View {
         }
         if !loginItemError.isEmpty {
             Text(loginItemError)
+                .font(.caption)
+                .foregroundStyle(.red)
+        }
+        if !repairError.isEmpty && !DesktopControlRuntime.shared.isCuaReady() {
+            Text(repairError)
                 .font(.caption)
                 .foregroundStyle(.red)
         }
@@ -118,6 +124,7 @@ struct DesktopControlMenu: View {
     @MainActor
     private func repairCua() async {
         loginItemError = ""
+        repairError = ""
         let runtime = DesktopControlRuntime.shared
         var generation: UUID?
         do {
@@ -130,7 +137,7 @@ struct DesktopControlMenu: View {
             return
         } catch {
             guard let generation, runtime.isCurrentLifecycle(generation) else { return }
-            loginItemError = "Cua service could not be repaired: \(error.localizedDescription)"
+            repairError = "Cua service could not be repaired: \(error.localizedDescription)"
         }
         guard let generation, runtime.isCurrentLifecycle(generation) else { return }
         relayPaused = runtime.paused
