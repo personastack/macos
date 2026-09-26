@@ -172,6 +172,7 @@ struct WindowPresentationConfigurator: NSViewRepresentable {
             super.viewDidMoveToWindow()
             DispatchQueue.main.async { [weak self] in
                 guard let window = self?.window else { return }
+                NSApp.setActivationPolicy(.regular)
                 WindowPresentation.configure(window)
             }
         }
