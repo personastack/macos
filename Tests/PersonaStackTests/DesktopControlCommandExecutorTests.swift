@@ -838,6 +838,23 @@ struct DesktopControlCommandExecutorTests {
         #expect(states == [.unlocked, .locked])
     }
 
+    @Test @MainActor
+    func sleepFencesControlUntilAnObservedUnlock() async {
+        let workspaceCenter = NotificationCenter()
+        let monitor = DesktopControlSessionLock(workspaceCenter: workspaceCenter)
+        monitor.receive(.unlocked)
+
+        workspaceCenter.post(name: NSWorkspace.willSleepNotification, object: nil)
+        for _ in 0..<20 where monitor.allowsControl { await Task.yield() }
+        #expect(monitor.state == .locked)
+
+        workspaceCenter.post(name: NSWorkspace.didWakeNotification, object: nil)
+        await Task.yield()
+        #expect(monitor.state == .locked)
+        monitor.receive(.unlocked)
+        #expect(monitor.allowsControl)
+    }
+
     private func target(persona: String, workspace: String = "workspace-1", config: String = "config-1", configVersion: Int64? = nil,
                         installation: String = "install-1") -> DesktopControlTarget {
         DesktopControlTarget(installationID: installation, workspaceID: workspace, configID: config,
