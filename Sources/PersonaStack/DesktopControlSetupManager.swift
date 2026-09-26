@@ -19,6 +19,7 @@ protocol DesktopControlSetupRuntime: AnyObject {
     func repair(resumeRelay: Bool, expectedGeneration: UUID?) async throws -> UUID
     func isCurrentLifecycle(_ generation: UUID) -> Bool
     func connect(installation: DesktopControlInstallation, expectedGeneration: UUID?) async
+    func savedInstallation(for appURL: URL) throws -> DesktopControlInstallation?
 }
 
 protocol DesktopControlSetupEnrollment: DesktopControlRelayStateReading {
@@ -66,7 +67,7 @@ enum DesktopControlSetupCommand: Equatable {
             guard Set(object.keys) == ["version", "action", "scope"] else { throw DesktopControlEnrollmentError.invalidRequest }
             return .sync(scope: scope)
         case "state":
-            guard !scope.isEmpty, Set(object.keys) == ["version", "action", "scope"] else { throw DesktopControlEnrollmentError.invalidRequest }
+            guard Set(object.keys) == ["version", "action", "scope"] else { throw DesktopControlEnrollmentError.invalidRequest }
             return .state(scope: scope)
         case "prepare":
             guard !scope.isEmpty,
@@ -180,7 +181,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             return ["ok": true, "version": "1"]
         case .state(let scope):
             try page.setupScope.require(scope)
-            let installation = try credentials.load()
+            let installation = try savedInstallation(credentials: credentials, appURL: page.appURL)
             return [
                 "ok": true,
                 "installation_id": installation?.installationID as Any? ?? NSNull(),
@@ -215,7 +216,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             }
             try requireCurrentScope(scope, generation: generation, page: page)
             try requireCurrentLifecycle(runtimeGeneration)
-            let saved = try credentials.load()
+            let saved = try savedInstallation(credentials: credentials, appURL: page.appURL)
             let installation: DesktopControlInstallation
             if let saved {
                 try saved.requireEnvironment(page.appURL)
@@ -261,6 +262,12 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
                 "suggested_name": Self.suggestedComputerName(),
             ]
         }
+    }
+
+    private func savedInstallation(credentials: any DesktopControlCredentialStoring,
+                                   appURL: URL) throws -> DesktopControlInstallation? {
+        if self.credentials != nil { return try credentials.load() }
+        return try runtime.savedInstallation(for: appURL)
     }
 
     private func requireCurrentScope(_ scope: String, page: Page) throws {

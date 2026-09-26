@@ -6,6 +6,7 @@ import Testing
     let ticket = String(repeating: "a", count: 43)
     #expect(try DesktopControlSetupCommand.parse(["version": "1", "action": "sync", "scope": "session-1"] as [String: Any]) == .sync(scope: "session-1"))
     #expect(try DesktopControlSetupCommand.parse(["version": "1", "action": "state", "scope": "session-1"] as [String: Any]) == .state(scope: "session-1"))
+    #expect(try DesktopControlSetupCommand.parse(["version": "1", "action": "state", "scope": ""] as [String: Any]) == .state(scope: ""))
     #expect(try DesktopControlSetupCommand.parse(["version": "1", "action": "prepare", "scope": "session-1", "enrollment_ticket": ticket] as [String: Any]) == .prepare(scope: "session-1", enrollmentTicket: ticket))
 }
 

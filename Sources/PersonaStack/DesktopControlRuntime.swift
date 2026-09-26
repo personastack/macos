@@ -787,6 +787,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         return saved
     }
 
+    func savedInstallation(for appURL: URL) throws -> DesktopControlInstallation? {
+        let saved = try savedInstallation()
+        try saved?.requireEnvironment(appURL)
+        return saved
+    }
+
     private func hasActiveConfig(for installation: DesktopControlInstallation) async throws -> Bool {
         guard let relayStateReader else { return true }
         return try await relayStateReader.hasActiveConfig(installation: installation, appURL: LaunchConfiguration.url())

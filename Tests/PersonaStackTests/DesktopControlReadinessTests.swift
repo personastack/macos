@@ -138,6 +138,29 @@ import PersonaStackCore
 }
 
 @MainActor
+@Test func desktopStatusUsesTheRuntimeCredentialCache() async throws {
+    let appURL = URL(string: "https://my.personastack.ai")!
+    let payload = Data(#"{"installation_id":"install-status-cache","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8)
+    var installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
+    try installation.bindEnvironment(appURL)
+    let credentials = CountingDesktopCredentials(installation: installation)
+    let runtime = DesktopControlRuntime.makeForTesting(installer: ReadinessInstaller(), credentials: credentials)
+    let manager = DesktopControlSetupManager(runtime: runtime)
+    let page = DesktopControlSetupManager.Page(appURL: appURL)
+
+    for _ in 0..<2 {
+        let state = try await manager.apply(.state(scope: ""), page: page)
+        #expect(state["installation_id"] as? String == installation.installationID)
+    }
+    #expect(credentials.readCount == 1)
+
+    page.setupScope.synchronize("workspace-setup")
+    await #expect(throws: DesktopControlEnrollmentError.invalidRequest) {
+        _ = try await manager.apply(.state(scope: ""), page: page)
+    }
+}
+
+@MainActor
 @Test func desktopControlStatusSurvivesPausedLockedAndCleanupRuntimeGates() async throws {
     let payload = Data(#"{"installation_id":"install-status","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://gateway.test/v1/desktop-control/ws"}"#.utf8)
     let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)

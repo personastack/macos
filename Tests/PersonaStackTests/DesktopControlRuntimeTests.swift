@@ -109,6 +109,8 @@ private final class DesktopControlSetupRuntimeFixture: DesktopControlSetupRuntim
         connectedInstallationID = installation.installationID
         gatewayConnected = true
     }
+
+    func savedInstallation(for appURL: URL) throws -> DesktopControlInstallation? { nil }
 }
 
 private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollment {
