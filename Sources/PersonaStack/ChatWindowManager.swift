@@ -65,9 +65,12 @@ final class ChatWindowManager: NSObject, WKScriptMessageHandlerWithReply {
 final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, NSWindowDelegate {
     let window: NSWindow
     let webView: ChatWebView
+    let titleBar: ChatWindowTitleBar
     private let url: URL
     private let onClose: () -> Void
-    private var expandedSize = NSSize(width: 440, height: 640)
+    private var titleBarHeight: NSLayoutConstraint?
+    private var webViewTop: NSLayoutConstraint?
+    private var expandedSize = NSSize(width: 440, height: 676)
     private var collapsed = false
     private var disposed = false
     private var closePending = false
@@ -79,7 +82,8 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
         config.websiteDataStore = .default()
         config.applicationNameForUserAgent = "PersonaStackDesktop/1"
         webView = ChatWebView(frame: .zero, configuration: config)
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 640),
+        titleBar = ChatWindowTitleBar(frame: .zero)
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 676),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                           backing: .buffered, defer: false)
         super.init()
@@ -92,12 +96,30 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
         window.hasShadow = false
         window.isReleasedWhenClosed = false
         window.hidesOnDeactivate = false
-        window.minSize = NSSize(width: 340, height: 360)
-        for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
-            window.standardWindowButton(button)?.isHidden = true
-        }
+        window.minSize = NSSize(width: 340, height: 396)
+        window.standardWindowButton(.zoomButton)?.isHidden = true
         webView.underPageBackgroundColor = .clear
-        window.contentView = webView
+        let contentView = NSView(frame: .zero)
+        webView.translatesAutoresizingMaskIntoConstraints = false
+        titleBar.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(webView)
+        contentView.addSubview(titleBar)
+        // The hosted chat has a four-point transparent edge. Fill it so the two surfaces read as one card.
+        let barHeight = titleBar.heightAnchor.constraint(equalToConstant: 40)
+        let contentTop = webView.topAnchor.constraint(equalTo: titleBar.bottomAnchor, constant: -4)
+        titleBarHeight = barHeight
+        webViewTop = contentTop
+        NSLayoutConstraint.activate([
+            titleBar.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            titleBar.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            titleBar.topAnchor.constraint(equalTo: contentView.topAnchor),
+            barHeight,
+            webView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            webView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            contentTop,
+            webView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+        ])
+        window.contentView = contentView
         window.delegate = self
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -178,7 +200,13 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
         if next { expandedSize = frame.size }
         collapsed = next
         webView.collapsed = next
-        window.minSize = next ? NSSize(width: 72, height: 72) : NSSize(width: 340, height: 360)
+        titleBarHeight?.constant = next ? 0 : 40
+        webViewTop?.constant = next ? 0 : -4
+        titleBar.isHidden = next
+        for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton] {
+            window.standardWindowButton(button)?.isHidden = next
+        }
+        window.minSize = next ? NSSize(width: 72, height: 72) : NSSize(width: 340, height: 396)
         if next { window.styleMask.remove(.resizable) } else { window.styleMask.insert(.resizable) }
         let size = next ? NSSize(width: 72, height: 72) : expandedSize
         var rect = NSRect(x: frame.minX, y: frame.maxY - size.height, width: size.width, height: size.height)
@@ -208,6 +236,23 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
     func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) { download.delegate = self }
     func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String) async -> URL? {
         FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first?.appendingPathComponent((suggestedFilename as NSString).lastPathComponent)
+    }
+}
+
+@MainActor
+final class ChatWindowTitleBar: NSView {
+    override var mouseDownCanMoveWindow: Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(srgbRed: 18.0 / 255, green: 18.0 / 255, blue: 42.0 / 255, alpha: 0.96).cgColor
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
     }
 }
 
