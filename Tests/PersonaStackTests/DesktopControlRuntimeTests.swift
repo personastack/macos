@@ -35,6 +35,15 @@ private struct DeniedDesktopControlCredentialStore: DesktopControlCredentialStor
     func delete() throws {}
 }
 
+private struct MainThreadRejectingCredentialStore: DesktopControlCredentialStoring {
+    func save(_ installation: DesktopControlInstallation) throws {}
+    func load() throws -> DesktopControlInstallation? {
+        if Thread.isMainThread { throw DesktopControlEnrollmentError.credentialStoreUnavailable }
+        return nil
+    }
+    func delete() throws {}
+}
+
 @Test @MainActor func startupRequiresAccessibleDesktopEnrollmentBeforeStartingCua() async {
     let installer = DesktopControlInstallerFixture(errors: [])
     let missing = DesktopControlRuntime.makeForTesting(installer: installer, credentials: EmptyDesktopControlCredentialStore())
@@ -47,6 +56,15 @@ private struct DeniedDesktopControlCredentialStore: DesktopControlCredentialStor
     #expect(!denied.hasActiveInstallation)
     #expect(await installer.repairArguments.isEmpty)
     #expect(DesktopControlEnrollmentError.credentialStoreUnavailable.localizedDescription.contains("Keychain"))
+}
+
+@Test @MainActor func startupReadsKeychainAwayFromTheMainActor() async {
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []),
+        credentials: MainThreadRejectingCredentialStore()
+    )
+    await #expect(throws: DesktopControlEnrollmentError.installationMissing) { try await runtime.resume() }
+    await #expect(throws: DesktopControlEnrollmentError.installationMissing) { try await runtime.startPaused() }
 }
 
 @Test @MainActor func macOSLockFencesCommandsBeforeAsynchronousHeartbeat() async {

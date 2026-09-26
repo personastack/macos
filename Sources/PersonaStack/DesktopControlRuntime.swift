@@ -144,7 +144,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         try requireCurrentLifecycle(generation)
         guard !disconnecting else { throw CancellationError() }
         setupMayRunUnconfigured = false
-        guard let installation = try savedInstallation() else { throw DesktopControlEnrollmentError.installationMissing }
+        guard let installation = try await savedInstallationForStartup(generation: generation) else {
+            throw DesktopControlEnrollmentError.installationMissing
+        }
         if await stopIfNoActiveConfiguration(installation: installation, generation: generation) { return }
         try requireCurrentLifecycle(generation)
         guard !disconnecting else { return }
@@ -297,7 +299,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         lifecycleGeneration = UUID()
         let generation = lifecycleGeneration
         setupMayRunUnconfigured = false
-        guard let installation = try savedInstallation() else { throw DesktopControlEnrollmentError.installationMissing }
+        guard let installation = try await savedInstallationForStartup(generation: generation) else {
+            throw DesktopControlEnrollmentError.installationMissing
+        }
         if await stopIfNoActiveConfiguration(installation: installation, generation: generation) { return }
         try requireCurrentLifecycle(generation)
         guard !disconnecting else { return }
@@ -831,6 +835,16 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private func savedInstallation() throws -> DesktopControlInstallation? {
         if let activeInstallation { return activeInstallation }
         let saved = try credentials.load()
+        activeInstallation = saved
+        return saved
+    }
+
+    private func savedInstallationForStartup(generation: UUID) async throws -> DesktopControlInstallation? {
+        if let activeInstallation { return activeInstallation }
+        let store = credentials
+        let saved = try await Task.detached(priority: .userInitiated) { try store.load() }.value
+        try requireCurrentLifecycle(generation)
+        guard !disconnecting else { throw CancellationError() }
         activeInstallation = saved
         return saved
     }
