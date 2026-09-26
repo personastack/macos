@@ -920,13 +920,34 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         return response
     }
 
-    private func heartbeatReadiness() -> String? {
+    private func heartbeatReadiness() async -> String? {
+        if Self.shouldProbeGuiRecovery(readiness: readiness, paused: paused,
+                                       unlocked: sessionLock.allowsControl, cuaReady: isCuaReady()),
+           let proxy {
+            let generation = lifecycleGeneration
+            let previousReadiness = readiness
+            do {
+                try await verifyCuaReadiness(proxy, generation: generation, timeout: 5)
+                if generation == lifecycleGeneration, readiness == previousReadiness,
+                   !paused, sessionLock.allowsControl, isCuaReady() {
+                    readiness = "ready"
+                }
+            } catch {
+                if generation == lifecycleGeneration, readiness == previousReadiness {
+                    readiness = Self.readiness(for: error)
+                }
+            }
+        }
         guard readiness == "ready" else { return readiness }
         guard isCuaReady() else {
             readiness = "cua_unavailable"
             return readiness
         }
         return readiness
+    }
+
+    static func shouldProbeGuiRecovery(readiness: String, paused: Bool, unlocked: Bool, cuaReady: Bool) -> Bool {
+        (readiness == "permission_required" || readiness == "cua_unavailable") && !paused && unlocked && cuaReady
     }
 
     private func readinessAfterGuiFailure(generation: UUID) async -> String {
@@ -987,8 +1008,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         }
     }
 
-    private func verifyCuaReadiness(_ candidate: CuaMCPProxy, generation: UUID) async throws {
-        try await verifyCuaPermissions(candidate, generation: generation)
+    private func verifyCuaReadiness(_ candidate: CuaMCPProxy, generation: UUID,
+                                    timeout: Int32 = 60) async throws {
+        try await verifyCuaPermissions(candidate, generation: generation, timeout: timeout)
 
         // Permission setup remains available while the initial lock state is
         // unknown. Actual screen probes wait for an observed unlock.
@@ -996,7 +1018,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
         let screenshot = try await candidate.callTool(
             name: "get_desktop_state",
-            argumentsJSON: Data("{}".utf8)
+            argumentsJSON: Data("{}".utf8), timeout: timeout
         )
         try requireCurrentLifecycle(generation)
         guard let screenshotResult = Self.toolResult(screenshot),
@@ -1007,7 +1029,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
         let accessibility = try await candidate.callTool(
             name: "get_accessibility_tree",
-            argumentsJSON: Data("{}".utf8)
+            argumentsJSON: Data("{}".utf8), timeout: timeout
         )
         try requireCurrentLifecycle(generation)
         guard let accessibilityResult = Self.toolResult(accessibility),

@@ -108,6 +108,24 @@ import PersonaStackCore
 }
 
 @MainActor
+@Test func degradedGuiHeartbeatRechecksOnlyAnUnlockedUsableCuaService() {
+    for readiness in ["permission_required", "cua_unavailable"] {
+        #expect(DesktopControlRuntime.shouldProbeGuiRecovery(readiness: readiness, paused: false,
+                                                              unlocked: true, cuaReady: true))
+        #expect(!DesktopControlRuntime.shouldProbeGuiRecovery(readiness: readiness, paused: true,
+                                                               unlocked: true, cuaReady: true))
+        #expect(!DesktopControlRuntime.shouldProbeGuiRecovery(readiness: readiness, paused: false,
+                                                               unlocked: false, cuaReady: true))
+        #expect(!DesktopControlRuntime.shouldProbeGuiRecovery(readiness: readiness, paused: false,
+                                                               unlocked: true, cuaReady: false))
+    }
+    for readiness in ["ready", "paused", "locked", "upgrade_required", "unknown"] {
+        #expect(!DesktopControlRuntime.shouldProbeGuiRecovery(readiness: readiness, paused: false,
+                                                               unlocked: true, cuaReady: true))
+    }
+}
+
+@MainActor
 @Test func desktopControlStatusSurvivesPausedLockedAndCleanupRuntimeGates() async throws {
     let payload = Data(#"{"installation_id":"install-status","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://gateway.test/v1/desktop-control/ws"}"#.utf8)
     let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
