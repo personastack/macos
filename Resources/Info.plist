@@ -29,6 +29,6 @@
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
   <key>PersonaStackDefaultURL</key>
-  <string>https://my.personastack.ai/user/personas</string>
+  <string>http://127.0.0.1:8080/user/personas</string>
 </dict>
 </plist>

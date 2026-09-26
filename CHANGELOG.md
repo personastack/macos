@@ -2,6 +2,12 @@
 
 All notable changes follow semantic versioning.
 
+## Unreleased
+
+### Changed
+
+- Require an explicit environment URL when packaging. An unconfigured development build stays on localhost instead of silently opening production.
+
 ## [0.1.10] - 2026-09-15
 
 ### Fixed

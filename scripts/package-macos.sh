@@ -4,7 +4,7 @@ set -eu
 root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 version=${VERSION:-0.1.0}
 configuration=${CONFIGURATION:-release}
-default_url=${PERSONASTACK_DEFAULT_URL:-https://my.personastack.ai/user/personas}
+default_url=${PERSONASTACK_DEFAULT_URL:?Set PERSONASTACK_DEFAULT_URL to the PersonaStack environment URL for this build}
 signing_identity=${PERSONASTACK_CODESIGN_IDENTITY:-}
 artifact_dir="$root_dir/artifacts"
 bundle_dir="$root_dir/build/PersonaStack.app"

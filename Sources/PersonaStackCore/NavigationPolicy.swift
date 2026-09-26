@@ -1,7 +1,9 @@
 import Foundation
 
 public enum NavigationPolicy {
-    public static let defaultURL = URL(string: "https://my.personastack.ai/user/personas")!
+    // Unpackaged development builds stay on localhost. Installer builds replace
+    // this value with the environment-specific URL from PersonaStackDefaultURL.
+    public static let defaultURL = URL(string: "http://127.0.0.1:8080/user/personas")!
     public static let appHosts: Set<String> = [
         "my.personastack.ai",
         "personastack.ai",
