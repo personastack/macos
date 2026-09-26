@@ -19,7 +19,7 @@ protocol DesktopControlSetupRuntime: AnyObject {
     func repair(resumeRelay: Bool, expectedGeneration: UUID?) async throws -> UUID
     func isCurrentLifecycle(_ generation: UUID) -> Bool
     func connect(installation: DesktopControlInstallation, expectedGeneration: UUID?) async
-    func savedInstallation(for appURL: URL) throws -> DesktopControlInstallation?
+    func savedInstallation(for appURL: URL) async throws -> DesktopControlInstallation?
 }
 
 protocol DesktopControlSetupEnrollment: DesktopControlRelayStateReading {
@@ -181,7 +181,8 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             return ["ok": true, "version": "1"]
         case .state(let scope):
             try page.setupScope.require(scope)
-            let installation = try savedInstallation(credentials: credentials, appURL: page.appURL)
+            let installation = try await savedInstallation(credentials: credentials, appURL: page.appURL)
+            try page.setupScope.require(scope)
             return [
                 "ok": true,
                 "operating_system": "macos",
@@ -217,7 +218,9 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             }
             try requireCurrentScope(scope, generation: generation, page: page)
             try requireCurrentLifecycle(runtimeGeneration)
-            let saved = try savedInstallation(credentials: credentials, appURL: page.appURL)
+            let saved = try await savedInstallation(credentials: credentials, appURL: page.appURL)
+            try requireCurrentScope(scope, generation: generation, page: page)
+            try requireCurrentLifecycle(runtimeGeneration)
             let installation: DesktopControlInstallation
             if let saved {
                 try saved.requireEnvironment(page.appURL)
@@ -267,9 +270,12 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
     }
 
     private func savedInstallation(credentials: any DesktopControlCredentialStoring,
-                                   appURL: URL) throws -> DesktopControlInstallation? {
-        if self.credentials != nil { return try credentials.load() }
-        return try runtime.savedInstallation(for: appURL)
+                                   appURL: URL) async throws -> DesktopControlInstallation? {
+        if self.credentials != nil {
+            let store = credentials
+            return try await Task.detached(priority: .userInitiated) { try store.load() }.value
+        }
+        return try await runtime.savedInstallation(for: appURL)
     }
 
     private func requireCurrentScope(_ scope: String, page: Page) throws {

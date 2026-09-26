@@ -151,14 +151,14 @@ import PersonaStackCore
 }
 
 @MainActor
-@Test func desktopRuntimeKeepsOneLoadedInstallationForItsLifecycle() throws {
+@Test func desktopRuntimeKeepsOneLoadedInstallationForItsLifecycle() async throws {
     let payload = Data(#"{"installation_id":"install-cache","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://gateway.test/v1/desktop-control/ws"}"#.utf8)
     let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
     let credentials = CountingDesktopCredentials(installation: installation)
     let runtime = DesktopControlRuntime.makeForTesting(installer: ReadinessInstaller(), credentials: credentials)
 
-    #expect(try runtime.savedInstallationForTesting()?.installationID == installation.installationID)
-    #expect(try runtime.savedInstallationForTesting()?.installationID == installation.installationID)
+    #expect(try await runtime.savedInstallationForTesting()?.installationID == installation.installationID)
+    #expect(try await runtime.savedInstallationForTesting()?.installationID == installation.installationID)
     #expect(credentials.readCount == 1)
 }
 

@@ -67,6 +67,22 @@ private struct MainThreadRejectingCredentialStore: DesktopControlCredentialStori
     await #expect(throws: DesktopControlEnrollmentError.installationMissing) { try await runtime.startPaused() }
 }
 
+@Test @MainActor func setupStateReadsKeychainAwayFromTheMainActor() async throws {
+    let appURL = URL(string: "https://my.personastack.ai")!
+    let credentials = MainThreadRejectingCredentialStore()
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []), credentials: credentials
+    )
+    let page = DesktopControlSetupManager.Page(appURL: appURL)
+    let runtimeState = try await DesktopControlSetupManager(runtime: runtime).apply(.state(scope: ""), page: page)
+    #expect(runtimeState["installation_id"] is NSNull)
+
+    let injectedState = try await DesktopControlSetupManager(
+        runtime: DesktopControlSetupRuntimeFixture(), credentials: credentials
+    ).apply(.state(scope: ""), page: page)
+    #expect(injectedState["installation_id"] is NSNull)
+}
+
 @Test @MainActor func macOSLockFencesCommandsBeforeAsynchronousHeartbeat() async {
     let executor = DesktopControlCommandExecutor()
     let runtime = DesktopControlRuntime.makeForTesting(
@@ -235,7 +251,7 @@ private final class DesktopControlSetupRuntimeFixture: DesktopControlSetupRuntim
         gatewayConnected = true
     }
 
-    func savedInstallation(for appURL: URL) throws -> DesktopControlInstallation? { nil }
+    func savedInstallation(for appURL: URL) async throws -> DesktopControlInstallation? { nil }
 }
 
 private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollment {

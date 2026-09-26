@@ -85,8 +85,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
 #if DEBUG
-    func savedInstallationForTesting() throws -> DesktopControlInstallation? {
-        try savedInstallation()
+    func savedInstallationForTesting() async throws -> DesktopControlInstallation? {
+        let saved = try await readSavedInstallation()
+        activeInstallation = saved
+        return saved
     }
 
     static func makeForTesting(installer: any DesktopControlDriverInstalling,
@@ -287,7 +289,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         try requireCurrentLifecycle(generation)
         paused = startPaused
         readiness = startPaused ? "paused" : (sessionLock.allowsControl ? "ready" : "locked")
-        if let saved = try? savedInstallation() {
+        if let saved = try? await readSavedInstallation() {
+            try requireCurrentLifecycle(generation)
+            activeInstallation = saved
             await gateway?.setReadiness(readiness)
             try requireCurrentLifecycle(generation)
             beginReconnectLoop(for: saved)
@@ -418,12 +422,13 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let installation: DesktopControlInstallation?
         let credentialLoadError: Error?
         do {
-            installation = try savedInstallation()
+            installation = try await readSavedInstallation()
             credentialLoadError = nil
         } catch {
             installation = nil
             credentialLoadError = error
         }
+        guard disconnecting, generation == lifecycleGeneration else { return }
         activeInstallation = installation
         await stopLocalControl(generation: generation)
         guard disconnecting, generation == lifecycleGeneration else { return }
@@ -779,7 +784,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private func publishReadinessFailure(_ error: Error, generation: UUID) async {
         guard generation == lifecycleGeneration else { return }
         readiness = Self.readiness(for: error)
-        guard let installation = try? savedInstallation() else { return }
+        guard let installation = try? await readSavedInstallation() else { return }
         guard generation == lifecycleGeneration else { return }
         activeInstallation = installation
         let connected = await gateway?.isConnected() == true
@@ -802,8 +807,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let generation = lifecycleGeneration
         setupMayRunUnconfigured = false
         let saved: DesktopControlInstallation?
-        do { saved = try savedInstallation() }
+        do { saved = try await readSavedInstallation() }
         catch { return }
+        guard generation == lifecycleGeneration else { return }
+        activeInstallation = saved
         guard let installation = saved else {
             await stopIdleRelay(expectedLifecycle: generation)
             return
@@ -832,25 +839,25 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         return false
     }
 
-    private func savedInstallation() throws -> DesktopControlInstallation? {
+    private func readSavedInstallation() async throws -> DesktopControlInstallation? {
         if let activeInstallation { return activeInstallation }
-        let saved = try credentials.load()
-        activeInstallation = saved
-        return saved
+        let store = credentials
+        return try await Task.detached(priority: .userInitiated) { try store.load() }.value
     }
 
     private func savedInstallationForStartup(generation: UUID) async throws -> DesktopControlInstallation? {
-        if let activeInstallation { return activeInstallation }
-        let store = credentials
-        let saved = try await Task.detached(priority: .userInitiated) { try store.load() }.value
+        let saved = try await readSavedInstallation()
         try requireCurrentLifecycle(generation)
         guard !disconnecting else { throw CancellationError() }
         activeInstallation = saved
         return saved
     }
 
-    func savedInstallation(for appURL: URL) throws -> DesktopControlInstallation? {
-        let saved = try savedInstallation()
+    func savedInstallation(for appURL: URL) async throws -> DesktopControlInstallation? {
+        let generation = lifecycleGeneration
+        let saved = try await readSavedInstallation()
+        try requireCurrentLifecycle(generation)
+        activeInstallation = saved
         try saved?.requireEnvironment(appURL)
         return saved
     }
