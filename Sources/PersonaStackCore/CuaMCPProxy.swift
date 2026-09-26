@@ -118,7 +118,14 @@ public actor CuaMCPProxy {
         guard started else { return }
         input.fileHandleForWriting.closeFile()
         output.fileHandleForReading.closeFile()
-        if process.isRunning { process.terminate() }
+        if process.isRunning {
+            process.terminate()
+            let deadline = ContinuousClock.now + .seconds(2)
+            while process.isRunning && ContinuousClock.now < deadline {
+                usleep(10_000)
+            }
+            if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
+        }
         process.waitUntilExit()
         started = false
         bufferedOutput.removeAll(keepingCapacity: false)

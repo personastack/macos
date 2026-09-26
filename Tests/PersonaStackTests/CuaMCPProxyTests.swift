@@ -6,6 +6,40 @@ import Testing
 @Suite
 struct CuaMCPProxyTests {
     @Test
+    func stopKillsAnUnresponsiveProxyWithinItsDeadline() async throws {
+        let marker = FileManager.default.temporaryDirectory.appendingPathComponent("cua-proxy-unresponsive-\(UUID().uuidString)")
+        let script = #"""
+        #!/usr/bin/python3
+        import json, pathlib, signal, sys, time
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        for line in sys.stdin:
+            request = json.loads(line)
+            if request.get("method") == "initialize":
+                result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.28.2"}}
+                print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
+            elif request.get("method") == "notifications/initialized":
+                pathlib.Path("\#(marker.path)").write_text("ready")
+                while True:
+                    time.sleep(1)
+        """#
+        let executable = try executableScript(script)
+        defer {
+            try? FileManager.default.removeItem(at: marker)
+            try? FileManager.default.removeItem(at: executable.deletingLastPathComponent())
+        }
+        let proxy = CuaMCPProxy(executableURL: executable)
+        _ = try await proxy.start()
+        let deadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: marker.path), Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(FileManager.default.fileExists(atPath: marker.path))
+        let started = Date()
+        await proxy.stop()
+        #expect(Date().timeIntervalSince(started) < 3)
+    }
+
+    @Test
     func fullChildStdinIsInterruptibleAndBounded() async throws {
         for interruptWrite in [true, false] {
             let marker = FileManager.default.temporaryDirectory.appendingPathComponent("cua-proxy-idle-child-\(UUID().uuidString)")
