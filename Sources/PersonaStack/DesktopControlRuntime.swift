@@ -144,7 +144,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         try requireCurrentLifecycle(generation)
         guard !disconnecting else { throw CancellationError() }
         setupMayRunUnconfigured = false
-        guard let installation = try savedInstallation() else { return }
+        guard let installation = try savedInstallation() else { throw DesktopControlEnrollmentError.installationMissing }
         if await stopIfNoActiveConfiguration(installation: installation, generation: generation) { return }
         try requireCurrentLifecycle(generation)
         guard !disconnecting else { return }
@@ -297,7 +297,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         lifecycleGeneration = UUID()
         let generation = lifecycleGeneration
         setupMayRunUnconfigured = false
-        guard let installation = try savedInstallation() else { return }
+        guard let installation = try savedInstallation() else { throw DesktopControlEnrollmentError.installationMissing }
         if await stopIfNoActiveConfiguration(installation: installation, generation: generation) { return }
         try requireCurrentLifecycle(generation)
         guard !disconnecting else { return }

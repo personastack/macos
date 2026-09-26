@@ -6,6 +6,7 @@ struct DesktopControlMenu: View {
     @Environment(\.openWindow) private var openWindow
     @AppStorage("desktopControlRelayEnabled") private var relayEnabled = false
     @AppStorage("desktopControlRelayPaused") private var relayPaused = false
+    @AppStorage("desktopControlRelayError") private var relayError = ""
     @AppStorage("desktopControlLoginItemError") private var loginItemError = ""
 
     var body: some View {
@@ -31,14 +32,14 @@ struct DesktopControlMenu: View {
             }
         }
         if relayEnabled {
-            Button(relayPaused ? "Resume Remote Control" : "Pause Remote Control") {
+            Button(!relayError.isEmpty ? "Retry Remote Control" : (relayPaused ? "Resume Remote Control" : "Pause Remote Control")) {
                 Task { await toggleRelay() }
             }
             Button("Disconnect this Mac…", role: .destructive) {
                 confirmDisconnect()
             }
         } else {
-            Button("Start Local Service") {
+            Button(relayError.isEmpty ? "Start Local Service" : "Retry Remote Control") {
                 Task { await toggleRelay() }
             }
         }
@@ -60,9 +61,15 @@ struct DesktopControlMenu: View {
                 .font(.caption)
                 .foregroundStyle(.red)
         }
+        if !relayError.isEmpty {
+            Text(relayError)
+                .font(.caption)
+                .foregroundStyle(.red)
+        }
     }
 
     private var relayStatus: String {
+        if !relayError.isEmpty { return "Desktop Control needs attention" }
         if !relayEnabled { return "Relay paused" }
         if relayPaused { return "Remote control paused. Connection active." }
         let runtime = DesktopControlRuntime.shared
@@ -74,7 +81,7 @@ struct DesktopControlMenu: View {
     @MainActor
     private func toggleRelay() async {
         loginItemError = ""
-        if relayEnabled && !relayPaused {
+        if relayEnabled && !relayPaused && relayError.isEmpty {
             let runtime = DesktopControlRuntime.shared
             guard let generation = runtime.beginPause() else { return }
             await runtime.pause(generation: generation)
@@ -84,18 +91,25 @@ struct DesktopControlMenu: View {
         }
         let runtime = DesktopControlRuntime.shared
         var generation: UUID?
+        relayError = ""
         do {
             let current = try runtime.beginResume()
             generation = current
             try await runtime.resume(generation: current)
             guard runtime.isCurrentLifecycle(current) else { return }
+            guard runtime.hasActiveInstallation else {
+                relayEnabled = false
+                relayPaused = false
+                relayError = "No active Desktop Control configuration remains. Open PersonaStack to add one."
+                return
+            }
             relayEnabled = true
             relayPaused = false
         } catch is CancellationError {
             return
         } catch {
             guard let generation, runtime.isCurrentLifecycle(generation) else { return }
-            loginItemError = "Cua service could not start: \(error.localizedDescription)"
+            relayError = error.localizedDescription
             relayEnabled = runtime.hasActiveInstallation
             relayPaused = runtime.paused
         }
@@ -111,6 +125,7 @@ struct DesktopControlMenu: View {
             generation = current
             try await runtime.repair(generation: current)
             guard runtime.isCurrentLifecycle(current) else { return }
+            relayError = ""
         } catch is CancellationError {
             return
         } catch {
@@ -145,6 +160,7 @@ struct DesktopControlMenu: View {
     @MainActor
     private func disconnectRelay() async {
         loginItemError = ""
+        relayError = ""
         let runtime = DesktopControlRuntime.shared
         var generation: UUID?
         do {

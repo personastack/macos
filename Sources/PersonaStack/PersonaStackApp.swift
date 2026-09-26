@@ -15,6 +15,7 @@ struct PersonaStackApp: App {
         let paused = UserDefaults.standard.bool(forKey: "desktopControlRelayPaused")
         Task { @MainActor in
             _ = MainWebViewHost.shared
+            UserDefaults.standard.set("", forKey: "desktopControlRelayError")
             do {
                 if paused {
                     try await DesktopControlRuntime.shared.startPaused()
