@@ -6,6 +6,7 @@ import WebKit
 
 @main
 struct PersonaStackApp: App {
+    @NSApplicationDelegateAdaptor(PersonaStackTerminationDelegate.self) private var terminationDelegate
     private let launchURL = LaunchConfiguration.url()
 
     init() {
@@ -40,6 +41,54 @@ struct PersonaStackApp: App {
             DesktopControlMenu()
         }
         .menuBarExtraStyle(.menu)
+    }
+}
+
+@MainActor
+final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
+    private let shutdown: @MainActor () async -> Void
+    private let reply: @MainActor (NSApplication) -> Void
+    private let timeout: Duration
+    private var terminating = false
+    private var replied = false
+    private var timeoutTask: Task<Void, Never>?
+
+    override init() {
+        shutdown = { await DesktopControlRuntime.shared.shutdownForQuit() }
+        reply = { $0.reply(toApplicationShouldTerminate: true) }
+        timeout = .seconds(10)
+        super.init()
+    }
+
+    init(shutdown: @escaping @MainActor () async -> Void,
+         reply: @escaping @MainActor (NSApplication) -> Void,
+         timeout: Duration) {
+        self.shutdown = shutdown
+        self.reply = reply
+        self.timeout = timeout
+        super.init()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !terminating else { return .terminateLater }
+        terminating = true
+        Task { @MainActor in
+            await shutdown()
+            finish(sender)
+        }
+        timeoutTask = Task { @MainActor in
+            try? await Task.sleep(for: timeout)
+            finish(sender)
+        }
+        return .terminateLater
+    }
+
+    private func finish(_ sender: NSApplication) {
+        guard !replied else { return }
+        replied = true
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        reply(sender)
     }
 }
 

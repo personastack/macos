@@ -338,6 +338,30 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         tools = []
     }
 
+    func shutdownForQuit() async {
+        lifecycleGeneration = UUID()
+        let generation = lifecycleGeneration
+        disconnecting = true
+        setupMayRunUnconfigured = false
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        gatewayAttemptID = UUID()
+        paused = true
+        readiness = "paused"
+        proxy?.interrupt()
+        startingProxy?.interrupt()
+        let pending = pendingGateway
+        let current = gateway
+        pendingGateway = nil
+        gateway = nil
+        gatewayConnectionID = nil
+        gatewayConnected = false
+        await pending?.stop()
+        await current?.stop()
+        await stopLocalControl(generation: generation)
+        activeInstallation = nil
+    }
+
     func disconnect() async throws {
         let generation = try beginDisconnect()
         try await disconnect(generation: generation)

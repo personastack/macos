@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import PersonaStackCore
 import ServiceManagement
@@ -46,6 +47,54 @@ private struct SavedDesktopControlCredentialStore: DesktopControlCredentialStori
     func save(_ installation: DesktopControlInstallation) throws {}
     func load() throws -> DesktopControlInstallation? { installation }
     func delete() throws {}
+}
+
+@Test @MainActor func quitFencesTheRelayAndLeavesEnrollmentForNextLaunch() async throws {
+    let payload = Data(#"{"installation_id":"installation-quit","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8)
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []),
+        credentials: SavedDesktopControlCredentialStore(installation: installation),
+        installation: installation, connected: true, readiness: "ready")
+    let generation = try runtime.beginResume()
+
+    await runtime.shutdownForQuit()
+
+    #expect(!runtime.isCurrentLifecycle(generation))
+    #expect(runtime.paused)
+    #expect(runtime.readiness == "paused")
+    #expect(!runtime.gatewayConnected)
+    #expect(!runtime.hasActiveInstallation)
+}
+
+@Test @MainActor func quitWaitsForCleanupAndRepliesOnlyOnce() async {
+    var cleanupCalls = 0
+    var replies = 0
+    let delegate = PersonaStackTerminationDelegate(
+        shutdown: { cleanupCalls += 1 },
+        reply: { _ in replies += 1 },
+        timeout: .seconds(1))
+    let app = NSApplication.shared
+
+    #expect(delegate.applicationShouldTerminate(app) == .terminateLater)
+    #expect(delegate.applicationShouldTerminate(app) == .terminateLater)
+    try? await Task.sleep(for: .milliseconds(30))
+    #expect(cleanupCalls == 1)
+    #expect(replies == 1)
+}
+
+@Test @MainActor func quitDeadlineRepliesWhenCleanupIsSlow() async {
+    var replies = 0
+    let delegate = PersonaStackTerminationDelegate(
+        shutdown: { try? await Task.sleep(for: .milliseconds(100)) },
+        reply: { _ in replies += 1 },
+        timeout: .milliseconds(10))
+
+    #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateLater)
+    try? await Task.sleep(for: .milliseconds(40))
+    #expect(replies == 1)
+    try? await Task.sleep(for: .milliseconds(100))
+    #expect(replies == 1)
 }
 
 private actor DesktopControlRelayStateFixture: DesktopControlRelayStateReading {
