@@ -59,7 +59,7 @@ PersonaStack for macOS presents a selected PersonaStack web surface in a dedicat
 
 - Only the macOS app exposes the pop-out control in the Persona Settings Live activity toolbar. It sends a strict version `1` `open_persona_activity` message with one validated `persona_id` through the registered main-frame `personastackStack` bridge.
 - Open one ordinary native window per persona at `/user/personas/activity/desktop-popout?persona_id=…` in the shared WebKit data store. The authenticated hosted page subscribes to the existing authorized persona console stream and uses the same transcript renderer as Persona Settings.
-- Keep the native titlebar controls hidden. Provide a narrow draggable strip with a custom close button in its top-right corner, without a title or menu bar.
+- Keep the native titlebar controls hidden. Overlay the draggable native close control on the hosted Live Console title row, with no separate strip, title, or menu bar.
 - Native code handles window presentation only. It never reads or relays persona activity data. Persona authorization and stream access remain owned by the hosted web/API path.
 - Persona activity windows are ephemeral and close on session invalidation, failed or denied hosted navigation, WebKit termination, or normal window close.
 

@@ -37,17 +37,20 @@ final class StackWindowManager: NSObject, WKScriptMessageHandlerWithReply {
         let url: URL?
         let transparent: Bool
         let showsWindowChrome: Bool
+        let chromeOverContent: Bool
         switch command {
         case .open(let view, let stackID):
             windowKey = key(view, stackID: stackID)
             url = StackWindowCommand.popoutURL(appURL: base, stackID: stackID, view: view)
             transparent = view == .graph
             showsWindowChrome = view == .stream
+            chromeOverContent = false
         case .openPersonaActivity(let personaID):
             windowKey = "persona-activity:\(personaID)"
             url = StackWindowCommand.personaActivityURL(appURL: base, personaID: personaID)
             transparent = false
             showsWindowChrome = true
+            chromeOverContent = true
         }
         if let existing = windows[windowKey] { existing.focus(); return }
         guard let url else { return }
@@ -55,6 +58,7 @@ final class StackWindowManager: NSObject, WKScriptMessageHandlerWithReply {
             url: url,
             transparent: transparent,
             showsWindowChrome: showsWindowChrome,
+            chromeOverContent: chromeOverContent,
             loadPage: loadPages
         ) { [weak self] in
             self?.windows.removeValue(forKey: windowKey)
@@ -79,6 +83,7 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         url: URL,
         transparent: Bool,
         showsWindowChrome: Bool = false,
+        chromeOverContent: Bool = false,
         loadPage: Bool = true,
         onClose: @escaping () -> Void
     ) {
@@ -88,7 +93,7 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         configuration.websiteDataStore = .default()
         configuration.applicationNameForUserAgent = "PersonaStackDesktop/1"
         webView = WKWebView(frame: .zero, configuration: configuration)
-        windowChrome = showsWindowChrome ? StackPopoutWindowChrome(frame: .zero) : nil
+        windowChrome = showsWindowChrome ? StackPopoutWindowChrome(frame: .zero, overlaysContent: chromeOverContent) : nil
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 700),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                           backing: .buffered, defer: false)
@@ -117,16 +122,17 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             windowChrome.translatesAutoresizingMaskIntoConstraints = false
             contentView.addSubview(webView)
             contentView.addSubview(windowChrome)
-            NSLayoutConstraint.activate([
+            var constraints = [
                 windowChrome.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
                 windowChrome.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
                 windowChrome.topAnchor.constraint(equalTo: contentView.topAnchor),
-                windowChrome.heightAnchor.constraint(equalToConstant: 36),
                 webView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
                 webView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-                webView.topAnchor.constraint(equalTo: windowChrome.bottomAnchor),
                 webView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-            ])
+            ]
+            constraints.append(windowChrome.heightAnchor.constraint(equalToConstant: chromeOverContent ? 48 : 36))
+            constraints.append(webView.topAnchor.constraint(equalTo: chromeOverContent ? contentView.topAnchor : windowChrome.bottomAnchor))
+            NSLayoutConstraint.activate(constraints)
             windowChrome.closeButton.target = self
             windowChrome.closeButton.action = #selector(closeWindow)
             window.contentView = contentView
@@ -199,7 +205,7 @@ final class StackPopoutWindowChrome: NSView {
         window?.performDrag(with: event)
     }
 
-    override init(frame frameRect: NSRect) {
+    init(frame frameRect: NSRect, overlaysContent: Bool) {
         let symbol = NSImage(
             systemSymbolName: "xmark",
             accessibilityDescription: "Close window"
@@ -208,7 +214,9 @@ final class StackPopoutWindowChrome: NSView {
         closeButton = NSButton(image: symbol, target: nil, action: nil)
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.backgroundColor = NSColor(srgbRed: 18.0 / 255, green: 18.0 / 255, blue: 42.0 / 255, alpha: 1).cgColor
+        layer?.backgroundColor = overlaysContent
+            ? NSColor.clear.cgColor
+            : NSColor(srgbRed: 18.0 / 255, green: 18.0 / 255, blue: 42.0 / 255, alpha: 1).cgColor
         closeButton.translatesAutoresizingMaskIntoConstraints = false
         closeButton.isBordered = false
         closeButton.imagePosition = .imageOnly
