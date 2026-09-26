@@ -124,9 +124,14 @@ public actor CuaMCPProxy {
             while process.isRunning && ContinuousClock.now < deadline {
                 usleep(10_000)
             }
-            if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
+            if process.isRunning {
+                _ = Darwin.kill(process.processIdentifier, SIGKILL)
+                let killDeadline = ContinuousClock.now + .seconds(2)
+                while process.isRunning && ContinuousClock.now < killDeadline {
+                    usleep(10_000)
+                }
+            }
         }
-        process.waitUntilExit()
         started = false
         bufferedOutput.removeAll(keepingCapacity: false)
     }
