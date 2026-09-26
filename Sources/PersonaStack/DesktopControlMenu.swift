@@ -1,6 +1,18 @@
 import AppKit
+import Combine
 import ServiceManagement
 import SwiftUI
+
+private final class DesktopControlMenuStatus: ObservableObject {
+    @Published var revision = 0
+    private var refresh: AnyCancellable?
+
+    init() {
+        refresh = Timer.publish(every: 2, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in self?.revision &+= 1 }
+    }
+}
 
 struct DesktopControlMenu: View {
     @Environment(\.openWindow) private var openWindow
@@ -9,12 +21,17 @@ struct DesktopControlMenu: View {
     @AppStorage("desktopControlRelayError") private var relayError = ""
     @AppStorage("desktopControlLoginItemError") private var loginItemError = ""
     @AppStorage("desktopControlRepairError") private var repairError = ""
+    @ObservedObject private var status = DesktopControlMenuStatus()
 
     var body: some View {
         Text("Desktop Control")
             .font(.headline)
         Label(relayStatus, systemImage: relayEnabled ? "dot.radiowaves.left.and.right" : "pause.circle")
             .foregroundStyle(relayEnabled ? .green : .secondary)
+            .onReceive(status.objectWillChange) { _ in
+                let savedRepairError = UserDefaults.standard.string(forKey: "desktopControlRepairError") ?? ""
+                if repairError != savedRepairError { repairError = savedRepairError }
+            }
         Divider()
         if relayEnabled {
             Button("Repair Cua Service") {
@@ -75,6 +92,7 @@ struct DesktopControlMenu: View {
     }
 
     private var relayStatus: String {
+        _ = status.revision
         if !relayError.isEmpty { return "Desktop Control needs attention" }
         if !relayEnabled { return "Relay paused" }
         if relayPaused { return "Remote control paused. Connection active." }
