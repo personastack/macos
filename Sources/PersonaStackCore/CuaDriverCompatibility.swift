@@ -1,12 +1,12 @@
 import Foundation
 
 public enum CuaDriverCompatibility {
-    public static let version = "0.28.2"
+    public static let version = "0.29.1"
     public static let schemaVersion = "1"
     public static let bundleIdentifier = "com.trycua.driver"
     public static let teamIdentifier = "YCK386LBJ7"
-    public static let archiveSHA256 = "e273181b26709c88b1d809474deb3c592b4efae3530b11d76318f1887fc3fbb1"
-    public static let archiveURL = URL(string: "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.28.2/cua-driver-rs-0.28.2-darwin-universal.tar.gz")!
+    public static let archiveSHA256 = "ee376d59ef37afac29a10c60c71469ac85fdc8844d1884bd317edd8def29055a"
+    public static let archiveURL = URL(string: "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.29.1/cua-driver-rs-0.29.1-darwin-universal.tar.gz")!
     public static let managedServiceEnvironment = [
         "CUA_DRIVER_RS_TELEMETRY_ENABLED": "0",
         "CUA_DRIVER_RS_UPDATE_CHECK": "false",

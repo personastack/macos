@@ -90,7 +90,7 @@ struct DesktopControlBindingRevocationTests {
             if method == "notifications/initialized":
                 continue
             if method == "initialize":
-                result = {"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"test-cua","version":"0.28.2"}}
+                result = {"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"test-cua","version":"0.29.1"}}
             elif method == "tools/call":
                 marker.write_text("entered")
                 while not release_marker.exists():

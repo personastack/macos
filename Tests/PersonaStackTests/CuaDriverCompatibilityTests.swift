@@ -4,10 +4,10 @@ import Testing
 
 struct CuaDriverCompatibilityTests {
     @Test func pinnedReleaseAndRequiredToolSetValidate() throws {
-        let manifest = Data(#"{"binary_version":"0.28.2","schema_version":"1"}"#.utf8)
+        let manifest = Data(#"{"binary_version":"0.29.1","schema_version":"1"}"#.utf8)
         try CuaDriverCompatibility.validate(manifestData: manifest,
                                             toolNames: CuaDriverCompatibility.requiredTools)
-        #expect(CuaDriverCompatibility.archiveSHA256 == "e273181b26709c88b1d809474deb3c592b4efae3530b11d76318f1887fc3fbb1")
+        #expect(CuaDriverCompatibility.archiveSHA256 == "ee376d59ef37afac29a10c60c71469ac85fdc8844d1884bd317edd8def29055a")
         #expect(CuaDriverCompatibility.exposedTools.isSuperset(of: CuaDriverCompatibility.requiredTools))
         #expect(CuaDriverCompatibility.licenseNotice.contains("Copyright (c) 2025 Cua AI, Inc."))
         #expect(CuaDriverCompatibility.licenseNotice.contains("permission notice shall be included"))
@@ -29,18 +29,18 @@ struct CuaDriverCompatibilityTests {
     }
 
     @Test func mismatchedVersionSchemaAndCatalogFailClosed() throws {
-        let wrongVersion = Data(#"{"binary_version":"0.28.3","schema_version":"1"}"#.utf8)
+        let wrongVersion = Data(#"{"binary_version":"0.28.2","schema_version":"1"}"#.utf8)
         #expect(throws: CuaDriverCompatibility.ValidationError.unsupportedVersion) {
             try CuaDriverCompatibility.validate(manifestData: wrongVersion,
                                                 toolNames: CuaDriverCompatibility.requiredTools)
         }
-        let wrongSchema = Data(#"{"binary_version":"0.28.2","schema_version":"2"}"#.utf8)
+        let wrongSchema = Data(#"{"binary_version":"0.29.1","schema_version":"2"}"#.utf8)
         #expect(throws: CuaDriverCompatibility.ValidationError.unsupportedSchema) {
             try CuaDriverCompatibility.validate(manifestData: wrongSchema,
                                                 toolNames: CuaDriverCompatibility.requiredTools)
         }
         #expect(throws: CuaDriverCompatibility.ValidationError.missingRequiredTools(["click"])) {
-            try CuaDriverCompatibility.validate(manifestData: Data(#"{"binary_version":"0.28.2","schema_version":"1"}"#.utf8),
+            try CuaDriverCompatibility.validate(manifestData: Data(#"{"binary_version":"0.29.1","schema_version":"1"}"#.utf8),
                                                 toolNames: CuaDriverCompatibility.requiredTools.subtracting(["click"]))
         }
     }

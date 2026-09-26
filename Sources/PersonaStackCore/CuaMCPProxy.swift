@@ -61,7 +61,7 @@ public actor CuaMCPProxy {
         guard !started else { throw CuaMCPProxyError.alreadyStarted }
         try verifyDaemonIdentity()
         process.executableURL = executableURL
-        // Pinned Cua v0.28.2 otherwise auto-launches an app by name if its
+        // Cua can auto-launch an app by name if its
         // selected socket disappears. The proxy-only embedded flag disables
         // that fallback; the already-running signed app remains the GUI owner.
         process.arguments = ["mcp"] + (socketURL.map { ["--socket", $0.path, "--embedded"] } ?? [])

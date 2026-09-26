@@ -16,7 +16,7 @@ struct CuaMCPProxyTests {
             if method == "notifications/initialized":
                 continue
             if method == "initialize":
-                result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.28.2"}}
+                result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.29.1"}}
             else:
                 result = {"content":[{"type":"image","mimeType":"image/png","data":"A" * (9 * 1024 * 1024)}]}
             print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
@@ -40,7 +40,7 @@ struct CuaMCPProxyTests {
         for line in sys.stdin:
             request = json.loads(line)
             if request.get("method") == "initialize":
-                result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.28.2"}}
+                result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.29.1"}}
                 print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
             elif request.get("method") == "notifications/initialized":
                 pathlib.Path("\#(marker.path)").write_text("ready")
@@ -74,7 +74,7 @@ struct CuaMCPProxyTests {
             for line in sys.stdin:
                 request = json.loads(line)
                 if request.get("method") == "initialize":
-                    result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.28.2"}}
+                    result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.29.1"}}
                     print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
                 elif request.get("method") == "notifications/initialized":
                     with open("\#(marker.path)", "w") as output:
@@ -121,7 +121,7 @@ struct CuaMCPProxyTests {
             request = json.loads(line)
             method = request.get("method")
             if method == "initialize":
-                result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.28.2"}}
+                result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.29.1"}}
             elif method == "tools/call":
                 with open("\#(marker.path)", "w") as output:
                     output.write("started")
@@ -171,7 +171,7 @@ struct CuaMCPProxyTests {
             if method == "notifications/initialized":
                 continue
             if method == "initialize":
-                result = {"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"cua","version":"0.28.2","telemetry":__import__("os").environ.get("CUA_DRIVER_RS_TELEMETRY_ENABLED"),"update_check":__import__("os").environ.get("CUA_DRIVER_RS_UPDATE_CHECK"),"argv":sys.argv[1:]}}
+                result = {"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"cua","version":"0.29.1","telemetry":__import__("os").environ.get("CUA_DRIVER_RS_TELEMETRY_ENABLED"),"update_check":__import__("os").environ.get("CUA_DRIVER_RS_UPDATE_CHECK"),"argv":sys.argv[1:]}}
             elif method == "tools/list":
                 names = ["get_desktop_state","get_accessibility_tree","get_window_state","move_cursor","click","type_text","press_key","launch_app","list_apps","list_windows"]
                 result = {"tools":[{"name":name,"inputSchema":{"type":"object"}} for name in names]}
@@ -218,7 +218,7 @@ struct CuaMCPProxyTests {
         for line in sys.stdin:
             request = json.loads(line)
             if request.get("method") == "initialize":
-                result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.28.2","argv":sys.argv[1:]}}
+                result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.29.1","argv":sys.argv[1:]}}
                 print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
         """#
         let executable = try executableScript(script)
