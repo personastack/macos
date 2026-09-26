@@ -75,6 +75,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
 #if DEBUG
+    func savedInstallationForTesting() throws -> DesktopControlInstallation? {
+        try savedInstallation()
+    }
+
     static func makeForTesting(installer: any DesktopControlDriverInstalling,
                                credentials: any DesktopControlCredentialStoring,
                                executor: DesktopControlCommandExecutor? = nil,
@@ -125,10 +129,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         try requireCurrentLifecycle(generation)
         guard !disconnecting else { throw CancellationError() }
         setupMayRunUnconfigured = false
-        if await stopIfNoActiveConfiguration(generation: generation) { return }
+        guard let installation = try savedInstallation() else { return }
+        if await stopIfNoActiveConfiguration(installation: installation, generation: generation) { return }
         try requireCurrentLifecycle(generation)
-        let saved = try credentials.load()
-        guard !disconnecting, activeInstallation != nil || saved != nil else { return }
+        guard !disconnecting else { return }
         try await startCua(forceRepairInstall: false, startPaused: false, generation: generation)
     }
 
@@ -262,7 +266,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         try requireCurrentLifecycle(generation)
         paused = startPaused
         readiness = startPaused ? "paused" : (sessionLock.allowsControl ? "ready" : "locked")
-        if let saved = try? credentials.load() {
+        if let saved = try? savedInstallation() {
             await gateway?.setReadiness(readiness)
             try requireCurrentLifecycle(generation)
             beginReconnectLoop(for: saved)
@@ -274,14 +278,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         lifecycleGeneration = UUID()
         let generation = lifecycleGeneration
         setupMayRunUnconfigured = false
-        if await stopIfNoActiveConfiguration(generation: generation) { return }
+        guard let installation = try savedInstallation() else { return }
+        if await stopIfNoActiveConfiguration(installation: installation, generation: generation) { return }
         try requireCurrentLifecycle(generation)
-        let saved = try credentials.load()
-        guard !disconnecting, activeInstallation != nil || saved != nil else { return }
+        guard !disconnecting else { return }
         paused = true
         readiness = "paused"
-        guard let installation = try credentials.load() else { return }
-        activeInstallation = installation
         let connected = await gateway?.isConnected() == true
         try requireCurrentLifecycle(generation)
         if connected {
@@ -368,7 +370,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let installation: DesktopControlInstallation?
         let credentialLoadError: Error?
         do {
-            installation = try credentials.load()
+            installation = try savedInstallation()
             credentialLoadError = nil
         } catch {
             installation = nil
@@ -725,7 +727,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private func publishReadinessFailure(_ error: Error, generation: UUID) async {
         guard generation == lifecycleGeneration else { return }
         readiness = Self.readiness(for: error)
-        guard let installation = try? credentials.load() else { return }
+        guard let installation = try? savedInstallation() else { return }
         guard generation == lifecycleGeneration else { return }
         activeInstallation = installation
         let connected = await gateway?.isConnected() == true
@@ -748,7 +750,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let generation = lifecycleGeneration
         setupMayRunUnconfigured = false
         let saved: DesktopControlInstallation?
-        do { saved = try credentials.load() }
+        do { saved = try savedInstallation() }
         catch { return }
         guard let installation = saved else {
             await stopIdleRelay(expectedLifecycle: generation)
@@ -763,12 +765,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         }
     }
 
-    private func stopIfNoActiveConfiguration(generation: UUID) async -> Bool {
+    private func stopIfNoActiveConfiguration(installation: DesktopControlInstallation, generation: UUID) async -> Bool {
         guard let relayStateReader else { return false }
-        let saved: DesktopControlInstallation?
-        do { saved = try credentials.load() }
-        catch { return false }
-        guard let installation = saved else { return false }
         do {
             let hasActiveConfig = try await relayStateReader.hasActiveConfig(installation: installation, appURL: LaunchConfiguration.url())
             guard generation == lifecycleGeneration else { return false }
@@ -780,6 +778,13 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             // A failed read must not stop a relay another workspace may still use.
         }
         return false
+    }
+
+    private func savedInstallation() throws -> DesktopControlInstallation? {
+        if let activeInstallation { return activeInstallation }
+        let saved = try credentials.load()
+        activeInstallation = saved
+        return saved
     }
 
     private func hasActiveConfig(for installation: DesktopControlInstallation) async throws -> Bool {

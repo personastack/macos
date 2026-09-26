@@ -126,6 +126,18 @@ import PersonaStackCore
 }
 
 @MainActor
+@Test func desktopRuntimeKeepsOneLoadedInstallationForItsLifecycle() throws {
+    let payload = Data(#"{"installation_id":"install-cache","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://gateway.test/v1/desktop-control/ws"}"#.utf8)
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
+    let credentials = CountingDesktopCredentials(installation: installation)
+    let runtime = DesktopControlRuntime.makeForTesting(installer: ReadinessInstaller(), credentials: credentials)
+
+    #expect(try runtime.savedInstallationForTesting()?.installationID == installation.installationID)
+    #expect(try runtime.savedInstallationForTesting()?.installationID == installation.installationID)
+    #expect(credentials.readCount == 1)
+}
+
+@MainActor
 @Test func desktopControlStatusSurvivesPausedLockedAndCleanupRuntimeGates() async throws {
     let payload = Data(#"{"installation_id":"install-status","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://gateway.test/v1/desktop-control/ws"}"#.utf8)
     let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
@@ -215,5 +227,30 @@ private actor ReadinessInstaller: DesktopControlDriverInstalling {
 private struct ReadinessCredentials: DesktopControlCredentialStoring {
     func save(_ installation: DesktopControlInstallation) throws {}
     func load() throws -> DesktopControlInstallation? { nil }
+    func delete() throws {}
+}
+
+private final class CountingDesktopCredentials: DesktopControlCredentialStoring, @unchecked Sendable {
+    private let installation: DesktopControlInstallation
+    private let lock = NSLock()
+    private var reads = 0
+
+    init(installation: DesktopControlInstallation) { self.installation = installation }
+
+    var readCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return reads
+    }
+
+    func save(_ installation: DesktopControlInstallation) throws {}
+
+    func load() throws -> DesktopControlInstallation? {
+        lock.lock()
+        defer { lock.unlock() }
+        reads += 1
+        return installation
+    }
+
     func delete() throws {}
 }
