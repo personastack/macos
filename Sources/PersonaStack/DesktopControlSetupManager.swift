@@ -184,6 +184,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             let installation = try savedInstallation(credentials: credentials, appURL: page.appURL)
             return [
                 "ok": true,
+                "operating_system": "macos",
                 "installation_id": installation?.installationID as Any? ?? NSNull(),
                 "cua_ready": runtime.isCuaReady(),
                 "native_executor_ready": runtime.nativeExecutorReady,
@@ -254,6 +255,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             preferences.set(false, forKey: "desktopControlRelayPaused")
             return [
                 "ok": true,
+                "operating_system": "macos",
                 "installation_id": installation.installationID,
                 "cua_ready": runtime.isCuaReady(),
                 "native_executor_ready": runtime.nativeExecutorReady,
