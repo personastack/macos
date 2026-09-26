@@ -16,7 +16,10 @@ import PersonaStackCore
     #expect(!DesktopControlRuntime.shouldForceRepair(after: CuaMCPProxyError.serviceRunning))
     #expect(!DesktopControlRuntime.shouldForceRepair(after: CuaMCPProxyError.serviceMismatch))
     #expect(!DesktopControlRuntime.shouldForceRepair(after: CancellationError()))
-    #expect(DesktopControlRuntime.shouldForceRepair(after: CuaMCPProxyError.functionalProbeFailed))
+    #expect(!DesktopControlRuntime.shouldForceRepair(after: CuaMCPProxyError.functionalProbeFailed))
+    #expect(!DesktopControlRuntime.shouldForceRepair(after: CuaMCPProxyError.responseTooLarge))
+    #expect(!DesktopControlRuntime.shouldForceRepair(after: CuaMCPProxyError.processExited))
+    #expect(DesktopControlRuntime.shouldForceRepair(after: CuaDriverInstallError.invalidSignature))
 }
 
 @MainActor

@@ -946,13 +946,11 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     static func shouldForceRepair(after error: Error) -> Bool {
         if error is CancellationError { return false }
-        guard let error = error as? CuaMCPProxyError else { return true }
-        switch error {
-        case .permissionsRequired, .serviceRunning, .serviceMismatch:
-            return false
-        default:
-            return true
-        }
+        // validateOrInstall already replaces an invalid installation. A proxy,
+        // permission, or functional probe failure happened after validation;
+        // reinstalling then collides with the live Cua daemon and hides the
+        // original error.
+        return !(error is CuaMCPProxyError)
     }
 
     private func handle(_ frame: DesktopControlFrame,

@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 import PersonaStackCore
 import UniformTypeIdentifiers
 
@@ -550,11 +551,95 @@ final class DesktopControlCommandExecutor {
               !Self.isCuaToolError(result) else {
             throw CommandError.commandFailed
         }
-        return result
+        return try Self.boundedCuaImageResult(result)
     }
 
     static func isCuaToolError(_ result: [String: Any]) -> Bool {
         (result["isError"] as? Bool) == true
+    }
+
+    // The Cua proxy may receive a full-resolution screenshot larger than the
+    // gateway's 8 MiB frame. Keep the image visible to the persona by sending
+    // a bounded JPEG and updating the screenshot dimensions it uses for input.
+    static func boundedCuaImageResult(_ result: [String: Any],
+                                      maxEncodedImageBytes: Int = 5 * 1024 * 1024) throws -> [String: Any] {
+        guard var content = result["content"] as? [[String: Any]] else { return result }
+        let imageIndices = content.indices.filter { content[$0]["type"] as? String == "image" }
+        guard !imageIndices.isEmpty, maxEncodedImageBytes > 0 else { return result }
+        let perImageLimit = maxEncodedImageBytes / imageIndices.count
+        var updated = result
+        var screenshotScale: Double?
+        var screenshotSize: (Int, Int)?
+        for index in imageIndices {
+            guard let encoded = content[index]["data"] as? String else { throw CommandError.commandFailed }
+            guard encoded.utf8.count > perImageLimit else { continue }
+            guard let sourceData = Data(base64Encoded: encoded),
+                  let source = CGImageSourceCreateWithData(sourceData as CFData, nil),
+                  let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+                  let width = properties[kCGImagePropertyPixelWidth] as? Int,
+                  let height = properties[kCGImagePropertyPixelHeight] as? Int,
+                  width > 0, height > 0, width <= 80_000_000 / height,
+                  let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                throw CommandError.commandFailed
+            }
+            var replacement: Data?
+            var replacementScale = 1.0
+            for scale in [1.0, 0.75, 0.5, 0.25, 0.125] {
+                guard let scaled = Self.scaledCuaImage(image, scale: scale) else { continue }
+                for quality in [0.7, 0.5, 0.3] {
+                    guard let jpeg = Self.jpegData(scaled, quality: quality) else { continue }
+                    if jpeg.count <= perImageLimit / 4 * 3 {
+                        replacement = jpeg
+                        replacementScale = Double(scaled.width) / Double(width)
+                        screenshotSize = (scaled.width, scaled.height)
+                        break
+                    }
+                }
+                if replacement != nil { break }
+            }
+            guard let replacement else { throw CommandError.commandFailed }
+            content[index]["data"] = replacement.base64EncodedString()
+            content[index]["mimeType"] = "image/jpeg"
+            screenshotScale = replacementScale
+        }
+        updated["content"] = content
+        if let screenshotScale, let screenshotSize,
+           var structured = updated["structuredContent"] as? [String: Any],
+           structured["screenshot_width"] != nil, structured["screenshot_height"] != nil {
+            structured["screenshot_width"] = screenshotSize.0
+            structured["screenshot_height"] = screenshotSize.1
+            structured["screenshot_mime_type"] = "image/jpeg"
+            if let priorScale = structured["scale_factor"] as? Double {
+                structured["scale_factor"] = priorScale * screenshotScale
+            }
+            updated["structuredContent"] = structured
+        }
+        return updated
+    }
+
+    private static func scaledCuaImage(_ image: CGImage, scale: Double) -> CGImage? {
+        guard scale < 1 else { return image }
+        let width = max(1, Int(Double(image.width) * scale))
+        let height = max(1, Int(Double(image.height) * scale))
+        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                                      bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        context.interpolationQuality = .high
+        context.setFillColor(CGColor(gray: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage()
+    }
+
+    private static func jpegData(_ image: CGImage, quality: Double) -> Data? {
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(output, UTType.jpeg.identifier as CFString, 1, nil) else {
+            return nil
+        }
+        CGImageDestinationAddImage(destination, image,
+                                   [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return output as Data
     }
 
     static func nativeProbeSucceeded(state: DesktopProcessState, exitCode: Int32?, output: String) -> Bool {

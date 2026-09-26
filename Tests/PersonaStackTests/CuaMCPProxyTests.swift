@@ -6,6 +6,31 @@ import Testing
 @Suite
 struct CuaMCPProxyTests {
     @Test
+    func acceptsLocalScreenshotResponseLargerThanRelayFrame() async throws {
+        let script = #"""
+        #!/usr/bin/python3
+        import json, sys
+        for line in sys.stdin:
+            request = json.loads(line)
+            method = request.get("method")
+            if method == "notifications/initialized":
+                continue
+            if method == "initialize":
+                result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.28.2"}}
+            else:
+                result = {"content":[{"type":"image","mimeType":"image/png","data":"A" * (9 * 1024 * 1024)}]}
+            print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
+        """#
+        let executable = try executableScript(script)
+        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
+        let proxy = CuaMCPProxy(executableURL: executable)
+        _ = try await proxy.start()
+        let response = try await proxy.callTool(name: "get_desktop_state", argumentsJSON: Data("{}".utf8))
+        #expect(response.count > 8 * 1024 * 1024)
+        await proxy.stop()
+    }
+
+    @Test
     func stopKillsAnUnresponsiveProxyWithinItsDeadline() async throws {
         let marker = FileManager.default.temporaryDirectory.appendingPathComponent("cua-proxy-unresponsive-\(UUID().uuidString)")
         let script = #"""

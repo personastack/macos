@@ -37,6 +37,9 @@ extension CuaMCPProxyError: LocalizedError {
 
 /// Owns one Cua stdio MCP proxy process. Only reviewed Cua tool names can be called.
 public actor CuaMCPProxy {
+    // A full-resolution 5K screenshot can exceed the relay's 8 MiB frame
+    // limit before the desktop app has a chance to compress it.
+    private static let maximumLocalResponseBytes = 32 * 1024 * 1024
     private let executableURL: URL
     private let socketURL: URL?
     private let expectedDaemonPID: Int32?
@@ -245,7 +248,7 @@ public actor CuaMCPProxy {
                 throw CuaMCPProxyError.processExited
             }
             bufferedOutput.append(contentsOf: chunk.prefix(count))
-            guard bufferedOutput.count <= 8 * 1024 * 1024 else { throw CuaMCPProxyError.responseTooLarge }
+            guard bufferedOutput.count <= Self.maximumLocalResponseBytes else { throw CuaMCPProxyError.responseTooLarge }
         }
     }
 
