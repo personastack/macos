@@ -324,12 +324,21 @@ struct DesktopShellExecutorTests {
             result = try await executor.read(id: started.executionID, after: 0, wait: .milliseconds(100))
         }
         #expect(result.state != .running)
+        var cancelledWrites = 0
         for writer in writers {
             do {
                 try await writer.value
-                Issue.record("stdin write unexpectedly succeeded after its shell exited")
-            } catch {}
+            } catch {
+                cancelledWrites += 1
+            }
         }
+        // The pipe can accept early writes before the shell exits. At least one
+        // queued write must be cancelled once the detached child holds stdin.
+        #expect(cancelledWrites > 0)
+        do {
+            try await executor.write(id: started.executionID, input: .data(Data([97])))
+            Issue.record("stdin write succeeded after terminal state was observed")
+        } catch {}
         #expect(await executor.closeAll())
     }
 }
