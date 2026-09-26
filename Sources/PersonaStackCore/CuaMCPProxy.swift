@@ -26,7 +26,7 @@ extension CuaMCPProxyError: LocalizedError {
         case .functionalProbeFailed:
             return "CuaDriver.app did not return a usable screenshot and accessibility snapshot. Check its permissions and retry."
         case .serviceRunning:
-            return "Quit CuaDriver.app, then retry Desktop Control repair. PersonaStack will not terminate CuaDriver.app or replace its managed files while it is running."
+            return "Quit CuaDriver.app, then retry Desktop Control repair. Repair will not terminate the running service or replace its managed files."
         case .serviceMismatch:
             return "CuaDriver.app does not own the selected local service. Quit the other Cua service, then retry Desktop Control setup."
         default:

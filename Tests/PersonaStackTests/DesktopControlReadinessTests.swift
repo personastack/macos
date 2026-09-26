@@ -10,7 +10,7 @@ import PersonaStackCore
     #expect(DesktopControlRuntime.readiness(for: CuaMCPProxyError.functionalProbeFailed) == "cua_unavailable")
     #expect(DesktopControlRuntime.readiness(for: CuaMCPProxyError.processExited) == "cua_unavailable")
     #expect(DesktopControlRuntime.readiness(for: DesktopControlGatewayConnectionError.upgradeRequired) == "upgrade_required")
-    #expect(CuaMCPProxyError.serviceRunning.localizedDescription.contains("will not terminate CuaDriver.app"))
+    #expect(CuaMCPProxyError.serviceRunning.localizedDescription.contains("Repair will not terminate"))
     #expect(DesktopControlRuntime.readiness(for: DesktopControlEnrollmentError.rejected) == "cua_unavailable")
     #expect(!DesktopControlRuntime.shouldForceRepair(after: CuaMCPProxyError.permissionsRequired))
     #expect(!DesktopControlRuntime.shouldForceRepair(after: CuaMCPProxyError.serviceRunning))

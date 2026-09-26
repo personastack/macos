@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import os
 import PersonaStackCore
@@ -11,6 +12,12 @@ protocol DesktopControlDriverInstalling: Sendable {
 }
 
 extension CuaDriverInstaller: DesktopControlDriverInstalling {}
+
+private struct DesktopControlOwnedCuaStopError: LocalizedError {
+    var errorDescription: String? {
+        "Desktop Control disconnected, but PersonaStack could not stop the CuaDriver service it started. Quit CuaDriver.app to finish local cleanup."
+    }
+}
 
 @MainActor
 final class DesktopControlRuntime: DesktopControlSetupRuntime {
@@ -25,7 +32,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private let preferences: UserDefaults
     private let confirmForegroundSetup: @MainActor () -> Bool
     private var cuaApplication: NSRunningApplication?
+    private var ownedCuaApplication: NSRunningApplication?
+    private var ownedCuaApplicationURL: URL?
     private var selectedCuaApplicationURL: URL?
+    private var stopCuaApplication: @MainActor (NSRunningApplication, URL) async -> Bool = DesktopControlRuntime.terminateOwnedCuaApplication
     private var proxy: CuaMCPProxy?
     private var startingProxy: CuaMCPProxy?
     private var gateway: DesktopControlGatewayConnection?
@@ -92,6 +102,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                                cleanupFailed: Bool = false,
                                relayStateReader: (any DesktopControlRelayStateReading)? = nil,
                                preferences: UserDefaults = .standard,
+                               ownedCuaApplication: NSRunningApplication? = nil,
+                               stopCuaApplication: (@MainActor (NSRunningApplication, URL) async -> Bool)? = nil,
                                confirmForegroundSetup: @escaping @MainActor () -> Bool = { true }) -> DesktopControlRuntime {
         let runtime = DesktopControlRuntime(installer: installer, credentials: credentials, relayStateReader: relayStateReader, preferences: preferences, confirmForegroundSetup: confirmForegroundSetup)
         if let executor { runtime.executor = executor }
@@ -102,6 +114,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         runtime.paused = paused
         runtime.executorCleanupInProgress = cleanupInProgress
         runtime.executorCleanupFailed = cleanupFailed
+        runtime.ownedCuaApplication = ownedCuaApplication
+        if ownedCuaApplication != nil { runtime.ownedCuaApplicationURL = Bundle.main.bundleURL }
+        if let stopCuaApplication { runtime.stopCuaApplication = stopCuaApplication }
         if let sessionLockState { runtime.sessionLock.receive(sessionLockState) }
         return runtime
     }
@@ -224,12 +239,16 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                 )
                 try requireCurrentLifecycle(generation)
                 let socketURL = Self.cuaSocketURL()
-                let application = try await launchCuaService(
+                let (application, launched) = try await launchCuaService(
                     at: installation.applicationURL, socketURL: socketURL, generation: generation
                 )
-                try requireCurrentLifecycle(generation)
                 cuaApplication = application
+                if launched {
+                    ownedCuaApplication = application
+                    ownedCuaApplicationURL = installation.applicationURL
+                }
                 selectedCuaApplicationURL = installation.applicationURL
+                try requireCurrentLifecycle(generation)
 
                 let candidate = CuaMCPProxy(
                     executableURL: installation.executableURL,
@@ -359,6 +378,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         await pending?.stop()
         await current?.stop()
         await stopLocalControl(generation: generation)
+        _ = await stopOwnedCuaService()
         activeInstallation = nil
     }
 
@@ -423,10 +443,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         gateway = nil
         gatewayConnectionID = nil
         gatewayConnected = false
+        let cuaStopped = await stopOwnedCuaService()
         activeInstallation = nil
         if let credentialLoadError { throw credentialLoadError }
         if installation != nil { try credentials.delete() }
         paused = false
+        if !cuaStopped { throw DesktopControlOwnedCuaStopError() }
     }
 
     func connect(installation: DesktopControlInstallation, expectedGeneration: UUID? = nil) async {
@@ -517,7 +539,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func launchCuaService(at applicationURL: URL, socketURL: URL,
-                                  generation: UUID) async throws -> NSRunningApplication {
+                                  generation: UUID) async throws -> (NSRunningApplication, Bool) {
         let running = NSWorkspace.shared.runningApplications.filter {
             $0.bundleIdentifier == CuaDriverCompatibility.bundleIdentifier && !$0.isTerminated
         }
@@ -536,6 +558,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                 at: applicationURL,
                 configuration: Self.cuaServiceLaunchConfiguration(socketURL: socketURL)
             )
+            ownedCuaApplication = application
+            ownedCuaApplicationURL = applicationURL
         }
         guard Self.matchesSelectedApplication(application.bundleURL, applicationURL),
               application.processIdentifier > 0 else { throw CuaMCPProxyError.serviceMismatch }
@@ -545,7 +569,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             guard !application.isTerminated else { throw CuaMCPProxyError.processExited }
             if let peerPID = CuaSocketIdentity.peerPID(at: socketURL) {
                 guard peerPID == application.processIdentifier else { throw CuaMCPProxyError.serviceMismatch }
-                return application
+                return (application, running.isEmpty)
             }
             try await Task.sleep(for: .milliseconds(50))
         } while ProcessInfo.processInfo.systemUptime < deadline
@@ -851,7 +875,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         guard generation == lifecycleGeneration else { return }
         await stopLocalControl(generation: generation)
         guard generation == lifecycleGeneration else { return }
-        if executorCleanupFailed {
+        let cuaStopped = await stopOwnedCuaService()
+        guard generation == lifecycleGeneration else { return }
+        if executorCleanupFailed || !cuaStopped {
             readiness = "cua_unavailable"
             await gateway?.setReadiness(readiness)
             if let installation = activeInstallation, gateway != nil { beginReconnectLoop(for: installation) }
@@ -866,6 +892,41 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         preferences.set(false, forKey: "desktopControlRelayPaused")
         paused = false
         readiness = "unknown"
+    }
+
+    private func stopOwnedCuaService() async -> Bool {
+        guard let ownedCuaApplication else {
+            cuaApplication = nil
+            selectedCuaApplicationURL = nil
+            return true
+        }
+        guard let ownedCuaApplicationURL else { return false }
+        guard await stopCuaApplication(ownedCuaApplication, ownedCuaApplicationURL) else { return false }
+        guard self.ownedCuaApplication === ownedCuaApplication else { return true }
+        self.ownedCuaApplication = nil
+        self.ownedCuaApplicationURL = nil
+        if cuaApplication === ownedCuaApplication {
+            cuaApplication = nil
+            selectedCuaApplicationURL = nil
+        }
+        return true
+    }
+
+    private static func terminateOwnedCuaApplication(_ application: NSRunningApplication, selectedURL: URL) async -> Bool {
+        guard matchesSelectedApplication(application.bundleURL, selectedURL), application.processIdentifier > 0 else { return false }
+        if application.isTerminated { return true }
+        if let peerPID = CuaSocketIdentity.peerPID(at: cuaSocketURL()), peerPID != application.processIdentifier { return false }
+        let quitRequested = application.terminate()
+        let deadline = ProcessInfo.processInfo.systemUptime + 2
+        var signaled = false
+        while !application.isTerminated && ProcessInfo.processInfo.systemUptime < deadline {
+            if !signaled && (!quitRequested || ProcessInfo.processInfo.systemUptime >= deadline - 1) {
+                _ = Darwin.kill(application.processIdentifier, SIGTERM)
+                signaled = true
+            }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return application.isTerminated
     }
 
     static func readiness(for error: Error) -> String {

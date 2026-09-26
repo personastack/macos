@@ -52,10 +52,13 @@ private struct SavedDesktopControlCredentialStore: DesktopControlCredentialStori
 @Test @MainActor func quitFencesTheRelayAndLeavesEnrollmentForNextLaunch() async throws {
     let payload = Data(#"{"installation_id":"installation-quit","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8)
     let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
+    var cuaStops = 0
     let runtime = DesktopControlRuntime.makeForTesting(
         installer: DesktopControlInstallerFixture(errors: []),
         credentials: SavedDesktopControlCredentialStore(installation: installation),
-        installation: installation, connected: true, readiness: "ready")
+        installation: installation, connected: true, readiness: "ready",
+        ownedCuaApplication: NSRunningApplication.current,
+        stopCuaApplication: { _, _ in cuaStops += 1; return true })
     let generation = try runtime.beginResume()
 
     await runtime.shutdownForQuit()
@@ -65,6 +68,41 @@ private struct SavedDesktopControlCredentialStore: DesktopControlCredentialStori
     #expect(runtime.readiness == "paused")
     #expect(!runtime.gatewayConnected)
     #expect(!runtime.hasActiveInstallation)
+    #expect(cuaStops == 1)
+}
+
+@Test @MainActor func machineDisconnectStopsOnlyCuaStartedByThisApp() async throws {
+    for ownsCua in [false, true] {
+        var cuaStops = 0
+        let runtime = DesktopControlRuntime.makeForTesting(
+            installer: DesktopControlInstallerFixture(errors: []),
+            credentials: EmptyDesktopControlCredentialStore(),
+            ownedCuaApplication: ownsCua ? NSRunningApplication.current : nil,
+            stopCuaApplication: { _, _ in cuaStops += 1; return true }
+        )
+
+        try await runtime.disconnect()
+
+        #expect(cuaStops == (ownsCua ? 1 : 0))
+        #expect(!runtime.gatewayConnected)
+    }
+}
+
+@Test @MainActor func machineDisconnectReportsOwnedCuaStopFailure() async throws {
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []),
+        credentials: EmptyDesktopControlCredentialStore(),
+        ownedCuaApplication: NSRunningApplication.current,
+        stopCuaApplication: { _, _ in false }
+    )
+
+    do {
+        try await runtime.disconnect()
+        Issue.record("expected local Cua cleanup failure")
+    } catch {
+        #expect(error.localizedDescription.contains("could not stop the CuaDriver service"))
+    }
+    #expect(!runtime.gatewayConnected)
 }
 
 @Test @MainActor func quitWaitsForCleanupAndRepliesOnlyOnce() async {
@@ -320,6 +358,62 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
         #expect(runtime.hasActiveInstallation == hasActiveConfig)
         #expect(preferences.bool(forKey: "desktopControlRelayEnabled") == hasActiveConfig)
     }
+}
+
+@Test @MainActor func idleRelayStopsOnlyItsOwnedCuaAfterLastMapping() async throws {
+    let payload = Data(#"{"installation_id":"install-cua-idle","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8)
+    var installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
+    try installation.bindEnvironment(URL(string: "https://my.personastack.ai")!)
+
+    for (hasActiveConfig, ownsCua, expectedStops) in [(true, true, 0), (false, false, 0), (false, true, 1)] {
+        let suite = "desktop-control-owned-cua-\(UUID().uuidString)"
+        let preferences = try #require(UserDefaults(suiteName: suite))
+        defer { preferences.removePersistentDomain(forName: suite) }
+        preferences.set(true, forKey: "desktopControlRelayEnabled")
+        var cuaStops = 0
+        let runtime = DesktopControlRuntime.makeForTesting(
+            installer: DesktopControlInstallerFixture(errors: []),
+            credentials: SavedDesktopControlCredentialStore(installation: installation),
+            connectionID: UUID(), installation: installation, connected: true,
+            readiness: "ready", relayStateReader: DesktopControlRelayStateFixture(active: hasActiveConfig),
+            preferences: preferences,
+            ownedCuaApplication: ownsCua ? NSRunningApplication.current : nil,
+            stopCuaApplication: { _, _ in cuaStops += 1; return true }
+        )
+
+        await runtime.finishSetupIfIdle()
+
+        #expect(cuaStops == expectedStops)
+        #expect(runtime.gatewayConnected == hasActiveConfig)
+        #expect(preferences.bool(forKey: "desktopControlRelayEnabled") == hasActiveConfig)
+    }
+}
+
+@Test @MainActor func idleRelayRetriesWhenOwnedCuaCannotStop() async throws {
+    let payload = Data(#"{"installation_id":"install-cua-stop-failure","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8)
+    var installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
+    try installation.bindEnvironment(URL(string: "https://my.personastack.ai")!)
+    let suite = "desktop-control-cua-stop-failure-\(UUID().uuidString)"
+    let preferences = try #require(UserDefaults(suiteName: suite))
+    defer { preferences.removePersistentDomain(forName: suite) }
+    preferences.set(true, forKey: "desktopControlRelayEnabled")
+    var cuaStops = 0
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []),
+        credentials: SavedDesktopControlCredentialStore(installation: installation),
+        connectionID: UUID(), installation: installation, connected: true,
+        readiness: "ready", relayStateReader: DesktopControlRelayStateFixture(active: false),
+        preferences: preferences, ownedCuaApplication: NSRunningApplication.current,
+        stopCuaApplication: { _, _ in cuaStops += 1; return false }
+    )
+
+    await runtime.finishSetupIfIdle()
+
+    #expect(cuaStops == 1)
+    #expect(runtime.gatewayConnected)
+    #expect(runtime.hasActiveInstallation)
+    #expect(runtime.readiness == "cua_unavailable")
+    #expect(preferences.bool(forKey: "desktopControlRelayEnabled"))
 }
 
 @Test @MainActor func idleRelayKeepsInstallationWhenExecutorCleanupFails() async throws {
