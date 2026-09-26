@@ -51,7 +51,7 @@ PersonaStack for macOS presents a selected PersonaStack web surface in a dedicat
 
 - Only the desktop app exposes pop-out controls on Stack Settings. A strict main-frame `personastackStack` bridge accepts version `1` `open_stack_view` messages with one validated `stack_id` and either `graph` or `stream` view.
 - Each view and stack pair has at most one ordinary, resizable, Dock-miniaturizable, visually borderless native window. It loads `/user/stacks/desktop-popout?stack_id=…&view=…` through the shared WebKit data store. Native code never reads stack content or calls PersonaStack APIs.
-- The graph page and native canvas are transparent. It renders only the existing shared graph personas, integration circles, connection lines, and motion. The stream keeps its existing hosted card surface and stack-name heading against an opaque, edge-to-edge canvas.
+- The graph page and native canvas are transparent. The graph-only WebKit view disables its default opaque page fill so the OS remains visible between graph elements. It renders only the existing shared graph personas, integration circles, connection lines, and motion. The stream keeps its existing hosted card surface and stack-name heading against an opaque, edge-to-edge canvas.
 - Stream windows hide the standard titlebar controls and use a narrow draggable native strip with a custom close button at the top-right. Do not add a window menu bar.
 - Windows are ephemeral and close on login/logout invalidation, failed or denied hosted navigation, WebKit termination, or normal window close. They are not restored across app launches.
 

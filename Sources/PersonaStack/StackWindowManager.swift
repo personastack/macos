@@ -103,9 +103,14 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             window.standardWindowButton(button)?.isHidden = true
         }
         webView.underPageBackgroundColor = .clear
-        // The hosted graph page and the public under-page color provide the
-        // transparent canvas. Do not use private WebKit drawing controls.
-        _ = transparent
+        if transparent {
+            // On macOS, underPageBackgroundColor does not suppress WebKit's
+            // opaque page fill. The graph needs the page itself to stay clear.
+            let setter = NSSelectorFromString("_setDrawsBackground:")
+            if webView.responds(to: setter) {
+                webView.setValue(false, forKey: "drawsBackground")
+            }
+        }
         if let windowChrome {
             let contentView = NSView(frame: .zero)
             webView.translatesAutoresizingMaskIntoConstraints = false
