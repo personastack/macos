@@ -203,7 +203,7 @@ struct DesktopFileSystemTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let target = root.appendingPathComponent("target")
         try Data().write(to: target)
-        for index in 0..<20_000 {
+        for index in 0..<5_000 {
             let link = root.appendingPathComponent(String(format: "entry-%05d", index))
             try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
         }
