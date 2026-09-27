@@ -72,7 +72,11 @@ struct DesktopControlMenu: View {
         Divider()
         Button("Open PersonaStack") {
             NSApp.setActivationPolicy(.regular)
-            openWindow(id: "personastack-main")
+            if let mainWindow = NSApp.windows.first(where: { $0.title == "PersonaStack" }) {
+                mainWindow.makeKeyAndOrderFront(nil)
+            } else {
+                openWindow(id: "personastack-main")
+            }
             NSApp.activate(ignoringOtherApps: true)
         }
         Button("Quit PersonaStack Desktop") {
