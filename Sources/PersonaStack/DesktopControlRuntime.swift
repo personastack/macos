@@ -1032,10 +1032,25 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             guard commandGeneration == lifecycleGeneration else { return response }
             readiness = recoveredReadiness
             await gateway?.setReadiness(readiness)
+            if Self.shouldRetryGuiObservation(operation: frame.operation, readiness: readiness),
+               Self.acceptsCommand(connectionID: connectionID,
+                                   currentConnectionID: gatewayConnectionID,
+                                   disconnecting: disconnecting),
+               !paused, sessionLock.allowsControl, !executorCleanupInProgress, !executorCleanupFailed {
+                let retried = await executor.handle(frame, proxy: proxy, onChunk: onChunk)
+                guard sessionLock.allowsControl else {
+                    return Self.failure(for: frame, code: "locked", message: "This Mac locked while the command was running. Check whether the action completed before retrying.")
+                }
+                return retried
+            }
             if readiness == "ready" { return response }
             return Self.failure(for: frame, code: readiness, message: "Cua could not complete GUI control. Review its permissions and service status in PersonaStack Desktop.")
         }
         return response
+    }
+
+    static func shouldRetryGuiObservation(operation: String?, readiness: String) -> Bool {
+        operation == "desktop_control_observe" && readiness == "ready"
     }
 
     private func heartbeatReadiness() async -> String? {

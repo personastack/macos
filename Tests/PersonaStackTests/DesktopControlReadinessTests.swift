@@ -123,6 +123,18 @@ import PersonaStackCore
 }
 
 @MainActor
+@Test func onlyReadyObservationsCanRetryAfterCuaFailure() {
+    #expect(DesktopControlRuntime.shouldRetryGuiObservation(operation: "desktop_control_observe", readiness: "ready"))
+    for operation in ["desktop_control_input", "desktop_control_application", "desktop_control_window",
+                      "desktop_control_clipboard", "desktop_control_browser"] {
+        #expect(!DesktopControlRuntime.shouldRetryGuiObservation(operation: operation, readiness: "ready"))
+    }
+    for readiness in ["permission_required", "cua_unavailable", "locked", "paused"] {
+        #expect(!DesktopControlRuntime.shouldRetryGuiObservation(operation: "desktop_control_observe", readiness: readiness))
+    }
+}
+
+@MainActor
 @Test func degradedGuiHeartbeatRechecksOnlyAnUnlockedUsableCuaService() {
     for readiness in ["permission_required", "cua_unavailable"] {
         #expect(DesktopControlRuntime.shouldProbeGuiRecovery(readiness: readiness, paused: false,
