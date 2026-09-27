@@ -22,7 +22,9 @@ esac
 
 "$root_dir/scripts/build-icon.sh"
 swift run --package-path "$root_dir" PersonaStackPolicyCheck
-rm -rf "$arm64_build_dir" "$x86_64_build_dir"
+if [ "${CLEAN_BUILD:-1}" = 1 ]; then
+  rm -rf "$arm64_build_dir" "$x86_64_build_dir"
+fi
 swift build --package-path "$root_dir" --scratch-path "$arm64_build_dir" --triple arm64-apple-macosx14.0 -c "$configuration"
 swift build --package-path "$root_dir" --scratch-path "$x86_64_build_dir" --triple x86_64-apple-macosx14.0 -c "$configuration"
 arm64_binary=$(find "$arm64_build_dir" -type f -name PersonaStack -perm -111 -print -quit)
