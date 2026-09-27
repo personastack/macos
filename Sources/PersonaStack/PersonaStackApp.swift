@@ -38,6 +38,14 @@ struct PersonaStackApp: App {
         }
         .defaultSize(width: 1440, height: 960)
         .windowStyle(.hiddenTitleBar)
+        .commands {
+            CommandGroup(after: .toolbar) {
+                Button("Toggle Full Screen") {
+                    NSApp.keyWindow?.toggleFullScreen(nil)
+                }
+                .keyboardShortcut("f", modifiers: [.control, .command])
+            }
+        }
 
         MenuBarExtra("PersonaStack Desktop", systemImage: "cursorarrow.motionlines") {
             DesktopControlMenu()
