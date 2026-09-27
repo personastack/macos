@@ -44,6 +44,20 @@ private struct MainThreadRejectingCredentialStore: DesktopControlCredentialStori
     func delete() throws {}
 }
 
+@Test @MainActor func overlappingRepairDoesNotReplaceTheActiveLifecycle() async throws {
+    let installer = DesktopControlInstallerFixture(errors: [])
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: installer, credentials: EmptyDesktopControlCredentialStore()
+    )
+    let first = try runtime.beginRepair()
+
+    #expect(throws: CancellationError.self) { try runtime.beginRepair() }
+    await #expect(throws: CuaDriverInstallError.self) {
+        try await runtime.repair(generation: first)
+    }
+    _ = try runtime.beginRepair()
+}
+
 @Test @MainActor func startupRequiresAccessibleDesktopEnrollmentBeforeStartingCua() async {
     let installer = DesktopControlInstallerFixture(errors: [])
     let missing = DesktopControlRuntime.makeForTesting(installer: installer, credentials: EmptyDesktopControlCredentialStore())

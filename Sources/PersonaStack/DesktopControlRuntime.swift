@@ -48,6 +48,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private var lifecycleGeneration = UUID()
     private var setupMayRunUnconfigured = false
     private var disconnecting = false
+    private var repairInProgress = false
     private var executorCleanupInProgress = false
     private var executorCleanupTask: Task<Bool, Never>?
     private var executorCleanupFailed = false
@@ -186,8 +187,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     func beginRepair(expectedGeneration: UUID? = nil) throws -> UUID {
-        guard !disconnecting else { throw CancellationError() }
+        guard !disconnecting, !repairInProgress else { throw CancellationError() }
         if let expectedGeneration { try requireCurrentLifecycle(expectedGeneration) }
+        repairInProgress = true
         lifecycleGeneration = UUID()
         return lifecycleGeneration
     }
@@ -199,6 +201,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     func repair(generation: UUID, resumeRelay: Bool = false) async throws {
+        defer { repairInProgress = false }
         try requireCurrentLifecycle(generation)
         guard !disconnecting else { throw CancellationError() }
         let remainPaused = paused && !resumeRelay
@@ -1174,10 +1177,18 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             timeout: timeout
         )
         try requireCurrentLifecycle(generation)
-        guard let permissionResult = Self.toolResult(permissions),
-              let structured = permissionResult["structuredContent"] as? [String: Any],
-              structured["accessibility"] as? Bool == true,
-              structured["screen_recording"] as? Bool == true else {
+        let permissionResult = Self.toolResult(permissions)
+        let structured = permissionResult?["structuredContent"] as? [String: Any]
+        guard structured?["accessibility"] as? Bool == true,
+              structured?["screen_recording"] as? Bool == true else {
+            let envelope = (try? JSONSerialization.jsonObject(with: permissions)) as? [String: Any]
+            let rawResult = envelope?["result"] as? [String: Any]
+            let rpcError = envelope?["error"] != nil
+            let toolError = rawResult?["isError"] as? Bool == true
+            let hasStructured = structured != nil
+            let accessibility = structured?["accessibility"] as? Bool == true
+            let screenRecording = structured?["screen_recording"] as? Bool == true
+            logger.error("Cua permission probe failed rpcError=\(rpcError, privacy: .public) toolError=\(toolError, privacy: .public) structured=\(hasStructured, privacy: .public) accessibility=\(accessibility, privacy: .public) screenRecording=\(screenRecording, privacy: .public)")
             throw CuaMCPProxyError.permissionsRequired
         }
     }

@@ -5,6 +5,7 @@ import SwiftUI
 
 private final class DesktopControlMenuStatus: ObservableObject {
     @Published var revision = 0
+    @Published var isRepairing = false
     private var refresh: AnyCancellable?
 
     init() {
@@ -36,9 +37,10 @@ struct DesktopControlMenu: View {
             }
         Divider()
         if relayEnabled {
-            Button("Repair Cua Service") {
+            Button(status.isRepairing ? "Repairing Cua Service…" : "Repair Cua Service") {
                 Task { await repairCua() }
             }
+            .disabled(status.isRepairing)
         }
         if relayEnabled && DesktopControlRuntime.shared.requiresForegroundSessionConfirmation {
             Button("Confirm This Mac Is Unlocked") {
@@ -95,12 +97,22 @@ struct DesktopControlMenu: View {
 
     private var relayStatus: String {
         _ = status.revision
+        if status.isRepairing { return "Repairing Cua Service…" }
         if !relayError.isEmpty { return "Desktop Control needs attention" }
         if !relayEnabled { return "Relay paused" }
         if relayPaused { return "Remote control paused. Connection active." }
         let runtime = DesktopControlRuntime.shared
         if let message = runtime.sessionRecoveryMessage { return message }
         if !runtime.isCuaReady() { return "Cua service needs attention" }
+        switch runtime.readiness {
+        case "permission_required": return "Cua permissions need attention"
+        case "cua_unavailable": return "Cua service needs attention"
+        case "locked": return "Mac is locked"
+        case "paused": return "Remote control paused"
+        case "upgrade_required": return "Desktop update required"
+        case "ready": break
+        default: return "Desktop Control is starting"
+        }
         return runtime.gatewayConnected ? "Connected to PersonaStack" : "Waiting for PersonaStack connection"
     }
 
@@ -143,6 +155,9 @@ struct DesktopControlMenu: View {
 
     @MainActor
     private func repairCua() async {
+        guard !status.isRepairing else { return }
+        status.isRepairing = true
+        defer { status.isRepairing = false }
         loginItemError = ""
         repairError = ""
         let runtime = DesktopControlRuntime.shared

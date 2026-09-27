@@ -1,10 +1,12 @@
 import Foundation
 import ImageIO
+import os
 import PersonaStackCore
 import UniformTypeIdentifiers
 
 @MainActor
 final class DesktopControlCommandExecutor {
+    private let logger = Logger(subsystem: "ai.personastack.desktop", category: "desktop-control-cua")
     private struct Owner: Equatable {
         let installationID: String
         let workspaceID: String
@@ -547,8 +549,12 @@ final class DesktopControlCommandExecutor {
         let encoded = try JSONEncoder().encode(rawArguments)
         let response = try await proxy.callTool(name: name, argumentsJSON: encoded)
         guard let object = try JSONSerialization.jsonObject(with: response) as? [String: Any],
-              let result = object["result"] as? [String: Any], object["error"] == nil,
-              !Self.isCuaToolError(result) else {
+              let result = object["result"] as? [String: Any], object["error"] == nil else {
+            logger.error("Cua tool response invalid tool=\(name, privacy: .public)")
+            throw CommandError.commandFailed
+        }
+        guard !Self.isCuaToolError(result) else {
+            logger.error("Cua tool returned an error tool=\(name, privacy: .public)")
             throw CommandError.commandFailed
         }
         return try Self.boundedCuaImageResult(result)
