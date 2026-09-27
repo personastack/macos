@@ -32,7 +32,7 @@ PersonaStack for macOS presents a selected PersonaStack web surface in a dedicat
 
 ## Version 0.1.4 behavior
 
-- Use a transparent full-size native title bar backed by the website's dark canvas color `#0a0a14`. Fill the titlebar safe area with that color and keep the standard close, minimize, and full-screen controls.
+- Use a transparent full-size native title bar backed by the website's dark canvas color `#0a0a14`. Fill the titlebar safe area with that color and keep the standard close, minimize, and full-screen controls. The main window joins macOS full-screen Spaces through its native green window control.
 
 ## Floating persona chat
 

@@ -12,7 +12,9 @@ public enum WindowPresentation {
     public static func configure(_ window: NSWindow) {
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
-        window.styleMask.insert(.fullSizeContentView)
+        window.styleMask.formUnion([.fullSizeContentView, .resizable])
+        window.collectionBehavior.remove(.fullScreenNone)
+        window.collectionBehavior.insert(.fullScreenPrimary)
         window.toolbar = nil
         window.backgroundColor = canvasColor
         window.appearance = NSAppearance(named: .darkAqua)
