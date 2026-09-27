@@ -1179,18 +1179,26 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         try requireCurrentLifecycle(generation)
         let permissionResult = Self.toolResult(permissions)
         let structured = permissionResult?["structuredContent"] as? [String: Any]
-        guard structured?["accessibility"] as? Bool == true,
-              structured?["screen_recording"] as? Bool == true else {
-            let envelope = (try? JSONSerialization.jsonObject(with: permissions)) as? [String: Any]
-            let rawResult = envelope?["result"] as? [String: Any]
-            let rpcError = envelope?["error"] != nil
-            let toolError = rawResult?["isError"] as? Bool == true
-            let hasStructured = structured != nil
-            let accessibility = structured?["accessibility"] as? Bool == true
-            let screenRecording = structured?["screen_recording"] as? Bool == true
+        let envelope = (try? JSONSerialization.jsonObject(with: permissions)) as? [String: Any]
+        let rawResult = envelope?["result"] as? [String: Any]
+        let rpcError = envelope?["error"] != nil
+        let toolError = rawResult?["isError"] as? Bool == true
+        let hasStructured = structured != nil
+        let accessibility = structured?["accessibility"] as? Bool == true
+        let screenRecording = structured?["screen_recording"] as? Bool == true
+        if let failure = Self.permissionProbeFailure(rpcError: rpcError, toolError: toolError,
+                                                     hasStructured: hasStructured, accessibility: accessibility,
+                                                     screenRecording: screenRecording) {
             logger.error("Cua permission probe failed rpcError=\(rpcError, privacy: .public) toolError=\(toolError, privacy: .public) structured=\(hasStructured, privacy: .public) accessibility=\(accessibility, privacy: .public) screenRecording=\(screenRecording, privacy: .public)")
-            throw CuaMCPProxyError.permissionsRequired
+            throw failure
         }
+    }
+
+    static func permissionProbeFailure(rpcError: Bool, toolError: Bool, hasStructured: Bool,
+                                       accessibility: Bool, screenRecording: Bool) -> CuaMCPProxyError? {
+        if rpcError || toolError || !hasStructured { return .functionalProbeFailed }
+        if !accessibility || !screenRecording { return .permissionsRequired }
+        return nil
     }
 
     private static func toolResult(_ data: Data) -> [String: Any]? {

@@ -23,6 +23,18 @@ import PersonaStackCore
 }
 
 @MainActor
+@Test func cuaPermissionProbeSeparatesToolFailureFromDeniedGrants() {
+    #expect(DesktopControlRuntime.permissionProbeFailure(rpcError: false, toolError: true,
+        hasStructured: false, accessibility: false, screenRecording: false) == .functionalProbeFailed)
+    #expect(DesktopControlRuntime.permissionProbeFailure(rpcError: true, toolError: false,
+        hasStructured: false, accessibility: false, screenRecording: false) == .functionalProbeFailed)
+    #expect(DesktopControlRuntime.permissionProbeFailure(rpcError: false, toolError: false,
+        hasStructured: true, accessibility: true, screenRecording: false) == .permissionsRequired)
+    #expect(DesktopControlRuntime.permissionProbeFailure(rpcError: false, toolError: false,
+        hasStructured: true, accessibility: true, screenRecording: true) == nil)
+}
+
+@MainActor
 @Test func cuaLaunchAndProxySelectOneSocketAndAppBundle() {
     let home = URL(fileURLWithPath: "/tmp/cua-test-home")
     let socket = DesktopControlRuntime.cuaSocketURL(homeDirectory: home)
