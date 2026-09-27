@@ -111,6 +111,10 @@ public actor CuaMCPProxy {
         return try request(method: "tools/call", parameters: String(decoding: params, as: UTF8.self), timeout: timeout)
     }
 
+    public func isProcessRunning() -> Bool {
+        started && process.isRunning && !interruption.isInterrupted
+    }
+
     /// Wake a blocked tool call without waiting for this actor's synchronous read.
     /// This only stops our stdio proxy. It never signals the Cua service.
     nonisolated public func interrupt() {

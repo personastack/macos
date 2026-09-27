@@ -72,6 +72,18 @@ private struct MainThreadRejectingCredentialStore: DesktopControlCredentialStori
     #expect(DesktopControlEnrollmentError.credentialStoreUnavailable.localizedDescription.contains("Keychain"))
 }
 
+@Test @MainActor func heartbeatStopsReportingReadyAfterEmbeddedCuaProxyExits() async {
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []),
+        credentials: EmptyDesktopControlCredentialStore(),
+        proxy: CuaMCPProxy(executableURL: URL(fileURLWithPath: "/nonexistent/cua-driver")),
+        readiness: "ready"
+    )
+
+    #expect(await runtime.heartbeatReadinessForTesting() == "cua_unavailable")
+    #expect(runtime.readiness == "cua_unavailable")
+}
+
 @Test @MainActor func startupReadsKeychainAwayFromTheMainActor() async {
     let runtime = DesktopControlRuntime.makeForTesting(
         installer: DesktopControlInstallerFixture(errors: []),

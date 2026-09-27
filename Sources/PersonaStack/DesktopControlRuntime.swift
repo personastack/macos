@@ -95,6 +95,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     static func makeForTesting(installer: any DesktopControlDriverInstalling,
                                credentials: any DesktopControlCredentialStoring,
                                executor: DesktopControlCommandExecutor? = nil,
+                               proxy: CuaMCPProxy? = nil,
                                connectionID: UUID? = nil,
                                installation: DesktopControlInstallation? = nil,
                                connected: Bool = false,
@@ -110,6 +111,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                                confirmForegroundSetup: @escaping @MainActor () -> Bool = { true }) -> DesktopControlRuntime {
         let runtime = DesktopControlRuntime(installer: installer, credentials: credentials, relayStateReader: relayStateReader, preferences: preferences, confirmForegroundSetup: confirmForegroundSetup)
         if let executor { runtime.executor = executor }
+        runtime.proxy = proxy
         runtime.gatewayConnectionID = connectionID
         runtime.activeInstallation = installation
         runtime.gatewayConnected = connected
@@ -131,6 +133,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     var lockCleanupStartedForTesting: Bool { executorCleanupInProgress && readiness == "locked" }
 
     func waitForLockCleanupForTesting() async { await lockCleanupTask?.value }
+
+    func heartbeatReadinessForTesting() async -> String? { await heartbeatReadiness() }
 #endif
 
     func beginResume() throws -> UUID {
@@ -1004,6 +1008,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         guard let activeInstallation, frame.target?.installationID == activeInstallation.installationID else {
             return Self.failure(for: frame, code: "desktop_executor_unavailable")
         }
+        if isStatus || Self.requiresCua(frame.operation) {
+            await markExitedCuaProxyUnavailable()
+        }
         if Self.requiresCua(frame.operation) {
             if readiness == "ready", !isCuaReady() {
                 readiness = "cua_unavailable"
@@ -1054,6 +1061,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func heartbeatReadiness() async -> String? {
+        await markExitedCuaProxyUnavailable()
         if Self.shouldProbeGuiRecovery(readiness: readiness, paused: paused,
                                        unlocked: sessionLock.allowsControl, cuaReady: isCuaReady()),
            let proxy {
@@ -1088,6 +1096,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         }
         Self.clearRecoveredRepairError(preferences: preferences, readiness: readiness, cuaReady: true)
         return readiness
+    }
+
+    private func markExitedCuaProxyUnavailable() async {
+        guard readiness == "ready", let currentProxy = proxy else { return }
+        guard !(await currentProxy.isProcessRunning()), readiness == "ready", proxy === currentProxy else { return }
+        readiness = "cua_unavailable"
     }
 
     static func clearRecoveredRepairError(preferences: UserDefaults, readiness: String, cuaReady: Bool) {
@@ -1131,6 +1145,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
               let application = cuaApplication, let selectedCuaApplicationURL else {
             throw CuaMCPProxyError.serviceMismatch
         }
+        if !(await failed.isProcessRunning()) {
+            await failed.stop()
+        }
         let candidate = CuaMCPProxy(
             executableURL: selectedCuaApplicationURL.deletingLastPathComponent().appendingPathComponent("cua-driver"),
             socketURL: Self.cuaSocketURL(), expectedDaemonPID: application.processIdentifier
@@ -1142,7 +1159,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             let catalog = try await candidate.listTools()
             try requireCurrentLifecycle(generation)
             let validatedTools = try await candidate.validateToolCatalog(catalog)
-            try await verifyCuaReadiness(candidate, generation: generation, timeout: 5)
+            try await verifyCuaReadiness(candidate, generation: generation, timeout: 25)
             try requireCurrentLifecycle(generation)
             guard proxy === failed, startingProxy === candidate, isCuaReady() else {
                 throw CuaMCPProxyError.serviceMismatch
