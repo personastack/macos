@@ -69,7 +69,6 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
     private let url: URL
     private let onClose: () -> Void
     private var titleBarHeight: NSLayoutConstraint?
-    private var webViewTop: NSLayoutConstraint?
     private var expandedSize = NSSize(width: 440, height: 676)
     private var collapsed = false
     private var disposed = false
@@ -104,11 +103,9 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
         titleBar.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(webView)
         contentView.addSubview(titleBar)
-        // The hosted chat has a four-point transparent edge. Fill it so the two surfaces read as one card.
         let barHeight = titleBar.heightAnchor.constraint(equalToConstant: 40)
-        let contentTop = webView.topAnchor.constraint(equalTo: titleBar.bottomAnchor, constant: -4)
+        let contentTop = webView.topAnchor.constraint(equalTo: titleBar.bottomAnchor)
         titleBarHeight = barHeight
-        webViewTop = contentTop
         NSLayoutConstraint.activate([
             titleBar.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             titleBar.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
@@ -201,7 +198,6 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
         collapsed = next
         webView.collapsed = next
         titleBarHeight?.constant = next ? 0 : 40
-        webViewTop?.constant = next ? 0 : -4
         titleBar.isHidden = next
         for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton] {
             window.standardWindowButton(button)?.isHidden = next
@@ -246,7 +242,7 @@ final class ChatWindowTitleBar: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.backgroundColor = NSColor(srgbRed: 18.0 / 255, green: 18.0 / 255, blue: 42.0 / 255, alpha: 0.96).cgColor
+        layer?.backgroundColor = NSColor(srgbRed: 18.0 / 255, green: 18.0 / 255, blue: 42.0 / 255, alpha: 1).cgColor
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -264,9 +260,15 @@ final class ChatWebView: WKWebView {
         super.layout()
         wantsLayer = true
         let mask = CAShapeLayer()
-        let rect = bounds.insetBy(dx: 4, dy: 4)
-        mask.path = collapsed ? CGPath(ellipseIn: rect, transform: nil)
-            : CGPath(roundedRect: rect, cornerWidth: 12, cornerHeight: 12, transform: nil)
+        if collapsed {
+            mask.path = CGPath(ellipseIn: bounds.insetBy(dx: 4, dy: 4), transform: nil)
+        } else {
+            let rect = NSRect(x: 0, y: 4, width: bounds.width, height: bounds.height - 4)
+            let path = CGMutablePath()
+            path.addRoundedRect(in: rect, cornerWidth: 12, cornerHeight: 12)
+            path.addRect(CGRect(x: rect.minX, y: rect.maxY - 12, width: rect.width, height: 12))
+            mask.path = path
+        }
         layer?.mask = mask
     }
 }
