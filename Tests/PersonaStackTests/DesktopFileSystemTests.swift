@@ -3,6 +3,78 @@ import Testing
 @testable import PersonaStackCore
 
 struct DesktopFileSystemTests {
+    @Test func sharedDesktopParityFileFixtures() async throws {
+        let fixture = try DesktopParityFixture.load().files
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let boundary = fixture.utf8Boundary
+        var boundaryBytes = Data(repeating: 97, count: boundary.asciiPrefixBytes)
+        boundaryBytes.append(try Data(hexString: boundary.trailingBytesHex))
+        let boundaryFile = root.appendingPathComponent("boundary.txt")
+        try boundaryBytes.write(to: boundaryFile)
+        let fs = DesktopFileSystem()
+        let opened = try await fs.open(path: boundaryFile.path)
+        #expect(opened.firstRead.content.count == boundary.firstPageBytes)
+        #expect(opened.firstRead.nextOffset == UInt64(boundary.nextOffset))
+        let tail = try await fs.read(id: opened.id, offset: opened.firstRead.nextOffset)
+        #expect(String(data: tail.content, encoding: .utf8) == boundary.tailText)
+        try await fs.close(id: opened.id)
+
+        let binary = fixture.binary
+        let binaryBytes = try Data(hexString: binary.bytesHex)
+        let binaryFile = root.appendingPathComponent("binary.bin")
+        try binaryBytes.write(to: binaryFile)
+        let binaryOpen = try await fs.open(path: binaryFile.path)
+        #expect(binaryOpen.firstRead.content.base64EncodedString() == binary.base64)
+        try await fs.close(id: binaryOpen.id)
+
+        let changed = fixture.changed
+        let changedFile = root.appendingPathComponent("changed.txt")
+        try Data(changed.before.utf8).write(to: changedFile)
+        let changedOpen = try await fs.open(path: changedFile.path)
+        try Data(changed.after.utf8).write(to: changedFile)
+        let changedRead = try await fs.read(id: changedOpen.id, offset: 0)
+        #expect(changedRead.changedSinceOpen)
+        #expect(String(decoding: changedRead.content, as: UTF8.self) == changed.after)
+        try await fs.close(id: changedOpen.id)
+
+        let symlink = fixture.symlink
+        let target = root.appendingPathComponent(symlink.targetName)
+        try Data(symlink.targetContents.utf8).write(to: target)
+        let link = root.appendingPathComponent(symlink.linkName)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        let metadata = try await fs.metadata(path: link.path)
+        #expect(metadata.kind.rawValue == symlink.kind)
+        #expect(metadata.symlinkTarget == target.resolvingSymlinksInPath().path)
+
+        let search = fixture.search
+        let searchRoot = root.appendingPathComponent("search", isDirectory: true)
+        try FileManager.default.createDirectory(at: searchRoot, withIntermediateDirectories: false)
+        for item in search.files {
+            try Data(item.content.utf8).write(to: searchRoot.appendingPathComponent(item.name))
+        }
+        var continuation: String?
+        for (index, expected) in search.pages.enumerated() {
+            let page = try await fs.search(root: searchRoot.path, nameGlob: search.nameGlob,
+                                           limit: search.limit, continuation: continuation)
+            #expect(page.matches.map(\.entry.name) == expected)
+            if index < search.pages.count - 1 { #expect(page.continuation != nil) }
+            if index == search.pages.count - 1 { #expect(page.continuation == nil) }
+            continuation = page.continuation
+        }
+        let contentPage = try await fs.search(root: searchRoot.path, contentContains: search.contentContains,
+                                              limit: search.files.count)
+        #expect(contentPage.matches.map(\.entry.name) == ["a.txt", "b.txt", "c.md"])
+
+        let permissionRoot = root.appendingPathComponent("restricted", isDirectory: true)
+        try FileManager.default.createDirectory(at: permissionRoot, withIntermediateDirectories: false)
+        try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: fixture.permission.mode)], ofItemAtPath: permissionRoot.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: permissionRoot.path) }
+        await #expect(throws: DesktopFileSystemError.permissionDenied) { try await fs.list(path: permissionRoot.path) }
+        #expect(fixture.permission.code == "desktop_file_permission_denied")
+    }
+
     @Test func openFileHandleLimitIsEnforcedAndHandlesCanBeReleased() async throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }

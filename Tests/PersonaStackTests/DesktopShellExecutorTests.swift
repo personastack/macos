@@ -32,10 +32,11 @@ struct DesktopShellExecutorTests {
     }
 
     @Test func commandAcceptsInputWhileRunning() async throws {
+        let fixture = try DesktopParityFixture.load().process
         let executor = DesktopShellExecutor()
-        let started = try await executor.start(command: "read answer; printf 'received:%s' \"$answer\"", workingDirectory: "/tmp")
+        let started = try await executor.start(command: fixture.blockedInputCommand, workingDirectory: "/tmp")
         #expect(started.state == .running)
-        try await executor.write(id: started.executionID, input: .data(Data("hello\n".utf8)))
+        try await executor.write(id: started.executionID, input: .data(Data(fixture.stdinText.utf8)))
         var completed = try await executor.read(id: started.executionID, after: 0, wait: .seconds(3))
         var chunks = completed.chunks
         while completed.state == .running {
@@ -49,9 +50,12 @@ struct DesktopShellExecutorTests {
     }
 
     @Test func managedProcessLimitIsEnforced() async throws {
+        let fixture = try DesktopParityFixture.load().process
         let executor = DesktopShellExecutor()
         do {
-            for _ in 0..<DesktopShellExecutor.maximumProcesses {
+            #expect(fixture.maxProcesses == DesktopShellExecutor.maximumProcesses)
+            #expect(fixture.limitCode == "desktop_process_limit")
+            for _ in 0..<fixture.maxProcesses {
                 _ = try await executor.start(command: "read answer", workingDirectory: "/tmp")
             }
             await #expect(throws: DesktopShellError.tooManyProcesses) {
@@ -105,8 +109,9 @@ struct DesktopShellExecutorTests {
     }
 
     @Test func cancellingManagedProcessStopsIt() async throws {
+        let fixture = try DesktopParityFixture.load().process
         let executor = DesktopShellExecutor()
-        let started = try await executor.start(command: "sleep 20", workingDirectory: "/tmp")
+        let started = try await executor.start(command: fixture.cancellationCommand, workingDirectory: "/tmp")
         try await executor.cancel(id: started.executionID)
         var ended = try await executor.status(id: started.executionID)
         let deadline = ContinuousClock.now + .seconds(5)
@@ -132,8 +137,9 @@ struct DesktopShellExecutorTests {
     }
 
     @Test func outputRingReportsWhenTheReaderFallsBehind() async throws {
+        let fixture = try DesktopParityFixture.load().process
         let executor = DesktopShellExecutor()
-        let started = try await executor.start(command: "head -c 5000000 /dev/zero", workingDirectory: "/tmp", timeout: 10)
+        let started = try await executor.start(command: "head -c \(fixture.outputGapBytes) /dev/zero", workingDirectory: "/tmp", timeout: 10)
         var status = try await executor.status(id: started.executionID)
         let deadline = ContinuousClock.now + .seconds(10)
         // Deliberately leave cursor zero behind while the producer fills the ring.
@@ -169,9 +175,15 @@ struct DesktopShellExecutorTests {
     }
 
     @Test func blockedInputDoesNotPreventCancellation() async throws {
+        let fixture = try DesktopParityFixture.load().process
         let executor = DesktopShellExecutor()
-        let started = try await executor.start(command: "sleep 20", workingDirectory: "/tmp")
-        let writer = Task { try await executor.write(id: started.executionID, input: .data(Data(repeating: 97, count: 32 * 1024))) }
+        let started = try await executor.start(command: fixture.cancellationCommand, workingDirectory: "/tmp")
+        let writer = Task {
+            for _ in 0..<fixture.blockedStdinWrites {
+                let data = Data(repeating: 97, count: fixture.blockedStdinWriteBytes)
+                try await executor.write(id: started.executionID, input: .data(data))
+            }
+        }
         try await Task.sleep(for: .milliseconds(100))
         try await executor.cancel(id: started.executionID)
         _ = try? await writer.value
@@ -205,14 +217,15 @@ struct DesktopShellExecutorTests {
     }
 
     @Test func closeAllStopsDisownedChildAfterItsShellLeaderExits() async throws {
+        let fixture = try DesktopParityFixture.load().process
         let executor = DesktopShellExecutor()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("desktop-shell-disowned-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let childMarker = directory.appendingPathComponent("child-survived.txt")
+        let childMarker = directory.appendingPathComponent(fixture.leaderChildMarker)
         let leaderPIDFile = directory.appendingPathComponent("leader.pid")
         _ = try await executor.start(
-            command: "printf '%s' $PPID > '\(leaderPIDFile.path)'; (sleep 2; touch '\(childMarker.path)') & disown; printf 'leader-exited'",
+            command: "printf '%s' $PPID > '\(leaderPIDFile.path)'; (sleep \(fixture.leaderChildDelaySeconds); touch '\(childMarker.path)') & disown; printf 'leader-exited'",
             workingDirectory: directory.path,
             timeout: 10
         )
@@ -229,7 +242,7 @@ struct DesktopShellExecutorTests {
         }
         #expect(Darwin.kill(leaderPID, 0) == -1 && errno == ESRCH, "shell leader was still running before group cleanup")
         #expect(await executor.closeAll())
-        try await Task.sleep(for: .seconds(2.2))
+        try await Task.sleep(for: .seconds(Double(fixture.leaderChildDelaySeconds) + 0.2))
         #expect(!FileManager.default.fileExists(atPath: childMarker.path))
     }
 

@@ -15,6 +15,6 @@ let package = Package(
         .target(name: "PersonaStackCore", dependencies: ["Yams"]),
         .executableTarget(name: "PersonaStack", dependencies: ["PersonaStackCore"]),
         .executableTarget(name: "PersonaStackPolicyCheck", dependencies: ["PersonaStackCore"]),
-        .testTarget(name: "PersonaStackTests", dependencies: ["PersonaStackCore", "PersonaStack"], resources: [.copy("Fixtures/local-session.json")]),
+        .testTarget(name: "PersonaStackTests", dependencies: ["PersonaStackCore", "PersonaStack"], resources: [.copy("Fixtures/local-session.json"), .copy("Fixtures/desktop-parity.json")]),
     ]
 )

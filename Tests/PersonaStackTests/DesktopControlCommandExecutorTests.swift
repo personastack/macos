@@ -88,6 +88,7 @@ struct DesktopControlCommandExecutorTests {
 
     @Test
     func configRevocationClosesOnlyItsHandlesAndFencesOlderCommands() async throws {
+        let fixture = try DesktopParityFixture.load()
         let executor = DesktopControlCommandExecutor()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("desktop-control-revoke-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -157,22 +158,24 @@ struct DesktopControlCommandExecutorTests {
         #expect(contentText == "A")
 
         let binaryFile = directory.appendingPathComponent("blob.bin")
-        try Data([0, 1, 255]).write(to: binaryFile)
+        let binaryBytes = try Data(hexString: fixture.files.binary.bytesHex)
+        try binaryBytes.write(to: binaryFile)
         let binaryOpen = command("desktop_control_file", ownerA, requestID: "open-binary-a",
                                  arguments: .object(["action": .string("open"), "path": .string(binaryFile.path),
                                                      "control_token": .string(tokenA)]))
         let binaryResult = await executor.handle(binaryOpen, proxy: nil)
         guard case .object(let binaryContent)? = binaryResult.result,
               case .string("base64")? = binaryContent["encoding"],
-              case .string("AAH/")? = binaryContent["content_base64"] else {
+              case .string(let encodedBinary)? = binaryContent["content_base64"],
+              encodedBinary == fixture.files.binary.base64 else {
             Issue.record("binary file content was not returned with base64 metadata")
             await executor.close()
             return
         }
         #expect(binaryContent["content_text"] == nil)
 
-        let imageFile = directory.appendingPathComponent("tiny.png")
-        var imageBytes = Data([137, 80, 78, 71, 13, 10, 26, 10])
+        let imageFile = directory.appendingPathComponent(fixture.files.image.name)
+        var imageBytes = try Data(hexString: fixture.files.image.bytesHex)
         imageBytes.append(Data(repeating: 7, count: DesktopFileSystem.maxReadBytes + 13))
         try imageBytes.write(to: imageFile)
         let imageOpen = await executor.handle(command("desktop_control_file", ownerA, requestID: "open-image-a",
@@ -182,12 +185,13 @@ struct DesktopControlCommandExecutorTests {
               case .array(let imageBlocks)? = imageResult["content"], imageBlocks.count == 1,
               case .object(let imageBlock) = imageBlocks[0],
               case .string("image")? = imageBlock["type"],
-              case .string("image/png")? = imageBlock["mimeType"],
+              case .string(let imageMIMEType)? = imageBlock["mimeType"],
               case .string(let imageBase64)? = imageBlock["data"] else {
             Issue.record("bounded multi-chunk image file was not returned as MCP image content")
             await executor.close()
             return
         }
+        #expect(imageMIMEType == fixture.files.image.mimeType)
         #expect(Data(base64Encoded: imageBase64) == imageBytes)
         #expect(imageResult["content_base64"] == nil)
         if case .number(let byteLength)? = imageResult["byte_length"] {
@@ -195,6 +199,17 @@ struct DesktopControlCommandExecutorTests {
         } else {
             Issue.record("image file open did not return full byte metadata")
         }
+
+        let missingWritePath = directory.appendingPathComponent("missing/uncertain.txt")
+        let knownWriteFailure = await executor.handle(command("desktop_control_file", ownerA, requestID: "known-write-failure-a",
+                                                               arguments: .object(["action": .string("write"), "path": .string(missingWritePath.path),
+                                                                                   "mode": .string("append"), "content_base64": .string(""),
+                                                                                   "control_token": .string(tokenA)])), proxy: nil)
+        #expect(knownWriteFailure.type == "failure")
+        #expect(knownWriteFailure.errorCode == fixture.files.uncertainWrite.knownFailureCode)
+        #expect(DesktopControlCommandExecutor.mayHavePartialWrite(.object(["action": .string("write"), "mode": .string("append")])))
+        #expect(fixture.files.uncertainWrite.code == "desktop_file_write_outcome_unknown")
+        #expect(!fixture.files.uncertainWrite.message.isEmpty)
 
         let linesFile = directory.appendingPathComponent("lines.txt")
         try Data("first\nsecond\n".utf8).write(to: linesFile)
