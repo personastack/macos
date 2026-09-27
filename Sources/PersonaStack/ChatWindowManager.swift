@@ -66,6 +66,7 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
     let window: NSWindow
     let webView: ChatWebView
     let titleBar: ChatWindowTitleBar
+    private let seamFill: NSView
     private let url: URL
     private let onClose: () -> Void
     private var titleBarHeight: NSLayoutConstraint?
@@ -82,6 +83,7 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
         config.applicationNameForUserAgent = "PersonaStackDesktop/1"
         webView = ChatWebView(frame: .zero, configuration: config)
         titleBar = ChatWindowTitleBar(frame: .zero)
+        seamFill = NSView(frame: .zero)
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 676),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                           backing: .buffered, defer: false)
@@ -97,10 +99,16 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
         window.hidesOnDeactivate = false
         window.minSize = NSSize(width: 340, height: 396)
         window.standardWindowButton(.zoomButton)?.isHidden = true
+        titleBar.pinButton.target = self
+        titleBar.pinButton.action = #selector(togglePin(_:))
         webView.underPageBackgroundColor = .clear
         let contentView = NSView(frame: .zero)
+        seamFill.wantsLayer = true
+        seamFill.layer?.backgroundColor = ChatWindowTitleBar.backgroundColor.cgColor
+        seamFill.translatesAutoresizingMaskIntoConstraints = false
         webView.translatesAutoresizingMaskIntoConstraints = false
         titleBar.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(seamFill)
         contentView.addSubview(webView)
         contentView.addSubview(titleBar)
         let barHeight = titleBar.heightAnchor.constraint(equalToConstant: 40)
@@ -115,6 +123,10 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
             webView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
             contentTop,
             webView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            seamFill.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            seamFill.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            seamFill.topAnchor.constraint(equalTo: webView.topAnchor),
+            seamFill.heightAnchor.constraint(equalToConstant: 56),
         ])
         window.contentView = contentView
         window.delegate = self
@@ -183,7 +195,9 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
         case .close: dispose()
         case .collapse: resize(collapsed: true)
         case .expand: resize(collapsed: false)
-        case .pin: window.level = window.level == .normal ? .floating : .normal
+        case .pin:
+            window.level = window.level == .normal ? .floating : .normal
+            titleBar.setPinned(window.level == .floating)
         case .drag(let dx, let dy):
             let origin = window.frame.origin
             window.setFrameOrigin(NSPoint(x: origin.x + dx, y: origin.y - dy))
@@ -191,12 +205,15 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
         }
     }
 
+    @objc private func togglePin(_ sender: NSButton) { apply(.pin) }
+
     private func resize(collapsed next: Bool) {
         guard next != collapsed else { return }
         let frame = window.frame
         if next { expandedSize = frame.size }
         collapsed = next
         webView.collapsed = next
+        seamFill.isHidden = next
         titleBarHeight?.constant = next ? 0 : 40
         titleBar.isHidden = next
         for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton] {
@@ -237,15 +254,43 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
 
 @MainActor
 final class ChatWindowTitleBar: NSView {
+    static let backgroundColor = NSColor(srgbRed: 18.0 / 255, green: 18.0 / 255, blue: 42.0 / 255, alpha: 1)
+    let pinButton = NSButton(frame: .zero)
     override var mouseDownCanMoveWindow: Bool { true }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.backgroundColor = NSColor(srgbRed: 18.0 / 255, green: 18.0 / 255, blue: 42.0 / 255, alpha: 1).cgColor
+        layer?.backgroundColor = Self.backgroundColor.cgColor
+        pinButton.isBordered = false
+        pinButton.setButtonType(.momentaryChange)
+        pinButton.image = NSImage(systemSymbolName: "pin", accessibilityDescription: "Always on top")
+        pinButton.imagePosition = .imageOnly
+        pinButton.contentTintColor = .lightGray
+        pinButton.toolTip = "Always on top"
+        pinButton.setAccessibilityLabel("Always on top")
+        pinButton.wantsLayer = true
+        pinButton.layer?.cornerRadius = 14
+        pinButton.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.04).cgColor
+        pinButton.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(pinButton)
+        NSLayoutConstraint.activate([
+            pinButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            pinButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            pinButton.widthAnchor.constraint(equalToConstant: 28),
+            pinButton.heightAnchor.constraint(equalToConstant: 28),
+        ])
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func setPinned(_ pinned: Bool) {
+        pinButton.image = NSImage(systemSymbolName: pinned ? "pin.fill" : "pin", accessibilityDescription: "Always on top")
+        pinButton.contentTintColor = pinned ? .white : .lightGray
+        pinButton.layer?.backgroundColor = pinned ? NSColor(srgbRed: 52.0 / 255, green: 93.0 / 255, blue: 85.0 / 255, alpha: 1).cgColor
+            : NSColor.white.withAlphaComponent(0.04).cgColor
+        pinButton.setAccessibilityValue(pinned ? "On" : "Off")
+    }
 
     override func mouseDown(with event: NSEvent) {
         window?.performDrag(with: event)

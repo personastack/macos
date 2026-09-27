@@ -128,10 +128,13 @@ struct ChatWindowTests {
         #expect(manager.chat(for: "p-1") === first)
         let frame = first.window.frame
         #expect(!first.titleBar.isHidden)
+        #expect(first.titleBar.pinButton.superview === first.titleBar)
+        #expect(first.titleBar.pinButton.toolTip == "Always on top")
         first.apply(.collapse)
         #expect(first.window.frame.size == NSSize(width: 72, height: 72))
         #expect(!first.window.styleMask.contains(.resizable))
         #expect(first.titleBar.isHidden)
+        #expect(first.titleBar.pinButton.isHiddenOrHasHiddenAncestor)
         #expect(first.window.standardWindowButton(.closeButton)?.isHidden == true)
         first.apply(.drag(20, 10))
         #expect(abs(first.window.frame.minX - frame.minX - 20) < 1)
@@ -140,10 +143,12 @@ struct ChatWindowTests {
         #expect(abs(first.window.frame.minX - frame.minX - 20) < 1)
         #expect(!first.titleBar.isHidden)
         #expect(first.window.standardWindowButton(.closeButton)?.isHidden == false)
-        first.apply(.pin)
+        first.titleBar.pinButton.performClick(nil)
         #expect(first.window.level == .floating)
+        #expect(first.titleBar.pinButton.accessibilityValue() as? String == "On")
         first.apply(.pin)
         #expect(first.window.level == .normal)
+        #expect(first.titleBar.pinButton.accessibilityValue() as? String == "Off")
         first.apply(.minimize)
         // AppKit completes Dock animations on the run loop, not synchronously.
         for _ in 0..<30 where !first.window.isMiniaturized { try await Task.sleep(for: .milliseconds(50)) }
