@@ -1053,6 +1053,16 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             } catch {
                 if generation == lifecycleGeneration, readiness == previousReadiness {
                     readiness = Self.readiness(for: error)
+                    if readiness == "cua_unavailable" {
+                        do {
+                            try await replaceFailedCuaProxy(proxy, generation: generation)
+                            if generation == lifecycleGeneration, !paused, sessionLock.allowsControl {
+                                readiness = "ready"
+                            }
+                        } catch {
+                            if generation == lifecycleGeneration { readiness = Self.readiness(for: error) }
+                        }
+                    }
                 }
             }
         }
@@ -1089,7 +1099,47 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                 : readiness
         } catch {
             guard generation == lifecycleGeneration else { return readiness }
-            return Self.reconciledGuiReadiness(permissionProbeSucceeded: false, failureReadiness: Self.readiness(for: error))
+            let failureReadiness = Self.readiness(for: error)
+            guard failureReadiness == "cua_unavailable" else { return failureReadiness }
+            do {
+                try await replaceFailedCuaProxy(proxy, generation: generation)
+                return generation == lifecycleGeneration && !paused && sessionLock.allowsControl ? "ready" : readiness
+            } catch {
+                return generation == lifecycleGeneration ? Self.readiness(for: error) : readiness
+            }
+        }
+    }
+
+    private func replaceFailedCuaProxy(_ failed: CuaMCPProxy, generation: UUID) async throws {
+        try requireCurrentLifecycle(generation)
+        guard proxy === failed, startingProxy == nil, isCuaReady(),
+              let application = cuaApplication, let selectedCuaApplicationURL else {
+            throw CuaMCPProxyError.serviceMismatch
+        }
+        let candidate = CuaMCPProxy(
+            executableURL: selectedCuaApplicationURL.deletingLastPathComponent().appendingPathComponent("cua-driver"),
+            socketURL: Self.cuaSocketURL(), expectedDaemonPID: application.processIdentifier
+        )
+        startingProxy = candidate
+        do {
+            _ = try await candidate.start()
+            try requireCurrentLifecycle(generation)
+            let catalog = try await candidate.listTools()
+            try requireCurrentLifecycle(generation)
+            let validatedTools = try await candidate.validateToolCatalog(catalog)
+            try await verifyCuaReadiness(candidate, generation: generation, timeout: 5)
+            try requireCurrentLifecycle(generation)
+            guard proxy === failed, startingProxy === candidate, isCuaReady() else {
+                throw CuaMCPProxyError.serviceMismatch
+            }
+            proxy = candidate
+            tools = validatedTools
+            startingProxy = nil
+            await failed.stop()
+        } catch {
+            await candidate.stop()
+            if startingProxy === candidate { startingProxy = nil }
+            throw error
         }
     }
 
