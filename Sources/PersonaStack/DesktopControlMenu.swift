@@ -71,13 +71,9 @@ struct DesktopControlMenu: View {
         .disabled(SMAppService.mainApp.status == .enabled)
         Divider()
         Button("Open PersonaStack") {
-            NSApp.setActivationPolicy(.regular)
-            if let mainWindow = NSApp.windows.first(where: { $0.title == "PersonaStack" }) {
-                mainWindow.makeKeyAndOrderFront(nil)
-            } else {
+            MainWebViewHost.showMainWindow {
                 openWindow(id: "personastack-main")
             }
-            NSApp.activate(ignoringOtherApps: true)
         }
         Button("Quit PersonaStack Desktop") {
             NSApp.terminate(nil)

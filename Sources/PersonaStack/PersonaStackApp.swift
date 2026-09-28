@@ -34,7 +34,7 @@ struct PersonaStackApp: App {
             PersonaStackWebView(url: launchURL)
                 .frame(minWidth: 1172, minHeight: 700)
                 .background(Color(nsColor: WindowPresentation.canvasColor).ignoresSafeArea())
-                .background(WindowPresentationConfigurator())
+                .background(WindowPresentationConfigurator(applicationDelegate: terminationDelegate))
         }
         .defaultSize(width: 1440, height: 960)
         .windowStyle(.hiddenTitleBar)
@@ -56,6 +56,7 @@ struct PersonaStackApp: App {
 
 @MainActor
 final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
+    var reopenMainWindow: (@MainActor () -> Void)?
     private let shutdown: @MainActor () async -> Void
     private let reply: @MainActor (NSApplication) -> Void
     private let timeout: Duration
@@ -77,6 +78,12 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         self.reply = reply
         self.timeout = timeout
         super.init()
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard let reopenMainWindow else { return true }
+        reopenMainWindow()
+        return false
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -107,6 +114,17 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
 @MainActor
 final class MainWebViewHost {
     static let shared = MainWebViewHost(appURL: LaunchConfiguration.url())
+
+    static func showMainWindow(openWindow: () -> Void) {
+        NSApp.setActivationPolicy(.regular)
+        if let window = NSApp.windows.first(where: { $0.title == "PersonaStack" }) {
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            window.makeKeyAndOrderFront(nil)
+        } else {
+            openWindow()
+        }
+        NSApp.activate(ignoringOtherApps: true)
+    }
 
     let webView: WKWebView
     let coordinator: PersonaStackWebView.Coordinator
@@ -170,8 +188,15 @@ final class MainWebViewHost {
 }
 
 struct WindowPresentationConfigurator: NSViewRepresentable {
+    @Environment(\.openWindow) private var openWindow
+    let applicationDelegate: PersonaStackTerminationDelegate
+
     func makeNSView(context: Context) -> NSView {
-        WindowPresentationView()
+        let action = openWindow
+        applicationDelegate.reopenMainWindow = {
+            MainWebViewHost.showMainWindow { action(id: "personastack-main") }
+        }
+        return WindowPresentationView()
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {}
