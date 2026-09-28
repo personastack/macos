@@ -75,6 +75,69 @@ private final class LegacyKeychainFixture: DesktopControlKeychainAccess, @unchec
     }
 }
 
+private final class BlockingLegacyKeychainFixture: DesktopControlKeychainAccess, @unchecked Sendable {
+    private let condition = NSCondition()
+    private var items: [String: Data] = [:]
+    private var legacyReadStarted = false
+    private var allowLegacyRead = false
+
+    func read(service: String, account: String) throws -> Data? {
+        condition.lock()
+        defer { condition.unlock() }
+        if account == "installation" {
+            legacyReadStarted = true
+            condition.broadcast()
+            while !allowLegacyRead { condition.wait() }
+        }
+        return items["\(service):\(account)"]
+    }
+
+    func write(_ data: Data, service: String, account: String) throws {
+        condition.lock()
+        defer { condition.unlock() }
+        items["\(service):\(account)"] = data
+    }
+
+    func remove(service: String, account: String) throws {
+        condition.lock()
+        defer { condition.unlock() }
+        items.removeValue(forKey: "\(service):\(account)")
+    }
+
+    func waitForLegacyRead() {
+        condition.lock()
+        defer { condition.unlock() }
+        while !legacyReadStarted { condition.wait() }
+    }
+
+    func continueLegacyRead() {
+        condition.lock()
+        defer { condition.unlock() }
+        allowLegacyRead = true
+        condition.broadcast()
+    }
+}
+
+private final class CredentialConfigurationSelection: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: DesktopEnvironmentConfiguration
+
+    init(_ value: DesktopEnvironmentConfiguration) { self.value = value }
+
+    var current: DesktopEnvironmentConfiguration {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+        set {
+            lock.lock()
+            defer { lock.unlock() }
+            value = newValue
+        }
+    }
+}
+
 @Test func legacyCredentialIsNotReturnedWhenScopedSaveFails() throws {
     let keychain = LegacyKeychainFixture()
     let service = "test.desktop-control"
@@ -105,6 +168,39 @@ private final class LegacyKeychainFixture: DesktopControlKeychainAccess, @unchec
     #expect(try keychain.read(service: service, account: store.account) != nil)
 }
 
+@Test func sameAppOriginKeepsDesktopEnrollmentsSeparateByGatewayAndMCP() throws {
+    let appURL = URL(string: "https://my.personastack.ai/user/personas")!
+    let firstConfiguration = try DesktopEnvironmentConfiguration(
+        appURL: "https://my.personastack.ai", gatewayURL: "https://cluster-agent.personastack.ai", mcpURL: "https://mcp.personastack.ai"
+    )
+    let secondConfiguration = try DesktopEnvironmentConfiguration(
+        appURL: "https://my.personastack.ai/", gatewayURL: "https://gateway-alt.example", mcpURL: "https://mcp-alt.example"
+    )
+    let keychain = LegacyKeychainFixture()
+    let firstCredentials = KeychainDesktopControlCredentialStore(
+        service: "test.desktop-control", appURL: appURL, configuration: firstConfiguration, keychain: keychain
+    )
+    let secondCredentials = KeychainDesktopControlCredentialStore(
+        service: "test.desktop-control", appURL: appURL, configuration: secondConfiguration, keychain: keychain
+    )
+    var first = try JSONDecoder().decode(
+        DesktopControlInstallation.self,
+        from: legacyInstallationData(gateway: "wss://cluster-agent.personastack.ai/v1/desktop-control/ws")
+    )
+    var second = try JSONDecoder().decode(
+        DesktopControlInstallation.self,
+        from: legacyInstallationData(gateway: "wss://gateway-alt.example/v1/desktop-control/ws")
+    )
+    try first.bindEnvironment(appURL, configuration: firstConfiguration)
+    try second.bindEnvironment(appURL, configuration: secondConfiguration)
+    try firstCredentials.save(first)
+    try secondCredentials.save(second)
+
+    #expect(firstCredentials.account != secondCredentials.account)
+    #expect(try firstCredentials.load() == first)
+    #expect(try secondCredentials.load() == second)
+}
+
 private func legacyInstallationData(gateway: String) throws -> Data {
     try JSONSerialization.data(withJSONObject: [
         "installation_id": "legacy-mac",
@@ -130,6 +226,39 @@ private func legacyInstallationData(gateway: String) throws -> Data {
     #expect(try store.load() == migrated)
 }
 
+@Test func legacyMigrationWritesToProfileCapturedBeforeKeychainRead() async throws {
+    let keychain = BlockingLegacyKeychainFixture()
+    let service = "test.desktop-control"
+    let appURL = URL(string: "https://my.personastack.ai/user/personas")!
+    try keychain.write(
+        legacyInstallationData(gateway: "wss://cluster-agent.personastack.ai/v1/desktop-control/ws"),
+        service: service,
+        account: "installation"
+    )
+    let changed = try DesktopEnvironmentConfiguration(
+        appURL: "https://my.personastack.ai",
+        gatewayURL: "https://gateway-alt.example",
+        mcpURL: "https://mcp-alt.example"
+    )
+    let selection = CredentialConfigurationSelection(.production)
+    let store = KeychainDesktopControlCredentialStore(
+        service: service,
+        appURL: appURL,
+        configurationProvider: { selection.current },
+        keychain: keychain
+    )
+
+    let load = Task.detached { try store.load() }
+    keychain.waitForLegacyRead()
+    selection.current = changed
+    keychain.continueLegacyRead()
+
+    let migrated = try #require(try await load.value)
+    try migrated.requireEnvironment(appURL, configuration: .production)
+    #expect(try keychain.read(service: service, account: "installation:" + DesktopEnvironmentConfiguration.production.preferenceIdentity) != nil)
+    #expect(try keychain.read(service: service, account: "installation:" + changed.preferenceIdentity) == nil)
+}
+
 @Test func legacyKeychainItemIsIgnoredByWrongOriginAndMigratesInItsOwnOrigin() throws {
     let keychain = LegacyKeychainFixture()
     let legacyData = try legacyInstallationData(gateway: "ws://cluster-agent.personastack.lan/v1/desktop-control/ws")
@@ -149,6 +278,75 @@ private func legacyInstallationData(gateway: String) throws -> Data {
     try production.delete()
     #expect(try keychain.read(service: service, account: "installation") == legacyData)
     #expect(try lan.load() == migrated)
+}
+
+@Test func legacyProductionCredentialCannotMigrateIntoCustomAppOrigin() throws {
+    let keychain = LegacyKeychainFixture()
+    let service = "test.desktop-control"
+    let legacyData = try legacyInstallationData(gateway: "wss://cluster-agent.personastack.ai/v1/desktop-control/ws")
+    try keychain.write(legacyData, service: service, account: "installation")
+    let custom = try DesktopEnvironmentConfiguration(
+        appURL: "https://custom.example", gatewayURL: "https://cluster-agent.personastack.ai", mcpURL: "https://mcp.personastack.ai"
+    )
+    let store = KeychainDesktopControlCredentialStore(
+        service: service, appURL: custom.appURL, configuration: custom, keychain: keychain
+    )
+
+    #expect(try store.load() == nil)
+    #expect(try keychain.read(service: service, account: store.account) == nil)
+    #expect(try keychain.read(service: service, account: "installation") == legacyData)
+}
+
+@Test func originScopedCredentialMigratesAndDisconnectRemovesItsLegacyCopy() throws {
+    let keychain = LegacyKeychainFixture()
+    let service = "test.desktop-control"
+    let appURL = URL(string: "https://my.personastack.ai/user/personas")!
+    let originScopedData = try legacyInstallationData(gateway: "wss://cluster-agent.personastack.ai/v1/desktop-control/ws")
+    try keychain.write(originScopedData, service: service, account: "installation:https://my.personastack.ai")
+    let store = KeychainDesktopControlCredentialStore(service: service, appURL: appURL, keychain: keychain)
+
+    let installation = try #require(try store.load())
+    try installation.requireEnvironment(appURL)
+    #expect(try keychain.read(service: service, account: store.account) != nil)
+    try store.delete()
+    #expect(try store.load() == nil)
+    #expect(try keychain.read(service: service, account: "installation:https://my.personastack.ai") == nil)
+}
+
+@Test func originScopedProductionCredentialDoesNotMigrateIntoCustomProfile() throws {
+    let keychain = LegacyKeychainFixture()
+    let service = "test.desktop-control"
+    let account = "installation:https://my.personastack.ai"
+    let data = try legacyInstallationData(gateway: "wss://cluster-agent.personastack.ai/v1/desktop-control/ws")
+    try keychain.write(data, service: service, account: account)
+    let custom = try DesktopEnvironmentConfiguration(
+        appURL: "https://my.personastack.ai", gatewayURL: "https://cluster-agent.personastack.ai", mcpURL: "https://mcp.custom.example"
+    )
+    let store = KeychainDesktopControlCredentialStore(
+        service: service, appURL: custom.appURL, configuration: custom, keychain: keychain
+    )
+
+    #expect(try store.load() == nil)
+    #expect(try keychain.read(service: service, account: store.account) == nil)
+    #expect(try keychain.read(service: service, account: account) == data)
+}
+
+@Test func legacyCredentialWithDifferentBoundOriginCannotBeRebound() throws {
+    let keychain = LegacyKeychainFixture()
+    let service = "test.desktop-control"
+    var installation = try JSONDecoder().decode(
+        DesktopControlInstallation.self,
+        from: legacyInstallationData(gateway: "wss://cluster-agent.personastack.ai/v1/desktop-control/ws")
+    )
+    try installation.bindEnvironment(URL(string: "https://other.example")!, configuration: try DesktopEnvironmentConfiguration(
+        appURL: "https://other.example", gatewayURL: "https://cluster-agent.personastack.ai", mcpURL: "https://mcp.personastack.ai"
+    ))
+    try keychain.write(JSONEncoder().encode(installation), service: service, account: "installation")
+    let store = KeychainDesktopControlCredentialStore(
+        service: service, appURL: URL(string: "https://my.personastack.ai")!, keychain: keychain
+    )
+
+    #expect(try store.load() == nil)
 }
 
 @Test func disconnectRemovesOnlyTheLegacyItemOwnedByThisOrigin() throws {
@@ -229,8 +427,9 @@ private func legacyInstallationData(gateway: String) throws -> Data {
         "gateway_websocket_url": "wss://unrelated.example.test/v1/desktop-control/ws",
         "environment_origin": "https://my.personastack.ai",
     ])
-    #expect(throws: DesktopControlEnrollmentError.invalidResponse) {
-        try JSONDecoder().decode(DesktopControlInstallation.self, from: stored)
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: stored)
+    #expect(throws: DesktopControlEnrollmentError.invalidRequest) {
+        try installation.requireEnvironment(URL(string: "https://my.personastack.ai")!)
     }
 }
 
@@ -441,6 +640,22 @@ private func legacyInstallationData(gateway: String) throws -> Data {
     #expect(!DesktopControlEnvironment.allowsGateway(gateway, for: "http://my.personastack.lan"))
     #expect(!DesktopControlEnvironment.allowsGateway(gateway, for: "http://personastack.ericgreer.info"))
     #expect(!DesktopControlEnvironment.allowsGateway(gateway, for: "https://my.personastack.ai"))
+}
+
+@Test func authenticatedDesktopRequestsRejectEveryRedirect() {
+    let session = URLSession.shared
+    let task = session.dataTask(with: URL(string: "https://source.example/secure")!)
+    let blocker = DesktopControlRedirectBlocker()
+    var redirectedRequest: URLRequest?
+    blocker.urlSession(
+        session,
+        task: task,
+        willPerformHTTPRedirection: HTTPURLResponse(url: URL(string: "https://source.example/secure")!, statusCode: 302, httpVersion: nil, headerFields: nil)!,
+        newRequest: URLRequest(url: URL(string: "https://other.example/secure")!),
+        completionHandler: { redirectedRequest = $0 }
+    )
+
+    #expect(redirectedRequest == nil)
 }
 
 @Test func retiredLANOriginCannotSendAnEnrollmentTicket() async {

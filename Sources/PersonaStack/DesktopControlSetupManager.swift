@@ -94,13 +94,21 @@ enum DesktopControlSetupCommand: Equatable {
 
 @MainActor
 final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithReply {
-    static let shared = DesktopControlSetupManager()
+    static let shared = DesktopControlSetupManager(
+        configurationProvider: { try LaunchConfiguration.selectedEnvironment() }
+    )
 
     final class Page {
         let appURL: URL
         var setupScope = DesktopControlSetupScope()
+        private(set) var isRetired = false
 
         init(appURL: URL) { self.appURL = appURL }
+
+        func retire() {
+            isRetired = true
+            setupScope.synchronize("")
+        }
     }
 
     private let logger = Logger(subsystem: "ai.personastack.desktop", category: "desktop-control-setup")
@@ -111,6 +119,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
     private let loginItemStatus: @MainActor () -> SMAppService.Status
     private let preferences: UserDefaults
     private let runtime: any DesktopControlSetupRuntime
+    private let configurationProvider: () throws -> DesktopEnvironmentConfiguration
 
     init(
         runtime: any DesktopControlSetupRuntime = DesktopControlRuntime.shared,
@@ -118,7 +127,8 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         credentials: (any DesktopControlCredentialStoring)? = nil,
         preferences: UserDefaults = .standard,
         registerLoginItem: @escaping @MainActor () throws -> Void = { try SMAppService.mainApp.register() },
-        loginItemStatus: @escaping @MainActor () -> SMAppService.Status = { SMAppService.mainApp.status }
+        loginItemStatus: @escaping @MainActor () -> SMAppService.Status = { SMAppService.mainApp.status },
+        configurationProvider: @escaping () throws -> DesktopEnvironmentConfiguration = { try LaunchConfiguration.selectedEnvironment() }
     ) {
         self.runtime = runtime
         self.enrollment = enrollment
@@ -126,12 +136,20 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         self.preferences = preferences
         self.registerLoginItem = registerLoginItem
         self.loginItemStatus = loginItemStatus
+        self.configurationProvider = configurationProvider
         super.init()
     }
 
     func invalidate(_ view: WKWebView) {
         pages.object(forKey: view)?.setupScope.synchronize("")
     }
+
+    func unregister(_ view: WKWebView) {
+        pages.object(forKey: view)?.retire()
+        pages.removeObject(forKey: view)
+    }
+
+    func registeredPage(for view: WKWebView) -> Page? { pages.object(forKey: view) }
 
     func register(_ view: WKWebView, appURL: URL) {
         pages.setObject(Page(appURL: appURL), forKey: view)
@@ -149,6 +167,10 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
 
     func dispatch(_ body: Any, page: Page,
                   replyHandler: @escaping @MainActor @Sendable (Any?, String?) -> Void) {
+        guard !page.isRetired else {
+            replyHandler(nil, DesktopControlEnrollmentError.invalidRequest.localizedDescription)
+            return
+        }
         guard let command = try? DesktopControlSetupCommand.parse(body) else {
             replyHandler(nil, DesktopControlEnrollmentError.invalidRequest.localizedDescription)
             return
@@ -173,16 +195,20 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
     }
 
     func apply(_ command: DesktopControlSetupCommand, page: Page) async throws -> [String: Any] {
+        guard !page.isRetired else { throw DesktopControlEnrollmentError.invalidRequest }
         let credentials = credentials ?? KeychainDesktopControlCredentialStore(appURL: page.appURL)
         switch command {
         case .sync(let scope):
             page.setupScope.synchronize(scope)
-            if scope.isEmpty { await runtime.finishSetupIfIdle() }
+            if scope.isEmpty {
+                await runtime.finishSetupIfIdle()
+                try requireCurrentScope(scope, page: page)
+            }
             return ["ok": true, "version": "1"]
         case .state(let scope):
-            try page.setupScope.require(scope)
+            try requireCurrentScope(scope, page: page)
             let installation = try await savedInstallation(credentials: credentials, appURL: page.appURL)
-            try page.setupScope.require(scope)
+            try requireCurrentScope(scope, page: page)
             return [
                 "ok": true,
                 "operating_system": "macos",
@@ -254,8 +280,12 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             await runtime.connect(installation: installation, expectedGeneration: runtimeGeneration)
             try requireCurrentScope(scope, generation: generation, page: page)
             try requireCurrentLifecycle(runtimeGeneration)
-            preferences.set(true, forKey: "desktopControlRelayEnabled")
-            preferences.set(false, forKey: "desktopControlRelayPaused")
+            let configuration = try configurationProvider()
+            guard let pageOrigin = try? DesktopControlEnvironment.origin(page.appURL), pageOrigin == configuration.appOrigin else {
+                throw DesktopControlEnrollmentError.invalidRequest
+            }
+            preferences.set(true, forKey: DesktopControlPreferenceKeys.relayEnabled(configuration))
+            preferences.set(false, forKey: DesktopControlPreferenceKeys.relayPaused(configuration))
             return [
                 "ok": true,
                 "operating_system": "macos",
@@ -283,6 +313,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
     }
 
     private func requireCurrentScope(_ scope: String, generation: UUID, page: Page) throws {
+        guard !page.isRetired else { throw CancellationError() }
         try page.setupScope.require(scope, generation: generation)
     }
 

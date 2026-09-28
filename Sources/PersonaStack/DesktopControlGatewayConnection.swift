@@ -36,14 +36,14 @@ actor DesktopControlGatewayConnection {
     private var diagnosticsSupported = false
 
     init(installation: DesktopControlInstallation,
-         session: URLSession = .shared,
+         session: URLSession? = nil,
          onDisconnect: @escaping DesktopControlDisconnectHandler = { _ in },
          diagnosticsProvider: @escaping DesktopControlDiagnosticsProvider = { DesktopControlDiagnostics(activeProcesses: 0, openFileHandles: 0, bufferedOutputBytes: 0, outputGapsTotal: 0) },
          readinessProvider: @escaping DesktopControlReadinessProvider = { nil },
          afterConfigRevocation: @escaping DesktopControlConfigRevocationHandler = {},
          handler: @escaping DesktopControlCommandHandler) {
         self.installation = installation
-        self.session = session
+        self.session = session ?? DesktopControlNetworkSession.makeWithoutRedirects()
         self.onDisconnect = onDisconnect
         self.diagnosticsProvider = diagnosticsProvider
         self.readinessProvider = readinessProvider

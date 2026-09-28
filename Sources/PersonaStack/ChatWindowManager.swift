@@ -16,6 +16,8 @@ final class ChatWindowManager: NSObject, WKScriptMessageHandlerWithReply {
         mainViews.setObject(appURL as NSURL, forKey: view)
     }
 
+    func unregister(_ view: WKWebView) { mainViews.removeObject(forKey: view) }
+
     func invalidateSession() { sync("") }
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage,
@@ -79,6 +81,14 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
         self.url = url
         self.onClose = onClose
         let config = WKWebViewConfiguration()
+        // The native title bar owns pinning, including when the hosted page is older.
+        config.userContentController.addUserScript(WKUserScript(source: """
+            (() => {
+                const style = document.createElement('style');
+                style.textContent = '[data-desktop-pin] { display: none !important; }';
+                document.head.appendChild(style);
+            })();
+            """, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         config.websiteDataStore = .default()
         config.applicationNameForUserAgent = "PersonaStackDesktop/1"
         webView = ChatWebView(frame: .zero, configuration: config)
@@ -261,7 +271,7 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
 @MainActor
 final class ChatWindowTitleBar: NSView {
     static let backgroundColor = NSColor(srgbRed: 18.0 / 255, green: 18.0 / 255, blue: 42.0 / 255, alpha: 1)
-    let pinButton = NSButton(frame: .zero)
+    let pinButton = ChatPinButton(frame: .zero)
     override var mouseDownCanMoveWindow: Bool { true }
 
     override init(frame frameRect: NSRect) {
@@ -270,14 +280,9 @@ final class ChatWindowTitleBar: NSView {
         layer?.backgroundColor = Self.backgroundColor.cgColor
         pinButton.isBordered = false
         pinButton.setButtonType(.momentaryChange)
-        pinButton.image = NSImage(systemSymbolName: "pin", accessibilityDescription: "Always on top")
-        pinButton.imagePosition = .imageOnly
-        pinButton.contentTintColor = .lightGray
         pinButton.toolTip = "Always on top"
         pinButton.setAccessibilityLabel("Always on top")
-        pinButton.wantsLayer = true
-        pinButton.layer?.cornerRadius = 14
-        pinButton.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.04).cgColor
+        setPinned(false)
         pinButton.translatesAutoresizingMaskIntoConstraints = false
         addSubview(pinButton)
         NSLayoutConstraint.activate([
@@ -291,15 +296,48 @@ final class ChatWindowTitleBar: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     func setPinned(_ pinned: Bool) {
-        pinButton.image = NSImage(systemSymbolName: pinned ? "pin.fill" : "pin", accessibilityDescription: "Always on top")
-        pinButton.contentTintColor = pinned ? .white : .lightGray
-        pinButton.layer?.backgroundColor = pinned ? NSColor(srgbRed: 52.0 / 255, green: 93.0 / 255, blue: 85.0 / 255, alpha: 1).cgColor
-            : NSColor.white.withAlphaComponent(0.04).cgColor
+        pinButton.pinned = pinned
         pinButton.setAccessibilityValue(pinned ? "On" : "Off")
     }
 
     override func mouseDown(with event: NSEvent) {
         window?.performDrag(with: event)
+    }
+}
+
+/// Matches the hosted chat action's circular border and 14-point outlined SVG pin.
+@MainActor
+final class ChatPinButton: NSButton {
+    var pinned = false { didSet { needsDisplay = true } }
+    override var isFlipped: Bool { false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let circle = NSBezierPath(ovalIn: bounds.insetBy(dx: 0.5, dy: 0.5))
+        let background = pinned ? NSColor(srgbRed: 52.0 / 255, green: 93.0 / 255, blue: 85.0 / 255, alpha: 1)
+            : NSColor.white.withAlphaComponent(isHighlighted ? 0.1 : 0.04)
+        background.setFill()
+        circle.fill()
+        NSColor.white.withAlphaComponent(0.12).setStroke()
+        circle.lineWidth = 1
+        circle.stroke()
+
+        let pin = NSBezierPath()
+        pin.move(to: NSPoint(x: 12, y: 17))
+        pin.line(to: NSPoint(x: 12, y: 22))
+        pin.move(to: NSPoint(x: 9, y: 3))
+        for point in [NSPoint(x: 15, y: 3), NSPoint(x: 15, y: 7), NSPoint(x: 18, y: 10),
+                      NSPoint(x: 18, y: 12), NSPoint(x: 6, y: 12), NSPoint(x: 6, y: 10), NSPoint(x: 9, y: 7)] {
+            pin.line(to: point)
+        }
+        pin.close()
+        var transform = AffineTransform(translationByX: bounds.midX - 7, byY: bounds.midY + 7)
+        transform.scale(x: 14.0 / 24, y: -14.0 / 24)
+        pin.transform(using: transform)
+        pin.lineWidth = 1.8 * 14 / 24
+        pin.lineCapStyle = .round
+        pin.lineJoinStyle = .round
+        (pinned ? NSColor.white : NSColor(srgbRed: 209.0 / 255, green: 213.0 / 255, blue: 219.0 / 255, alpha: 1)).setStroke()
+        pin.stroke()
     }
 }
 

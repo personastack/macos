@@ -11,7 +11,9 @@ public enum NavigationPolicy {
     ]
 
     public static func keepsInApp(_ url: URL, appURL: URL? = nil) -> Bool {
-        isAppHost(url.host) || url.host?.caseInsensitiveCompare(appURL?.host ?? "") == .orderedSame
+        guard let appURL else { return isAppHost(url.host) }
+        guard let target = normalizedOrigin(url), target == normalizedOrigin(appURL) else { return false }
+        return true
     }
 
     public static func isAppHost(_ host: String?) -> Bool {
@@ -23,12 +25,39 @@ public enum NavigationPolicy {
         url.scheme?.lowercased() == "https" && url.host?.lowercased() == "accounts.google.com"
     }
 
+    private static func normalizedOrigin(_ url: URL) -> String? {
+        guard var parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = parts.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = parts.host?.lowercased(), parts.user == nil, parts.password == nil else { return nil }
+        parts.scheme = scheme
+        parts.host = host
+        if (scheme == "http" && parts.port == 80) || (scheme == "https" && parts.port == 443) { parts.port = nil }
+        parts.path = ""
+        parts.query = nil
+        parts.fragment = nil
+        return parts.string
+    }
+
     public static func shouldOpenInDefaultBrowser(_ url: URL, linkWasUserActivated: Bool, appURL: URL? = nil) -> Bool {
         linkWasUserActivated && !keepsInApp(url, appURL: appURL)
     }
 }
 
 public enum LaunchConfiguration {
+    public static func selectedEnvironment() throws -> DesktopEnvironmentConfiguration {
+        try DesktopEnvironmentConfigurationStore.shared.current(fallbackAppURL: url())
+    }
+
+    public static func selectedURL() -> URL {
+        let store = DesktopEnvironmentConfigurationStore.shared
+        do {
+            if let configuration = try store.load() { return configuration.appPageURL }
+        } catch {
+            return NavigationPolicy.defaultURL
+        }
+        return store.hasStoredValue() ? NavigationPolicy.defaultURL : url()
+    }
+
     public static func url(arguments: [String] = CommandLine.arguments) -> URL {
         url(
             arguments: arguments,

@@ -3,7 +3,12 @@ import Foundation
 import PersonaStackCore
 import ServiceManagement
 import Testing
+import WebKit
 @testable import PersonaStack
+
+private func waitForCredentialRead(_ semaphore: DispatchSemaphore) -> Bool {
+    semaphore.wait(timeout: .now() + 2) == .success
+}
 
 private actor DesktopControlInstallerFixture: DesktopControlDriverInstalling {
     private let errors: [any Error]
@@ -41,6 +46,26 @@ private struct MainThreadRejectingCredentialStore: DesktopControlCredentialStori
         if Thread.isMainThread { throw DesktopControlEnrollmentError.credentialStoreUnavailable }
         return nil
     }
+    func delete() throws {}
+}
+
+private final class SuspendedDesktopControlCredentialStore: DesktopControlCredentialStoring, @unchecked Sendable {
+    let readStarted = DispatchSemaphore(value: 0)
+    let continueRead = DispatchSemaphore(value: 0)
+    private let installation: DesktopControlInstallation
+
+    init(installation: DesktopControlInstallation) { self.installation = installation }
+
+    func save(_ installation: DesktopControlInstallation) throws {}
+
+    func load() throws -> DesktopControlInstallation? {
+        readStarted.signal()
+        guard continueRead.wait(timeout: .now() + 2) == .success else {
+            throw DesktopControlEnrollmentError.credentialStoreUnavailable
+        }
+        return installation
+    }
+
     func delete() throws {}
 }
 
@@ -107,6 +132,26 @@ private struct MainThreadRejectingCredentialStore: DesktopControlCredentialStori
         runtime: DesktopControlSetupRuntimeFixture(), credentials: credentials
     ).apply(.state(scope: ""), page: page)
     #expect(injectedState["installation_id"] is NSNull)
+}
+
+@Test @MainActor func unregisterFencesQueuedSetupCallbacks() async throws {
+    let appURL = URL(string: "https://my.personastack.ai")!
+    let runtime = DesktopControlSetupRuntimeFixture()
+    let manager = DesktopControlSetupManager(runtime: runtime)
+    let view = WKWebView()
+    manager.register(view, appURL: appURL)
+    let page = try #require(manager.registeredPage(for: view))
+    var replyError: String?
+
+    manager.dispatch(["version": "1", "action": "sync", "scope": ""], page: page) { _, error in
+        replyError = error
+    }
+    manager.unregister(view)
+    await Task.yield()
+
+    #expect(replyError != nil)
+    #expect(runtime.finishSetupCalls == 0)
+    #expect(manager.registeredPage(for: view) == nil)
 }
 
 @Test @MainActor func macOSLockFencesCommandsBeforeAsynchronousHeartbeat() async {
@@ -185,6 +230,125 @@ private struct SavedDesktopControlCredentialStore: DesktopControlCredentialStori
     #expect(!runtime.gatewayConnected)
 }
 
+@Test @MainActor func environmentSwitchStopsLocalControlButKeepsTheOldEnrollment() async throws {
+    let payload = Data(#"{"installation_id":"installation-switch","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8)
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
+    var cuaStops = 0
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []),
+        credentials: SavedDesktopControlCredentialStore(installation: installation),
+        installation: installation,
+        connected: true,
+        readiness: "ready",
+        ownedCuaApplication: NSRunningApplication.current,
+        stopCuaApplication: { _, _ in cuaStops += 1; return true }
+    )
+
+    try await runtime.prepareForEnvironmentSwitch()
+
+    #expect(runtime.paused)
+    #expect(!runtime.gatewayConnected)
+    #expect(!runtime.hasActiveInstallation)
+    #expect(runtime.readiness == "unknown")
+    #expect(cuaStops == 1)
+    #expect(try await runtime.savedInstallationForTesting()?.installationID == installation.installationID)
+}
+
+@Test @MainActor func setupCredentialReadCannotRestoreOldInstallationAfterEnvironmentSwitch() async throws {
+    let payload = Data(#"{"installation_id":"installation-late-read","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8)
+    var installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
+    try installation.bindEnvironment(DesktopEnvironmentConfiguration.production.appPageURL,
+                                     configuration: .production)
+    let credentials = SuspendedDesktopControlCredentialStore(installation: installation)
+    let changed = try DesktopEnvironmentConfiguration(
+        appURL: "https://my.personastack.ai",
+        gatewayURL: "https://gateway-alt.example",
+        mcpURL: "https://mcp-alt.example"
+    )
+    var selectedConfiguration = DesktopEnvironmentConfiguration.production
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []),
+        credentials: credentials,
+        configurationProvider: { selectedConfiguration }
+    )
+    let finishingSetup = Task { @MainActor in await runtime.finishSetupIfIdle() }
+    let readStarted = await Task.detached { waitForCredentialRead(credentials.readStarted) }.value
+    #expect(readStarted)
+
+    try await runtime.prepareForEnvironmentSwitch()
+    selectedConfiguration = changed
+    runtime.completeEnvironmentSwitch()
+    credentials.continueRead.signal()
+    await finishingSetup.value
+
+    #expect(!runtime.hasActiveInstallation)
+}
+
+@Test @MainActor func savedInstallationValidatesProfileBeforeCachingCredential() async throws {
+    let payload = Data(#"{"installation_id":"installation-wrong-gateway","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://unrelated.example/v1/desktop-control/ws","environment_origin":"https://my.personastack.ai"}"#.utf8)
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []),
+        credentials: SavedDesktopControlCredentialStore(installation: installation)
+    )
+
+    await #expect(throws: DesktopControlEnrollmentError.invalidRequest) {
+        try await runtime.savedInstallation(for: URL(string: "https://my.personastack.ai/user/personas")!)
+    }
+
+    #expect(!runtime.hasActiveInstallation)
+}
+
+@Test @MainActor func failedEnvironmentSwitchKeepsRemoteControlFenced() async throws {
+    let payload = Data(#"{"installation_id":"installation-switch-failure","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8)
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []),
+        credentials: SavedDesktopControlCredentialStore(installation: installation),
+        installation: installation,
+        connected: true,
+        readiness: "ready",
+        ownedCuaApplication: NSRunningApplication.current,
+        stopCuaApplication: { _, _ in false }
+    )
+
+    await #expect(throws: DesktopControlEnvironmentSwitchError.cleanupFailed) {
+        try await runtime.prepareForEnvironmentSwitch()
+    }
+
+    #expect(runtime.paused)
+    #expect(!runtime.gatewayConnected)
+    #expect(runtime.readiness == "cua_unavailable")
+    #expect(!runtime.hasActiveInstallation)
+    runtime.abortEnvironmentSwitch()
+    #expect(runtime.hasPendingEnvironmentSwitch)
+    #expect(!runtime.isReady())
+    #expect(throws: CancellationError.self) { try runtime.beginResume() }
+    let repairGeneration = try runtime.beginRepair()
+    #expect(runtime.isCurrentLifecycle(repairGeneration))
+}
+
+@Test @MainActor func failedEnvironmentSwitchCanStillBeDisconnected() async throws {
+    let payload = Data(#"{"installation_id":"installation-switch-disconnect","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8)
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []),
+        credentials: SavedDesktopControlCredentialStore(installation: installation),
+        installation: installation,
+        connected: true,
+        readiness: "ready",
+        ownedCuaApplication: NSRunningApplication.current,
+        stopCuaApplication: { _, _ in false }
+    )
+
+    await #expect(throws: DesktopControlEnvironmentSwitchError.cleanupFailed) {
+        try await runtime.prepareForEnvironmentSwitch()
+    }
+    runtime.abortEnvironmentSwitch()
+
+    _ = try runtime.beginDisconnect()
+}
+
 @Test @MainActor func quitWaitsForCleanupAndRepliesOnlyOnce() async {
     var cleanupCalls = 0
     var replies = 0
@@ -203,15 +367,23 @@ private struct SavedDesktopControlCredentialStore: DesktopControlCredentialStori
 
 @Test @MainActor func quitDeadlineRepliesWhenCleanupIsSlow() async {
     var replies = 0
+    var cleanupContinuation: CheckedContinuation<Void, Never>?
     let delegate = PersonaStackTerminationDelegate(
-        shutdown: { try? await Task.sleep(for: .milliseconds(100)) },
+        shutdown: { await withCheckedContinuation { cleanupContinuation = $0 } },
         reply: { _ in replies += 1 },
         timeout: .milliseconds(10))
 
     #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateLater)
-    try? await Task.sleep(for: .milliseconds(40))
+    for _ in 0..<100 where cleanupContinuation == nil {
+        try? await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(cleanupContinuation != nil)
+    for _ in 0..<100 where replies == 0 {
+        try? await Task.sleep(for: .milliseconds(10))
+    }
     #expect(replies == 1)
-    try? await Task.sleep(for: .milliseconds(100))
+    cleanupContinuation?.resume()
+    try? await Task.sleep(for: .milliseconds(20))
     #expect(replies == 1)
 }
 
@@ -235,6 +407,7 @@ private final class DesktopControlSetupRuntimeFixture: DesktopControlSetupRuntim
     private(set) var ready = false
     private(set) var nativeProbeCount = 0
     private(set) var connectedInstallationID = ""
+    private(set) var finishSetupCalls = 0
     var permissionGranted = false
     private var generation = UUID()
     var readiness: String { ready ? "ready" : "permission_required" }
@@ -263,7 +436,7 @@ private final class DesktopControlSetupRuntimeFixture: DesktopControlSetupRuntim
         try await resume(generation: generation)
     }
 
-    func finishSetupIfIdle() async {}
+    func finishSetupIfIdle() async { finishSetupCalls += 1 }
 
     func repair(resumeRelay: Bool, expectedGeneration: UUID?) async throws -> UUID {
         repairAttempts += 1
@@ -423,7 +596,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
         let suite = "desktop-control-relay-idle-\(UUID().uuidString)"
         let preferences = try #require(UserDefaults(suiteName: suite))
         defer { preferences.removePersistentDomain(forName: suite) }
-        preferences.set(true, forKey: "desktopControlRelayEnabled")
+        preferences.set(true, forKey: DesktopControlPreferenceKeys.relayEnabled(.production))
         let runtime = DesktopControlRuntime.makeForTesting(
             installer: DesktopControlInstallerFixture(errors: []),
             credentials: SavedDesktopControlCredentialStore(installation: installation),
@@ -436,7 +609,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
 
         #expect(runtime.gatewayConnected == hasActiveConfig)
         #expect(runtime.hasActiveInstallation == hasActiveConfig)
-        #expect(preferences.bool(forKey: "desktopControlRelayEnabled") == hasActiveConfig)
+        #expect(preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(.production)) == hasActiveConfig)
     }
 }
 
@@ -449,7 +622,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
         let suite = "desktop-control-owned-cua-\(UUID().uuidString)"
         let preferences = try #require(UserDefaults(suiteName: suite))
         defer { preferences.removePersistentDomain(forName: suite) }
-        preferences.set(true, forKey: "desktopControlRelayEnabled")
+        preferences.set(true, forKey: DesktopControlPreferenceKeys.relayEnabled(.production))
         var cuaStops = 0
         let runtime = DesktopControlRuntime.makeForTesting(
             installer: DesktopControlInstallerFixture(errors: []),
@@ -465,7 +638,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
 
         #expect(cuaStops == expectedStops)
         #expect(runtime.gatewayConnected == hasActiveConfig)
-        #expect(preferences.bool(forKey: "desktopControlRelayEnabled") == hasActiveConfig)
+        #expect(preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(.production)) == hasActiveConfig)
     }
 }
 
@@ -476,7 +649,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     let suite = "desktop-control-cua-stop-failure-\(UUID().uuidString)"
     let preferences = try #require(UserDefaults(suiteName: suite))
     defer { preferences.removePersistentDomain(forName: suite) }
-    preferences.set(true, forKey: "desktopControlRelayEnabled")
+    preferences.set(true, forKey: DesktopControlPreferenceKeys.relayEnabled(.production))
     var cuaStops = 0
     let runtime = DesktopControlRuntime.makeForTesting(
         installer: DesktopControlInstallerFixture(errors: []),
@@ -493,7 +666,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     #expect(runtime.gatewayConnected)
     #expect(runtime.hasActiveInstallation)
     #expect(runtime.readiness == "cua_unavailable")
-    #expect(preferences.bool(forKey: "desktopControlRelayEnabled"))
+    #expect(preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(.production)))
 }
 
 @Test @MainActor func idleRelayKeepsInstallationWhenExecutorCleanupFails() async throws {
@@ -503,7 +676,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     let suite = "desktop-control-idle-failure-\(UUID().uuidString)"
     let preferences = try #require(UserDefaults(suiteName: suite))
     defer { preferences.removePersistentDomain(forName: suite) }
-    preferences.set(true, forKey: "desktopControlRelayEnabled")
+    preferences.set(true, forKey: DesktopControlPreferenceKeys.relayEnabled(.production))
     let executor = DesktopControlCommandExecutor()
     let owner = DesktopControlTarget(installationID: installation.installationID, workspaceID: "workspace-a",
                                      configID: "config-a", personaID: "persona-a", runID: "run-a",
@@ -524,7 +697,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
 
     #expect(runtime.gatewayConnected)
     #expect(runtime.hasActiveInstallation)
-    #expect(preferences.bool(forKey: "desktopControlRelayEnabled"))
+    #expect(preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(.production)))
     #expect(runtime.readiness == "cua_unavailable")
 }
 
@@ -546,7 +719,8 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
         credentials: SavedDesktopControlCredentialStore(installation: installation),
         preferences: preferences,
         registerLoginItem: { loginItemRegistrations += 1 },
-        loginItemStatus: { loginItemRegistrations > 0 ? .enabled : .notRegistered }
+        loginItemStatus: { loginItemRegistrations > 0 ? .enabled : .notRegistered },
+        configurationProvider: { .production }
     )
     let page = DesktopControlSetupManager.Page(appURL: appURL)
     let scope = "workspace-setup-session"
@@ -597,8 +771,8 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     #expect(runtime.repairAttempts == 0)
     #expect(runtime.connectedInstallationID == installation.installationID)
     #expect(loginItemRegistrations == 1)
-    #expect(preferences.bool(forKey: "desktopControlRelayEnabled"))
-    #expect(!(preferences.bool(forKey: "desktopControlRelayPaused")))
+    #expect(preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(.production)))
+    #expect(!(preferences.bool(forKey: DesktopControlPreferenceKeys.relayPaused(.production))))
     #expect(await enrollment.readyInstallationIDs == [installation.installationID])
     #expect(await enrollment.attachedTicketInstallationIDs == [installation.installationID])
     #expect(page.setupScope.generation == setupGeneration)
@@ -643,5 +817,5 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     #expect(await enrollment.readyInstallationIDs.isEmpty)
     #expect(await enrollment.attachedTicketInstallationIDs.isEmpty)
     #expect(!runtime.gatewayConnected)
-    #expect(!preferences.bool(forKey: "desktopControlRelayEnabled"))
+    #expect(!preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(.production)))
 }

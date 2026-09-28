@@ -1,5 +1,6 @@
 import AppKit
 import Testing
+import WebKit
 import PersonaStackCore
 @testable import PersonaStack
 
@@ -15,6 +16,44 @@ struct ChatWindowTests {
         let bounds = mask?.path?.boundingBoxOfPath
         #expect(bounds?.minY == 0)
         #expect(abs((bounds?.maxY ?? -1) - chat.webView.bounds.height) < 0.1)
+    }
+
+    @MainActor
+    @Test func testNativePinReplacesHostedPinOnOlderPages() async throws {
+        _ = NSApplication.shared
+        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false) {}
+        defer { chat.dispose() }
+        // Use the chat's WebKit configuration with a local document and no navigation delegate.
+        let hosted = WKWebView(frame: .zero, configuration: chat.webView.configuration)
+        hosted.loadHTMLString("""
+            <html><head><style>[data-desktop-pin] { display: inline-flex; }</style></head>
+            <body><button data-desktop-pin>Always on top</button></body></html>
+            """, baseURL: nil)
+        var hidden = false
+        for _ in 0..<40 {
+            hidden = (try? await hosted.evaluateJavaScript("""
+                !!document.querySelector('[data-desktop-pin]') &&
+                getComputedStyle(document.querySelector('[data-desktop-pin]')).display === 'none'
+                """)) as? Bool == true
+            if hidden { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(hidden)
+        for width in [440.0, 390.0] {
+            chat.window.setContentSize(NSSize(width: width, height: 676))
+            chat.window.contentView?.layoutSubtreeIfNeeded()
+            let pin = chat.titleBar.pinButton
+            #expect(pin.frame.size == NSSize(width: 28, height: 28))
+            #expect(abs(chat.titleBar.bounds.maxX - pin.frame.maxX - 16) < 0.1)
+            #expect(abs(chat.titleBar.bounds.midY - pin.frame.midY) < 0.1)
+            #expect(chat.titleBar.subviews.filter { $0 is NSButton }.count == 1)
+        }
+        chat.titleBar.pinButton.performClick(nil)
+        #expect(chat.window.level == .floating)
+        #expect(chat.titleBar.pinButton.pinned)
+        chat.titleBar.pinButton.performClick(nil)
+        #expect(chat.window.level == .normal)
+        #expect(!chat.titleBar.pinButton.pinned)
     }
 
     @Test func testStrictCommands() {

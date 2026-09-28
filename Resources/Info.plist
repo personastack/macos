@@ -28,6 +28,11 @@
   <string>Record audio attachments when you choose the microphone in persona chat.</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsArbitraryLoads</key>
+    <true/>
+  </dict>
   <key>PersonaStackDefaultURL</key>
   <string>http://127.0.0.1:8080/user/personas</string>
 </dict>

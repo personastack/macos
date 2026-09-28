@@ -26,28 +26,24 @@ struct DesktopControlInstallation: Codable, Equatable, Sendable {
             throw DesktopControlEnrollmentError.invalidResponse
         }
         let environmentOrigin = try values.decodeIfPresent(String.self, forKey: .environmentOrigin)
-        if let environmentOrigin,
-           !DesktopControlEnvironment.allowsGateway(gatewayURL, for: environmentOrigin) {
-            throw DesktopControlEnrollmentError.invalidResponse
-        }
         self.environmentOrigin = environmentOrigin
         self.installationID = installationID
         self.machineCredential = machineCredential
         self.gatewayWebsocketURL = gatewayURL
     }
 
-    mutating func bindEnvironment(_ appURL: URL) throws {
+    mutating func bindEnvironment(_ appURL: URL, configuration: DesktopEnvironmentConfiguration? = nil) throws {
         let origin = try DesktopControlEnvironment.origin(appURL)
-        guard DesktopControlEnvironment.allowsGateway(gatewayWebsocketURL, for: origin) else {
+        guard DesktopControlEnvironment.allowsGateway(gatewayWebsocketURL, for: origin, configuration: configuration) else {
             throw DesktopControlEnrollmentError.invalidResponse
         }
         environmentOrigin = origin
     }
 
-    func requireEnvironment(_ appURL: URL) throws {
+    func requireEnvironment(_ appURL: URL, configuration: DesktopEnvironmentConfiguration? = nil) throws {
         guard environmentOrigin == (try DesktopControlEnvironment.origin(appURL)),
               let environmentOrigin,
-              DesktopControlEnvironment.allowsGateway(gatewayWebsocketURL, for: environmentOrigin) else {
+              DesktopControlEnvironment.allowsGateway(gatewayWebsocketURL, for: environmentOrigin, configuration: configuration) else {
             throw DesktopControlEnrollmentError.invalidRequest
         }
     }
@@ -126,30 +122,27 @@ protocol DesktopControlCredentialStoring: Sendable {
 }
 
 enum DesktopControlEnvironment {
-    private static let gatewayPath = "/v1/desktop-control/ws"
-
     static func supportsAppOrigin(_ appURL: URL) -> Bool {
-        guard let origin = try? origin(appURL) else { return false }
-        return expectedGateway(for: origin) != nil
+        return (try? DesktopEnvironmentConfigurationStore.shared.environment(for: appURL)) != nil
     }
 
-    static func allowsGateway(_ gatewayURL: URL, for origin: String) -> Bool {
-        guard let expected = expectedGateway(for: origin) else { return false }
-        guard let parts = URLComponents(url: gatewayURL, resolvingAgainstBaseURL: false) else { return false }
-        let defaultPort = expected.scheme == "wss" ? 443 : 80
-        return parts.scheme?.lowercased() == expected.scheme
-            && parts.host?.lowercased() == expected.host
-            && (parts.port == nil || parts.port == defaultPort)
-            && parts.user == nil && parts.password == nil
-            && parts.path == gatewayPath && parts.query == nil && parts.fragment == nil
+    static func allowsGateway(_ gatewayURL: URL, for origin: String,
+                              configuration suppliedConfiguration: DesktopEnvironmentConfiguration? = nil) -> Bool {
+        guard let appURL = URL(string: origin),
+              let configuration = suppliedConfiguration ?? (try? DesktopEnvironmentConfigurationStore.shared.environment(for: appURL)),
+              configuration.appOrigin == origin else { return false }
+        return sameEndpoint(gatewayURL, configuration.gatewayWebsocketURL)
     }
 
-    private static func expectedGateway(for origin: String) -> (scheme: String, host: String)? {
-        switch origin {
-        case "https://my.personastack.ai": ("wss", "cluster-agent.personastack.ai")
-        case "https://personastack.ericgreer.info": ("ws", "cluster-agent.personastack.lan")
-        default: nil
-        }
+    static func sameEndpoint(_ actual: URL, _ expected: URL) -> Bool {
+        guard let actualParts = URLComponents(url: actual, resolvingAgainstBaseURL: false),
+              let expectedParts = URLComponents(url: expected, resolvingAgainstBaseURL: false) else { return false }
+        return actualParts.scheme?.lowercased() == expectedParts.scheme?.lowercased()
+            && actualParts.host?.lowercased() == expectedParts.host?.lowercased()
+            && actualParts.port == expectedParts.port
+            && actualParts.path == expectedParts.path
+            && actualParts.user == nil && actualParts.password == nil
+            && actualParts.query == nil && actualParts.fragment == nil
     }
 
     static func origin(_ appURL: URL) throws -> String {
@@ -168,6 +161,23 @@ protocol DesktopControlKeychainAccess: Sendable {
     func read(service: String, account: String) throws -> Data?
     func write(_ data: Data, service: String, account: String) throws
     func remove(service: String, account: String) throws
+}
+
+final class DesktopControlRedirectBlocker: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    static let shared = DesktopControlRedirectBlocker()
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+}
+
+enum DesktopControlNetworkSession {
+    static func makeWithoutRedirects() -> URLSession {
+        URLSession(configuration: .ephemeral, delegate: DesktopControlRedirectBlocker.shared, delegateQueue: nil)
+    }
 }
 
 struct SystemDesktopControlKeychainAccess: DesktopControlKeychainAccess {
@@ -217,55 +227,112 @@ struct SystemDesktopControlKeychainAccess: DesktopControlKeychainAccess {
 
 struct KeychainDesktopControlCredentialStore: DesktopControlCredentialStoring {
     private let service: String
-    private let appURL: URL
+    private let appURLOverride: URL?
+    private let configurationOverride: DesktopEnvironmentConfiguration?
+    private let configurationProvider: (@Sendable () -> DesktopEnvironmentConfiguration)?
     private let keychain: any DesktopControlKeychainAccess
-    let account: String
+    var account: String {
+        (try? credentialContext().account) ?? "installation:invalid"
+    }
 
-    init(service: String = "ai.personastack.desktop-control", appURL: URL = LaunchConfiguration.url(),
+    init(service: String = "ai.personastack.desktop-control", appURL: URL? = nil,
+         configuration: DesktopEnvironmentConfiguration? = nil,
+         configurationProvider: (@Sendable () -> DesktopEnvironmentConfiguration)? = nil,
          keychain: any DesktopControlKeychainAccess = SystemDesktopControlKeychainAccess()) {
         self.service = service
-        self.appURL = appURL
+        self.appURLOverride = appURL
+        self.configurationOverride = configuration
+        self.configurationProvider = configurationProvider
         self.keychain = keychain
-        self.account = "installation:" + ((try? DesktopControlEnvironment.origin(appURL)) ?? "invalid")
     }
 
     func save(_ installation: DesktopControlInstallation) throws {
-        try keychain.write(JSONEncoder().encode(installation), service: service, account: account)
+        let context = try credentialContext()
+        try keychain.write(JSONEncoder().encode(installation), service: service, account: context.account)
     }
 
     func load() throws -> DesktopControlInstallation? {
-        if let data = try keychain.read(service: service, account: account) {
+        let context = try credentialContext()
+        if let data = try keychain.read(service: service, account: context.account) {
             guard let installation = try? JSONDecoder().decode(DesktopControlInstallation.self, from: data) else {
                 throw DesktopControlEnrollmentError.credentialStoreUnavailable
             }
-            try installation.requireEnvironment(appURL)
+            try installation.requireEnvironment(context.appURL, configuration: context.configuration)
             return installation
         }
-        guard var legacy = try matchingLegacyInstallation() else { return nil }
-        try legacy.bindEnvironment(appURL)
-        try save(legacy)
+        guard var legacy = try matchingLegacyInstallation(configuration: context.configuration, appURL: context.appURL)
+            ?? matchingOriginScopedInstallation(configuration: context.configuration) else { return nil }
+        try legacy.bindEnvironment(context.appURL, configuration: context.configuration)
+        try keychain.write(JSONEncoder().encode(legacy), service: service, account: context.account)
         return legacy
     }
 
     func delete() throws {
+        let context = try credentialContext()
         // A migrated legacy credential must not reappear after an explicit
         // disconnect. An item owned by the other environment is untouched.
-        if try matchingLegacyInstallation() != nil {
+        if try matchingLegacyInstallation(configuration: context.configuration, appURL: context.appURL) != nil {
             try keychain.remove(service: service, account: "installation")
         }
-        try keychain.remove(service: service, account: account)
+        if try matchingOriginScopedInstallation(configuration: context.configuration) != nil {
+            try keychain.remove(service: service, account: "installation:" + context.configuration.appOrigin)
+        }
+        try keychain.remove(service: service, account: context.account)
     }
 
-    private func matchingLegacyInstallation() throws -> DesktopControlInstallation? {
-        // Older builds used one account for every environment. Its gateway is
-        // the only safe evidence of which official origin owns the item.
-        guard let origin = try? DesktopControlEnvironment.origin(appURL),
+    private func credentialContext() throws -> (appURL: URL, configuration: DesktopEnvironmentConfiguration, account: String) {
+        let appURL: URL
+        let configuration: DesktopEnvironmentConfiguration
+        if let configurationOverride {
+            configuration = configurationOverride
+            appURL = appURLOverride ?? configuration.appPageURL
+        } else if let configurationProvider {
+            configuration = configurationProvider()
+            appURL = appURLOverride ?? configuration.appPageURL
+        } else if let appURLOverride {
+            appURL = appURLOverride
+            guard let selected = try? DesktopEnvironmentConfigurationStore.shared.environment(for: appURL) else {
+                throw DesktopControlEnrollmentError.invalidRequest
+            }
+            configuration = selected
+        } else {
+            guard let selected = try? LaunchConfiguration.selectedEnvironment() else {
+                throw DesktopControlEnrollmentError.invalidRequest
+            }
+            configuration = selected
+            appURL = selected.appPageURL
+        }
+        guard (try? DesktopControlEnvironment.origin(appURL)) == configuration.appOrigin else {
+            throw DesktopControlEnrollmentError.invalidRequest
+        }
+        return (appURL, configuration, "installation:" + configuration.preferenceIdentity)
+    }
+
+    private func matchingLegacyInstallation(configuration: DesktopEnvironmentConfiguration,
+                                            appURL: URL) throws -> DesktopControlInstallation? {
+        // The oldest build used one account for every environment. Only its
+        // original production and LAN service pairs can identify ownership.
+        guard configuration == .production || configuration == .lan,
+              let origin = try? DesktopControlEnvironment.origin(appURL), origin == configuration.appOrigin,
               let data = try keychain.read(service: service, account: "installation"),
               let legacy = try? JSONDecoder().decode(DesktopControlInstallation.self, from: data),
-              DesktopControlEnvironment.allowsGateway(legacy.gatewayWebsocketURL, for: origin) else {
+              legacy.environmentOrigin == nil || legacy.environmentOrigin == origin,
+              DesktopControlEnvironment.allowsGateway(legacy.gatewayWebsocketURL, for: origin, configuration: configuration) else {
             return nil
         }
         return legacy
+    }
+
+    private func matchingOriginScopedInstallation(configuration: DesktopEnvironmentConfiguration) throws -> DesktopControlInstallation? {
+        let origin = configuration.appOrigin
+        guard configuration == .production || configuration == .lan,
+              let data = try keychain.read(service: service, account: "installation:" + origin),
+              let installation = try? JSONDecoder().decode(DesktopControlInstallation.self, from: data),
+              installation.environmentOrigin == nil || installation.environmentOrigin == origin,
+              DesktopControlEnvironment.allowsGateway(installation.gatewayWebsocketURL, for: origin, configuration: configuration) else {
+            return nil
+        }
+        return installation
     }
 }
 
@@ -280,8 +347,8 @@ protocol DesktopControlRelayStateReading: Sendable {
 actor URLSessionDesktopControlEnrollmentTransport: DesktopControlEnrollmentTransport {
     private let session: URLSession
 
-    init(session: URLSession = .shared) {
-        self.session = session
+    init(session: URLSession? = nil) {
+        self.session = session ?? DesktopControlNetworkSession.makeWithoutRedirects()
     }
 
     func post(url: URL, body: Data, bearer: String?) async throws -> (Data, Int) {

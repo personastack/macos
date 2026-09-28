@@ -5,25 +5,34 @@ import WebKit
 
 @MainActor
 final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
-    static let shared = LocalSessionManager()
+    static let shared = LocalSessionManager(validateMCP: LocalSessionMCPRedirectValidator.validate)
     private let logger = Logger(subsystem: "ai.personastack.desktop", category: "local-session")
     private final class Page {
         let appURL: URL
         var pending = LocalSessionPendingRequests()
+        private(set) var isRetired = false
         init(_ appURL: URL) { self.appURL = appURL }
+
+        func retire() {
+            isRetired = true
+            pending.sync("")
+        }
     }
     private let pages = NSMapTable<WKWebView, Page>.weakToStrongObjects()
     private var configuringProfiles = Set<String>()
+    private var inFlightInstalls: [UUID: Task<LocalSessionInstalledFiles, Error>] = [:]
     private let preferences: UserDefaults
     private let probe: @Sendable (LocalSessionHarness) throws -> LocalSessionHarnessProbe
     private let preflight: @Sendable (LocalSessionHarness, LocalSessionHarnessProbe) throws -> Void
     private let install: @Sendable (LocalSessionBundle, URL, UUID, LocalSessionHarnessProbe) throws -> LocalSessionInstalledFiles
+    private let validateMCP: @Sendable (URL) async throws -> Void
 
     init(preferences: UserDefaults = .standard,
          probe: @escaping @Sendable (LocalSessionHarness) throws -> LocalSessionHarnessProbe = { try LocalSessionProbe.inspect($0) },
          preflight: @escaping @Sendable (LocalSessionHarness, LocalSessionHarnessProbe) throws -> Void = LocalSessionManager.preflightFiles,
-         install: @escaping @Sendable (LocalSessionBundle, URL, UUID, LocalSessionHarnessProbe) throws -> LocalSessionInstalledFiles = LocalSessionManager.installFiles) {
-        self.preferences = preferences; self.probe = probe; self.preflight = preflight; self.install = install
+         install: @escaping @Sendable (LocalSessionBundle, URL, UUID, LocalSessionHarnessProbe) throws -> LocalSessionInstalledFiles = LocalSessionManager.installFiles,
+         validateMCP: @escaping @Sendable (URL) async throws -> Void = { _ in }) {
+        self.preferences = preferences; self.probe = probe; self.preflight = preflight; self.install = install; self.validateMCP = validateMCP
         super.init()
     }
 
@@ -33,6 +42,16 @@ final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
     }
 
     func register(_ view: WKWebView, appURL: URL) { pages.setObject(Page(appURL), forKey: view) }
+    func invalidate(_ view: WKWebView) {
+        pages.object(forKey: view)?.retire()
+        pages.removeObject(forKey: view)
+    }
+
+    func invalidateAndWait(_ view: WKWebView) async {
+        invalidate(view)
+        let installs = Array(inFlightInstalls.values)
+        for install in installs { _ = try? await install.value }
+    }
     func invalidateSession() {
         for page in pages.objectEnumerator()?.allObjects as? [Page] ?? [] { page.pending.sync("") }
     }
@@ -66,6 +85,7 @@ final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
     }
 
     private func apply(_ command: LocalSessionCommand, page: Page) async throws -> [String: Any] {
+        guard !page.isRetired else { throw LocalSessionError.staleRequest }
         let key = preferenceKey(page.appURL)
         switch command {
         case .state(let scope):
@@ -86,11 +106,12 @@ final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
             logger.notice("local session prepare CLI probe started")
             let installation = try await Task.detached { try probe(harness) }.value
             logger.notice("local session prepare CLI probe completed")
+            guard !page.isRetired, page.pending.scope == scope, page.pending.generation == generation else { throw LocalSessionError.staleRequest }
             let preflight = self.preflight
             logger.notice("local session prepare plugin preflight started")
             _ = try await Task.detached { try preflight(harness, installation) }.value
             logger.notice("local session prepare plugin preflight completed")
-            guard page.pending.scope == scope, page.pending.generation == generation else { throw LocalSessionError.staleRequest }
+            guard !page.isRetired, page.pending.scope == scope, page.pending.generation == generation else { throw LocalSessionError.staleRequest }
             let id = try page.pending.prepare(persona: persona, harness: harness)
             return ["ok": true, "pending_id": id.uuidString]
         case .configure(let scope, let id, let data):
@@ -98,19 +119,26 @@ final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
             let bundle = try LocalSessionBundle.decode(data, appURL: page.appURL)
             logger.notice("local session configure bundle validation completed")
             try page.pending.consume(id, scope: scope, bundle: bundle)
+            guard let mcpURL = URL(string: bundle.mcpURL) else { throw LocalSessionError.invalidBundle }
             let generation = page.pending.generation
+            try await validateMCP(mcpURL)
+            guard !page.isRetired, page.pending.scope == scope, page.pending.generation == generation else { throw LocalSessionError.staleRequest }
             let probe = self.probe
             logger.notice("local session configure CLI probe started")
             let installation = try await Task.detached { try probe(bundle.harness) }.value
             logger.notice("local session configure CLI probe completed")
-            guard page.pending.scope == scope, page.pending.generation == generation else { throw LocalSessionError.staleRequest }
+            guard !page.isRetired, page.pending.scope == scope, page.pending.generation == generation else { throw LocalSessionError.staleRequest }
             let profileKey = installation.profile.resolvingSymlinksInPath().standardizedFileURL.path
             guard configuringProfiles.insert(profileKey).inserted else { throw LocalSessionError.staleRequest }
             defer { configuringProfiles.remove(profileKey) }
             let install = self.install
             let appURL = page.appURL
             logger.notice("local session configure plugin installation started")
-            _ = try await Task.detached { try install(bundle, appURL, id, installation) }.value
+            let installTask = Task.detached { try install(bundle, appURL, id, installation) }
+            let installID = UUID()
+            inFlightInstalls[installID] = installTask
+            defer { inFlightInstalls.removeValue(forKey: installID) }
+            _ = try await installTask.value
             logger.notice("local session configure plugin installation completed")
             return ["ok": true]
         }
@@ -144,6 +172,24 @@ final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
         case "state", "select_harness", "prepare", "configure": return action
         case "launch": return "legacy_launch"
         default: return "unknown"
+        }
+    }
+}
+
+enum LocalSessionMCPRedirectValidator {
+    static func validate(_ url: URL) async throws {
+        var request = URLRequest(url: url, timeoutInterval: 8)
+        request.httpMethod = "HEAD"
+        let session = DesktopControlNetworkSession.makeWithoutRedirects()
+        defer { session.finishTasksAndInvalidate() }
+        do {
+            let (_, response) = try await session.data(for: request)
+            guard let response = response as? HTTPURLResponse else { throw LocalSessionError.mcpUnavailable }
+            guard !(300..<400).contains(response.statusCode) else { throw LocalSessionError.mcpRedirect }
+        } catch let error as LocalSessionError {
+            throw error
+        } catch {
+            throw LocalSessionError.mcpUnavailable
         }
     }
 }

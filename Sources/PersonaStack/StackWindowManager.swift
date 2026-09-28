@@ -13,6 +13,8 @@ final class StackWindowManager: NSObject, WKScriptMessageHandlerWithReply {
 
     func register(_ view: WKWebView, appURL: URL) { mainViews.setObject(appURL as NSURL, forKey: view) }
 
+    func unregister(_ view: WKWebView) { mainViews.removeObject(forKey: view) }
+
     func invalidateSession() {
         let stale = Array(windows.values)
         windows.removeAll()
@@ -44,7 +46,7 @@ final class StackWindowManager: NSObject, WKScriptMessageHandlerWithReply {
             url = StackWindowCommand.popoutURL(appURL: base, stackID: stackID, view: view)
             transparent = view == .graph
             showsWindowChrome = view == .stream
-            chromeOverContent = false
+            chromeOverContent = view == .stream
         case .openPersonaActivity(let personaID):
             windowKey = "persona-activity:\(personaID)"
             url = StackWindowCommand.personaActivityURL(appURL: base, personaID: personaID)

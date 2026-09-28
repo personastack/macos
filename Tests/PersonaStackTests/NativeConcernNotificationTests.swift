@@ -20,7 +20,8 @@ struct NativeConcernNotificationTests {
             name: "personastackConcern",
             isMainFrame: true,
             host: "my.personastack.ai",
-            body: ["version": "1", "event": "created"]
+            body: ["version": "1", "event": "created"],
+            appURL: URL(string: "https://my.personastack.ai")
         )
 
         let request = try #require(scheduledRequests.first)
@@ -42,11 +43,14 @@ struct NativeConcernNotificationTests {
             scheduleNotification: { scheduledRequests.append($0) }
         )
         let acceptedPayload: [String: Any] = ["version": "1", "event": "created"]
-        let invalidMessages: [(name: String, isMainFrame: Bool, host: String?, body: Any)] = [
-            ("otherHandler", true, "my.personastack.ai", acceptedPayload),
-            ("personastackConcern", false, "my.personastack.ai", acceptedPayload),
-            ("personastackConcern", true, "attacker.invalid", acceptedPayload),
-            ("personastackConcern", true, "my.personastack.ai", ["version": "1", "event": "resolved"]),
+        let validOrigin = URL(string: "https://my.personastack.ai")!
+        let invalidMessages: [(name: String, isMainFrame: Bool, host: String?, body: Any, appURL: URL?)] = [
+            ("otherHandler", true, "my.personastack.ai", acceptedPayload, validOrigin),
+            ("personastackConcern", false, "my.personastack.ai", acceptedPayload, validOrigin),
+            ("personastackConcern", true, "attacker.invalid", acceptedPayload, URL(string: "https://attacker.invalid")),
+            ("personastackConcern", true, "my.personastack.ai", acceptedPayload, URL(string: "http://my.personastack.ai")),
+            ("personastackConcern", true, "my.personastack.ai", acceptedPayload, URL(string: "https://my.personastack.ai:444")),
+            ("personastackConcern", true, "my.personastack.ai", ["version": "1", "event": "resolved"], validOrigin),
         ]
 
         for message in invalidMessages {
@@ -54,7 +58,8 @@ struct NativeConcernNotificationTests {
                 name: message.name,
                 isMainFrame: message.isMainFrame,
                 host: message.host,
-                body: message.body
+                body: message.body,
+                appURL: message.appURL
             )
         }
 
@@ -84,7 +89,8 @@ struct NativeConcernNotificationTests {
         #expect(host.coordinator === coordinator)
         coordinator.handleConcernMessage(name: "personastackConcern", isMainFrame: true,
                                          host: "my.personastack.ai",
-                                         body: ["version": "1", "event": "created"])
+                                         body: ["version": "1", "event": "created"],
+                                         appURL: URL(string: "https://my.personastack.ai"))
         #expect(scheduledRequests.count == 1)
 
         let reopenedWindowContent = NSView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
@@ -93,7 +99,30 @@ struct NativeConcernNotificationTests {
         #expect(originalWebView.superview === reopenedWindowContent)
         coordinator.handleConcernMessage(name: "personastackConcern", isMainFrame: true,
                                          host: "my.personastack.ai",
-                                         body: ["version": "1", "event": "created"])
+                                         body: ["version": "1", "event": "created"],
+                                         appURL: URL(string: "https://my.personastack.ai"))
         #expect(scheduledRequests.count == 2)
+    }
+
+    @MainActor
+    @Test
+    func retiredCoordinatorCannotScheduleNotifications() throws {
+        var scheduledRequests: [UNNotificationRequest] = []
+        let coordinator = PersonaStackWebView.Coordinator(
+            appURL: try #require(URL(string: "https://my.personastack.ai/user/personas")),
+            configureNotificationCenter: { _ in },
+            scheduleNotification: { scheduledRequests.append($0) }
+        )
+        coordinator.retire()
+
+        coordinator.handleConcernMessage(
+            name: "personastackConcern",
+            isMainFrame: true,
+            host: "my.personastack.ai",
+            body: ["version": "1", "event": "created"],
+            appURL: URL(string: "https://my.personastack.ai")
+        )
+
+        #expect(scheduledRequests.isEmpty)
     }
 }

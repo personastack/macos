@@ -7,15 +7,15 @@ import WebKit
 @main
 struct PersonaStackApp: App {
     @NSApplicationDelegateAdaptor(PersonaStackTerminationDelegate.self) private var terminationDelegate
-    private let launchURL = LaunchConfiguration.url()
-
+    @ObservedObject private var serverSettings = DesktopEnvironmentSettings.shared
     init() {
-        guard UserDefaults.standard.bool(forKey: "desktopControlRelayEnabled") else { return }
+        guard let configuration = try? LaunchConfiguration.selectedEnvironment(),
+              UserDefaults.standard.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(configuration)) else { return }
         NSApplication.shared.setActivationPolicy(.accessory)
-        let paused = UserDefaults.standard.bool(forKey: "desktopControlRelayPaused")
+        let paused = UserDefaults.standard.bool(forKey: DesktopControlPreferenceKeys.relayPaused(configuration))
         Task { @MainActor in
             _ = MainWebViewHost.shared
-            UserDefaults.standard.set("", forKey: "desktopControlRelayError")
+            UserDefaults.standard.set("", forKey: DesktopControlPreferenceKeys.relayError(configuration))
             UserDefaults.standard.set("", forKey: "desktopControlRepairError")
             do {
                 if paused {
@@ -24,14 +24,15 @@ struct PersonaStackApp: App {
                     try await DesktopControlRuntime.shared.resume()
                 }
             } catch {
-                UserDefaults.standard.set(error.localizedDescription, forKey: "desktopControlRelayError")
+                UserDefaults.standard.set(error.localizedDescription, forKey: DesktopControlPreferenceKeys.relayError(configuration))
             }
         }
     }
 
     var body: some Scene {
         Window("PersonaStack", id: "personastack-main") {
-            PersonaStackWebView(url: launchURL)
+            PersonaStackWebView(url: serverSettings.appPageURL)
+                .id(serverSettings.generation)
                 .frame(minWidth: 1172, minHeight: 700)
                 .background(Color(nsColor: WindowPresentation.canvasColor).ignoresSafeArea())
                 .background(WindowPresentationConfigurator(applicationDelegate: terminationDelegate))
@@ -39,6 +40,7 @@ struct PersonaStackApp: App {
         .defaultSize(width: 1440, height: 960)
         .windowStyle(.hiddenTitleBar)
         .commands {
+            DesktopServerSettingsCommands()
             CommandGroup(after: .toolbar) {
                 Button("Toggle Full Screen") {
                     NSApp.keyWindow?.toggleFullScreen(nil)
@@ -51,6 +53,12 @@ struct PersonaStackApp: App {
             DesktopControlMenu()
         }
         .menuBarExtraStyle(.menu)
+
+        Window("PersonaStack Servers", id: "desktop-server-settings") {
+            DesktopServerSettingsWindow()
+        }
+        .defaultSize(width: 600, height: 480)
+        .windowResizability(.contentSize)
     }
 }
 
@@ -113,7 +121,15 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
 /// hidden window retains its WebView when the visible window is closed.
 @MainActor
 final class MainWebViewHost {
-    static let shared = MainWebViewHost(appURL: LaunchConfiguration.url())
+    private(set) static var shared = MainWebViewHost(appURL: LaunchConfiguration.selectedURL())
+
+    static func replaceSharedHost(with appURL: URL) -> MainWebViewHost {
+        let oldHost = shared
+        oldHost.retire()
+        let newHost = MainWebViewHost(appURL: appURL)
+        shared = newHost
+        return oldHost
+    }
 
     static func showMainWindow(openWindow: () -> Void) {
         NSApp.setActivationPolicy(.regular)
@@ -123,6 +139,12 @@ final class MainWebViewHost {
         } else {
             openWindow()
         }
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    static func showServerSettingsWindow(openWindow: () -> Void) {
+        NSApp.setActivationPolicy(.regular)
+        openWindow()
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -178,6 +200,23 @@ final class MainWebViewHost {
             notificationAuthorizationRequested = true
             coordinator.requestNotificationAuthorization()
         }
+    }
+
+    func retire() {
+        ChatWindowManager.shared.unregister(webView)
+        StackWindowManager.shared.unregister(webView)
+        LocalSessionManager.shared.invalidate(webView)
+        DesktopControlSetupManager.shared.unregister(webView)
+        coordinator.retire()
+        webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
+        for name in ["personastackConcern", "personastackChat", "personastackStack", "personastackLocalSession", "personastackDesktopControl"] {
+            webView.configuration.userContentController.removeScriptMessageHandler(forName: name)
+        }
+        webView.removeFromSuperview()
+        backgroundWindow.contentView = nil
+        coordinator.webView = nil
     }
 
     func park(from container: NSView) {
@@ -240,6 +279,7 @@ struct PersonaStackWebView: NSViewRepresentable {
         let appURL: URL
         private let scheduleNotification: (UNNotificationRequest) -> Void
         private var popupWindows: [ObjectIdentifier: NSWindow] = [:]
+        private(set) var isRetired = false
 
         init(
             appURL: URL,
@@ -274,18 +314,29 @@ struct PersonaStackWebView: NSViewRepresentable {
                 name: message.name,
                 isMainFrame: message.frameInfo.isMainFrame,
                 host: message.frameInfo.securityOrigin.host,
-                body: message.body
+                body: message.body,
+                appURL: Self.url(for: message.frameInfo.securityOrigin)
             )
         }
 
-        func handleConcernMessage(name: String, isMainFrame: Bool, host: String?, body: Any) {
-            guard name == "personastackConcern",
+        func handleConcernMessage(name: String, isMainFrame: Bool, host: String?, body: Any, appURL messageURL: URL? = nil) {
+            guard !isRetired,
+                  name == "personastackConcern",
                   isMainFrame,
-                  NavigationPolicy.isAppHost(host),
+                  host?.lowercased() == self.appURL.host?.lowercased(),
+                  messageURL.map({ ChatWindowCommand.sameOrigin($0, self.appURL) }) == true,
                   NotificationBridge.isNewConcernEvent(body) else {
                 return
             }
             postConcernNotification()
+        }
+
+    private static func url(for origin: WKSecurityOrigin) -> URL? {
+            var parts = URLComponents()
+            parts.scheme = origin.protocol
+            parts.host = origin.host
+            if origin.port > 0 { parts.port = origin.port }
+            return parts.url
         }
 
         nonisolated func userNotificationCenter(
@@ -305,12 +356,13 @@ struct PersonaStackWebView: NSViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
+            guard !isRetired else { return .cancel }
             guard let url = navigationAction.request.url else {
                 return .cancel
             }
 
             if webView === self.webView, navigationAction.targetFrame?.isMainFrame == true,
-               NavigationPolicy.isAppHost(url.host) {
+               ChatWindowCommand.sameOrigin(url, appURL) {
                 DesktopControlSetupManager.shared.invalidate(webView)
             }
 
@@ -378,6 +430,27 @@ struct PersonaStackWebView: NSViewRepresentable {
         func webViewDidClose(_ webView: WKWebView) {
             guard let window = popupWindows.removeValue(forKey: ObjectIdentifier(webView)) else { return }
             window.close()
+        }
+
+        func retire() {
+            guard !isRetired else { return }
+            isRetired = true
+            for window in popupWindows.values {
+                if let popup = window.contentViewController?.view as? WKWebView {
+                    popup.stopLoading()
+                    popup.navigationDelegate = nil
+                    popup.uiDelegate = nil
+                    for name in ["personastackConcern", "personastackChat", "personastackStack", "personastackLocalSession", "personastackDesktopControl"] {
+                        popup.configuration.userContentController.removeScriptMessageHandler(forName: name)
+                    }
+                }
+                window.close()
+            }
+            popupWindows.removeAll()
+            webView?.stopLoading()
+            webView?.navigationDelegate = nil
+            webView?.uiDelegate = nil
+            webView = nil
         }
 
         func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,

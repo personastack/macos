@@ -19,9 +19,20 @@ private struct DesktopControlOwnedCuaStopError: LocalizedError {
     }
 }
 
+enum DesktopControlEnvironmentSwitchError: LocalizedError {
+    case cleanupFailed
+
+    var errorDescription: String? {
+        "Desktop Control could not finish cleanup. Remote control remains paused. Repair or disconnect it before changing servers."
+    }
+}
+
 @MainActor
 final class DesktopControlRuntime: DesktopControlSetupRuntime {
-    static let shared = DesktopControlRuntime(relayStateReader: DesktopControlEnrollmentClient())
+    static let shared = DesktopControlRuntime(
+        relayStateReader: DesktopControlEnrollmentClient(),
+        configurationProvider: { try LaunchConfiguration.selectedEnvironment() }
+    )
     private let logger = Logger(subsystem: "ai.personastack.desktop", category: "desktop-control-relay")
 
     private let sessionLock = DesktopControlSessionLock()
@@ -30,6 +41,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private let credentials: any DesktopControlCredentialStoring
     private let relayStateReader: (any DesktopControlRelayStateReading)?
     private let preferences: UserDefaults
+    private let configurationProvider: () throws -> DesktopEnvironmentConfiguration
     private let confirmForegroundSetup: @MainActor () -> Bool
     private var cuaApplication: NSRunningApplication?
     private var ownedCuaApplication: NSRunningApplication?
@@ -48,6 +60,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private var lifecycleGeneration = UUID()
     private var setupMayRunUnconfigured = false
     private var disconnecting = false
+    private var environmentSwitchPending = false
     private var repairInProgress = false
     private var executorCleanupInProgress = false
     private var executorCleanupTask: Task<Bool, Never>?
@@ -63,11 +76,13 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                  credentials: any DesktopControlCredentialStoring = KeychainDesktopControlCredentialStore(),
                  relayStateReader: (any DesktopControlRelayStateReading)? = nil,
                  preferences: UserDefaults = .standard,
+                 configurationProvider: @escaping () throws -> DesktopEnvironmentConfiguration = { try LaunchConfiguration.selectedEnvironment() },
                  confirmForegroundSetup: @escaping @MainActor () -> Bool = DesktopControlRuntime.showForegroundSetupConfirmation) {
         self.installer = installer
         self.credentials = credentials
         self.relayStateReader = relayStateReader
         self.preferences = preferences
+        self.configurationProvider = configurationProvider
         self.confirmForegroundSetup = confirmForegroundSetup
         sessionLock.onChange = { [weak self] state in
             guard let self else { return }
@@ -106,10 +121,13 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                                cleanupFailed: Bool = false,
                                relayStateReader: (any DesktopControlRelayStateReading)? = nil,
                                preferences: UserDefaults = .standard,
+                               configurationProvider: @escaping () throws -> DesktopEnvironmentConfiguration = { .production },
                                ownedCuaApplication: NSRunningApplication? = nil,
                                stopCuaApplication: (@MainActor (NSRunningApplication, URL) async -> Bool)? = nil,
                                confirmForegroundSetup: @escaping @MainActor () -> Bool = { true }) -> DesktopControlRuntime {
-        let runtime = DesktopControlRuntime(installer: installer, credentials: credentials, relayStateReader: relayStateReader, preferences: preferences, confirmForegroundSetup: confirmForegroundSetup)
+        let runtime = DesktopControlRuntime(installer: installer, credentials: credentials, relayStateReader: relayStateReader,
+                                            preferences: preferences, configurationProvider: configurationProvider,
+                                            confirmForegroundSetup: confirmForegroundSetup)
         if let executor { runtime.executor = executor }
         runtime.proxy = proxy
         runtime.gatewayConnectionID = connectionID
@@ -138,7 +156,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 #endif
 
     func beginResume() throws -> UUID {
-        guard !disconnecting else { throw CancellationError() }
+        guard !disconnecting, !environmentSwitchPending else { throw CancellationError() }
         lifecycleGeneration = UUID()
         return lifecycleGeneration
     }
@@ -149,7 +167,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     func resume(generation: UUID) async throws {
         try requireCurrentLifecycle(generation)
-        guard !disconnecting else { throw CancellationError() }
+        guard !disconnecting, !environmentSwitchPending else { throw CancellationError() }
         setupMayRunUnconfigured = false
         guard let installation = try await savedInstallationForStartup(generation: generation) else {
             throw DesktopControlEnrollmentError.installationMissing
@@ -162,7 +180,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     func resumeForSetup(generation: UUID) async throws {
         try requireCurrentLifecycle(generation)
-        guard !disconnecting else { throw CancellationError() }
+        guard !disconnecting, !environmentSwitchPending else { throw CancellationError() }
         try confirmForegroundSession()
         try requireCurrentLifecycle(generation)
         setupMayRunUnconfigured = true
@@ -397,6 +415,58 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         activeInstallation = nil
     }
 
+    func prepareForEnvironmentSwitch() async throws {
+        guard !disconnecting || environmentSwitchPending else { throw CancellationError() }
+        lifecycleGeneration = UUID()
+        let generation = lifecycleGeneration
+        disconnecting = true
+        environmentSwitchPending = true
+        setupMayRunUnconfigured = false
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        gatewayAttemptID = UUID()
+        paused = true
+        readiness = "paused"
+        proxy?.interrupt()
+        startingProxy?.interrupt()
+        let pending = pendingGateway
+        let current = gateway
+        pendingGateway = nil
+        gateway = nil
+        gatewayConnectionID = nil
+        gatewayConnected = false
+        await pending?.stop()
+        await current?.stop()
+        await stopLocalControl(generation: generation)
+        guard generation == lifecycleGeneration else { throw CancellationError() }
+        let cuaStopped = await stopOwnedCuaService()
+        await gateway?.stop()
+        gateway = nil
+        gatewayConnectionID = nil
+        activeInstallation = nil
+        guard !executorCleanupFailed, cuaStopped else {
+            readiness = "cua_unavailable"
+            throw DesktopControlEnvironmentSwitchError.cleanupFailed
+        }
+        readiness = "unknown"
+    }
+
+    func completeEnvironmentSwitch() {
+        guard environmentSwitchPending else { return }
+        environmentSwitchPending = false
+        disconnecting = false
+    }
+
+    func abortEnvironmentSwitch() {
+        guard environmentSwitchPending else { return }
+        disconnecting = false
+        paused = true
+        if readiness == "unknown" { readiness = "cua_unavailable" }
+    }
+
+    var hasPendingEnvironmentSwitch: Bool { environmentSwitchPending }
+    var isDisconnecting: Bool { disconnecting }
+
     func disconnect() async throws {
         let generation = try beginDisconnect()
         try await disconnect(generation: generation)
@@ -442,7 +512,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let enrollment = DesktopControlEnrollmentClient(credentials: credentials)
         if let installation {
             do {
-                try await enrollment.revokeRemote(installation: installation, appURL: LaunchConfiguration.url())
+                try await enrollment.revokeRemote(installation: installation, appURL: LaunchConfiguration.selectedURL())
             } catch {
                 Task { @MainActor [weak self] in
                     guard let self, generation == self.lifecycleGeneration else { return }
@@ -463,12 +533,13 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         activeInstallation = nil
         if let credentialLoadError { throw credentialLoadError }
         if installation != nil { try credentials.delete() }
+        environmentSwitchPending = false
         paused = false
         if !cuaStopped { throw DesktopControlOwnedCuaStopError() }
     }
 
     func connect(installation: DesktopControlInstallation, expectedGeneration: UUID? = nil) async {
-        guard !disconnecting else { return }
+        guard !disconnecting, !environmentSwitchPending else { return }
         let generation = lifecycleGeneration
         guard expectedGeneration == nil || expectedGeneration == generation else { return }
         activeInstallation = installation
@@ -489,11 +560,11 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     func isReady() -> Bool {
-        !paused && sessionLock.allowsControl && readiness == "ready" && isCuaReady() && gatewayConnected
+        !environmentSwitchPending && !paused && sessionLock.allowsControl && readiness == "ready" && isCuaReady() && gatewayConnected
     }
 
     var nativeExecutorReady: Bool {
-        !paused && sessionLock.allowsControl && !executorCleanupInProgress && !executorCleanupFailed
+        !environmentSwitchPending && !paused && sessionLock.allowsControl && !executorCleanupInProgress && !executorCleanupFailed
     }
 
     var hasActiveInstallation: Bool { activeInstallation != nil }
@@ -601,7 +672,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func beginReconnectLoop(for installation: DesktopControlInstallation) {
-        guard reconnectTask == nil else { return }
+        guard !environmentSwitchPending, reconnectTask == nil else { return }
         activeInstallation = installation
         reconnectTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
@@ -639,7 +710,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     private func establishConnection(_ installation: DesktopControlInstallation, generation: UUID) async throws {
         try requireCurrentLifecycle(generation)
-        guard !disconnecting, !executorCleanupInProgress else { throw CancellationError() }
+        guard !disconnecting, !environmentSwitchPending, !executorCleanupInProgress else { throw CancellationError() }
         guard paused || isCuaReady() || readiness != "ready" else { throw CuaMCPProxyError.notStarted }
         let attemptID = UUID()
         gatewayAttemptID = attemptID
@@ -811,12 +882,18 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     func finishSetupIfIdle() async {
+        guard !disconnecting, !environmentSwitchPending else { return }
         let generation = lifecycleGeneration
+        let configuration: DesktopEnvironmentConfiguration
+        do { configuration = try configurationProvider() }
+        catch { return }
         setupMayRunUnconfigured = false
         let saved: DesktopControlInstallation?
         do { saved = try await readSavedInstallation() }
         catch { return }
-        guard generation == lifecycleGeneration else { return }
+        guard generation == lifecycleGeneration, !disconnecting, !environmentSwitchPending else { return }
+        do { try saved?.requireEnvironment(configuration.appPageURL, configuration: configuration) }
+        catch { return }
         activeInstallation = saved
         guard let installation = saved else {
             await stopIdleRelay(expectedLifecycle: generation)
@@ -834,7 +911,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private func stopIfNoActiveConfiguration(installation: DesktopControlInstallation, generation: UUID) async -> Bool {
         guard let relayStateReader else { return false }
         do {
-            let hasActiveConfig = try await relayStateReader.hasActiveConfig(installation: installation, appURL: LaunchConfiguration.url())
+            let hasActiveConfig = try await relayStateReader.hasActiveConfig(installation: installation, appURL: LaunchConfiguration.selectedURL())
             guard generation == lifecycleGeneration else { return false }
             if !hasActiveConfig {
                 await stopIdleRelay(expectedLifecycle: generation)
@@ -861,21 +938,28 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     func savedInstallation(for appURL: URL) async throws -> DesktopControlInstallation? {
+        guard !disconnecting, !environmentSwitchPending else { throw CancellationError() }
         let generation = lifecycleGeneration
+        let configuration = try configurationProvider()
+        guard (try? DesktopControlEnvironment.origin(appURL)) == configuration.appOrigin else {
+            throw DesktopControlEnrollmentError.invalidRequest
+        }
         let saved = try await readSavedInstallation()
-        try requireCurrentLifecycle(generation)
+        guard generation == lifecycleGeneration, !disconnecting, !environmentSwitchPending else {
+            throw CancellationError()
+        }
+        try saved?.requireEnvironment(appURL, configuration: configuration)
         activeInstallation = saved
-        try saved?.requireEnvironment(appURL)
         return saved
     }
 
     private func hasActiveConfig(for installation: DesktopControlInstallation) async throws -> Bool {
         guard let relayStateReader else { return true }
-        return try await relayStateReader.hasActiveConfig(installation: installation, appURL: LaunchConfiguration.url())
+        return try await relayStateReader.hasActiveConfig(installation: installation, appURL: LaunchConfiguration.selectedURL())
     }
 
     private func reconcileRelayAfterConfigRevocation(connectionID: UUID) async {
-        guard gatewayConnectionID == connectionID, !disconnecting,
+        guard gatewayConnectionID == connectionID, !disconnecting, !environmentSwitchPending,
               !setupMayRunUnconfigured, let installation = activeInstallation else { return }
         let generation = lifecycleGeneration
         do {
@@ -888,7 +972,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func stopIdleRelay(expectedLifecycle: UUID) async {
-        guard lifecycleGeneration == expectedLifecycle, !disconnecting else { return }
+        guard lifecycleGeneration == expectedLifecycle, !disconnecting, !environmentSwitchPending else { return }
         lifecycleGeneration = UUID()
         let generation = lifecycleGeneration
         setupMayRunUnconfigured = false
@@ -916,8 +1000,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         gatewayConnectionID = nil
         gatewayConnected = false
         activeInstallation = nil
-        preferences.set(false, forKey: "desktopControlRelayEnabled")
-        preferences.set(false, forKey: "desktopControlRelayPaused")
+        if let configuration = try? configurationProvider() {
+            preferences.set(false, forKey: DesktopControlPreferenceKeys.relayEnabled(configuration))
+            preferences.set(false, forKey: DesktopControlPreferenceKeys.relayPaused(configuration))
+        }
         paused = false
         readiness = "unknown"
     }
@@ -986,7 +1072,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                         onChunk: @escaping @Sendable (DesktopControlFrame) async throws -> Void) async -> DesktopControlFrame {
         guard Self.acceptsCommand(connectionID: connectionID,
                                   currentConnectionID: gatewayConnectionID,
-                                  disconnecting: disconnecting) else {
+                                  disconnecting: disconnecting || environmentSwitchPending) else {
             return Self.failure(for: frame, code: "desktop_connection_stale", message: "The desktop connection changed before this command could run. Retry only after checking whether the previous action completed.")
         }
         let isStatus = frame.operation == "desktop_control_status"

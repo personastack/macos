@@ -16,6 +16,8 @@ public enum LocalSessionError: String, Error, LocalizedError, Sendable {
     case unsafeFiles = "PersonaStack cannot safely install the local session files."
     case missingHarness = "Install the selected CLI, then try again."
     case outdatedHarness = "Update the selected CLI, then try again."
+    case mcpRedirect = "The selected MCP service redirects requests. Enter its final MCP base URL in Server Settings and try again."
+    case mcpUnavailable = "PersonaStack could not verify the selected MCP service. Check its address and network connection, then try again."
     public var errorDescription: String? { rawValue }
 }
 
@@ -96,14 +98,9 @@ public struct LocalSessionBundle: Codable, Sendable {
     }
 
     public static func permitsMCP(_ endpoint: String, appURL: URL) -> Bool {
-        guard appURL.user == nil, appURL.password == nil else { return false }
-        if ChatWindowCommand.sameOrigin(appURL, URL(string: "https://my.personastack.ai")!) {
-            return endpoint == "https://mcp.personastack.ai/v1/mcp"
-        }
-        if ChatWindowCommand.sameOrigin(appURL, URL(string: "https://personastack.ericgreer.info")!) {
-            return endpoint == "http://mcp.personastack.lan/v1/mcp"
-        }
-        return false
+        guard let configuration = try? DesktopEnvironmentConfigurationStore.shared.environment(for: appURL),
+              let endpointURL = URL(string: endpoint) else { return false }
+        return configuration.permitsMCP(endpointURL, for: appURL)
     }
 
     private static func date(_ value: String) -> Date? {

@@ -3,6 +3,12 @@ import Foundation
 import PersonaStackCore
 import WebKit
 
+let customEnvironment = try! DesktopEnvironmentConfiguration(
+    appURL: "http://desktop-test.example:8080/",
+    gatewayURL: "http://gateway-test.example:8081/",
+    mcpURL: "http://mcp-test.example:8082/"
+)
+
 let window = NSWindow(
     contentRect: .zero,
     styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -25,6 +31,12 @@ let checks = [
     LaunchConfiguration.url(arguments: ["PersonaStack"], packagedDefaultURL: "file:///tmp/test") == NavigationPolicy.defaultURL,
     LaunchConfiguration.url(arguments: ["PersonaStack", "--personastack-url", "file:///tmp/test"]) == NavigationPolicy.defaultURL,
     NavigationPolicy.keepsInApp(URL(string: "https://test.example/user/personas")!, appURL: URL(string: "https://test.example")!),
+    NavigationPolicy.keepsInApp(URL(string: "http://desktop-test.example:8080/user/personas")!, appURL: customEnvironment.appURL),
+    !NavigationPolicy.keepsInApp(URL(string: "https://desktop-test.example:8080/user/personas")!, appURL: customEnvironment.appURL),
+    customEnvironment.gatewayWebsocketURL == URL(string: "ws://gateway-test.example:8081/v1/desktop-control/ws")!,
+    customEnvironment.mcpEndpointURL == URL(string: "http://mcp-test.example:8082/v1/mcp")!,
+    customEnvironment.permitsMCP(customEnvironment.mcpEndpointURL, for: customEnvironment.appURL),
+    !customEnvironment.permitsMCP(URL(string: "https://mcp.personastack.ai/v1/mcp")!, for: customEnvironment.appURL),
     NavigationPolicy.isGoogleOAuthURL(URL(string: "https://accounts.google.com/gsi/select")!),
     !NavigationPolicy.isGoogleOAuthURL(URL(string: "https://google.com/gsi/select")!),
     NavigationPolicy.keepsInApp(URL(string: "https://personastack.ai/privacy")!),

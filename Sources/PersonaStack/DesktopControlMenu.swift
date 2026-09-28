@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import PersonaStackCore
 import ServiceManagement
 import SwiftUI
 
@@ -17,12 +18,38 @@ private final class DesktopControlMenuStatus: ObservableObject {
 
 struct DesktopControlMenu: View {
     @Environment(\.openWindow) private var openWindow
-    @AppStorage("desktopControlRelayEnabled") private var relayEnabled = false
-    @AppStorage("desktopControlRelayPaused") private var relayPaused = false
-    @AppStorage("desktopControlRelayError") private var relayError = ""
+    @ObservedObject private var serverSettings = DesktopEnvironmentSettings.shared
     @AppStorage("desktopControlLoginItemError") private var loginItemError = ""
     @AppStorage("desktopControlRepairError") private var repairError = ""
     @ObservedObject private var status = DesktopControlMenuStatus()
+
+    private var relayEnabled: Bool {
+        get { serverSettings.hasTrustedConfiguration && UserDefaults.standard.bool(forKey: preferenceKey(DesktopControlPreferenceKeys.relayEnabled)) }
+        nonmutating set {
+            guard serverSettings.hasTrustedConfiguration else { return }
+            UserDefaults.standard.set(newValue, forKey: preferenceKey(DesktopControlPreferenceKeys.relayEnabled))
+        }
+    }
+
+    private var relayPaused: Bool {
+        get {
+            serverSettings.hasTrustedConfiguration
+                && (UserDefaults.standard.bool(forKey: preferenceKey(DesktopControlPreferenceKeys.relayPaused))
+                    || DesktopControlRuntime.shared.paused)
+        }
+        nonmutating set {
+            guard serverSettings.hasTrustedConfiguration else { return }
+            UserDefaults.standard.set(newValue, forKey: preferenceKey(DesktopControlPreferenceKeys.relayPaused))
+        }
+    }
+
+    private var relayError: String {
+        get { serverSettings.hasTrustedConfiguration ? UserDefaults.standard.string(forKey: preferenceKey(DesktopControlPreferenceKeys.relayError)) ?? "" : "" }
+        nonmutating set {
+            guard serverSettings.hasTrustedConfiguration else { return }
+            UserDefaults.standard.set(newValue, forKey: preferenceKey(DesktopControlPreferenceKeys.relayError))
+        }
+    }
 
     var body: some View {
         Text("Desktop Control")
@@ -36,11 +63,11 @@ struct DesktopControlMenu: View {
                 if loginItemError != savedLoginItemError { loginItemError = savedLoginItemError }
             }
         Divider()
-        if relayEnabled {
+        if relayEnabled || DesktopControlRuntime.shared.hasPendingEnvironmentSwitch {
             Button(status.isRepairing ? "Repairing Cua Service…" : "Repair Cua Service") {
                 Task { await repairCua() }
             }
-            .disabled(status.isRepairing)
+            .disabled(status.isRepairing || DesktopControlRuntime.shared.isDisconnecting)
         }
         if relayEnabled && DesktopControlRuntime.shared.requiresForegroundSessionConfirmation {
             Button("Confirm This Mac Is Unlocked") {
@@ -57,13 +84,16 @@ struct DesktopControlMenu: View {
             Button(!relayError.isEmpty ? "Retry Remote Control" : (relayPaused ? "Resume Remote Control" : "Pause Remote Control")) {
                 Task { await toggleRelay() }
             }
+            .disabled(DesktopControlRuntime.shared.hasPendingEnvironmentSwitch)
+        }
+        if relayEnabled || DesktopControlRuntime.shared.hasPendingEnvironmentSwitch {
             Button("Disconnect this Mac…", role: .destructive) {
                 confirmDisconnect()
             }
         } else {
             Button(relayError.isEmpty ? "Start Local Service" : "Retry Remote Control") {
                 Task { await toggleRelay() }
-            }
+            }.disabled(!serverSettings.hasTrustedConfiguration || DesktopControlRuntime.shared.hasPendingEnvironmentSwitch)
         }
         Button("Launch at Login") {
             registerLoginItem()
@@ -75,6 +105,7 @@ struct DesktopControlMenu: View {
                 openWindow(id: "personastack-main")
             }
         }
+        DesktopServerSettingsMenuItem()
         Button("Quit PersonaStack Desktop") {
             NSApp.terminate(nil)
         }
@@ -95,8 +126,14 @@ struct DesktopControlMenu: View {
         }
     }
 
+    private func preferenceKey(_ key: (DesktopEnvironmentConfiguration) -> String) -> String {
+        key(serverSettings.configuration)
+    }
+
     private var relayStatus: String {
         _ = status.revision
+        if !serverSettings.hasTrustedConfiguration { return "Set all three server URLs to enable Desktop Control" }
+        if DesktopControlRuntime.shared.hasPendingEnvironmentSwitch { return "Server change incomplete. Retry Server Settings, repair, or disconnect." }
         if status.isRepairing { return "Repairing Cua Service…" }
         if !relayError.isEmpty { return "Desktop Control needs attention" }
         if !relayEnabled { return "Relay paused" }

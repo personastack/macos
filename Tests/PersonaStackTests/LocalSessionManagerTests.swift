@@ -12,6 +12,10 @@ private final class LocalSessionConfigurationRecorder: @unchecked Sendable {
     var all: [UUID] { lock.lock(); defer { lock.unlock() }; return values }
 }
 
+private func waitForSignal(_ semaphore: DispatchSemaphore) -> Bool {
+    semaphore.wait(timeout: .now() + 2) == .success
+}
+
 @MainActor
 struct LocalSessionManagerTests {
     private func probe() -> LocalSessionHarnessProbe {
@@ -100,5 +104,129 @@ struct LocalSessionManagerTests {
         await #expect(throws: LocalSessionError.unsafeFiles) {
             _ = try await manager.apply(.prepare(scope: "scope", persona: "persona-a", harness: .codex), view: view)
         }
+    }
+
+    @Test func environmentSwitchWaitsForAnAlreadyStartedPluginInstall() async throws {
+        let fixture = LocalSessionBundleTests()
+        let data = try JSONSerialization.data(withJSONObject: fixture.fixture())
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let finished = LocalSessionConfigurationRecorder()
+        let result = probe()
+        let manager = LocalSessionManager(probe: { _ in result }, preflight: { _, _ in }, install: { _, _, id, _ in
+            started.signal()
+            release.wait()
+            finished.append(id)
+            let root = URL(fileURLWithPath: "/fixture/sessions/" + id.uuidString)
+            return LocalSessionInstalledFiles(directory: root, pluginManifest: root.appendingPathComponent("plugin.json"), skillDirectories: [])
+        })
+        let view = WKWebView()
+        manager.register(view, appURL: fixture.appURL)
+        _ = try await manager.apply(.state(scope: "switch-test"), view: view)
+        let prepared = try await manager.apply(.prepare(scope: "switch-test", persona: "persona-a", harness: .codex), view: view)
+        let pendingIDValue = try #require(prepared["pending_id"] as? String)
+        let pendingID = try #require(UUID(uuidString: pendingIDValue))
+        let configuring = Task { @MainActor in
+            _ = try await manager.apply(.configure(scope: "switch-test", pendingID: pendingID, bundle: data), view: view)
+        }
+
+        let installStarted = await Task.detached { waitForSignal(started) }.value
+        #expect(installStarted)
+        try await Task.sleep(for: .milliseconds(20))
+        let releaser = Task.detached {
+            try? await Task.sleep(for: .milliseconds(30))
+            release.signal()
+        }
+
+        await manager.invalidateAndWait(view)
+        await releaser.value
+        _ = try await configuring.value
+        #expect(finished.all == [pendingID])
+        await #expect(throws: LocalSessionError.invalidRequest) {
+            _ = try await manager.apply(.state(scope: "switch-test"), view: view)
+        }
+    }
+
+    @Test func configureRejectsScopeThatChangesAwayAndBackDuringMCPValidation() async throws {
+        let fixture = LocalSessionBundleTests()
+        let data = try JSONSerialization.data(withJSONObject: fixture.fixture())
+        let validationStarted = DispatchSemaphore(value: 0)
+        let releaseValidation = DispatchSemaphore(value: 0)
+        let installations = LocalSessionConfigurationRecorder()
+        let result = probe()
+        let manager = LocalSessionManager(
+            probe: { _ in result },
+            preflight: { _, _ in },
+            install: { _, _, id, _ in
+                installations.append(id)
+                let root = URL(fileURLWithPath: "/fixture/sessions/" + id.uuidString)
+                return LocalSessionInstalledFiles(directory: root, pluginManifest: root.appendingPathComponent("plugin.json"), skillDirectories: [])
+            },
+            validateMCP: { _ in
+                validationStarted.signal()
+                let validationReleased = await Task.detached(operation: { waitForSignal(releaseValidation) }).value
+                guard validationReleased else {
+                    throw LocalSessionError.mcpUnavailable
+                }
+            }
+        )
+        let view = WKWebView()
+        manager.register(view, appURL: fixture.appURL)
+        _ = try await manager.apply(.state(scope: "same-scope"), view: view)
+        let prepared = try await manager.apply(.prepare(scope: "same-scope", persona: "persona-a", harness: .codex), view: view)
+        let pendingValue = try #require(prepared["pending_id"] as? String)
+        let pendingID = try #require(UUID(uuidString: pendingValue))
+        let configuring = Task { @MainActor in
+            _ = try await manager.apply(.configure(scope: "same-scope", pendingID: pendingID, bundle: data), view: view)
+        }
+
+        #expect(await Task.detached { waitForSignal(validationStarted) }.value)
+        manager.invalidateSession()
+        _ = try await manager.apply(.state(scope: "same-scope"), view: view)
+        releaseValidation.signal()
+
+        await #expect(throws: LocalSessionError.staleRequest) { try await configuring.value }
+        #expect(installations.all.isEmpty)
+    }
+
+    @Test func retiredPageCannotStartConfigurationAfterMCPValidation() async throws {
+        let fixture = LocalSessionBundleTests()
+        let data = try JSONSerialization.data(withJSONObject: fixture.fixture())
+        let validationStarted = DispatchSemaphore(value: 0)
+        let releaseValidation = DispatchSemaphore(value: 0)
+        let installations = LocalSessionConfigurationRecorder()
+        let result = probe()
+        let manager = LocalSessionManager(
+            probe: { _ in result },
+            preflight: { _, _ in },
+            install: { _, _, id, _ in
+                installations.append(id)
+                let root = URL(fileURLWithPath: "/fixture/sessions/" + id.uuidString)
+                return LocalSessionInstalledFiles(directory: root, pluginManifest: root.appendingPathComponent("plugin.json"), skillDirectories: [])
+            },
+            validateMCP: { _ in
+                validationStarted.signal()
+                let validationReleased = await Task.detached(operation: { waitForSignal(releaseValidation) }).value
+                guard validationReleased else {
+                    throw LocalSessionError.mcpUnavailable
+                }
+            }
+        )
+        let view = WKWebView()
+        manager.register(view, appURL: fixture.appURL)
+        _ = try await manager.apply(.state(scope: "retired-page"), view: view)
+        let prepared = try await manager.apply(.prepare(scope: "retired-page", persona: "persona-a", harness: .codex), view: view)
+        let pendingValue = try #require(prepared["pending_id"] as? String)
+        let pendingID = try #require(UUID(uuidString: pendingValue))
+        let configuring = Task { @MainActor in
+            _ = try await manager.apply(.configure(scope: "retired-page", pendingID: pendingID, bundle: data), view: view)
+        }
+
+        #expect(await Task.detached { waitForSignal(validationStarted) }.value)
+        await manager.invalidateAndWait(view)
+        releaseValidation.signal()
+
+        await #expect(throws: LocalSessionError.staleRequest) { try await configuring.value }
+        #expect(installations.all.isEmpty)
     }
 }
