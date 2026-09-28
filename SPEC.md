@@ -21,6 +21,7 @@ PersonaStack for macOS presents a selected PersonaStack web surface in a dedicat
 - Keep `https://accounts.google.com` OAuth popups in a native child window so Google Sign-In can return to the embedded app.
 - Allow automated top-level redirects to preserve existing OAuth callback flows.
 - Download non-displayable responses to the user's Downloads directory.
+- HTML file inputs in the main window and pop-outs open a native file picker attached to the requesting window. Honor the input's multiple-selection and directory-selection options. Cancel returns no files. Hosted image validation, cropping, uploads, and drag-and-drop remain owned by the web app.
 - Expose no native JavaScript bridge, local API, credentials, or direct PersonaStack service connection.
 
 ## Version 0.1.3 behavior

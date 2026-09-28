@@ -9,6 +9,22 @@ public enum WindowPresentation {
         configuration.applicationNameForUserAgent = "PersonaStackDesktop/1"
     }
 
+    public static func presentUploadPanel(for webView: WKWebView, parameters: WKOpenPanelParameters,
+                                          completionHandler: @escaping @MainActor @Sendable ([URL]?) -> Void) {
+        guard let window = webView.window else {
+            completionHandler(nil)
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = parameters.allowsDirectories
+        panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+        panel.canCreateDirectories = false
+        panel.beginSheetModal(for: window) { response in
+            completionHandler(response == .OK ? panel.urls : nil)
+        }
+    }
+
     public static func configure(_ window: NSWindow) {
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true

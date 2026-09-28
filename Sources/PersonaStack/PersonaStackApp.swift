@@ -380,6 +380,12 @@ struct PersonaStackWebView: NSViewRepresentable {
             window.close()
         }
 
+        func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
+                     initiatedByFrame frame: WKFrameInfo,
+                     completionHandler: @escaping @MainActor @Sendable ([URL]?) -> Void) {
+            WindowPresentation.presentUploadPanel(for: webView, parameters: parameters, completionHandler: completionHandler)
+        }
+
         func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
             download.delegate = self
         }

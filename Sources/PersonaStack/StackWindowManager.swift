@@ -72,6 +72,12 @@ final class StackWindowManager: NSObject, WKScriptMessageHandlerWithReply {
 
 @MainActor
 final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate {
+    func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping @MainActor @Sendable ([URL]?) -> Void) {
+        WindowPresentation.presentUploadPanel(for: webView, parameters: parameters, completionHandler: completionHandler)
+    }
+
     let window: NSWindow
     let webView: WKWebView
     let windowChrome: StackPopoutWindowChrome?
