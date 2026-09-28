@@ -314,7 +314,7 @@ final class ChatWebView: WKWebView {
         if collapsed {
             mask.path = CGPath(ellipseIn: bounds.insetBy(dx: 4, dy: 4), transform: nil)
         } else {
-            let rect = NSRect(x: 0, y: 4, width: bounds.width, height: bounds.height - 4)
+            let rect = NSRect(origin: .zero, size: bounds.size)
             let path = CGMutablePath()
             path.addRoundedRect(in: rect, cornerWidth: 12, cornerHeight: 12)
             path.addRect(CGRect(x: rect.minX, y: rect.maxY - 12, width: rect.width, height: 12))

@@ -4,6 +4,19 @@ import PersonaStackCore
 @testable import PersonaStack
 
 struct ChatWindowTests {
+    @MainActor
+    @Test func testExpandedChatMaskReachesBottomEdge() {
+        _ = NSApplication.shared
+        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false) {}
+        defer { chat.dispose() }
+        chat.window.contentView?.layoutSubtreeIfNeeded()
+        chat.webView.layoutSubtreeIfNeeded()
+        let mask = chat.webView.layer?.mask as? CAShapeLayer
+        let bounds = mask?.path?.boundingBoxOfPath
+        #expect(bounds?.minY == 0)
+        #expect(abs((bounds?.maxY ?? -1) - chat.webView.bounds.height) < 0.1)
+    }
+
     @Test func testStrictCommands() {
         #expect(ChatWindowCommand.parse(["version": "1", "action": "open_persona_chat", "persona_id": "p-1", "scope": "s"], main: true) == .open("p-1", "s"))
         for action in ["minimize", "close", "collapse", "expand", "pin"] {
