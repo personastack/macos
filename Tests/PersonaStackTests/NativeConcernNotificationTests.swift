@@ -12,6 +12,7 @@ struct NativeConcernNotificationTests {
         var scheduledRequests: [UNNotificationRequest] = []
         let coordinator = PersonaStackWebView.Coordinator(
             appURL: try #require(URL(string: "https://my.personastack.ai/user/personas")),
+            notificationCoordinator: nil,
             configureNotificationCenter: { _ in },
             scheduleNotification: { scheduledRequests.append($0) }
         )
@@ -39,6 +40,7 @@ struct NativeConcernNotificationTests {
         var scheduledRequests: [UNNotificationRequest] = []
         let coordinator = PersonaStackWebView.Coordinator(
             appURL: try #require(URL(string: "https://my.personastack.ai/user/personas")),
+            notificationCoordinator: nil,
             configureNotificationCenter: { _ in },
             scheduleNotification: { scheduledRequests.append($0) }
         )
@@ -73,6 +75,7 @@ struct NativeConcernNotificationTests {
         let appURL = try #require(URL(string: "https://my.personastack.ai/user/personas"))
         let coordinator = PersonaStackWebView.Coordinator(
             appURL: appURL,
+            notificationCoordinator: nil,
             configureNotificationCenter: { _ in },
             scheduleNotification: { scheduledRequests.append($0) }
         )
@@ -110,6 +113,7 @@ struct NativeConcernNotificationTests {
         var scheduledRequests: [UNNotificationRequest] = []
         let coordinator = PersonaStackWebView.Coordinator(
             appURL: try #require(URL(string: "https://my.personastack.ai/user/personas")),
+            notificationCoordinator: nil,
             configureNotificationCenter: { _ in },
             scheduleNotification: { scheduledRequests.append($0) }
         )

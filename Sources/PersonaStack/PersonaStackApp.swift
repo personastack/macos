@@ -9,9 +9,13 @@ struct PersonaStackApp: App {
     @NSApplicationDelegateAdaptor(PersonaStackTerminationDelegate.self) private var terminationDelegate
     @ObservedObject private var serverSettings = DesktopEnvironmentSettings.shared
     init() {
+        let foregroundUpdateRelaunch = UserDefaults.standard.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
         guard let configuration = try? LaunchConfiguration.selectedEnvironment(),
               UserDefaults.standard.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(configuration)) else { return }
-        NSApplication.shared.setActivationPolicy(.accessory)
+        if DesktopUpdatePolicy.shouldUseAccessoryActivation(relayEnabled: true,
+                                                            foregroundUpdateRelaunch: foregroundUpdateRelaunch) {
+            NSApplication.shared.setActivationPolicy(.accessory)
+        }
         let paused = UserDefaults.standard.bool(forKey: DesktopControlPreferenceKeys.relayPaused(configuration))
         Task { @MainActor in
             _ = MainWebViewHost.shared
@@ -31,16 +35,21 @@ struct PersonaStackApp: App {
 
     var body: some Scene {
         Window("PersonaStack", id: "personastack-main") {
-            PersonaStackWebView(url: serverSettings.appPageURL)
-                .id(serverSettings.generation)
-                .frame(minWidth: 1172, minHeight: 700)
-                .background(Color(nsColor: WindowPresentation.canvasColor).ignoresSafeArea())
-                .background(WindowPresentationConfigurator(applicationDelegate: terminationDelegate))
+            ZStack(alignment: .topTrailing) {
+                PersonaStackWebView(url: serverSettings.appPageURL)
+                    .id(serverSettings.generation)
+                    .frame(minWidth: 1172, minHeight: 700)
+                    .background(Color(nsColor: WindowPresentation.canvasColor).ignoresSafeArea())
+                    .background(WindowPresentationConfigurator(applicationDelegate: terminationDelegate))
+                DesktopUpdateToast()
+                    .padding(18)
+            }
         }
         .defaultSize(width: 1440, height: 960)
         .windowStyle(.hiddenTitleBar)
         .commands {
             DesktopServerSettingsCommands()
+            DesktopUpdateCommands()
             CommandGroup(after: .toolbar) {
                 Button("Toggle Full Screen") {
                     NSApp.keyWindow?.toggleFullScreen(nil)
@@ -51,6 +60,7 @@ struct PersonaStackApp: App {
 
         MenuBarExtra("PersonaStack Desktop", systemImage: "cursorarrow.motionlines") {
             DesktopControlMenu()
+            DesktopUpdatesMenuSection()
         }
         .menuBarExtraStyle(.menu)
 
@@ -65,6 +75,7 @@ struct PersonaStackApp: App {
 @MainActor
 final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     var reopenMainWindow: (@MainActor () -> Void)?
+    private var shouldRestoreMainWindowAfterUpdate = false
     private let shutdown: @MainActor () async -> Void
     private let reply: @MainActor (NSApplication) -> Void
     private let timeout: Duration
@@ -77,6 +88,31 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         reply = { $0.reply(toApplicationShouldTerminate: true) }
         timeout = .seconds(10)
         super.init()
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        DesktopNotificationCoordinator.shared.install()
+        DesktopUpdater.shared.start()
+        guard UserDefaults.standard.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey) else { return }
+        UserDefaults.standard.removeObject(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
+        shouldRestoreMainWindowAfterUpdate = true
+        NSApp.setActivationPolicy(.regular)
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            NSApp.activate(ignoringOtherApps: true)
+            self?.restoreMainWindowAfterUpdateIfNeeded()
+        }
+    }
+
+    func installMainWindowReopener(_ action: @escaping @MainActor () -> Void) {
+        reopenMainWindow = action
+        restoreMainWindowAfterUpdateIfNeeded()
+    }
+
+    private func restoreMainWindowAfterUpdateIfNeeded() {
+        guard shouldRestoreMainWindowAfterUpdate, let reopenMainWindow else { return }
+        shouldRestoreMainWindowAfterUpdate = false
+        reopenMainWindow()
     }
 
     init(shutdown: @escaping @MainActor () async -> Void,
@@ -95,6 +131,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if !terminating { DesktopUpdater.shared.applicationWillTerminate() }
         guard !terminating else { return .terminateLater }
         terminating = true
         Task { @MainActor in
@@ -198,7 +235,7 @@ final class MainWebViewHost {
         container.addSubview(webView)
         if requestNotifications && !notificationAuthorizationRequested {
             notificationAuthorizationRequested = true
-            coordinator.requestNotificationAuthorization()
+            DesktopNotificationCoordinator.shared.requestAuthorization()
         }
     }
 
@@ -232,7 +269,7 @@ struct WindowPresentationConfigurator: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSView {
         let action = openWindow
-        applicationDelegate.reopenMainWindow = {
+        applicationDelegate.installMainWindowReopener {
             MainWebViewHost.showMainWindow { action(id: "personastack-main") }
         }
         return WindowPresentationView()
@@ -274,7 +311,7 @@ struct PersonaStackWebView: NSViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler, UNUserNotificationCenterDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler {
         weak var webView: WKWebView?
         let appURL: URL
         private let scheduleNotification: (UNNotificationRequest) -> Void
@@ -283,6 +320,7 @@ struct PersonaStackWebView: NSViewRepresentable {
 
         init(
             appURL: URL,
+            notificationCoordinator: UNUserNotificationCenterDelegate? = DesktopNotificationCoordinator.shared,
             configureNotificationCenter: @escaping (UNUserNotificationCenterDelegate) -> Void = { delegate in
                 UNUserNotificationCenter.current().delegate = delegate
             },
@@ -293,7 +331,9 @@ struct PersonaStackWebView: NSViewRepresentable {
             self.appURL = appURL
             self.scheduleNotification = scheduleNotification
             super.init()
-            configureNotificationCenter(self)
+            if let notificationCoordinator {
+                configureNotificationCenter(notificationCoordinator)
+            }
         }
 
         func start(_ url: URL) {
@@ -303,10 +343,6 @@ struct PersonaStackWebView: NSViewRepresentable {
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
             guard webView === self.webView else { return }
             start(appURL)
-        }
-
-        func requestNotificationAuthorization() {
-            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -337,13 +373,6 @@ struct PersonaStackWebView: NSViewRepresentable {
             parts.host = origin.host
             if origin.port > 0 { parts.port = origin.port }
             return parts.url
-        }
-
-        nonisolated func userNotificationCenter(
-            _ center: UNUserNotificationCenter,
-            willPresent notification: UNNotification
-        ) async -> UNNotificationPresentationOptions {
-            [.banner, .list, .sound]
         }
 
         private func postConcernNotification() {

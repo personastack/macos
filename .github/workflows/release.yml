@@ -13,22 +13,42 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
+      - name: Test appcast validation fixtures
+        run: python3 -m unittest scripts/tests/test_validate_appcast.py
+      - name: Validate updater release configuration
+        env:
+          SPARKLE_PUBLIC_KEY: ${{ vars.PERSONASTACK_SPARKLE_PUBLIC_ED_KEY }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.PERSONASTACK_SPARKLE_PRIVATE_ED_KEY }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$SPARKLE_PUBLIC_KEY" ] || [ -z "$SPARKLE_PRIVATE_KEY" ] || [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "Sparkle public key, Sparkle private key, and Homebrew tap token must be configured before a release." >&2
+            exit 1
+          fi
+          derived_public_key=$(printf '%s' "$SPARKLE_PRIVATE_KEY" | swift scripts/derive-sparkle-public-key.swift)
+          if [ "$derived_public_key" != "$SPARKLE_PUBLIC_KEY" ]; then
+            echo "Sparkle public and private keys do not match." >&2
+            exit 1
+          fi
       - name: Build unsigned installer
         env:
           PERSONASTACK_DEFAULT_URL: https://my.personastack.ai/user/personas
+          PERSONASTACK_SPARKLE_PUBLIC_ED_KEY: ${{ vars.PERSONASTACK_SPARKLE_PUBLIC_ED_KEY }}
         run: VERSION="${GITHUB_REF_NAME#v}" ./scripts/package-macos.sh
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" artifacts/*.dmg --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" artifacts/*.dmg --generate-notes --title "PersonaStack $GITHUB_REF_NAME"
+            echo "Release $GITHUB_REF_NAME already exists. Refusing to replace its immutable installer." >&2
+            exit 1
           fi
+          gh release create "$GITHUB_REF_NAME" artifacts/*.dmg --generate-notes --title "PersonaStack $GITHUB_REF_NAME"
       - name: Publish Homebrew cask
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.PERSONASTACK_SPARKLE_PRIVATE_ED_KEY }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
             echo "HOMEBREW_TAP_TOKEN is required to publish the Homebrew cask." >&2
@@ -45,10 +65,66 @@ jobs:
           fi
           mkdir -p Casks Downloads
           cp "$GITHUB_WORKSPACE"/artifacts/*.dmg Downloads/
-          "$GITHUB_WORKSPACE"/scripts/render-homebrew-cask.sh "$version" Downloads/*.dmg Casks/personastack.rb
+          current_dmg="Downloads/PersonaStack-$version-unsigned.dmg"
+          test -f "$current_dmg"
+          "$GITHUB_WORKSPACE"/scripts/render-homebrew-cask.sh "$version" "$current_dmg" Casks/personastack.rb
+          grep -q '^  auto_updates true$' Casks/personastack.rb
           git add Casks/personastack.rb Downloads/
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "feat: publish PersonaStack cask $version"
           git tag -a "$tap_tag" -m "PersonaStack $version"
           git push origin HEAD:main "refs/tags/$tap_tag"
+          gh release view -R personastack/macos-desktop "$GITHUB_REF_NAME" --json body -q .body \
+            >"$tap_dir/Downloads/PersonaStack-$version-unsigned.md"
+          sparkle_zip=$(mktemp)
+          sparkle_dir=$(mktemp -d)
+          curl -fsSL https://github.com/sparkle-project/Sparkle/releases/download/2.10.0/Sparkle-for-Swift-Package-Manager.zip -o "$sparkle_zip"
+          echo "17e28312b8e18ab7cdbbe09a6fb28cc55a5479ec6c371dbc07cdecd2a14fd959  $sparkle_zip" | shasum -a 256 -c -
+          unzip -q "$sparkle_zip" -d "$sparkle_dir"
+          chmod 755 "$sparkle_dir/bin/generate_appcast"
+          chmod 755 "$sparkle_dir/bin/sign_update"
+          archive_dir="$sparkle_dir/archives"
+          mkdir -p "$archive_dir"
+          cp "Downloads/PersonaStack-$version-unsigned.dmg" "$archive_dir/"
+          cp "Downloads/PersonaStack-$version-unsigned.md" "$archive_dir/"
+          if [ -f appcast.xml ]; then cp appcast.xml "$archive_dir/appcast.xml"; fi
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$sparkle_dir/bin/generate_appcast" \
+            --ed-key-file - --maximum-versions 0 --embed-release-notes \
+            --link https://personastack.ai \
+            --download-url-prefix "https://raw.githubusercontent.com/personastack/homebrew-tap/$tap_tag/Downloads/" \
+            -o "$archive_dir/appcast.xml" "$archive_dir"
+          cp "$archive_dir/appcast.xml" "$tap_dir/appcast.xml"
+          archive_signature=$(python3 - "$tap_dir/appcast.xml" "$version" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          namespace = "http://www.andymatuschak.org/xml-namespaces/sparkle"
+          item = None
+          for node in root.findall(".//item"):
+              if node.findtext(f"{{{namespace}}}version") == sys.argv[2]:
+                  item = node
+                  break
+          if item is None:
+              raise SystemExit("appcast release item is missing")
+          enclosure = item.find("enclosure")
+          signature = enclosure.get(f"{{{namespace}}}edSignature") if enclosure is not None else None
+          if not signature:
+              raise SystemExit("appcast archive signature is missing")
+          print(signature)
+          PY
+          )
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$sparkle_dir/bin/sign_update" \
+            --ed-key-file - --verify "$GITHUB_WORKSPACE/artifacts/PersonaStack-$version-unsigned.dmg" "$archive_signature"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$sparkle_dir/bin/sign_update" \
+            --ed-key-file - --verify "$tap_dir/appcast.xml"
+          python3 "$GITHUB_WORKSPACE/scripts/validate-appcast.py" \
+            "$tap_dir/appcast.xml" "$version" "$tap_tag" \
+            "$GITHUB_WORKSPACE/artifacts/PersonaStack-$version-unsigned.dmg" "$tap_dir/Casks/personastack.rb"
+          cd "$tap_dir"
+          git add appcast.xml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "feat: publish signed PersonaStack appcast $version"
+          git push origin HEAD:main

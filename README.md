@@ -28,3 +28,7 @@ brew install --cask personastack/tap/personastack
 Open PersonaStack from Applications and sign in. Requires macOS 14 or later.
 
 The current app is unsigned. If macOS blocks its first launch, choose **Open Anyway** in **System Settings → Privacy & Security**.
+
+## Updates
+
+PersonaStack checks for updates while it is running. Open the menu-bar dropdown or the **PersonaStack** menu and choose **Check for Updates…** to check now. You can opt into background downloads in the menu-bar dropdown. Prepared updates install when you quit PersonaStack. The app does not restart without your action.
