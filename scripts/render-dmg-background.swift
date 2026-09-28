@@ -85,7 +85,6 @@ func drawText(_ text: String, at point: CGPoint, font: NSFont, color: NSColor) {
 
 drawText("Install PersonaStack", at: CGPoint(x: 36, y: 420), font: .systemFont(ofSize: 23, weight: .semibold), color: .white)
 drawText("Drag the app to Applications to install", at: CGPoint(x: 36, y: 394), font: .systemFont(ofSize: 12, weight: .regular), color: NSColor(white: 0.78, alpha: 1))
-drawText("DRAG TO INSTALL  ·  EJECT WHEN FINISHED", at: CGPoint(x: 36, y: 27), font: .systemFont(ofSize: 9, weight: .medium), color: NSColor(red: 0.62, green: 0.72, blue: 0.96, alpha: 0.82))
 
 context.restoreGState()
 NSGraphicsContext.restoreGraphicsState()
