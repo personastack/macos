@@ -490,7 +490,7 @@ private func legacyInstallationData(gateway: String) throws -> Data {
     var installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
     let appURL = URL(string: "https://my.personastack.ai/user/desktop-control")!
     try installation.bindEnvironment(appURL)
-    let response = try JSONSerialization.data(withJSONObject: ["has_active_config": false])
+    let response = try JSONSerialization.data(withJSONObject: ["has_active_config": false, "has_config": false])
     let transport = EnrollmentTransportFixture(response: response, status: 200)
     let client = DesktopControlEnrollmentClient(transport: transport)
 

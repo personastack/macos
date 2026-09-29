@@ -473,6 +473,10 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
         attachedTicketInstallationIDs.append(installation.installationID)
     }
 
+    func configurationState(installation: DesktopControlInstallation, appURL: URL) async throws -> DesktopControlConfigurationState {
+        DesktopControlConfigurationState(hasActiveConfig: false, hasConfig: false)
+    }
+
     func hasActiveConfig(installation: DesktopControlInstallation, appURL: URL) async throws -> Bool { true }
 }
 
@@ -756,7 +760,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     #expect(page.setupScope.generation == setupGeneration)
     #expect(page.setupScope.value == scope)
     #expect(await enrollment.readyInstallationIDs.isEmpty)
-    #expect(await enrollment.attachedTicketInstallationIDs.isEmpty)
+    #expect(await enrollment.attachedTicketInstallationIDs == [installation.installationID])
 
     runtime.permissionGranted = true
     let retried = await sendSetupMessage()
@@ -774,7 +778,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     #expect(preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(.production)))
     #expect(!(preferences.bool(forKey: DesktopControlPreferenceKeys.relayPaused(.production))))
     #expect(await enrollment.readyInstallationIDs == [installation.installationID])
-    #expect(await enrollment.attachedTicketInstallationIDs == [installation.installationID])
+    #expect(await enrollment.attachedTicketInstallationIDs == [installation.installationID, installation.installationID])
     #expect(page.setupScope.generation == setupGeneration)
 
     page.setupScope.synchronize("")
@@ -784,7 +788,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     #expect(runtime.attempts == 2)
     #expect(loginItemRegistrations == 1)
     #expect(await enrollment.readyInstallationIDs == [installation.installationID])
-    #expect(await enrollment.attachedTicketInstallationIDs == [installation.installationID])
+    #expect(await enrollment.attachedTicketInstallationIDs == [installation.installationID, installation.installationID])
 }
 
 @Test @MainActor func setupDoesNotEnrollUntilLoginItemIsEnabled() async throws {
@@ -815,7 +819,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
         #expect(error.localizedDescription.contains("Login Items & Extensions"))
     }
     #expect(await enrollment.readyInstallationIDs.isEmpty)
-    #expect(await enrollment.attachedTicketInstallationIDs.isEmpty)
+    #expect(await enrollment.attachedTicketInstallationIDs == [installation.installationID])
     #expect(!runtime.gatewayConnected)
     #expect(!preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(.production)))
 }

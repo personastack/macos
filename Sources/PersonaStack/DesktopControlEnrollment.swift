@@ -84,6 +84,7 @@ extension DesktopControlInstallation: CustomStringConvertible, CustomDebugString
 enum DesktopControlEnrollmentError: Error, Equatable {
     case invalidRequest
     case rejected
+    case installationInUse
     case invalidResponse
     case credentialStoreUnavailable
     case installationMissing
@@ -99,6 +100,8 @@ extension DesktopControlEnrollmentError: LocalizedError {
             "Desktop Control setup request is invalid or expired. Refresh the setup page and retry."
         case .rejected:
             "Desktop Control could not enroll this installation. Refresh setup to request a new ticket, then retry."
+        case .installationInUse:
+            "This desktop is already connected to a PersonaStack integration. Remove the integration in use before connecting this desktop again."
         case .invalidResponse:
             "The server returned an invalid Desktop Control enrollment response."
         case .credentialStoreUnavailable:
@@ -365,6 +368,16 @@ actor URLSessionDesktopControlEnrollmentTransport: DesktopControlEnrollmentTrans
     }
 }
 
+struct DesktopControlConfigurationState: Decodable, Sendable {
+    let hasActiveConfig: Bool
+    let hasConfig: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case hasActiveConfig = "has_active_config"
+        case hasConfig = "has_config"
+    }
+}
+
 actor DesktopControlEnrollmentClient: DesktopControlRelayStateReading {
     private let transport: any DesktopControlEnrollmentTransport
     private let credentials: (any DesktopControlCredentialStoring)?
@@ -414,6 +427,10 @@ actor DesktopControlEnrollmentClient: DesktopControlRelayStateReading {
     }
 
     func hasActiveConfig(installation: DesktopControlInstallation, appURL: URL) async throws -> Bool {
+        try await configurationState(installation: installation, appURL: appURL).hasActiveConfig
+    }
+
+    func configurationState(installation: DesktopControlInstallation, appURL: URL) async throws -> DesktopControlConfigurationState {
         try installation.requireEnvironment(appURL)
         guard let endpoint = Self.endpoint(appURL, path: "/v1/desktop-control/ready") else {
             throw DesktopControlEnrollmentError.invalidRequest
@@ -424,13 +441,14 @@ actor DesktopControlEnrollmentClient: DesktopControlRelayStateReading {
             "relay_state_only": true,
         ])
         let (data, status) = try await transport.post(url: endpoint, body: body, bearer: installation.machineCredential)
-        guard status == 200, data.count <= 1024,
-              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              Set(object.keys) == ["has_active_config"],
-              let hasActiveConfig = object["has_active_config"] as? Bool else {
+        guard status == 200, data.count <= 1024 else {
             throw DesktopControlEnrollmentError.invalidResponse
         }
-        return hasActiveConfig
+        guard let state = try? JSONDecoder().decode(DesktopControlConfigurationState.self, from: data),
+              !state.hasActiveConfig || state.hasConfig else {
+            throw DesktopControlEnrollmentError.invalidResponse
+        }
+        return state
     }
 
     func attach(ticket: String, installation: DesktopControlInstallation, appURL: URL) async throws {
@@ -444,6 +462,7 @@ actor DesktopControlEnrollmentClient: DesktopControlRelayStateReading {
             "installation_id": installation.installationID,
         ])
         let (data, status) = try await transport.post(url: endpoint, body: body, bearer: installation.machineCredential)
+        if status == 409 { throw DesktopControlEnrollmentError.installationInUse }
         guard status == 204, data.isEmpty else { throw DesktopControlEnrollmentError.rejected }
     }
 

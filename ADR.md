@@ -1,3 +1,7 @@
+# 2026-09-28 - Exclusive Desktop Control installation
+
+- Decision: Eric limits each local installation to one PersonaStack account and one integration configuration at a time. App updates preserve its Keychain installation ID. A fresh attachment fails until the existing integration is removed. Disabling it keeps the reservation. The API owns enforcement and account assignment.
+
 # Architecture decisions
 
 - 2026-09-15: The macOS client is a thin native SwiftUI and WebKit shell for the existing `my.personastack.ai` website. It does not add a second authentication, API, datastore, or product-state authority. The first release is unsigned and distributed as a GitHub Release disk image.

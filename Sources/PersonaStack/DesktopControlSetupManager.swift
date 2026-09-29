@@ -30,6 +30,7 @@ protocol DesktopControlSetupEnrollment: DesktopControlRelayStateReading {
     ) async throws -> DesktopControlInstallation
     func reportReady(installation: DesktopControlInstallation, appURL: URL) async throws
     func attach(ticket: String, installation: DesktopControlInstallation, appURL: URL) async throws
+    func configurationState(installation: DesktopControlInstallation, appURL: URL) async throws -> DesktopControlConfigurationState
 }
 
 extension DesktopControlEnrollmentClient: DesktopControlSetupEnrollment {}
@@ -209,10 +210,16 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             try requireCurrentScope(scope, page: page)
             let installation = try await savedInstallation(credentials: credentials, appURL: page.appURL)
             try requireCurrentScope(scope, page: page)
+            var configurationInUse = false
+            if let installation {
+                configurationInUse = try await enrollment.configurationState(installation: installation, appURL: page.appURL).hasConfig
+                try requireCurrentScope(scope, page: page)
+            }
             return [
                 "ok": true,
                 "operating_system": "macos",
                 "installation_id": installation?.installationID as Any? ?? NSNull(),
+                "configuration_in_use": configurationInUse,
                 "cua_ready": runtime.isCuaReady(),
                 "native_executor_ready": runtime.nativeExecutorReady,
                 "gateway_connected": runtime.gatewayConnected,
@@ -221,6 +228,12 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         case .prepare(let scope, let ticket):
             let generation = page.setupScope.generation
             try page.setupScope.require(scope, generation: generation)
+            let saved = try await savedInstallation(credentials: credentials, appURL: page.appURL)
+            try requireCurrentScope(scope, generation: generation, page: page)
+            if let saved {
+                try await enrollment.attach(ticket: ticket, installation: saved, appURL: page.appURL)
+                try requireCurrentScope(scope, generation: generation, page: page)
+            }
             var runtimeGeneration = try runtime.beginResume()
             do {
                 try await runtime.resumeForSetup(generation: runtimeGeneration)
@@ -244,17 +257,11 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             }
             try requireCurrentScope(scope, generation: generation, page: page)
             try requireCurrentLifecycle(runtimeGeneration)
-            let saved = try await savedInstallation(credentials: credentials, appURL: page.appURL)
-            try requireCurrentScope(scope, generation: generation, page: page)
-            try requireCurrentLifecycle(runtimeGeneration)
             let installation: DesktopControlInstallation
             if let saved {
                 try saved.requireEnvironment(page.appURL)
                 installation = saved
                 try await enrollment.reportReady(installation: installation, appURL: page.appURL)
-                try requireCurrentScope(scope, generation: generation, page: page)
-                try requireCurrentLifecycle(runtimeGeneration)
-                try await enrollment.attach(ticket: ticket, installation: installation, appURL: page.appURL)
                 try requireCurrentScope(scope, generation: generation, page: page)
                 try requireCurrentLifecycle(runtimeGeneration)
             } else {

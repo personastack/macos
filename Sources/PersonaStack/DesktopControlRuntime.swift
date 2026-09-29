@@ -532,7 +532,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let cuaStopped = await stopOwnedCuaService()
         activeInstallation = nil
         if let credentialLoadError { throw credentialLoadError }
-        if installation != nil { try credentials.delete() }
+        // Keep the installation identity after revocation. Deleting it would
+        // let a later setup enroll a second identity while its config remains.
         environmentSwitchPending = false
         paused = false
         if !cuaStopped { throw DesktopControlOwnedCuaStopError() }
