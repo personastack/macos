@@ -84,7 +84,6 @@ extension DesktopControlInstallation: CustomStringConvertible, CustomDebugString
 enum DesktopControlEnrollmentError: Error, Equatable {
     case invalidRequest
     case rejected
-    case installationInUse
     case invalidResponse
     case credentialStoreUnavailable
     case installationMissing
@@ -100,8 +99,6 @@ extension DesktopControlEnrollmentError: LocalizedError {
             "Desktop Control setup request is invalid or expired. Refresh the setup page and retry."
         case .rejected:
             "Desktop Control could not enroll this installation. Refresh setup to request a new ticket, then retry."
-        case .installationInUse:
-            "This desktop is already connected to a PersonaStack integration. Remove the integration in use before connecting this desktop again."
         case .invalidResponse:
             "The server returned an invalid Desktop Control enrollment response."
         case .credentialStoreUnavailable:
@@ -462,7 +459,6 @@ actor DesktopControlEnrollmentClient: DesktopControlRelayStateReading {
             "installation_id": installation.installationID,
         ])
         let (data, status) = try await transport.post(url: endpoint, body: body, bearer: installation.machineCredential)
-        if status == 409 { throw DesktopControlEnrollmentError.installationInUse }
         guard status == 204, data.isEmpty else { throw DesktopControlEnrollmentError.rejected }
     }
 

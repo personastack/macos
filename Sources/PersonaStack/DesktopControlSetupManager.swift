@@ -16,6 +16,7 @@ protocol DesktopControlSetupRuntime: AnyObject {
     func resume(generation: UUID) async throws
     func resumeForSetup(generation: UUID) async throws
     func finishSetupIfIdle() async
+    func disconnect() async throws
     func repair(resumeRelay: Bool, expectedGeneration: UUID?) async throws -> UUID
     func isCurrentLifecycle(_ generation: UUID) -> Bool
     func connect(installation: DesktopControlInstallation, expectedGeneration: UUID?) async
@@ -231,6 +232,8 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             let saved = try await savedInstallation(credentials: credentials, appURL: page.appURL)
             try requireCurrentScope(scope, generation: generation, page: page)
             if let saved {
+                try await runtime.disconnect()
+                try requireCurrentScope(scope, generation: generation, page: page)
                 try await enrollment.attach(ticket: ticket, installation: saved, appURL: page.appURL)
                 try requireCurrentScope(scope, generation: generation, page: page)
             }

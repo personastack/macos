@@ -408,7 +408,9 @@ private final class DesktopControlSetupRuntimeFixture: DesktopControlSetupRuntim
     private(set) var nativeProbeCount = 0
     private(set) var connectedInstallationID = ""
     private(set) var finishSetupCalls = 0
+    private(set) var disconnectCalls = 0
     var permissionGranted = false
+    var disconnectError: (any Error)?
     private var generation = UUID()
     var readiness: String { ready ? "ready" : "permission_required" }
 
@@ -437,6 +439,10 @@ private final class DesktopControlSetupRuntimeFixture: DesktopControlSetupRuntim
     }
 
     func finishSetupIfIdle() async { finishSetupCalls += 1 }
+    func disconnect() async throws {
+        disconnectCalls += 1
+        if let disconnectError { throw disconnectError }
+    }
 
     func repair(resumeRelay: Bool, expectedGeneration: UUID?) async throws -> UUID {
         repairAttempts += 1
@@ -451,6 +457,40 @@ private final class DesktopControlSetupRuntimeFixture: DesktopControlSetupRuntim
     }
 
     func savedInstallation(for appURL: URL) async throws -> DesktopControlInstallation? { nil }
+}
+
+@Test @MainActor func setupDoesNotAttachWhenLocalDisconnectFails() async throws {
+    let installationPayload = Data(#"{"installation_id":"installation-disconnect-failure","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8)
+    let appURL = URL(string: "https://my.personastack.ai")!
+    var installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: installationPayload)
+    try installation.bindEnvironment(appURL)
+    let runtime = DesktopControlSetupRuntimeFixture()
+    runtime.disconnectError = DesktopControlEnrollmentError.revocationFailed
+    let enrollment = DesktopControlSetupEnrollmentFixture()
+    let manager = DesktopControlSetupManager(
+        runtime: runtime,
+        enrollment: enrollment,
+        credentials: SavedDesktopControlCredentialStore(installation: installation),
+        configurationProvider: { .production }
+    )
+    let page = DesktopControlSetupManager.Page(appURL: appURL)
+    page.setupScope.synchronize("workspace-setup-session")
+
+    do {
+        _ = try await manager.apply(
+            .prepare(scope: "workspace-setup-session", enrollmentTicket: String(repeating: "a", count: 43)),
+            page: page
+        )
+        Issue.record("setup must preserve the existing link when local disconnect fails")
+    } catch let error as DesktopControlEnrollmentError {
+        #expect(error == .revocationFailed)
+    } catch {
+        Issue.record("unexpected setup error: \(error)")
+    }
+
+    #expect(runtime.disconnectCalls == 1)
+    #expect(await enrollment.attachedTicketInstallationIDs.isEmpty)
+    #expect(runtime.attempts == 0)
 }
 
 private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollment {
@@ -552,7 +592,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
         CuaMCPProxyError.permissionsRequired,
     ])
     let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: EmptyDesktopControlCredentialStore())
-    let manager = DesktopControlSetupManager(runtime: runtime)
+    let manager = DesktopControlSetupManager(runtime: runtime, credentials: EmptyDesktopControlCredentialStore())
     let page = DesktopControlSetupManager.Page(appURL: URL(string: "https://personastack.ai")!)
     page.setupScope.synchronize("workspace-setup-session")
     let command = DesktopControlSetupCommand.prepare(
@@ -761,6 +801,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     #expect(page.setupScope.value == scope)
     #expect(await enrollment.readyInstallationIDs.isEmpty)
     #expect(await enrollment.attachedTicketInstallationIDs == [installation.installationID])
+    #expect(runtime.disconnectCalls == 1)
 
     runtime.permissionGranted = true
     let retried = await sendSetupMessage()
@@ -779,6 +820,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     #expect(!(preferences.bool(forKey: DesktopControlPreferenceKeys.relayPaused(.production))))
     #expect(await enrollment.readyInstallationIDs == [installation.installationID])
     #expect(await enrollment.attachedTicketInstallationIDs == [installation.installationID, installation.installationID])
+    #expect(runtime.disconnectCalls == 2)
     #expect(page.setupScope.generation == setupGeneration)
 
     page.setupScope.synchronize("")
@@ -789,6 +831,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     #expect(loginItemRegistrations == 1)
     #expect(await enrollment.readyInstallationIDs == [installation.installationID])
     #expect(await enrollment.attachedTicketInstallationIDs == [installation.installationID, installation.installationID])
+    #expect(runtime.disconnectCalls == 2)
 }
 
 @Test @MainActor func setupDoesNotEnrollUntilLoginItemIsEnabled() async throws {

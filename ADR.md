@@ -1,6 +1,6 @@
 # 2026-09-28 - Exclusive Desktop Control installation
 
-- Decision: Eric limits each local installation to one PersonaStack account and one integration configuration at a time. App updates preserve its Keychain installation ID. A fresh attachment fails until the existing integration is removed. Disabling it keeps the reservation. The API owns enforcement and account assignment.
+- Decision: Eric limits each local installation to one PersonaStack account and one integration configuration at a time across all workspaces. App updates and Disconnect preserve the Keychain installation ID and machine credential. Explicit setup first revokes the local session, then machine-proven API attachment replaces the prior configuration and persona bindings. Disabling a configuration keeps the installation reserved. The installation ID is a locator and never authorizes deletion. The API owns enforcement and account assignment.
 
 # Architecture decisions
 
