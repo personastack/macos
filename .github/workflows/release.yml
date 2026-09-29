@@ -63,6 +63,10 @@ jobs:
             echo "Homebrew installer tag $tap_tag already exists." >&2
             exit 1
           fi
+          if GH_TOKEN="$HOMEBREW_TAP_TOKEN" gh release view --repo personastack/homebrew-tap "$tap_tag" >/dev/null 2>&1; then
+            echo "Homebrew release $tap_tag already exists." >&2
+            exit 1
+          fi
           mkdir -p Casks Downloads
           cp "$GITHUB_WORKSPACE"/artifacts/*.dmg Downloads/
           current_dmg="Downloads/PersonaStack-$version-unsigned.dmg"
@@ -75,6 +79,14 @@ jobs:
           git commit -m "feat: publish PersonaStack cask $version"
           git tag -a "$tap_tag" -m "PersonaStack $version"
           git push origin HEAD:main "refs/tags/$tap_tag"
+          latest_dmg="$RUNNER_TEMP/PersonaStack-latest.dmg"
+          cp "$current_dmg" "$latest_dmg"
+          GH_TOKEN="$HOMEBREW_TAP_TOKEN" gh release create \
+            --repo personastack/homebrew-tap \
+            "$tap_tag" "$current_dmg" "$latest_dmg" \
+            --title "PersonaStack $version" \
+            --notes "Download PersonaStack for macOS." \
+            --latest
           gh release view -R personastack/macos-desktop "$GITHUB_REF_NAME" --json body -q .body \
             >"$tap_dir/Downloads/PersonaStack-$version-unsigned.md"
           sparkle_zip=$(mktemp)
