@@ -332,8 +332,10 @@ struct PersonaStackWebView: NSViewRepresentable {
         weak var webView: WKWebView?
         let appURL: URL
         private let scheduleNotification: (UNNotificationRequest) -> Void
+        private let cancelPermissionVerification: () -> Void
         private var popupWindows: [ObjectIdentifier: NSWindow] = [:]
         private(set) var isRetired = false
+        private(set) var documentGeneration = UUID()
 
         init(
             appURL: URL,
@@ -343,10 +345,14 @@ struct PersonaStackWebView: NSViewRepresentable {
             },
             scheduleNotification: @escaping (UNNotificationRequest) -> Void = { request in
                 UNUserNotificationCenter.current().add(request)
+            },
+            cancelPermissionVerification: @escaping () -> Void = {
+                DesktopPermissionChecklist.shared.cancelVerification()
             }
         ) {
             self.appURL = appURL
             self.scheduleNotification = scheduleNotification
+            self.cancelPermissionVerification = cancelPermissionVerification
             super.init()
             if let notificationCoordinator {
                 configureNotificationCenter(notificationCoordinator)
@@ -359,7 +365,18 @@ struct PersonaStackWebView: NSViewRepresentable {
 
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
             guard webView === self.webView else { return }
+            invalidateDocumentVerification()
             start(appURL)
+        }
+
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+            guard webView === self.webView else { return }
+            invalidateDocumentVerification()
+        }
+
+        private func invalidateDocumentVerification() {
+            documentGeneration = UUID()
+            cancelPermissionVerification()
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -482,6 +499,7 @@ struct PersonaStackWebView: NSViewRepresentable {
         func retire() {
             guard !isRetired else { return }
             isRetired = true
+            invalidateDocumentVerification()
             for window in popupWindows.values {
                 if let popup = window.contentViewController?.view as? WKWebView {
                     popup.stopLoading()

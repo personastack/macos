@@ -18,30 +18,17 @@ final class DesktopPermissionChecklist {
     private let selectedProfile: () -> DesktopEnvironmentConfiguration?
     private var explicitObservations: [DesktopPermissionID: DesktopPermissionObservation] = [:]
     private var activationObserver: NSObjectProtocol?
-    private var mediaTestID: String?
-    private weak var mediaTestView: WKWebView?
+    private let voiceVerifier = DesktopVoicePermissionVerifier()
+    private var verificationGeneration = UUID()
     private var inputTest: DesktopInputPermissionWindow?
 
     func cancelVerification() {
+        verificationGeneration = UUID()
         explicitObservations.removeAll()
+        window.coordinator.invalidateVerification(.microphone)
         inputTest?.invalidate()
         inputTest = nil
-        if let id = mediaTestID { stopMediaTest(id: id) }
-    }
-
-    private func stopMediaTest(id: String) {
-        guard mediaTestID == id else { return }
-        let view = mediaTestView
-        mediaTestID = nil
-        mediaTestView = nil
-        view?.callAsyncJavaScript("""
-            const test = window.__personastackPermissionMicrophoneTest;
-            if (test && test.id === expectedID) {
-                test.cancelled = true;
-                if (test.stream) test.stream.getTracks().forEach((track) => track.stop());
-                if (test.abort) test.abort();
-            }
-            """, arguments: ["expectedID": id], in: nil, in: .page, completionHandler: nil)
+        voiceVerifier.invalidate()
     }
 
     init(directoryURL: @escaping (FileManager.SearchPathDirectory) -> URL? = {
@@ -137,7 +124,8 @@ final class DesktopPermissionChecklist {
             return .init(.unsupported, detail: "Voice recording needs an HTTPS app URL or a loopback development URL. Review Server Settings.")
         }
         return .init(.ready, detail: "Microphone access is allowed. Use Setup Microphone to test WebKit recording.",
-                     verificationKey: "\(ownerKey):microphone:\(input.uniqueID)", requiresVerification: true)
+                     verificationKey: "\(ownerKey):microphone:\(input.uniqueID):\(MainWebViewHost.shared.coordinator.documentGeneration.uuidString)",
+                     requiresVerification: true)
     }
 
     private func observeUpdates() -> DesktopPermissionObservation {
@@ -240,68 +228,30 @@ final class DesktopPermissionChecklist {
             if let observation = observeMicrophone() { return observation }
             return await adapter.observe(.microphone)
         }
-        let view = MainWebViewHost.shared.webView
+        let host = MainWebViewHost.shared
+        let view = host.webView
         guard let url = view.url, let expected = profile?.appURL,
               (try? DesktopControlEnvironment.origin(url)) == (try? DesktopControlEnvironment.origin(expected)) else {
             return .init(.failed, detail: "Open the selected PersonaStack app before testing voice input.")
         }
+        let generation = verificationGeneration
+        let document = host.coordinator.documentGeneration
         do {
-            let id = UUID().uuidString
-            mediaTestID = id
-            mediaTestView = view
-            defer {
-                if mediaTestID == id { mediaTestID = nil; mediaTestView = nil }
-            }
-            let result: Bool = try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { continuation in
-                    view.callAsyncJavaScript("""
-                if (!window.isSecureContext || !navigator.mediaDevices || typeof MediaRecorder === 'undefined') return false;
-                const test = {id: testID, cancelled: false, stream: null, abort: null};
-                window.__personastackPermissionMicrophoneTest = test;
-                let timeout;
-                try {
-                    const media = navigator.mediaDevices.getUserMedia({audio: true});
-                    media.then((stream) => {
-                        if (test.cancelled) stream.getTracks().forEach((track) => track.stop());
-                        else test.stream = stream;
-                    }, () => {});
-                    const stream = await Promise.race([media, new Promise((_, reject) => {
-                        timeout = setTimeout(() => reject(new Error('permission test timeout')), 10000);
-                    })]);
-                    if (test.cancelled) return false;
-                    const recorder = new MediaRecorder(stream);
-                    return await new Promise((resolve) => {
-                        let hasData = false;
-                        test.abort = () => { if (recorder.state !== 'inactive') recorder.stop(); resolve(false); };
-                        recorder.ondataavailable = (event) => { hasData = event.data.size > 0; };
-                        recorder.onstop = () => resolve(hasData);
-                        recorder.onerror = () => resolve(false);
-                        recorder.start();
-                        setTimeout(() => { if (recorder.state !== 'inactive') recorder.stop(); }, 200);
-                    });
-                } finally {
-                    clearTimeout(timeout);
-                    test.cancelled = true;
-                    if (test.stream) test.stream.getTracks().forEach((track) => track.stop());
-                    if (window.__personastackPermissionMicrophoneTest === test) delete window.__personastackPermissionMicrophoneTest;
-                }
-                """, arguments: ["testID": id], in: nil, in: .page) { result in
-                        switch result {
-                        case .success(let value): continuation.resume(returning: value as? Bool == true)
-                        case .failure(let error): continuation.resume(throwing: error)
-                        }
-                    }
-                }
-            } onCancel: {
-                Task { @MainActor in DesktopPermissionChecklist.shared.stopMediaTest(id: id) }
+            let result = try await voiceVerifier.verify(page: DesktopVoicePermissionWebPage(view: view)) { [weak self, weak host, weak view] in
+                guard let self, let host, let view else { return false }
+                return MainWebViewHost.shared === host && host.webView === view && view.url == url &&
+                    !host.coordinator.isRetired && host.coordinator.documentGeneration == document &&
+                    self.verificationGeneration == generation && self.observeMicrophone()?.verificationKey == observed.verificationKey
             }
             try Task.checkCancellation()
-            guard result, observeMicrophone()?.verificationKey == observed.verificationKey else {
-                return .init(.failed, detail: "WebKit could not record microphone input. Check the input device and retry.")
+            guard result else {
+                return .init(.failed, detail: "Voice recording could not be verified. Reload the selected PersonaStack page, check the microphone, and retry.")
             }
-            return .init(.ready, detail: "PersonaStack's WebKit microphone recording succeeded. The test audio was discarded.",
+            return .init(.ready, detail: "PersonaStack's voice-message recorder succeeded. The test audio was discarded.",
                          verificationKey: observed.verificationKey, requiresVerification: true, verified: true)
-        } catch { return .init(.failed, detail: "WebKit could not record microphone input. Check the input device and retry.") }
+        } catch is CancellationError { return .init(.checking, detail: "Setup cancelled.") }
+        catch DesktopVoicePermissionError.pageChanged { return .init(.checking, detail: "The page or microphone changed. Retry Setup Microphone.") }
+        catch { return .init(.failed, detail: "Voice recording could not be verified. Reload the selected PersonaStack page, check the microphone, and retry.") }
     }
 
     private func setupDirectory(_ id: DesktopPermissionID) async -> DesktopPermissionObservation {

@@ -146,9 +146,17 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         }
     }
 
+    func invalidateVerification(_ id: DesktopPermissionID) {
+        verificationKeys.removeValue(forKey: id)
+        guard let index = rows.firstIndex(where: { $0.id == id }) else { return }
+        rows[index].observation = .init(.checking, detail: "Use Setup \(id.title) to verify access again.")
+    }
+
     private func apply(_ value: DesktopPermissionObservation, id: DesktopPermissionID, explicit: Bool) {
         guard let index = rows.firstIndex(where: { $0.id == id }) else { return }
-        if value.state != .ready { verificationKeys.removeValue(forKey: id) }
+        if value.state != .ready || verificationKeys[id] != value.verificationKey {
+            verificationKeys.removeValue(forKey: id)
+        }
         if explicit, value.state == .ready, value.verified, let key = value.verificationKey {
             verificationKeys[id] = key
         }
