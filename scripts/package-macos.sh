@@ -13,7 +13,6 @@ staging_dir="$root_dir/build/dmg-root"
 rw_dmg="$root_dir/build/PersonaStack-$version-rw.dmg"
 arm64_build_dir="$root_dir/build/swift-arm64"
 x86_64_build_dir="$root_dir/build/swift-x86_64"
-mount_point="/Volumes/PersonaStack"
 
 case "$configuration" in
   release) product_configuration=Release ;;
@@ -90,16 +89,20 @@ mkdir -p "$staging_dir/.background"
 "$root_dir/scripts/render-dmg-background.swift" "$staging_dir/.background/background@2x.png"
 ln -s /Applications "$staging_dir/Applications"
 mkdir -p "$artifact_dir"
-if [ -e "$mount_point" ]; then
-  printf '%s\n' "Eject the existing PersonaStack volume before packaging" >&2
-  exit 1
-fi
 hdiutil create -volname "PersonaStack" -srcfolder "$staging_dir" -ov -format UDRW "$rw_dmg" >/dev/null
-hdiutil attach -readwrite -noverify -noautoopen "$rw_dmg" >/dev/null
-trap 'hdiutil detach "$mount_point" >/dev/null 2>&1 || true' EXIT
-osascript <<'APPLESCRIPT'
+mount_root=$(mktemp -d "${TMPDIR:-/tmp}/personastack-dmg.XXXXXX")
+mount_point="$mount_root/mount"
+mkdir "$mount_point"
+cleanup_mount() {
+  hdiutil detach "$mount_point" >/dev/null 2>&1 || true
+  rmdir "$mount_point" "$mount_root" 2>/dev/null || true
+}
+trap cleanup_mount EXIT
+hdiutil attach -readwrite -noverify -noautoopen -mountpoint "$mount_point" "$rw_dmg" >/dev/null
+osascript - "$mount_point" <<'APPLESCRIPT'
+on run argv
 tell application "Finder"
-  tell disk "PersonaStack"
+  tell folder (POSIX file (item 1 of argv) as alias)
     open
     set current view of container window to icon view
     set toolbar visible of container window to false
@@ -119,8 +122,10 @@ tell application "Finder"
     delay 2
   end tell
 end tell
+end run
 APPLESCRIPT
 hdiutil detach "$mount_point" >/dev/null
+rmdir "$mount_point" "$mount_root"
 trap - EXIT
 hdiutil convert "$rw_dmg" -ov -format UDZO -imagekey zlib-level=9 -o "$artifact_dir/PersonaStack-$version-$artifact_suffix.dmg" >/dev/null
 rm -f "$rw_dmg"
