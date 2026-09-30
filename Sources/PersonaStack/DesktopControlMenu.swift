@@ -52,7 +52,7 @@ struct DesktopControlMenu: View {
     }
 
     var body: some View {
-        Text("Desktop Control")
+        Text("PersonaStack")
             .font(.headline)
         Label(relayStatus, systemImage: relayEnabled ? "dot.radiowaves.left.and.right" : "pause.circle")
             .foregroundStyle(relayEnabled ? .green : .secondary)
