@@ -114,7 +114,7 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
     private func grant(_ allowed: Bool, permission: DesktopPermissionID) -> DesktopPermissionObservation {
         .init(allowed ? .ready : .notGranted,
               detail: allowed ? "macOS permits PersonaStack. Use Setup \(permission.title) to verify the operation."
-                              : "Allow PersonaStack in Privacy & Security → \(permission.title).",
+                              : Self.privacyDenialObservation(permission).detail,
               verificationKey: "\(Bundle.main.bundleIdentifier ?? "unpackaged"):\(permission.rawValue):\(allowed)",
               requiresVerification: true)
     }
@@ -123,7 +123,7 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         let status = AVCaptureDevice.authorizationStatus(for: .audio)
         switch status {
         case .notDetermined: return .init(.notGranted, detail: "Allow microphone input for voice messages.")
-        case .denied: return .init(.denied, detail: "Enable PersonaStack in Privacy & Security → Microphone.")
+        case .denied: return Self.privacyDenialObservation(.microphone)
         case .restricted: return .init(.restricted, detail: "macOS restricts microphone access. Contact your Mac administrator.")
         case .authorized:
             guard AVCaptureDevice.default(for: .audio) != nil else {
@@ -138,6 +138,19 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
 
     private func openPrivacy(_ name: String) {
         openSettings("com.apple.preference.security?Privacy_\(name)")
+    }
+
+    static func privacyDenialObservation(_ permission: DesktopPermissionID) -> DesktopPermissionObservation {
+        switch permission {
+        case .accessibility:
+            return .init(.notGranted, detail: "Allow PersonaStack in Privacy & Security → Accessibility. If it is already enabled, remove the old PersonaStack entry with −. Click + and choose PersonaStack.app from Applications. Enable it, then retry Setup Accessibility.")
+        case .microphone:
+            return .init(.denied, detail: "Enable PersonaStack in Privacy & Security → Microphone. If it is already enabled, turn it off and on. Relaunch PersonaStack if macOS requests it, then retry Setup Microphone.")
+        case .screenRecording, .directCapture:
+            return .init(.notGranted, detail: "Allow PersonaStack in Privacy & Security → Screen & System Audio Recording. If it is already enabled, turn it off and on. Relaunch PersonaStack if macOS requests it, then retry Setup \(permission.title).")
+        default:
+            return .init(.notGranted, detail: "Allow PersonaStack in Privacy & Security → \(permission.title).")
+        }
     }
 
     private func openFullDiskAccess() {

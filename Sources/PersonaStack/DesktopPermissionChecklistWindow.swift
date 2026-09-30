@@ -162,6 +162,8 @@ private struct DesktopPermissionChecklistView: View {
             }
             Text("Set up Desktop Control while this Mac is unlocked. Locked-screen control is unavailable in this release. Each Setup button opens approval or verifies a capability. Status updates here when you return.")
                 .foregroundStyle(.secondary)
+            Text("After an update, macOS may need you to approve access again. If a permission is already enabled in System Settings, follow its recovery steps below, then retry Setup.")
+                .font(.caption).foregroundStyle(.secondary)
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(coordinator.rows) { row in

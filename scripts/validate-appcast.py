@@ -28,7 +28,9 @@ def main() -> int:
     if enclosure is None:
         raise SystemExit("release item has no enclosure")
     url = enclosure.get("url", "")
-    expected_name = f"PersonaStack-{version}-unsigned.dmg"
+    expected_name = Path(dmg_path).name
+    if expected_name not in (f"PersonaStack-{version}-unsigned.dmg", f"PersonaStack-{version}-selfsigned.dmg"):
+        raise SystemExit("release archive filename is not a supported versioned installer")
     expected_url = f"https://raw.githubusercontent.com/personastack/homebrew-tap/{tap_tag}/Downloads/{expected_name}"
     if url != expected_url:
         raise SystemExit("release archive URL is not the immutable tap artifact")
@@ -48,6 +50,9 @@ def main() -> int:
         raise SystemExit("cask version does not match the appcast")
     if f'sha256 "{digest}"' not in cask:
         raise SystemExit("cask digest does not match the published DMG")
+    cask_url = re.search(r'^  url "([^"]+)"$', cask, re.MULTILINE)
+    if cask_url is None or cask_url.group(1).replace("#{version}", version) != expected_url:
+        raise SystemExit("cask URL does not select the same immutable installer as the appcast")
     if "auto_updates true" not in cask:
         raise SystemExit("cask does not enable application updates")
     if "<!-- sparkle-signatures:\n" not in contents or "edSignature:" not in contents:

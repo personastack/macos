@@ -6,6 +6,9 @@ version=${2:?usage: verify-update-bundle.sh APP_BUNDLE VERSION [PUBLIC_KEY]}
 expected_public_key=${3:-}
 plist="$bundle/Contents/Info.plist"
 framework="$bundle/Contents/Frameworks/Sparkle.framework"
+root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+"$root_dir/scripts/verify-app-signature.sh" "$bundle"
 
 test -d "$bundle/Contents/MacOS"
 test -x "$bundle/Contents/MacOS/PersonaStack"

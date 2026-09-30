@@ -19,10 +19,13 @@ class ValidateAppcastTests(unittest.TestCase):
         notes: Optional[str] = None,
         embedded_notes: Optional[str] = None,
         notes_format: str = "markdown",
+        filename: Optional[str] = None,
+        render_cask: bool = False,
+        cask_url: Optional[str] = None,
     ) -> subprocess.CompletedProcess[str]:
         version = "1.2.3"
         tap_tag = f"desktop-v{version}"
-        filename = f"PersonaStack-{version}-unsigned.dmg"
+        filename = filename if filename is not None else f"PersonaStack-{version}-unsigned.dmg"
         expected_url = (
             f"https://raw.githubusercontent.com/personastack/homebrew-tap/"
             f"{tap_tag}/Downloads/{filename}"
@@ -49,6 +52,7 @@ edSignature: fixture-feed-signature
         cask = f'''cask "personastack" do
   version "{version}"
   sha256 "{digest}"
+  url "{cask_url or expected_url}"
   auto_updates true
 end
 '''
@@ -62,6 +66,9 @@ end
             appcast_path.write_text(appcast, encoding="utf-8")
             dmg_path.write_bytes(dmg_bytes)
             cask_path.write_text(cask, encoding="utf-8")
+            if render_cask:
+                subprocess.run([str(ROOT / "scripts/render-homebrew-cask.sh"), version,
+                                str(dmg_path), str(cask_path)], check=True)
             notes_path.write_text(notes, encoding="utf-8")
             return subprocess.run(
                 [
@@ -82,6 +89,25 @@ end
     def test_accepts_exact_versioned_archive_url_and_cask_digest(self) -> None:
         result = self.run_validator()
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_accepts_certificate_signed_installer(self) -> None:
+        result = self.run_validator(filename="PersonaStack-1.2.3-selfsigned.dmg", render_cask=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_cask_selecting_a_different_installer(self) -> None:
+        result = self.run_validator(cask_url="https://example.invalid/other.dmg")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_rejects_wrong_signing_kind_for_supplied_installer(self) -> None:
+        result = self.run_validator(
+            archive_url="https://raw.githubusercontent.com/personastack/homebrew-tap/desktop-v1.2.3/Downloads/PersonaStack-1.2.3-unsigned.dmg",
+            filename="PersonaStack-1.2.3-selfsigned.dmg",
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_rejects_ad_hoc_installer(self) -> None:
+        result = self.run_validator(filename="PersonaStack-1.2.3-adhoc.dmg")
+        self.assertNotEqual(result.returncode, 0)
 
     def test_rejects_untrusted_origin_with_matching_path_suffix(self) -> None:
         result = self.run_validator(

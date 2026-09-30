@@ -5,7 +5,8 @@ root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 version=${VERSION:-0.1.0}
 configuration=${CONFIGURATION:-release}
 default_url=${PERSONASTACK_DEFAULT_URL:?Set PERSONASTACK_DEFAULT_URL to the PersonaStack environment URL for this build}
-signing_identity=${PERSONASTACK_CODESIGN_IDENTITY:-}
+signing_identity=${PERSONASTACK_CODESIGN_IDENTITY:?Set PERSONASTACK_CODESIGN_IDENTITY to the pinned certificate-backed signing identity}
+signing_keychain=${PERSONASTACK_CODESIGN_KEYCHAIN:?Set PERSONASTACK_CODESIGN_KEYCHAIN to the release signing keychain}
 sparkle_public_key=${PERSONASTACK_SPARKLE_PUBLIC_ED_KEY:-}
 artifact_dir="$root_dir/artifacts"
 bundle_dir="$root_dir/build/PersonaStack.app"
@@ -22,6 +23,10 @@ esac
 
 if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
   printf '%s\n' "Stable release version must use numeric major.minor.patch: $version" >&2
+  exit 2
+fi
+if [ "$signing_identity" = '-' ]; then
+  printf '%s\n' 'Ad-hoc signatures cannot preserve macOS permission identity across updates.' >&2
   exit 2
 fi
 if [ -n "$sparkle_public_key" ] && ! printf '%s' "$sparkle_public_key" | grep -Eq '^[A-Za-z0-9+/]+={0,2}$'; then
@@ -71,17 +76,11 @@ if [ -n "$sparkle_public_key" ]; then
     || /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $sparkle_public_key" "$bundle_dir/Contents/Info.plist"
 fi
 
-artifact_suffix=unsigned
-if [ -n "$signing_identity" ]; then
-  if [ "$signing_identity" = "-" ]; then
-    artifact_suffix=adhoc
-    codesign --force --options runtime --identifier ai.personastack.desktop --sign "$signing_identity" "$bundle_dir"
-  else
-    artifact_suffix=signed
-    codesign --force --options runtime --timestamp --identifier ai.personastack.desktop --sign "$signing_identity" "$bundle_dir"
-  fi
-  codesign --verify --deep --strict --verbose=2 "$bundle_dir"
-fi
+artifact_suffix=selfsigned
+# Seal the completed bundle. The certificate-backed designated requirement
+# stays constant across builds. Preserve Sparkle's existing nested signatures.
+codesign --force --timestamp=none --identifier ai.personastack.desktop \
+  --keychain "$signing_keychain" --sign "$signing_identity" "$bundle_dir"
 "$root_dir/scripts/verify-update-bundle.sh" "$bundle_dir" "$version" "$sparkle_public_key"
 
 cp -R "$bundle_dir" "$staging_dir/"

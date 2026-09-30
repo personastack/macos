@@ -27,6 +27,13 @@ jobs:
         run: python3 -m unittest discover -s scripts/tests
       - name: Validate authored release notes
         run: python3 scripts/release_notes.py "$RELEASE_VERSION" "release-notes/$RELEASE_VERSION.md"
+      - name: Import pinned release signing identity
+        env:
+          PERSONASTACK_CODESIGN_CERTIFICATE_P12_BASE64: ${{ secrets.PERSONASTACK_CODESIGN_CERTIFICATE_P12_BASE64 }}
+          PERSONASTACK_CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.PERSONASTACK_CODESIGN_CERTIFICATE_PASSWORD }}
+        run: ./scripts/import-release-signing.sh
+      - name: Test signing identity across updates
+        run: ./scripts/test-signing-continuity.sh
       - name: Validate updater release configuration
         env:
           SPARKLE_PUBLIC_KEY: ${{ vars.PERSONASTACK_SPARKLE_PUBLIC_ED_KEY }}
@@ -55,7 +62,7 @@ jobs:
           swift test --disable-xctest --skip-update -j 2 \
             "${test_scheduling[@]}" \
             --filter '(LocalRun|[Pp]ermission|[Pp]rotected|[Vv]olume|[Vv]oice|[Mm]icrophone|[Dd]irectory|[Cc]ua|[Dd]esktopControl)'
-      - name: Build unsigned installer
+      - name: Build certificate-signed installer
         env:
           PERSONASTACK_DEFAULT_URL: https://my.personastack.ai/user/personas
           PERSONASTACK_SPARKLE_PUBLIC_ED_KEY: ${{ vars.PERSONASTACK_SPARKLE_PUBLIC_ED_KEY }}
@@ -65,7 +72,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: PersonaStack-validation-${{ env.RELEASE_VERSION }}
-          path: artifacts/PersonaStack-${{ env.RELEASE_VERSION }}-unsigned.dmg
+          path: artifacts/PersonaStack-${{ env.RELEASE_VERSION }}-selfsigned.dmg
           if-no-files-found: error
       - name: Publish GitHub release
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -76,7 +83,7 @@ jobs:
             echo "Release $GITHUB_REF_NAME already exists. Refusing to replace its immutable installer." >&2
             exit 1
           fi
-          gh release create "$GITHUB_REF_NAME" artifacts/*.dmg \
+          gh release create "$GITHUB_REF_NAME" "artifacts/PersonaStack-$RELEASE_VERSION-selfsigned.dmg" \
             --notes-file "release-notes/${GITHUB_REF_NAME#v}.md" --title "PersonaStack $GITHUB_REF_NAME"
       - name: Publish Homebrew cask
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -103,8 +110,8 @@ jobs:
             exit 1
           fi
           mkdir -p Casks Downloads
-          cp "$GITHUB_WORKSPACE"/artifacts/*.dmg Downloads/
-          current_dmg="Downloads/PersonaStack-$version-unsigned.dmg"
+          cp "$GITHUB_WORKSPACE/artifacts/PersonaStack-$version-selfsigned.dmg" Downloads/
+          current_dmg="Downloads/PersonaStack-$version-selfsigned.dmg"
           test -f "$current_dmg"
           "$GITHUB_WORKSPACE"/scripts/render-homebrew-cask.sh "$version" "$current_dmg" Casks/personastack.rb
           grep -q '^  auto_updates true$' Casks/personastack.rb
@@ -123,7 +130,7 @@ jobs:
             --notes-file "$GITHUB_WORKSPACE/release-notes/$version.md" \
             --latest
           gh release view -R personastack/macos-desktop "$GITHUB_REF_NAME" --json body -q .body \
-            >"$tap_dir/Downloads/PersonaStack-$version-unsigned.md"
+            >"$tap_dir/Downloads/PersonaStack-$version-selfsigned.md"
           sparkle_zip=$(mktemp)
           sparkle_dir=$(mktemp -d)
           curl -fsSL https://github.com/sparkle-project/Sparkle/releases/download/2.10.0/Sparkle-for-Swift-Package-Manager.zip -o "$sparkle_zip"
@@ -133,8 +140,8 @@ jobs:
           chmod 755 "$sparkle_dir/bin/sign_update"
           archive_dir="$sparkle_dir/archives"
           mkdir -p "$archive_dir"
-          cp "Downloads/PersonaStack-$version-unsigned.dmg" "$archive_dir/"
-          cp "Downloads/PersonaStack-$version-unsigned.md" "$archive_dir/"
+          cp "Downloads/PersonaStack-$version-selfsigned.dmg" "$archive_dir/"
+          cp "Downloads/PersonaStack-$version-selfsigned.md" "$archive_dir/"
           if [ -f appcast.xml ]; then cp appcast.xml "$archive_dir/appcast.xml"; fi
           printf '%s' "$SPARKLE_PRIVATE_KEY" | "$sparkle_dir/bin/generate_appcast" \
             --ed-key-file - --maximum-versions 0 --embed-release-notes \
@@ -163,12 +170,12 @@ jobs:
           PY
           )
           printf '%s' "$SPARKLE_PRIVATE_KEY" | "$sparkle_dir/bin/sign_update" \
-            --ed-key-file - --verify "$GITHUB_WORKSPACE/artifacts/PersonaStack-$version-unsigned.dmg" "$archive_signature"
+            --ed-key-file - --verify "$GITHUB_WORKSPACE/artifacts/PersonaStack-$version-selfsigned.dmg" "$archive_signature"
           printf '%s' "$SPARKLE_PRIVATE_KEY" | "$sparkle_dir/bin/sign_update" \
             --ed-key-file - --verify "$tap_dir/appcast.xml"
           python3 "$GITHUB_WORKSPACE/scripts/validate-appcast.py" \
             "$tap_dir/appcast.xml" "$version" "$tap_tag" \
-            "$GITHUB_WORKSPACE/artifacts/PersonaStack-$version-unsigned.dmg" "$tap_dir/Casks/personastack.rb" \
+            "$GITHUB_WORKSPACE/artifacts/PersonaStack-$version-selfsigned.dmg" "$tap_dir/Casks/personastack.rb" \
             "$GITHUB_WORKSPACE/release-notes/$version.md"
           cd "$tap_dir"
           git add appcast.xml
@@ -176,3 +183,11 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "feat: publish signed PersonaStack appcast $version"
           git push origin HEAD:main
+      - name: Remove temporary signing keychain
+        if: always()
+        run: |
+          signing_dir="$RUNNER_TEMP/personastack-release-signing"
+          if [ -f "$signing_dir/signing.keychain-db" ]; then
+            security delete-keychain "$signing_dir/signing.keychain-db"
+          fi
+          rm -rf "$signing_dir"

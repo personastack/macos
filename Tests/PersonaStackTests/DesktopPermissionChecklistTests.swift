@@ -90,6 +90,64 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     #expect(allowed.state == .verificationRequired)
 }
 
+@Test @MainActor func permissionChecklistPrivacyRecoveryMatchesTheSettingsPane() {
+    let accessibility = DesktopPermissionChecklistSystemAdapter.privacyDenialObservation(.accessibility)
+    #expect(accessibility.state == .notGranted)
+    #expect(accessibility.detail.contains("remove the old PersonaStack entry"))
+    #expect(accessibility.detail.contains("PersonaStack.app from Applications"))
+    for id in [DesktopPermissionID.microphone, .screenRecording, .directCapture] {
+        let observation = DesktopPermissionChecklistSystemAdapter.privacyDenialObservation(id)
+        #expect(observation.state == (id == .microphone ? .denied : .notGranted))
+        #expect(observation.detail.contains("turn it off and on"))
+        #expect(observation.detail.contains("Relaunch PersonaStack if macOS requests it"))
+        #expect(!observation.detail.contains("remove"))
+        #expect(!observation.detail.contains("Click +"))
+        #expect(!observation.verified)
+    }
+}
+
+@Test @MainActor func permissionChecklistReauthorizationStillRequiresGrantAndFunctionalProof() async {
+    // Moving from an unsigned release may require fresh TCC approval.
+    // Recovery guidance must never turn an enabled Settings entry into proof.
+    for id in [DesktopPermissionID.accessibility, .screenRecording, .directCapture, .microphone] {
+        let fake = PermissionChecklistFake()
+        let denied = DesktopPermissionChecklistSystemAdapter.privacyDenialObservation(id)
+        fake.values[id] = denied
+        let model = DesktopPermissionChecklistCoordinator(adapter: fake)
+        model.open()
+        await model.refresh()
+        #expect(model.rows.first { $0.id == id }?.state == denied.state)
+        #expect(!model.canFinish)
+        #expect(fake.requested.isEmpty)
+
+        model.setup(id)
+        while model.busyPermission != nil { await Task.yield() }
+        #expect(model.rows.first { $0.id == id }?.state == denied.state)
+        #expect(!model.canFinish)
+
+        fake.values[id] = .init(.ready, detail: "macOS grant observed", verificationKey: "current-owner",
+                                requiresVerification: true)
+        await model.refresh()
+        #expect(model.rows.first { $0.id == id }?.state == .verificationRequired)
+        #expect(!model.canFinish)
+        #expect(fake.requested == [id])
+
+        fake.setupValues[id] = .init(.ready, detail: "Operation verified", verificationKey: "current-owner",
+                                     requiresVerification: true, verified: true)
+        model.setup(id)
+        while model.busyPermission != nil { await Task.yield() }
+        #expect(model.rows.first { $0.id == id }?.state == .ready)
+        #expect(model.canFinish)
+
+        fake.values[id] = denied
+        await model.refresh()
+        #expect(model.rows.first { $0.id == id }?.state == denied.state)
+        #expect(!model.canFinish)
+        #expect(fake.requested == [id, id])
+        model.cancel()
+    }
+}
+
 @Test @MainActor func permissionChecklistExplicitProofSurvivesPollingOnlyForItsCurrentKey() async {
     let fake = PermissionChecklistFake()
     fake.values[.accessibility] = .init(.ready, detail: "Allowed", verificationKey: "owner-generation-1", requiresVerification: true)

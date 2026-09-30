@@ -199,7 +199,7 @@ final class DesktopPermissionChecklist {
     private func observeCua(_ id: DesktopPermissionID) async -> DesktopPermissionObservation {
         let allowed = id == .accessibility ? AXIsProcessTrusted() : CGPreflightScreenCaptureAccess()
         guard allowed else {
-            return .init(.notGranted, detail: "Allow PersonaStack in Privacy & Security → \(id == .accessibility ? "Accessibility" : "Screen & System Audio Recording").")
+            return DesktopPermissionChecklistSystemAdapter.privacyDenialObservation(id)
         }
         guard let snapshot = try? await DesktopControlRuntime.shared.cuaPermissionSnapshot(), snapshot.hostAttributionValid else {
             return .init(.verificationRequired, detail: "Use Setup \(id.title) to start PersonaStack's owned desktop runtime and verify access.",
