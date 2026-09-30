@@ -20,9 +20,12 @@ final class DesktopPermissionChecklist {
     private var activationObserver: NSObjectProtocol?
     private var mediaTestID: String?
     private weak var mediaTestView: WKWebView?
+    private var inputTest: DesktopInputPermissionWindow?
 
     func cancelVerification() {
         explicitObservations.removeAll()
+        inputTest?.invalidate()
+        inputTest = nil
         if let id = mediaTestID { stopMediaTest(id: id) }
     }
 
@@ -57,6 +60,7 @@ final class DesktopPermissionChecklist {
         self.adapter = adapter
         window = DesktopPermissionChecklistWindow(coordinator: DesktopPermissionChecklistCoordinator(adapter: adapter))
         window.onPresent = { [weak self] in self?.cancelVerification() }
+        window.onCancel = { [weak self] in self?.cancelVerification() }
         adapter.hooks = .init(
             observe: { [weak self] in await self?.observe($0) },
             setup: { [weak self] in await self?.setup($0) }
@@ -202,11 +206,33 @@ final class DesktopPermissionChecklist {
             guard result.state == .ready else { return result }
             try await runtime.verifyCuaCapabilitiesForPermissions()
             try Task.checkCancellation()
+            if id == .accessibility {
+                let target = DesktopInputPermissionWindow()
+                inputTest = target
+                defer {
+                    target.invalidate()
+                    if inputTest === target { inputTest = nil }
+                }
+                try await runtime.verifyCuaInputForPermissions(target: target)
+                try Task.checkCancellation()
+            }
             let verified = await observeCua(id)
-            return .init(verified.state, detail: "PersonaStack's desktop runtime verified screen capture and accessibility reads.",
-                         verificationKey: verified.verificationKey, requiresVerification: true, verified: verified.state == .ready)
+            return Self.finishCuaVerification(id, initial: result, current: verified)
         } catch is CancellationError { return .init(.checking, detail: "Setup cancelled.") }
+        catch let error as DesktopInputPermissionVerificationError { return .init(.failed, detail: error.localizedDescription) }
         catch { return .init(.failed, detail: "Desktop access could not be verified. Review PersonaStack's permissions and retry. A full app relaunch may be needed.") }
+    }
+
+    static func finishCuaVerification(_ id: DesktopPermissionID, initial: DesktopPermissionObservation,
+                                      current: DesktopPermissionObservation) -> DesktopPermissionObservation {
+        guard current.state == .ready else { return current }
+        guard initial.state == .ready, let key = initial.verificationKey, !key.isEmpty, current.verificationKey == key else {
+            return .init(.checking, detail: "Desktop access changed during verification. Retry Setup \(id.title).")
+        }
+        return .init(.ready, detail: id == .accessibility
+                     ? "PersonaStack verified clicking and text input in its own test window."
+                     : "PersonaStack's desktop runtime verified screen capture and accessibility reads.",
+                     verificationKey: key, requiresVerification: true, verified: true)
     }
 
     private func setupMicrophone() async -> DesktopPermissionObservation {

@@ -60,7 +60,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private var reconnectTask: Task<Void, Never>?
     private var activeInstallation: DesktopControlInstallation?
     private var executor = DesktopControlCommandExecutor()
-    private var lifecycleGeneration = UUID()
+    private weak var inputPermissionTarget: (any DesktopInputPermissionTarget)?
+    private var lifecycleGeneration = UUID() {
+        didSet { inputPermissionTarget?.invalidate() }
+    }
     private var setupMayRunUnconfigured = false
     private var disconnecting = false
     private var environmentSwitchPending = false
@@ -94,6 +97,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         sessionLock.onChange = { [weak self] state in
             guard let self else { return }
             self.lockGeneration = UUID()
+            self.inputPermissionTarget?.invalidate()
             let lockGeneration = self.lockGeneration
             if state != .unlocked {
                 self.verifiedCuaCapabilitiesGeneration = nil
@@ -162,6 +166,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     var executorCleanupFailedForTesting: Bool { executorCleanupFailed }
 
     func waitForLockCleanupForTesting() async { await lockCleanupTask?.value }
+    func receiveSessionLockForTesting(_ state: DesktopControlSessionLock.State) { sessionLock.receive(state) }
 
     func heartbeatReadinessForTesting() async -> String? { await heartbeatReadiness() }
     var hasPendingRelayReconnectForTesting: Bool { reconnectTask != nil }
@@ -581,7 +586,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     var nativeExecutorReady: Bool {
-        !environmentSwitchPending && !paused && sessionLock.allowsControl && !executorCleanupInProgress && !executorCleanupFailed
+        !environmentSwitchPending && !paused && sessionLock.allowsControl && !executorCleanupInProgress
+            && !executorCleanupFailed && !executor.nativeVerificationInProgress
     }
 
     var hasActiveInstallation: Bool { activeInstallation != nil }
@@ -675,6 +681,41 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         try await verifyCuaReadiness(proxy, generation: generation, timeout: 15)
         try requireCurrentLifecycle(generation)
         guard sessionLock.allowsControl else { throw CuaMCPProxyError.permissionsRequired }
+    }
+
+    /// Input proof is local-only and cannot share the daemon with a remote task.
+    func verifyCuaInputForPermissions(target: any DesktopInputPermissionTarget) async throws {
+        defer {
+            target.invalidate()
+            if inputPermissionTarget === target { inputPermissionTarget = nil }
+        }
+        guard sessionLock.allowsControl, isCuaReady(), let proxy, let service = cuaService,
+              !disconnecting, !environmentSwitchPending, !repairInProgress,
+              !executorCleanupInProgress, !executorCleanupFailed else { throw CuaMCPProxyError.permissionsRequired }
+        let generation = lifecycleGeneration
+        let lock = lockGeneration
+        let executor = self.executor
+        let id: UUID
+        do { id = try await executor.beginNativeVerification(onInvalidation: { [weak target] in target?.invalidate() }) }
+        catch is CancellationError { throw CancellationError() }
+        catch { throw DesktopInputPermissionVerificationError.busy }
+        defer { executor.endNativeVerification(id) }
+        inputPermissionTarget = target
+        func requireCurrent() throws {
+            try Task.checkCancellation()
+            try requireCurrentLifecycle(generation)
+            try executor.requireNativeVerification(id)
+            guard self.executor === executor, self.proxy === proxy, cuaService === service,
+                  service.isRunning, isCuaReady(), sessionLock.allowsControl, lockGeneration == lock,
+                  !repairInProgress, !executorCleanupInProgress, !executorCleanupFailed else { throw CancellationError() }
+        }
+        try requireCurrent()
+        try await DesktopInputPermissionVerifier.verify(target: target, call: { name, arguments in
+            try requireCurrent()
+            let response = try await proxy.callTool(name: name, argumentsJSON: arguments, timeout: 5)
+            try requireCurrent()
+            return response
+        }, isCurrent: requireCurrent)
     }
 
     func probeNativeCapabilities(generation: UUID) async throws {
@@ -831,6 +872,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func cleanupExecutor() async {
+        inputPermissionTarget?.invalidate()
         if let task = executorCleanupTask {
             _ = await task.value
             return

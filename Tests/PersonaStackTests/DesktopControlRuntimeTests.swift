@@ -46,8 +46,8 @@ private struct EmptyDesktopControlCredentialStore: DesktopControlCredentialStori
 private final class PermissionPreparationCredentialStore: DesktopControlCredentialStoring, @unchecked Sendable {
     private let lock = NSLock()
     private var reads = 0
-    let installation: DesktopControlInstallation
-    init(installation: DesktopControlInstallation) { self.installation = installation }
+    let installation: DesktopControlInstallation?
+    init(installation: DesktopControlInstallation?) { self.installation = installation }
     var readCount: Int { lock.withLock { reads } }
     func load() throws -> DesktopControlInstallation? { lock.withLock { reads += 1; return installation } }
     func save(_ installation: DesktopControlInstallation) throws { Issue.record("Permission preparation cannot save enrollment") }
@@ -197,6 +197,7 @@ def chunk(kind, data):
     return struct.pack('>I',len(data))+kind+data+struct.pack('>I',zlib.crc32(kind+data)&0xffffffff)
 png = b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',1,1,8,2,0,0,0))+chunk(b'IDAT',zlib.compress(b'\x00\x00\x00\x00'))+chunk(b'IEND',b'')
 names = ['get_desktop_state','get_accessibility_tree','get_window_state','move_cursor','click','type_text','press_key','launch_app','list_apps','list_windows']
+input_snapshots = 0
 for line in sys.stdin:
     request = json.loads(line)
     if 'id' not in request: continue
@@ -216,6 +217,36 @@ for line in sys.stdin:
             pixels = 'bad' if os.path.exists(os.path.join(root,'invalid-pixels')) else base64.b64encode(png).decode()
             result = {'content':[{'type':'image','mimeType':'image/png','data':pixels}]}
         elif name == 'get_accessibility_tree': result = {'content':[{'type':'text','text':'{"application":"fixture","children":[]}'}]}
+        elif name in ['get_window_state', 'click', 'type_text']:
+            arguments = request['params']['arguments']
+            with open(os.path.join(root, 'input-target.json')) as source: target = json.load(source)
+            assert arguments['pid'] == target['pid'] == host
+            assert arguments['window_id'] == target['window_id'] == 90001
+            assert arguments['session'].startswith('permissions-')
+            with open(os.path.join(root, 'input-calls.jsonl'), 'a') as out: out.write(json.dumps({'name':name,'arguments':arguments})+'\n')
+            base = {'session','pid','window_id'}
+            if name == 'get_window_state':
+                assert set(arguments) == base | {'include_screenshot','include_accessibility_tree','max_elements','max_depth','timeout_ms'}
+                assert arguments['include_screenshot'] is False and arguments['include_accessibility_tree'] is True
+                assert arguments['max_elements'] == 32 and arguments['max_depth'] == 8 and arguments['timeout_ms'] == 1000
+                input_snapshots += 1
+                sid = 's%08x' % input_snapshots
+                result = {'structuredContent':{'pid':host,'window_id':90001,'snapshot_id':sid,'truncated':False,'elements_complete':False,'elements':[
+                    {'element_index':3,'element_token':sid+':3','role':'AXButton','label':'Verify Desktop Control Click','enabled':True,'actions':['AXPress']},
+                    {'element_index':4,'element_token':sid+':4','role':'AXTextField','label':'Desktop Control Verification Text','enabled':True}]}}
+            elif name == 'click':
+                assert set(arguments) == base | {'element_token','action','button','delivery_mode'}
+                assert arguments['element_token'] == 's%08x:3' % input_snapshots
+                assert arguments['action'] == 'press' and arguments['button'] == 'left' and arguments['delivery_mode'] == 'background'
+                with open(os.path.join(root, 'input-clicked'), 'w') as out: out.write('1')
+                result = {'structuredContent':{'path':'ax','verified':False,'effect':'unverifiable'}}
+            else:
+                assert set(arguments) == base | {'element_token','text','scope','delay_ms','delivery_mode'}
+                assert arguments['element_token'] == 's%08x:4' % input_snapshots
+                assert arguments['scope'] == 'window' and arguments['delay_ms'] == 0 and arguments['delivery_mode'] == 'background'
+                assert arguments['text'] == target['expected_text']
+                with open(os.path.join(root, 'input-text'), 'w') as out: out.write(arguments['text'])
+                result = {'structuredContent':{'path':'ax','effect':'confirmed','verified':True,'characters':len(arguments['text']),'requested_chars':len(arguments['text'])}}
         else: raise RuntimeError('unplanned tool: '+name)
     else: raise RuntimeError('unplanned method: '+method)
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
@@ -223,6 +254,122 @@ for line in sys.stdin:
     try Data(script.utf8).write(to: executable)
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
     return executable
+}
+
+@MainActor
+private final class RuntimeInputTarget: DesktopInputPermissionTarget {
+    let pid = Darwin.getpid()
+    let windowID = 90001
+    let expectedText = "PersonaStack fixture input"
+    private let root: URL
+    private(set) var presented = false
+    private(set) var invalidated = false
+    var onClickObserved: (() throws -> Void)?
+    private var clickObserved = false
+    init(root: URL) { self.root = root }
+    var clickCount: Int { FileManager.default.fileExists(atPath: root.appendingPathComponent("input-clicked").path) ? 1 : 0 }
+    var text: String { (try? String(contentsOf: root.appendingPathComponent("input-text"), encoding: .utf8)) ?? "" }
+    func present() throws {
+        presented = true
+        let data = try JSONSerialization.data(withJSONObject: ["pid": pid, "window_id": windowID, "expected_text": expectedText])
+        try data.write(to: root.appendingPathComponent("input-target.json"))
+    }
+    func requireCurrent() throws {
+        guard presented, !invalidated else { throw CancellationError() }
+        if clickCount > 0, !clickObserved {
+            clickObserved = true
+            try onClickObserved?()
+        }
+    }
+    func invalidate() { invalidated = true }
+    var calls: [String] {
+        let data = (try? String(contentsOf: root.appendingPathComponent("input-calls.jsonl"), encoding: .utf8)) ?? ""
+        return data.split(separator: "\n").compactMap {
+            (try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any])?["name"] as? String
+        }
+    }
+}
+
+@Test @MainActor func permissionInputUsesOnlyTheOwnedWindowAndNeverStartsEnrollment() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-input-fixture-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let executable = try makeRuntimeDriverFixture(root)
+    let credentials = PermissionPreparationCredentialStore(installation: nil)
+    let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
+        credentials: credentials, readiness: "paused", paused: true, sessionLockState: .unlocked, hostPermissions: { (true, true) })
+    do {
+        try await runtime.prepareCuaPermissions()
+        try await runtime.verifyCuaCapabilitiesForPermissions()
+        let target = RuntimeInputTarget(root: root)
+        try await runtime.verifyCuaInputForPermissions(target: target)
+        #expect(target.calls == ["get_window_state", "click", "get_window_state", "type_text"])
+        #expect(target.clickCount == 1 && target.text == target.expectedText && target.invalidated)
+        #expect(credentials.readCount == 0)
+        #expect(!runtime.hasActiveInstallation && !runtime.gatewayConnected && !runtime.hasPendingRelayReconnectForTesting)
+        #expect(runtime.paused && runtime.readiness == "paused")
+        await runtime.shutdownForQuit()
+    } catch { await runtime.shutdownForQuit(); throw error }
+}
+
+@Test(arguments: ["lifecycle", "lock"]) @MainActor func permissionInputRejectsLateLifecycleChangeWithoutTyping(change: String) async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-input-stale-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let executable = try makeRuntimeDriverFixture(root)
+    let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
+        credentials: PermissionPreparationCredentialStore(installation: nil), sessionLockState: .unlocked, hostPermissions: { (true, true) })
+    do {
+        try await runtime.prepareCuaPermissions()
+        try await runtime.verifyCuaCapabilitiesForPermissions()
+        let target = RuntimeInputTarget(root: root)
+        target.onClickObserved = {
+            if change == "lock" { runtime.receiveSessionLockForTesting(.locked) }
+            else { _ = try runtime.beginResume() }
+        }
+        await #expect(throws: CancellationError.self) { try await runtime.verifyCuaInputForPermissions(target: target) }
+        #expect(target.calls == ["get_window_state", "click"])
+        #expect(target.text.isEmpty && target.invalidated)
+        if change == "lock" { await runtime.waitForLockCleanupForTesting() }
+        await runtime.shutdownForQuit()
+    } catch { await runtime.shutdownForQuit(); throw error }
+}
+
+@Test @MainActor func permissionInputPreservesAnExistingRemoteLeaseWithoutOpeningItsWindow() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-input-busy-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let executable = try makeRuntimeDriverFixture(root)
+    let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
+    let credentials = PermissionPreparationCredentialStore(installation: nil)
+    let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
+        credentials: credentials, executor: executor, sessionLockState: .unlocked, hostPermissions: { (true, true) })
+    do {
+        try await runtime.prepareCuaPermissions()
+        try await runtime.verifyCuaCapabilitiesForPermissions()
+        let owner = DesktopControlTarget(installationID: "install", workspaceID: "workspace", configID: "config",
+                                        personaID: "persona", runID: "run", generation: 1, configVersion: 1)
+        let acquire = DesktopControlFrame(type: "command", requestID: "acquire", target: owner, operation: "desktop_control_acquire", arguments: .object([:]))
+        let first = await executor.handle(acquire, proxy: nil)
+        #expect(first.type == "result")
+        let target = RuntimeInputTarget(root: root)
+        await #expect(throws: DesktopInputPermissionVerificationError.busy) { try await runtime.verifyCuaInputForPermissions(target: target) }
+        #expect(!target.presented && target.invalidated && target.calls.isEmpty)
+        let renewed = await executor.handle(acquire, proxy: nil)
+        #expect(renewed.type == "result" && renewed.result == first.result)
+        #expect(credentials.readCount == 0)
+        await runtime.shutdownForQuit()
+    } catch { await runtime.shutdownForQuit(); throw error }
+}
+
+@Test @MainActor func permissionInputWithoutUsableOwnedCuaNeverOpensAWindow() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-input-denied-\(UUID().uuidString)")
+    let target = RuntimeInputTarget(root: root)
+    let runtime = DesktopControlRuntime.makeForTesting(installer: DesktopControlInstallerFixture(errors: []),
+        credentials: PermissionPreparationCredentialStore(installation: nil), sessionLockState: .locked)
+    await #expect(throws: CuaMCPProxyError.permissionsRequired) { try await runtime.verifyCuaInputForPermissions(target: target) }
+    #expect(!target.presented && target.invalidated && target.calls.isEmpty)
+    await runtime.shutdownForQuit()
 }
 
 @Test @MainActor func permissionPreparationCannotAdvertiseGuiReadyWithoutCurrentGrantsAndPixels() async throws {

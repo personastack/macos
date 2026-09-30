@@ -48,6 +48,10 @@ final class DesktopControlCommandExecutor {
     private var cleanupWaiters: [CheckedContinuation<Bool, Never>] = []
     private var leaseEpoch: UInt64 = 0
     private var activeOperations = 0
+    private var nativeVerificationID: UUID?
+    private var nativeVerificationInvalidated = false
+    private var invalidateNativeTarget: (@MainActor () -> Void)?
+    var nativeVerificationInProgress: Bool { nativeVerificationID != nil }
     private var revokedConfigVersions: [ConfigScope: Int64] = [:]
     private var revokedBindingGenerations: [BindingScope: Int64] = [:]
     private var closed = false
@@ -60,6 +64,7 @@ final class DesktopControlCommandExecutor {
     private var activeOperationWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var cleanupResourceBarrierForTesting: (@Sendable () async -> Void)?
     private var cleanupFailuresForTesting = 0
+    private var leaseGrantBarrierForTesting: (@Sendable () async -> Void)?
 #endif
 
     init(now: @escaping () -> ContinuousClock.Instant = { .now },
@@ -82,6 +87,50 @@ final class DesktopControlCommandExecutor {
                                          openFileHandles: handleCount,
                                          bufferedOutputBytes: shellState.bufferedOutputBytes,
                                          outputGapsTotal: shellState.outputGapsTotal)
+    }
+
+    /// Local permission setup must never interleave its input with remote work.
+    func beginNativeVerification(onInvalidation: (@MainActor () -> Void)? = nil) async throws -> UUID {
+        guard canBeginNativeVerification else { throw CommandError.executorUnavailable }
+        let id = UUID()
+        nativeVerificationID = id
+        nativeVerificationInvalidated = false
+        invalidateNativeTarget = onInvalidation
+        activeOperations += 1
+        do {
+            let state = await diagnostics()
+            try requireNativeVerification(id)
+            try Task.checkCancellation()
+            guard state.activeProcesses == 0, state.openFileHandles == 0 else { throw CommandError.executorUnavailable }
+            return id
+        } catch {
+            endNativeVerification(id)
+            throw error
+        }
+    }
+
+    private var canBeginNativeVerification: Bool {
+        nativeVerificationID == nil && lease == nil && activeOperations == 0 && !closed && !unavailable
+            && !revocationInProgress && !cleanupInProgress && failedCleanupLease == nil && !failedCleanupWithoutLease
+    }
+
+    func requireNativeVerification(_ id: UUID) throws {
+        guard nativeVerificationID == id, !nativeVerificationInvalidated, !closed, !unavailable, !revocationInProgress,
+              !cleanupInProgress, lease == nil, activeOperations == 1 else { throw CancellationError() }
+    }
+
+    func endNativeVerification(_ id: UUID) {
+        if nativeVerificationID == id {
+            nativeVerificationID = nil
+            nativeVerificationInvalidated = false
+            invalidateNativeTarget = nil
+            activeOperations -= 1
+        }
+    }
+
+    private func invalidateNativeVerification() {
+        nativeVerificationInvalidated = true
+        invalidateNativeTarget?()
     }
 
     func probeNativeCapabilities(isCurrent: @MainActor @Sendable () throws -> Void) async throws {
@@ -172,6 +221,10 @@ final class DesktopControlCommandExecutor {
         cleanupFailuresForTesting += 1
     }
 
+    func pauseLeaseGrantAfterCleanupForTesting(_ barrier: @escaping @Sendable () async -> Void) {
+        leaseGrantBarrierForTesting = barrier
+    }
+
     private func signalActiveOperationWaiters() {
         let ready = activeOperationWaiters.filter { activeOperations >= $0.0 }
         activeOperationWaiters.removeAll { activeOperations >= $0.0 }
@@ -182,6 +235,7 @@ final class DesktopControlCommandExecutor {
     @discardableResult
     func close() async -> Bool {
         closed = true
+        invalidateNativeVerification()
         expiryTask?.cancel()
         expiryTask = nil
         if cleanupInProgress { return await waitForLeaseCleanup() }
@@ -220,7 +274,7 @@ final class DesktopControlCommandExecutor {
         guard isStatus || !revocationInProgress else {
             return Self.failure(frame, "desktop_control_revocation_in_progress", "Another Desktop Control configuration is being cleaned up. Retry after it finishes.")
         }
-        guard isStatus || (!closed && !unavailable) else {
+        guard isStatus || (!closed && !unavailable && nativeVerificationID == nil) else {
             return Self.failure(frame, "desktop_executor_unavailable", "The desktop control service is paused or recovering.")
         }
         let owner = Owner(installationID: target.installationID, workspaceID: target.workspaceID,
@@ -248,8 +302,8 @@ final class DesktopControlCommandExecutor {
             let result: Any
             switch frame.operation {
             case "desktop_control_status":
-                let ready = !closed && !unavailable && !revocationInProgress
-                result = ["available": ready, "native_executor_ready": ready, "busy": validLease() != nil]
+                let ready = !closed && !unavailable && !revocationInProgress && nativeVerificationID == nil
+                result = ["available": ready, "native_executor_ready": ready, "busy": validLease() != nil || nativeVerificationID != nil]
             case "desktop_control_acquire":
                 result = try await acquire(owner, scope: scope, configVersion: configVersion)
             case "desktop_control_release":
@@ -353,6 +407,7 @@ final class DesktopControlCommandExecutor {
     }
 
     private func acquire(_ owner: Owner, scope: ConfigScope, configVersion: Int64) async throws -> [String: Any] {
+        guard nativeVerificationID == nil else { throw CommandError.executorUnavailable }
         if let active = validLease() {
             guard active.owner == owner else { throw CommandError.busy }
             var renewed = active
@@ -362,6 +417,9 @@ final class DesktopControlCommandExecutor {
         }
         if lease != nil {
             guard await clearExpiredLease() else { throw CommandError.executorUnavailable }
+#if DEBUG
+            if let barrier = leaseGrantBarrierForTesting { await barrier() }
+#endif
             // Another acquisition can resume between cleanup completion and this
             // continuation. Never replace that newly granted lease.
             guard isBindingAuthorized(owner) else { throw CommandError.bindingRevoked }
@@ -370,7 +428,7 @@ final class DesktopControlCommandExecutor {
                 return ["control_token": active.token, "expires_in_seconds": 90]
             }
         }
-        guard !closed, !unavailable, !revocationInProgress else { throw CommandError.executorUnavailable }
+        guard !closed, !unavailable, !revocationInProgress, nativeVerificationID == nil else { throw CommandError.executorUnavailable }
         guard isConfigVersionAuthorized(scope, configVersion) else { throw CommandError.configurationRevoked }
         guard powerAssertion.acquire() else { throw CommandError.sleepPreventionUnavailable }
         let token = UUID().uuidString.lowercased()
@@ -380,6 +438,7 @@ final class DesktopControlCommandExecutor {
     }
 
     private func revokeConfig(_ frame: DesktopControlFrame, scope: ConfigScope, version: Int64, binding: BindingScope? = nil) async -> DesktopControlFrame {
+        invalidateNativeVerification()
         activeRevocations += 1
         defer { activeRevocations -= 1 }
         let cutoff = frame.target?.generation ?? 0
