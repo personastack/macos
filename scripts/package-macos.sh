@@ -106,6 +106,9 @@ tell application "Finder"
     set statusbar visible of container window to false
     set bounds of container window to {120, 100, 860, 600}
     set icon size of icon view options of container window to 112
+    set text size of icon view options of container window to 12
+    set label position of icon view options of container window to bottom
+    set shows item info of icon view options of container window to false
     set arrangement of icon view options of container window to not arranged
     set background picture of icon view options of container window to file ".background:background@2x.png"
     set position of item "PersonaStack.app" of container window to {180, 260}

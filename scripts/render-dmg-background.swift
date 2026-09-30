@@ -86,6 +86,13 @@ func drawText(_ text: String, at point: CGPoint, font: NSFont, color: NSColor) {
 drawText("Install PersonaStack", at: CGPoint(x: 36, y: 420), font: .systemFont(ofSize: 23, weight: .semibold), color: .white)
 drawText("Drag the app to Applications to install", at: CGPoint(x: 36, y: 394), font: .systemFont(ofSize: 12, weight: .regular), color: NSColor(white: 0.78, alpha: 1))
 
+// Finder uses black filenames over picture backgrounds. Keep both native labels
+// readable beneath the 112-point icons positioned by package-macos.sh.
+NSColor(red: 0.82, green: 0.86, blue: 0.93, alpha: 1).setFill()
+for centerX in [CGFloat(180), CGFloat(560)] {
+  NSBezierPath(roundedRect: CGRect(x: centerX - 63, y: 157, width: 126, height: 22), xRadius: 5, yRadius: 5).fill()
+}
+
 context.restoreGState()
 NSGraphicsContext.restoreGraphicsState()
 guard let png = bitmap.representation(using: .png, properties: [:]) else {
