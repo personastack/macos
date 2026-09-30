@@ -138,6 +138,51 @@ public actor DesktopFileSystem {
         return DesktopFilePage(entries: entries, nextOffset: hasMore ? offset + entries.count : nil)
     }
 
+    /// Deliberate local permission check. Only the exclusively created marker is
+    /// read. Existing directory entries contribute metadata, never file content.
+    public func verifyDirectoryAccess(path: String, probeID: UUID = UUID()) throws {
+        try Task.checkCancellation()
+        guard let input = Self.url(path) else { throw DesktopFileSystemError.invalidPath }
+        let directory = input.resolvingSymlinksInPath().standardizedFileURL
+        _ = try list(path: directory.path, limit: 1)
+        try Task.checkCancellation()
+        let probe = directory.appendingPathComponent(".personastack-permission-check-\(probeID.uuidString)")
+        let descriptor = probe.path.withCString {
+            Darwin.open($0, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        }
+        guard descriptor >= 0 else {
+            throw Self.operationError(errno, fallback: .invalidPath, exists: .destinationExists)
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        var identity = stat()
+        guard fstat(descriptor, &identity) == 0 else { throw DesktopFileSystemError.notRegularFile }
+        var removed = false
+        defer {
+            if !removed { try? Self.removeDirectoryVerificationFile(probe, identity: identity) }
+            try? handle.close()
+        }
+        try Task.checkCancellation()
+        let marker = Data("PersonaStack permission check\n".utf8)
+        try handle.write(contentsOf: marker)
+        try handle.seek(toOffset: 0)
+        guard try handle.read(upToCount: marker.count + 1) == marker else {
+            throw DesktopFileSystemError.patchMismatch
+        }
+        try Task.checkCancellation()
+        try Self.removeDirectoryVerificationFile(probe, identity: identity)
+        removed = true
+        try handle.close()
+    }
+
+    /// Refuse cleanup when the path no longer names the inode we created.
+    static func removeDirectoryVerificationFile(_ path: URL, identity: stat) throws {
+        var current = stat()
+        guard lstat(path.path, &current) == 0 else { throw operationError(errno, fallback: .invalidPath) }
+        guard current.st_dev == identity.st_dev, current.st_ino == identity.st_ino,
+              (current.st_mode & S_IFMT) == S_IFREG else { throw DesktopFileSystemError.destinationExists }
+        guard unlink(path.path) == 0 else { throw operationError(errno, fallback: .invalidPath) }
+    }
+
     public func search(root: String, nameContains: String? = nil, nameGlob: String? = nil,
                        contentContains: String? = nil, limit: Int = 100,
                        continuation: String? = nil, timeLimit: TimeInterval = 2) throws -> DesktopFileSearchPage {

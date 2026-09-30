@@ -12,7 +12,10 @@ import WebKit
 final class DesktopPermissionChecklist {
     static let shared = DesktopPermissionChecklist()
     let window: DesktopPermissionChecklistWindow
-    private let adapter: DesktopPermissionChecklistSystemAdapter
+    let adapter: DesktopPermissionChecklistSystemAdapter
+    private let directoryURL: (FileManager.SearchPathDirectory) -> URL?
+    private let verifyDirectory: @MainActor (URL) async throws -> Void
+    private let selectedProfile: () -> DesktopEnvironmentConfiguration?
     private var explicitObservations: [DesktopPermissionID: DesktopPermissionObservation] = [:]
     private var activationObserver: NSObjectProtocol?
     private var mediaTestID: String?
@@ -38,7 +41,18 @@ final class DesktopPermissionChecklist {
             """, arguments: ["expectedID": id], in: nil, in: .page, completionHandler: nil)
     }
 
-    private init() {
+    init(directoryURL: @escaping (FileManager.SearchPathDirectory) -> URL? = {
+             FileManager.default.urls(for: $0, in: .userDomainMask).first
+         }, verifyDirectory: (@MainActor (URL) async throws -> Void)? = nil,
+         selectedProfile: @escaping () -> DesktopEnvironmentConfiguration? = {
+             try? LaunchConfiguration.selectedEnvironment()
+         }) {
+        self.directoryURL = directoryURL
+        self.verifyDirectory = verifyDirectory ?? { url in
+            let files = DesktopFileSystem()
+            try await files.verifyDirectoryAccess(path: url.path)
+        }
+        self.selectedProfile = selectedProfile
         let adapter = DesktopPermissionChecklistSystemAdapter()
         self.adapter = adapter
         window = DesktopPermissionChecklistWindow(coordinator: DesktopPermissionChecklistCoordinator(adapter: adapter))
@@ -57,7 +71,7 @@ final class DesktopPermissionChecklist {
         }
     }
 
-    private var profile: DesktopEnvironmentConfiguration? { try? LaunchConfiguration.selectedEnvironment() }
+    private var profile: DesktopEnvironmentConfiguration? { selectedProfile() }
     private var ownerKey: String {
         "\(Bundle.main.bundleIdentifier ?? "unpackaged"):\(profile?.preferenceIdentity ?? "unconfigured"):\(ProcessInfo.processInfo.operatingSystemVersionString)"
     }
@@ -81,7 +95,7 @@ final class DesktopPermissionChecklist {
             }
             return .init(.notNeeded, detail: "This macOS version has no Local Network privacy approval.")
         case .desktopFiles, .documentsFiles, .downloadsFiles:
-            return evidence(id, detail: "Use Setup \(id.title) to verify directory access. No existing file content is read.")
+            return evidence(id, detail: "Use Setup \(id.title) to verify listing and read/write access with a disposable file. No existing file content is read.")
         case .awakeDuringRemoteWork:
             return evidence(id, detail: "Use Setup Awake During Remote Work to verify idle sleep prevention. PersonaStack holds it only during a remote task.")
         default: return nil
@@ -271,17 +285,34 @@ final class DesktopPermissionChecklist {
         case .documentsFiles: directory = .documentDirectory
         default: directory = .downloadsDirectory
         }
-        guard let url = FileManager.default.urls(for: directory, in: .userDomainMask).first else {
-            return .init(.failed, detail: "The selected directory is unavailable on this Mac.")
+        let key = ownerKey
+        explicitObservations.removeValue(forKey: id)
+        guard let url = directoryURL(directory) else {
+            return directoryResult(id, state: .failed, detail: "The selected directory is unavailable on this Mac.", key: key)
         }
         do {
-            _ = try await DesktopFileSystem().list(path: url.path, limit: 1)
+            try await verifyDirectory(url)
             try Task.checkCancellation()
-            let value = DesktopPermissionObservation(.ready, detail: "PersonaStack verified directory listing without reading existing file contents.",
-                                                     verificationKey: ownerKey, requiresVerification: true, verified: true)
-            explicitObservations[id] = value
-            return value
-        } catch { return .init(.failed, detail: "Directory access failed. Review PersonaStack in Files and Folders settings and retry.") }
+            return directoryResult(id, state: .ready,
+                detail: "PersonaStack verified listing, writing, reading and removing its disposable file. No existing file content was read.", key: key)
+        } catch DesktopFileSystemError.permissionDenied {
+            return directoryResult(id, state: .denied,
+                detail: "File access was denied. Review PersonaStack in Files and Folders settings and check this folder's permissions, then retry.", key: key)
+        } catch {
+            return directoryResult(id, state: .failed,
+                detail: "PersonaStack could not verify read/write access and disposable-file cleanup. Check that the folder is available and writable, then retry.", key: key)
+        }
+    }
+
+    private func directoryResult(_ id: DesktopPermissionID, state: DesktopPermissionState,
+                                 detail: String, key: String) -> DesktopPermissionObservation {
+        guard !Task.isCancelled, key == ownerKey else {
+            return .init(.checking, detail: "Setup changed or was cancelled. Retry the file access check.")
+        }
+        let result = DesktopPermissionObservation(state, detail: detail, verificationKey: key,
+                                                 requiresVerification: state == .ready, verified: state == .ready)
+        explicitObservations[id] = result
+        return result
     }
 
     private func setupConnection(_ id: DesktopPermissionID) async -> DesktopPermissionObservation {

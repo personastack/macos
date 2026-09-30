@@ -17,16 +17,17 @@ struct DesktopPermissionChecklistHooks {
 @MainActor
 final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistAdapting {
     var hooks: DesktopPermissionChecklistHooks
-    private let notificationCenter: UNUserNotificationCenter
+    private let providedNotificationCenter: UNUserNotificationCenter?
+    private var notificationCenter: UNUserNotificationCenter { providedNotificationCenter ?? .current() }
     private let openSettings: (String) -> Void
 
     init(hooks: DesktopPermissionChecklistHooks = .init(),
-         notificationCenter: UNUserNotificationCenter = .current(),
+         notificationCenter: UNUserNotificationCenter? = nil,
          openSettings: @escaping (String) -> Void = { section in
              if let url = URL(string: "x-apple.systempreferences:\(section)") { NSWorkspace.shared.open(url) }
          }) {
         self.hooks = hooks
-        self.notificationCenter = notificationCenter
+        self.providedNotificationCenter = notificationCenter
         self.openSettings = openSettings
     }
 
@@ -82,7 +83,11 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         case .fullDiskAccess: openPrivacy("AllFiles")
         case .desktopFiles, .documentsFiles, .downloadsFiles, .removableVolumes, .networkVolumes:
             // The existing executor's explicit hook owns the resource probe.
-            if let value = await hooks.setup(permission) { return value }
+            if let value = await hooks.setup(permission) {
+                guard !Task.isCancelled else { return .init(.checking, detail: "Setup cancelled.") }
+                if value.state == .denied { openPrivacy("FilesAndFolders") }
+                return value
+            }
             openPrivacy("FilesAndFolders")
             return Self.unconfiguredObservation(permission)
         case .localNetwork:
