@@ -37,6 +37,7 @@ final class DesktopControlCommandExecutor {
 
     private let files = DesktopFileSystem()
     private let shell = DesktopShellExecutor()
+    private let powerAssertion: DesktopControlPowerAssertion
     private var lease: Lease?
     private var cleanupLease: Lease?
     private var cleanupInProgress = false
@@ -61,8 +62,10 @@ final class DesktopControlCommandExecutor {
     private var cleanupFailuresForTesting = 0
 #endif
 
-    init(now: @escaping () -> ContinuousClock.Instant = { .now }) {
+    init(now: @escaping () -> ContinuousClock.Instant = { .now },
+         powerAssertion: DesktopControlPowerAssertion = .init()) {
         self.now = now
+        self.powerAssertion = powerAssertion
         expiryTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(5))
@@ -178,10 +181,12 @@ final class DesktopControlCommandExecutor {
 
     @discardableResult
     func close() async -> Bool {
-        guard !closed else { return !unavailable && !revocationInProgress }
         closed = true
         expiryTask?.cancel()
         expiryTask = nil
+        if cleanupInProgress { return await waitForLeaseCleanup() }
+        // Keep commands fenced while a later local close retries only owned
+        // resources from an earlier failed termination.
         return await clearExpiredLease()
     }
 
@@ -367,6 +372,7 @@ final class DesktopControlCommandExecutor {
         }
         guard !closed, !unavailable, !revocationInProgress else { throw CommandError.executorUnavailable }
         guard isConfigVersionAuthorized(scope, configVersion) else { throw CommandError.configurationRevoked }
+        guard powerAssertion.acquire() else { throw CommandError.sleepPreventionUnavailable }
         let token = UUID().uuidString.lowercased()
         let now = now()
         lease = Lease(owner: owner, configVersion: configVersion, token: token, started: now, lastActivity: now)
@@ -456,7 +462,7 @@ final class DesktopControlCommandExecutor {
         guard !revocationInProgress else { return false }
         activeRevocations += 1
         defer { activeRevocations -= 1 }
-        return await cleanupLeaseAndResources(lease)
+        return await cleanupLeaseAndResources(failedCleanupLease ?? lease)
     }
 
     private func cleanupLeaseAndResources(_ closingLease: Lease?) async -> Bool {
@@ -489,6 +495,7 @@ final class DesktopControlCommandExecutor {
         // until callbacks, file handles, and managed processes have drained.
         leaseEpoch &+= 1
         lease = nil
+        let sleepPreventionReleased = powerAssertion.relinquish()
         await shell.requestStopAll()
         guard await settleOperations() else { unavailable = true; return false }
 #if DEBUG
@@ -502,6 +509,7 @@ final class DesktopControlCommandExecutor {
             unavailable = true
             return false
         }
+        guard sleepPreventionReleased else { return false }
 #if DEBUG
         if cleanupFailuresForTesting > 0 {
             cleanupFailuresForTesting -= 1
@@ -902,7 +910,7 @@ final class DesktopControlCommandExecutor {
 }
 
 private enum CommandError: Error, LocalizedError {
-    case invalidArguments, busy, controlRequired, configurationRevoked, bindingRevoked, commandFailed, executorUnavailable
+    case invalidArguments, busy, controlRequired, configurationRevoked, bindingRevoked, commandFailed, executorUnavailable, sleepPreventionUnavailable
     var code: String {
         switch self {
         case .invalidArguments: "invalid_arguments"
@@ -912,6 +920,7 @@ private enum CommandError: Error, LocalizedError {
         case .bindingRevoked: "desktop_control_binding_revoked"
         case .commandFailed: "desktop_command_failed"
         case .executorUnavailable: "desktop_executor_unavailable"
+        case .sleepPreventionUnavailable: "desktop_executor_unavailable"
         }
     }
     var errorDescription: String? {
@@ -923,6 +932,7 @@ private enum CommandError: Error, LocalizedError {
         case .bindingRevoked: "This persona no longer has access to this Desktop Control configuration."
         case .commandFailed: "The desktop command failed."
         case .executorUnavailable: "The previous desktop command is still stopping. Retry after the desktop service recovers."
+        case .sleepPreventionUnavailable: "PersonaStack could not keep this Mac awake during remote work. Retry Setup Awake During Remote Work in Permissions and Setup."
         }
     }
 }

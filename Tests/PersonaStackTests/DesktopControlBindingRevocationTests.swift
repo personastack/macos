@@ -26,7 +26,7 @@ struct DesktopControlBindingRevocationTests {
 
     @Test
     func revokedBindingClosesOwnedResourcesAndPreservesSharedConfigForOtherPersonas() async throws {
-        let executor = DesktopControlCommandExecutor()
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
         let owner = target(3)
         let token = try await acquire(executor, owner)
         let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -52,7 +52,7 @@ struct DesktopControlBindingRevocationTests {
 
     @Test
     func staleRevocationDoesNotTouchNewerBindingLeaseOrLowerRememberedCutoff() async throws {
-        let executor = DesktopControlCommandExecutor()
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
         #expect(await executor.handle(frame("desktop_control_revoke_binding", target(4, run: "")), proxy: nil).type == "result")
         let newer = target(5)
         let token = try await acquire(executor, newer)
@@ -107,7 +107,7 @@ struct DesktopControlBindingRevocationTests {
         _ = try await proxy.start()
         defer { Task { await proxy.stop() } }
 
-        let executor = DesktopControlCommandExecutor()
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
         let activeOwner = target(1)
         let token = try await acquire(executor, activeOwner)
         let observe = frame("desktop_control_observe", activeOwner,
@@ -158,7 +158,7 @@ struct DesktopControlBindingRevocationTests {
 
     @Test
     func malformedBindingRevocationsAreRejectedAndReservedCapacityIsAvailable() async {
-        let executor = DesktopControlCommandExecutor()
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
         for invalid in [target(0, run: ""), target(1, persona: "", run: ""), target(1), target(1, run: "", version: 0)] {
             let revoke = frame("desktop_control_revoke_binding", invalid)
             #expect(!DesktopControlGatewayConnection.validCommand(revoke, installationID: "install"))

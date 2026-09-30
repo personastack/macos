@@ -239,7 +239,7 @@ import PersonaStackCore
     let connectionID = UUID()
     let owner = DesktopControlTarget(installationID: installation.installationID, workspaceID: "workspace-a",
                                      configID: "config-a", personaID: "persona-a", runID: "run-a", generation: 1)
-    let pausedExecutor = DesktopControlCommandExecutor()
+    let pausedExecutor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
     let pausedRuntime = DesktopControlRuntime.makeForTesting(
         installer: ReadinessInstaller(), credentials: ReadinessCredentials(), executor: pausedExecutor,
         connectionID: connectionID, installation: installation, connected: true,
@@ -264,7 +264,7 @@ import PersonaStackCore
     #expect(pausedValues["control_available"] == .bool(false))
     await pausedExecutor.close()
 
-    let failedExecutor = DesktopControlCommandExecutor()
+    let failedExecutor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
     #expect(await failedExecutor.close())
     let cleanupRuntime = DesktopControlRuntime.makeForTesting(
         installer: ReadinessInstaller(), credentials: ReadinessCredentials(), executor: failedExecutor,
@@ -288,7 +288,7 @@ import PersonaStackCore
     let payload = Data(#"{"installation_id":"install-status","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://gateway.test/v1/desktop-control/ws"}"#.utf8)
     let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
     let connectionID = UUID()
-    let executor = DesktopControlCommandExecutor()
+    let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
     #expect(await executor.close())
     let runtime = DesktopControlRuntime.makeForTesting(
         installer: ReadinessInstaller(), credentials: ReadinessCredentials(), executor: executor,

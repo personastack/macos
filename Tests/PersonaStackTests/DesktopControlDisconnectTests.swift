@@ -18,7 +18,8 @@ private struct DisconnectCredentials: DesktopControlCredentialStoring {
 
 @Test @MainActor
 func currentGatewayDisconnectClosesOwnedResourcesAndStaleDisconnectDoesNothing() async throws {
-    let executor = DesktopControlCommandExecutor()
+    let power = DesktopControlPowerAssertion.testFixture()
+    let executor = DesktopControlCommandExecutor(powerAssertion: power)
     let connectionID = UUID()
     let runtime = DesktopControlRuntime.makeForTesting(installer: DisconnectInstaller(),
         credentials: DisconnectCredentials(), executor: executor, connectionID: connectionID)
@@ -32,6 +33,7 @@ func currentGatewayDisconnectClosesOwnedResourcesAndStaleDisconnectDoesNothing()
     guard case .object(let result)? = acquired.result, case .string(let token)? = result["control_token"] else {
         Issue.record("missing control token"); return
     }
+    #expect(power.isHeld)
     let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try Data("fixture".utf8).write(to: path)
     defer { try? FileManager.default.removeItem(at: path) }
@@ -40,9 +42,11 @@ func currentGatewayDisconnectClosesOwnedResourcesAndStaleDisconnectDoesNothing()
     #expect(await executor.handle(command("desktop_control_execute", ["control_token": .string(token),
         "command": .string("sleep 30"), "working_directory": .string("/tmp")]), proxy: nil).type == "result")
     await runtime.gatewayDisconnected(connectionID: UUID(), error: nil)
+    #expect(power.isHeld)
     #expect(await executor.diagnostics().openFileHandles == 1)
     #expect(await executor.diagnostics().activeProcesses == 1)
     await runtime.gatewayDisconnected(connectionID: connectionID, error: nil)
+    #expect(!power.isHeld)
     #expect(await executor.diagnostics().openFileHandles == 0)
     #expect(await executor.diagnostics().activeProcesses == 0)
     #expect(await executor.handle(command("desktop_control_acquire"), proxy: nil).errorCode == "desktop_executor_unavailable")

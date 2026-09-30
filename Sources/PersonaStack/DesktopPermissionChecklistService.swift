@@ -83,7 +83,7 @@ final class DesktopPermissionChecklist {
         case .desktopFiles, .documentsFiles, .downloadsFiles:
             return evidence(id, detail: "Use Setup \(id.title) to verify directory access. No existing file content is read.")
         case .awakeDuringRemoteWork:
-            return .init(.unsupported, detail: "Task-scoped sleep prevention will be enabled with the verified locked-control helper.")
+            return evidence(id, detail: "Use Setup Awake During Remote Work to verify idle sleep prevention. PersonaStack holds it only during a remote task.")
         default: return nil
         }
     }
@@ -157,7 +157,15 @@ final class DesktopPermissionChecklist {
                 return .init(.ready, detail: "macOS confirmed PersonaStack's test notification.",
                              verificationKey: result.verificationKey, requiresVerification: true, verified: true)
             } catch { return .init(.failed, detail: "The test notification could not be delivered. Review notification settings and retry.") }
-        case .lockedScreenControl, .awakeDuringRemoteWork:
+        case .awakeDuringRemoteWork:
+            guard DesktopControlPowerAssertion.verifyAvailability() else {
+                return .init(.failed, detail: "PersonaStack could not verify idle sleep prevention. Retry setup after the Mac recovers.")
+            }
+            let value = DesktopPermissionObservation(.ready, detail: "PersonaStack verified that it can prevent idle system sleep during remote work.",
+                                                     verificationKey: ownerKey, requiresVerification: true, verified: true)
+            explicitObservations[id] = value
+            return value
+        case .lockedScreenControl:
             let alert = NSAlert()
             alert.messageText = "Locked-Screen Control Is Not Available Yet"
             alert.informativeText = "A signed helper must first prove safe unattended access to this Mac. Current remote control remains unavailable while the screen is locked."

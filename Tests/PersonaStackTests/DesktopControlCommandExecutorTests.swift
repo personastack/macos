@@ -62,7 +62,7 @@ struct DesktopControlCommandExecutorTests {
 
     @Test
     func leaseIsExclusiveAcrossPersonaOwnersAndCanBeReleased() async throws {
-        let executor = DesktopControlCommandExecutor()
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
         let first = command("desktop_control_acquire", target(persona: "persona-1"), requestID: "acquire-1")
         let acquired = await executor.handle(first, proxy: nil)
         #expect(acquired.type == "result")
@@ -90,7 +90,7 @@ struct DesktopControlCommandExecutorTests {
     @Test
     func configRevocationClosesOnlyItsHandlesAndFencesOlderCommands() async throws {
         let fixture = try DesktopParityFixture.load()
-        let executor = DesktopControlCommandExecutor()
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("desktop-control-revoke-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -311,7 +311,7 @@ struct DesktopControlCommandExecutorTests {
 
     @Test
     func foreignInstallationCannotUseAnotherInstallationFileHandle() async throws {
-        let executor = DesktopControlCommandExecutor()
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("desktop-control-foreign-install-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -364,7 +364,7 @@ struct DesktopControlCommandExecutorTests {
 
     @Test
     func configRevocationStopsAnActiveOutputStreamBeforeItCanContinue() async throws {
-        let executor = DesktopControlCommandExecutor()
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
         let cleanupGate = DesktopControlCallbackGate()
         executor.pauseCleanupBeforeResourceCloseForTesting { await cleanupGate.suspend() }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("desktop-control-stream-revoke-\(UUID().uuidString)", isDirectory: true)
@@ -449,7 +449,7 @@ struct DesktopControlCommandExecutorTests {
 
     @Test
     func configRevocationDuringLeaseCleanupWaitsForStreamCallback() async throws {
-        let executor = DesktopControlCommandExecutor()
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
         let cleanupGate = DesktopControlCallbackGate()
         executor.pauseCleanupBeforeResourceCloseForTesting { await cleanupGate.suspend() }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("desktop-control-stream-cleanup-revoke-\(UUID().uuidString)", isDirectory: true)
@@ -544,7 +544,7 @@ struct DesktopControlCommandExecutorTests {
 
     @Test
     func failedCleanupRequiresSameScopeRetryBeforeAcknowledgement() async {
-        let executor = DesktopControlCommandExecutor()
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
         let owner = target(persona: "persona-1", workspace: "workspace-a", config: "config-a", configVersion: 1)
         let acquired = await executor.handle(command("desktop_control_acquire", owner, requestID: "failed-cleanup-acquire"), proxy: nil)
         guard case .object(let lease)? = acquired.result,
@@ -572,7 +572,7 @@ struct DesktopControlCommandExecutorTests {
 
     @Test
     func fileOperationsRequireTheCurrentControlToken() async {
-        let executor = DesktopControlCommandExecutor()
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
         let read = command("desktop_control_file", target(persona: "persona-1"), requestID: "read-1",
                            arguments: .object(["action": .string("list"), "path": .string("/")]))
         let response = await executor.handle(read, proxy: nil)
@@ -583,7 +583,7 @@ struct DesktopControlCommandExecutorTests {
 
     @Test
     func expiredFileHandlesReturnAnActionableFailure() async throws {
-        let executor = DesktopControlCommandExecutor()
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
         let owner = target(persona: "persona-1")
         let acquired = await executor.handle(command("desktop_control_acquire", owner, requestID: "acquire-file"), proxy: nil)
         guard case .object(let lease)? = acquired.result,
@@ -617,7 +617,7 @@ struct DesktopControlCommandExecutorTests {
 
     @Test
     func shellStartAndExpiredHandleFailuresAreActionable() async throws {
-        let executor = DesktopControlCommandExecutor()
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
         let owner = target(persona: "persona-1")
         let acquired = await executor.handle(command("desktop_control_acquire", owner, requestID: "acquire-shell-error"), proxy: nil)
         guard case .object(let lease)? = acquired.result,
@@ -646,7 +646,7 @@ struct DesktopControlCommandExecutorTests {
 
     @Test
     func configRevocationStopsProcessBeforeDrainingBlockedStdinWrites() async throws {
-        let executor = DesktopControlCommandExecutor()
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
         let owner = target(persona: "persona-1", configVersion: 1)
         let acquired = await executor.handle(command("desktop_control_acquire", owner, requestID: "acquire-blocked-stdin"), proxy: nil)
         guard case .object(let lease)? = acquired.result,
@@ -684,7 +684,7 @@ struct DesktopControlCommandExecutorTests {
 
     @Test
     func nativeCapabilityProbeVerifiesFileReadbackAndIncrementalShellOutput() async throws {
-        let executor = DesktopControlCommandExecutor()
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
         var lifecycleChecks = 0
         try await executor.probeNativeCapabilities {
             lifecycleChecks += 1
@@ -726,7 +726,7 @@ struct DesktopControlCommandExecutorTests {
         """#.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
         let proxy = CuaMCPProxy(executableURL: executable)
-        let executor = DesktopControlCommandExecutor()
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
         _ = try await proxy.start()
         let owner = target(persona: "persona-cua-error")
         let acquired = await executor.handle(command("desktop_control_acquire", owner, requestID: "acquire-cua-error"), proxy: nil)
@@ -749,7 +749,7 @@ struct DesktopControlCommandExecutorTests {
 
     @Test
     func shellOutputIsForwardedAndRetainedForNonStreamingCallers() async throws {
-        let executor = DesktopControlCommandExecutor()
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
         let owner = target(persona: "persona-1")
         let acquired = await executor.handle(command("desktop_control_acquire", owner, requestID: "acquire-stream"), proxy: nil)
         guard case .object(let lease)? = acquired.result,
@@ -779,7 +779,7 @@ struct DesktopControlCommandExecutorTests {
     @Test
     func runningCommandRenewsIdleLeaseButHardLifetimeStillClosesIt() async throws {
         var clock = ContinuousClock.now
-        let executor = DesktopControlCommandExecutor(now: { clock })
+        let executor = DesktopControlCommandExecutor(now: { clock }, powerAssertion: .testFixture())
         let owner = target(persona: "persona-1")
         let acquired = await executor.handle(command("desktop_control_acquire", owner, requestID: "acquire"), proxy: nil)
         guard case .object(let value)? = acquired.result, case .string(let token)? = value["control_token"] else {
@@ -803,7 +803,7 @@ struct DesktopControlCommandExecutorTests {
 
     @Test
     func closedConnectionExecutorCannotGrantAReplacementLease() async {
-        let executor = DesktopControlCommandExecutor()
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
         let owner = target(persona: "persona-1")
         #expect(await executor.handle(command("desktop_control_acquire", owner, requestID: "acquire"), proxy: nil).type == "result")
         #expect(await executor.close())
@@ -823,7 +823,7 @@ struct DesktopControlCommandExecutorTests {
     @Test
     func concurrentAcquisitionAfterExpiryHasOnlyOneWinner() async {
         var clock = ContinuousClock.now
-        let executor = DesktopControlCommandExecutor(now: { clock })
+        let executor = DesktopControlCommandExecutor(now: { clock }, powerAssertion: .testFixture())
         _ = await executor.handle(command("desktop_control_acquire", target(persona: "old"), requestID: "old"), proxy: nil)
         clock += .seconds(91)
         let tasks = (0..<20).map { index in

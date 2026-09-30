@@ -159,6 +159,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     var lockCleanupStartedForTesting: Bool { executorCleanupInProgress && readiness == "locked" }
+    var executorCleanupFailedForTesting: Bool { executorCleanupFailed }
 
     func waitForLockCleanupForTesting() async { await lockCleanupTask?.value }
 

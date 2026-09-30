@@ -368,7 +368,14 @@ for line in sys.stdin:
 }
 
 @Test @MainActor func macOSLockFencesCommandsBeforeAsynchronousHeartbeat() async {
-    let executor = DesktopControlCommandExecutor()
+    let power = DesktopControlPowerAssertion.testFixture()
+    let executor = DesktopControlCommandExecutor(powerAssertion: power)
+    let owner = DesktopControlTarget(installationID: "install", workspaceID: "workspace", configID: "config",
+                                     personaID: "persona", runID: "run", generation: 1, configVersion: 1)
+    let acquire = DesktopControlFrame(type: "command", requestID: "lock-power-acquire", target: owner,
+                                      operation: "desktop_control_acquire", arguments: .object([:]))
+    #expect(await executor.handle(acquire, proxy: nil).type == "result")
+    #expect(power.isHeld)
     let runtime = DesktopControlRuntime.makeForTesting(
         installer: DesktopControlInstallerFixture(errors: []),
         credentials: EmptyDesktopControlCredentialStore(), executor: executor,
@@ -376,6 +383,8 @@ for line in sys.stdin:
     )
     #expect(runtime.lockCleanupStartedForTesting)
     #expect(runtime.readiness == "locked")
+    await runtime.waitForLockCleanupForTesting()
+    #expect(!power.isHeld)
     _ = await executor.close()
 }
 
@@ -390,17 +399,26 @@ private struct SavedDesktopControlCredentialStore: DesktopControlCredentialStori
 @Test @MainActor func quitFencesTheRelayAndLeavesEnrollmentForNextLaunch() async throws {
     let payload = Data(#"{"installation_id":"installation-quit","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8)
     let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
+    let power = DesktopControlPowerAssertion.testFixture()
+    let executor = DesktopControlCommandExecutor(powerAssertion: power)
+    let owner = DesktopControlTarget(installationID: installation.installationID, workspaceID: "workspace", configID: "config",
+                                     personaID: "persona", runID: "run", generation: 1, configVersion: 1)
+    let acquire = DesktopControlFrame(type: "command", requestID: "quit-power-acquire", target: owner,
+                                      operation: "desktop_control_acquire", arguments: .object([:]))
+    #expect(await executor.handle(acquire, proxy: nil).type == "result")
+    #expect(power.isHeld)
     var cuaStops = 0
     let runtime = DesktopControlRuntime.makeForTesting(
         installer: DesktopControlInstallerFixture(errors: []),
         credentials: SavedDesktopControlCredentialStore(installation: installation),
-        installation: installation, connected: true, readiness: "ready",
+        executor: executor, installation: installation, connected: true, readiness: "ready",
         ownedCuaService: CuaEmbeddedService(executableURL: URL(fileURLWithPath: "/fake/cua")),
         stopCuaService: { _ in cuaStops += 1; return true })
     let generation = try runtime.beginResume()
 
     await runtime.shutdownForQuit()
 
+    #expect(!power.isHeld)
     #expect(!runtime.isCurrentLifecycle(generation))
     #expect(runtime.paused)
     #expect(runtime.readiness == "paused")
@@ -940,7 +958,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     let preferences = try #require(UserDefaults(suiteName: suite))
     defer { preferences.removePersistentDomain(forName: suite) }
     preferences.set(true, forKey: DesktopControlPreferenceKeys.relayEnabled(.production))
-    let executor = DesktopControlCommandExecutor()
+    let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
     let owner = DesktopControlTarget(installationID: installation.installationID, workspaceID: "workspace-a",
                                      configID: "config-a", personaID: "persona-a", runID: "run-a",
                                      generation: 1, configVersion: 1)
