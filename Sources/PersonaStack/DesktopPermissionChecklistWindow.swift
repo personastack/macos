@@ -2,12 +2,14 @@ import AppKit
 import SwiftUI
 import PersonaStackCore
 
+enum DesktopProtectedAccessSetupAction { case check, settings, cancel }
+
 @MainActor
 final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     let coordinator: DesktopPermissionChecklistCoordinator
     private var window: NSWindow?
     private var activationObserver: NSObjectProtocol?
-    private var volumeSelection: (id: UUID, window: NSWindow)?
+    private var permissionSelection: (id: UUID, permission: DesktopPermissionID, window: NSWindow)?
     var onCancel: (() -> Void)?
     var onPresent: (() -> Void)?
 
@@ -57,8 +59,7 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
 
     func chooseVolume(_ id: DesktopPermissionID, mounts: [DesktopVolumePermissionMount],
                       observation: (DesktopVolumePermissionMount) -> DesktopPermissionObservation) async -> DesktopVolumePermissionMount? {
-        guard let window, coordinator.isVisible, !mounts.isEmpty, volumeSelection == nil, !Task.isCancelled else { return nil }
-        let selectionID = UUID()
+        guard !mounts.isEmpty else { return nil }
         let alert = NSAlert()
         alert.messageText = "Setup \(id.title)"
         alert.informativeText = "Choose a volume to check. PersonaStack will list its root. On writable volumes it will also create, read and remove one disposable file. Existing file contents stay unread. Read-only volumes get a listing check only."
@@ -73,24 +74,47 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
         }
         picker.setAccessibilityLabel("Mounted volume")
         alert.accessoryView = picker
-        return await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                guard !Task.isCancelled else { continuation.resume(returning: nil); return }
-                volumeSelection = (selectionID, alert.window)
-                alert.beginSheetModal(for: window) { [weak self] response in
-                    if self?.volumeSelection?.id == selectionID { self?.volumeSelection = nil }
-                    let index = picker.indexOfSelectedItem
-                    continuation.resume(returning: response == .alertFirstButtonReturn && mounts.indices.contains(index) ? mounts[index] : nil)
-                }
-            }
-        } onCancel: {
-            Task { @MainActor [weak self] in self?.cancelVolumeSelection(id: selectionID) }
+        let response = await presentPermissionAlert(alert, permission: id)
+        let index = picker.indexOfSelectedItem
+        return response == .alertFirstButtonReturn && mounts.indices.contains(index) ? mounts[index] : nil
+    }
+
+    func protectedAccessSetupAction() async -> DesktopProtectedAccessSetupAction {
+        let alert = NSAlert()
+        alert.messageText = "Setup Full Disk Access"
+        alert.informativeText = "Add the installed PersonaStack app in System Settings → Privacy & Security → Full Disk Access. macOS may require a relaunch. Check Access attempts one directory read in your Library/Mail folder. Entry names are discarded. No file contents are read or changed. A successful check proves this operation only. Full Disk Access remains unqualified in this release."
+        alert.icon = NSImage(named: NSImage.applicationIconName)
+        alert.addButton(withTitle: "Check Access")
+        alert.addButton(withTitle: "Open Settings")
+        alert.addButton(withTitle: "Cancel")
+        switch await presentPermissionAlert(alert, permission: .fullDiskAccess) {
+        case .alertFirstButtonReturn: return .check
+        case .alertSecondButtonReturn: return .settings
+        default: return .cancel
         }
     }
 
-    func cancelVolumeSelection(id: UUID? = nil) {
-        guard let selected = volumeSelection, id == nil || selected.id == id else { return }
-        volumeSelection = nil
+    private func presentPermissionAlert(_ alert: NSAlert, permission: DesktopPermissionID) async -> NSApplication.ModalResponse? {
+        guard let window, coordinator.isVisible, permissionSelection == nil, !Task.isCancelled else { return nil }
+        let selectionID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else { continuation.resume(returning: nil); return }
+                permissionSelection = (selectionID, permission, alert.window)
+                alert.beginSheetModal(for: window) { [weak self] response in
+                    if self?.permissionSelection?.id == selectionID { self?.permissionSelection = nil }
+                    continuation.resume(returning: response)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in self?.cancelPermissionSelection(id: selectionID) }
+        }
+    }
+
+    func cancelPermissionSelection(permission: DesktopPermissionID? = nil, id: UUID? = nil) {
+        guard let selected = permissionSelection, id == nil || selected.id == id,
+              permission == nil || selected.permission == permission else { return }
+        permissionSelection = nil
         selected.window.sheetParent?.endSheet(selected.window, returnCode: .cancel)
     }
 

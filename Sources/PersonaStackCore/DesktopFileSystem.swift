@@ -202,17 +202,55 @@ public actor DesktopFileSystem {
     }
 
     private static func verifyDirectoryListing(descriptor: Int32) throws {
+        let failure = directoryListingFailure(descriptor: descriptor)
+        guard failure == 0 else { throw operationError(failure, fallback: .notDirectory) }
+    }
+
+    /// Explicit protected-resource check. This proves a directory operation,
+    /// never the system-wide Full Disk Access grant. No entry names are retained.
+    public func verifyProtectedDirectoryAccess(home: URL) throws {
+        try Task.checkCancellation()
+        guard home.isFileURL, Self.url(home.path) != nil else { throw DesktopFileSystemError.invalidPath }
+        let flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW_ANY
+        let root = Darwin.open(home.path, flags)
+        guard root >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        defer { _ = Darwin.close(root) }
+        try Self.verifyOwnedDirectory(root)
+        let library = openat(root, "Library", flags)
+        guard library >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        defer { _ = Darwin.close(library) }
+        try Self.verifyOwnedDirectory(library)
+        try Task.checkCancellation()
+        let mail = openat(library, "Mail", flags)
+        guard mail >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        defer { _ = Darwin.close(mail) }
+        try Self.verifyOwnedDirectory(mail)
+        try Task.checkCancellation()
+        let failure = Self.directoryListingFailure(descriptor: mail)
+        guard failure == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(failure)) }
+        try Task.checkCancellation()
+    }
+
+    private static func verifyOwnedDirectory(_ descriptor: Int32) throws {
+        var info = stat()
+        guard fstat(descriptor, &info) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        guard (info.st_mode & S_IFMT) == S_IFDIR, info.st_uid == geteuid() else {
+            throw DesktopFileSystemError.invalidPath
+        }
+    }
+
+    private static func directoryListingFailure(descriptor: Int32) -> Int32 {
         let copy = dup(descriptor)
-        guard copy >= 0 else { throw operationError(errno, fallback: .notDirectory) }
+        guard copy >= 0 else { return errno }
         guard let directory = fdopendir(copy) else {
             let failure = errno
             _ = Darwin.close(copy)
-            throw operationError(failure, fallback: .notDirectory)
+            return failure
         }
         defer { closedir(directory) }
         errno = 0
         _ = readdir(directory)
-        guard errno == 0 else { throw operationError(errno, fallback: .notDirectory) }
+        return errno
     }
 
     /// Refuse cleanup when the selected directory's entry no longer names our inode.

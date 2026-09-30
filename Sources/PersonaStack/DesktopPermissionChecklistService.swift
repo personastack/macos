@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import AVFoundation
 import CoreGraphics
+import Darwin
 import Foundation
 import PersonaStackCore
 import WebKit
@@ -19,6 +20,10 @@ final class DesktopPermissionChecklist {
     private let volumeSnapshot: () throws -> [DesktopVolumePermissionMount]
     private let chooseVolume: (@MainActor (DesktopPermissionID, [DesktopVolumePermissionMount]) async -> DesktopVolumePermissionMount?)?
     private let verifyVolume: (@MainActor (DesktopVolumePermissionMount) async throws -> Void)?
+    private let protectedAccessAction: (@MainActor () async -> DesktopProtectedAccessSetupAction)?
+    private let verifyProtectedAccess: @MainActor () async throws -> Void
+    private var protectedAccessGeneration = UUID()
+    private var protectedAccessAttempt: UUID?
     private lazy var volumeCheck = makeVolumeCheck()
 
     private func makeVolumeCheck() -> DesktopVolumePermissionCheck {
@@ -51,6 +56,7 @@ final class DesktopPermissionChecklist {
     func cancelVerification() {
         verificationGeneration = UUID()
         explicitObservations.removeAll()
+        invalidateProtectedAccessVerification()
         window.coordinator.invalidateVerification(.microphone)
         invalidateVolumeVerification()
         inputTest?.invalidate()
@@ -66,7 +72,10 @@ final class DesktopPermissionChecklist {
          }, volumeSnapshot: @escaping () throws -> [DesktopVolumePermissionMount] = DesktopVolumePermissionCheck.passiveMountedVolumes,
          chooseVolume: (@MainActor (DesktopPermissionID, [DesktopVolumePermissionMount]) async -> DesktopVolumePermissionMount?)? = nil,
          verifyVolume: (@MainActor (DesktopVolumePermissionMount) async throws -> Void)? = nil,
-         mountNotificationCenter: NotificationCenter = NSWorkspace.shared.notificationCenter) {
+         mountNotificationCenter: NotificationCenter = NSWorkspace.shared.notificationCenter,
+         protectedAccessAction: (@MainActor () async -> DesktopProtectedAccessSetupAction)? = nil,
+         verifyProtectedAccess: (@MainActor () async throws -> Void)? = nil,
+         activationNotificationCenter: NotificationCenter = .default) {
         self.directoryURL = directoryURL
         self.verifyDirectory = verifyDirectory ?? { url in
             let files = DesktopFileSystem()
@@ -76,6 +85,11 @@ final class DesktopPermissionChecklist {
         self.volumeSnapshot = volumeSnapshot
         self.chooseVolume = chooseVolume
         self.verifyVolume = verifyVolume
+        self.protectedAccessAction = protectedAccessAction
+        self.verifyProtectedAccess = verifyProtectedAccess ?? {
+            let files = DesktopFileSystem()
+            try await files.verifyProtectedDirectoryAccess(home: FileManager.default.homeDirectoryForCurrentUser)
+        }
         let adapter = DesktopPermissionChecklistSystemAdapter()
         self.adapter = adapter
         window = DesktopPermissionChecklistWindow(coordinator: DesktopPermissionChecklistCoordinator(adapter: adapter))
@@ -85,9 +99,10 @@ final class DesktopPermissionChecklist {
             observe: { [weak self] in await self?.observe($0) },
             setup: { [weak self] in await self?.setup($0) }
         )
-        activationObserver = NotificationCenter.default.addObserver(
+        activationObserver = activationNotificationCenter.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.invalidateProtectedAccessVerification() }
             Task { @MainActor in
                 self?.explicitObservations.removeAll()
                 self?.invalidateVolumeVerification()
@@ -104,10 +119,18 @@ final class DesktopPermissionChecklist {
 
     private func invalidateVolumeVerification() {
         volumeCheck.invalidate()
-        window.cancelVolumeSelection()
         for id in [DesktopPermissionID.removableVolumes, .networkVolumes] {
+            window.cancelPermissionSelection(permission: id)
             window.coordinator.invalidateVerification(id)
         }
+    }
+
+    private func invalidateProtectedAccessVerification() {
+        protectedAccessGeneration = UUID()
+        protectedAccessAttempt = nil
+        explicitObservations.removeValue(forKey: .fullDiskAccess)
+        window.cancelPermissionSelection(permission: .fullDiskAccess)
+        window.coordinator.invalidateVerification(.fullDiskAccess)
     }
 
     private var profile: DesktopEnvironmentConfiguration? { selectedProfile() }
@@ -136,6 +159,11 @@ final class DesktopPermissionChecklist {
         case .desktopFiles, .documentsFiles, .downloadsFiles:
             return evidence(id, detail: "Use Setup \(id.title) to verify listing and read/write access with a disposable file. No existing file content is read.")
         case .removableVolumes, .networkVolumes: return volumeCheck.observe(id)
+        case .fullDiskAccess:
+            let key = "\(ownerKey):\(protectedAccessGeneration)"
+            if let result = explicitObservations[id], result.verificationKey == key { return result }
+            explicitObservations.removeValue(forKey: id)
+            return DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(id)
         case .awakeDuringRemoteWork:
             return evidence(id, detail: "Use Setup Awake During Remote Work to verify idle sleep prevention. PersonaStack holds it only during a remote task.")
         default: return nil
@@ -202,6 +230,7 @@ final class DesktopPermissionChecklist {
             return observeUpdates()
         case .desktopFiles, .documentsFiles, .downloadsFiles: return await setupDirectory(id)
         case .removableVolumes, .networkVolumes: return await volumeCheck.setup(id)
+        case .fullDiskAccess: return await setupProtectedAccess()
         case .localNetwork, .messagingConnection: return await setupConnection(id)
         case .notifications:
             let result = await adapter.observe(.notifications)
@@ -328,6 +357,53 @@ final class DesktopPermissionChecklist {
             return directoryResult(id, state: .failed,
                 detail: "PersonaStack could not verify read/write access and disposable-file cleanup. Check that the folder is available and writable, then retry.", key: key)
         }
+    }
+
+    private func setupProtectedAccess() async -> DesktopPermissionObservation {
+        guard !Task.isCancelled, protectedAccessAttempt == nil else {
+            return .init(.checking, detail: "The protected-access check is busy or was cancelled.")
+        }
+        let attempt = UUID()
+        let key = "\(ownerKey):\(protectedAccessGeneration)"
+        protectedAccessAttempt = attempt
+        explicitObservations.removeValue(forKey: .fullDiskAccess)
+        defer { if protectedAccessAttempt == attempt { protectedAccessAttempt = nil } }
+        let action: DesktopProtectedAccessSetupAction
+        if let protectedAccessAction { action = await protectedAccessAction() }
+        else { action = await window.protectedAccessSetupAction() }
+        guard protectedAccessIsCurrent(attempt, key: key) else { return protectedAccessChanged() }
+        switch action {
+        case .cancel: return .init(.checking, detail: "Protected-access check cancelled. Full Disk Access remains unverified.")
+        case .settings:
+            return protectedAccessResult(.notGranted, detail: "Add the installed PersonaStack app in Full Disk Access settings. Relaunch if macOS asks, then retry Setup Full Disk Access. The grant remains unverified.", attempt: attempt, key: key)
+        case .check: break
+        }
+        do {
+            try await verifyProtectedAccess()
+            return protectedAccessResult(.unsupported, detail: "PersonaStack could list the protected Mail directory. Entry names were discarded. No file content was read. This operation succeeded, but the Full Disk Access grant remains unqualified in this release.", attempt: attempt, key: key)
+        } catch {
+            let failure = error as NSError
+            if failure.domain == NSPOSIXErrorDomain && [Int(EPERM), Int(EACCES)].contains(failure.code) {
+                return protectedAccessResult(.denied, detail: "Protected-directory access was blocked. Review Full Disk Access and folder permissions. Mac policy may also deny access. Relaunch if macOS asks, then retry.", attempt: attempt, key: key)
+            }
+            return protectedAccessResult(.unsupported, detail: "The protected-directory check is unavailable or inconclusive. Full Disk Access remains unverified. No missing or redirected resource is treated as approval.", attempt: attempt, key: key)
+        }
+    }
+
+    private func protectedAccessIsCurrent(_ attempt: UUID, key: String) -> Bool {
+        !Task.isCancelled && protectedAccessAttempt == attempt && key == "\(ownerKey):\(protectedAccessGeneration)"
+    }
+
+    private func protectedAccessChanged() -> DesktopPermissionObservation {
+        .init(.checking, detail: "Setup changed or was cancelled. Retry Setup Full Disk Access.")
+    }
+
+    private func protectedAccessResult(_ state: DesktopPermissionState, detail: String,
+                                       attempt: UUID, key: String) -> DesktopPermissionObservation {
+        guard protectedAccessIsCurrent(attempt, key: key) else { return protectedAccessChanged() }
+        let result = DesktopPermissionObservation(state, detail: detail, verificationKey: key)
+        explicitObservations[.fullDiskAccess] = result
+        return result
     }
 
     private func directoryResult(_ id: DesktopPermissionID, state: DesktopPermissionState,

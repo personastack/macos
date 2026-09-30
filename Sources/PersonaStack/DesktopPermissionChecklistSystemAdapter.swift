@@ -80,7 +80,17 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
             } catch {
                 return .init(.failed, detail: "PersonaStack could not register Launch at Login. Check Login Items and retry.")
             }
-        case .fullDiskAccess: openPrivacy("AllFiles")
+        case .fullDiskAccess:
+            if let value = await hooks.setup(permission) {
+                if let current = await hooks.observe(permission), current != value {
+                    return .init(.checking, detail: "Setup changed. Retry Setup Full Disk Access.")
+                }
+                guard !Task.isCancelled else { return .init(.checking, detail: "Setup cancelled.") }
+                if value.state == .notGranted || value.state == .denied { openFullDiskAccess() }
+                return value
+            }
+            openFullDiskAccess()
+            return Self.unconfiguredObservation(permission)
         case .desktopFiles, .documentsFiles, .downloadsFiles, .removableVolumes, .networkVolumes:
             // The existing executor's explicit hook owns the resource probe.
             if let value = await hooks.setup(permission) {
@@ -130,6 +140,10 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         openSettings("com.apple.preference.security?Privacy_\(name)")
     }
 
+    private func openFullDiskAccess() {
+        openSettings("com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles")
+    }
+
     static func loginObservation(_ status: SMAppService.Status) -> DesktopPermissionObservation {
         switch status {
         case .enabled: .init(.ready, detail: "PersonaStack starts after you log in to this Mac.")
@@ -162,7 +176,7 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         case .lockedScreenControl:
             return .init(.unsupported, detail: "Locked-screen control is unavailable in this release. Remote control stops when macOS locks.")
         case .fullDiskAccess:
-            return .init(.unsupported, detail: "Enable PersonaStack in Full Disk Access for broader file access. This release cannot verify that grant. File commands still report access denied for protected resources.")
+            return .init(.unsupported, detail: "Add PersonaStack in Full Disk Access settings for broader file access. Setup Full Disk Access offers a content-free protected-directory check. This release cannot qualify the system-wide grant.")
         case .inputMonitoring:
             return .init(.notNeeded, detail: "Ordinary mouse and keyboard control does not require Input Monitoring. No locked-control listener is installed.")
         case .camera: return .init(.notNeeded, detail: "PersonaStack does not use camera capture.")
