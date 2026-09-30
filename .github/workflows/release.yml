@@ -1,6 +1,12 @@
 name: Release macOS desktop app
 
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Numeric version to validate without publishing
+        required: true
+        type: string
   push:
     tags:
       - "v*"
@@ -13,8 +19,14 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
+      - name: Select release version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version || github.ref_name }}
+        run: printf 'RELEASE_VERSION=%s\n' "${REQUESTED_VERSION#v}" >> "$GITHUB_ENV"
       - name: Test appcast validation fixtures
-        run: python3 -m unittest scripts/tests/test_validate_appcast.py
+        run: python3 -m unittest discover -s scripts/tests
+      - name: Validate authored release notes
+        run: python3 scripts/release_notes.py "$RELEASE_VERSION" "release-notes/$RELEASE_VERSION.md"
       - name: Validate updater release configuration
         env:
           SPARKLE_PUBLIC_KEY: ${{ vars.PERSONASTACK_SPARKLE_PUBLIC_ED_KEY }}
@@ -30,12 +42,25 @@ jobs:
             echo "Sparkle public and private keys do not match." >&2
             exit 1
           fi
+      - name: Test native release changes
+        run: |
+          swift package resolve
+          swift test --disable-xctest --skip-update -j 2 \
+            --filter '(LocalRun|[Pp]ermission|[Pp]rotected|[Vv]olume|[Vv]oice|[Mm]icrophone|[Dd]irectory)'
       - name: Build unsigned installer
         env:
           PERSONASTACK_DEFAULT_URL: https://my.personastack.ai/user/personas
           PERSONASTACK_SPARKLE_PUBLIC_ED_KEY: ${{ vars.PERSONASTACK_SPARKLE_PUBLIC_ED_KEY }}
-        run: VERSION="${GITHUB_REF_NAME#v}" ./scripts/package-macos.sh
+        run: VERSION="$RELEASE_VERSION" ./scripts/package-macos.sh
+      - name: Save validation installer
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: PersonaStack-validation-${{ env.RELEASE_VERSION }}
+          path: artifacts/PersonaStack-${{ env.RELEASE_VERSION }}-unsigned.dmg
+          if-no-files-found: error
       - name: Publish GitHub release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -43,8 +68,10 @@ jobs:
             echo "Release $GITHUB_REF_NAME already exists. Refusing to replace its immutable installer." >&2
             exit 1
           fi
-          gh release create "$GITHUB_REF_NAME" artifacts/*.dmg --generate-notes --title "PersonaStack $GITHUB_REF_NAME"
+          gh release create "$GITHUB_REF_NAME" artifacts/*.dmg \
+            --notes-file "release-notes/${GITHUB_REF_NAME#v}.md" --title "PersonaStack $GITHUB_REF_NAME"
       - name: Publish Homebrew cask
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.PERSONASTACK_SPARKLE_PRIVATE_ED_KEY }}
@@ -85,7 +112,7 @@ jobs:
             --repo personastack/homebrew-tap \
             "$tap_tag" "$current_dmg" "$latest_dmg" \
             --title "PersonaStack $version" \
-            --notes "Download PersonaStack for macOS." \
+            --notes-file "$GITHUB_WORKSPACE/release-notes/$version.md" \
             --latest
           gh release view -R personastack/macos-desktop "$GITHUB_REF_NAME" --json body -q .body \
             >"$tap_dir/Downloads/PersonaStack-$version-unsigned.md"
@@ -133,7 +160,8 @@ jobs:
             --ed-key-file - --verify "$tap_dir/appcast.xml"
           python3 "$GITHUB_WORKSPACE/scripts/validate-appcast.py" \
             "$tap_dir/appcast.xml" "$version" "$tap_tag" \
-            "$GITHUB_WORKSPACE/artifacts/PersonaStack-$version-unsigned.dmg" "$tap_dir/Casks/personastack.rb"
+            "$GITHUB_WORKSPACE/artifacts/PersonaStack-$version-unsigned.dmg" "$tap_dir/Casks/personastack.rb" \
+            "$GITHUB_WORKSPACE/release-notes/$version.md"
           cd "$tap_dir"
           git add appcast.xml
           git config user.name "github-actions[bot]"

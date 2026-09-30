@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Optional
+from xml.sax.saxutils import escape
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -12,7 +13,13 @@ VALIDATOR = ROOT / "scripts" / "validate-appcast.py"
 
 
 class ValidateAppcastTests(unittest.TestCase):
-    def run_validator(self, archive_url: Optional[str] = None) -> subprocess.CompletedProcess[str]:
+    def run_validator(
+        self,
+        archive_url: Optional[str] = None,
+        notes: Optional[str] = None,
+        embedded_notes: Optional[str] = None,
+        notes_format: str = "markdown",
+    ) -> subprocess.CompletedProcess[str]:
         version = "1.2.3"
         tap_tag = f"desktop-v{version}"
         filename = f"PersonaStack-{version}-unsigned.dmg"
@@ -22,11 +29,13 @@ class ValidateAppcastTests(unittest.TestCase):
         )
         dmg_bytes = b"fixture dmg bytes"
         digest = hashlib.sha256(dmg_bytes).hexdigest()
+        notes = notes if notes is not None else f"# PersonaStack {version}\n\n## Fixes\n\n- Fixed update progress.\n"
+        embedded_notes = embedded_notes if embedded_notes is not None else notes
         appcast = f'''<?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
   <channel>
     <item>
-      <description>Release notes</description>
+      <description sparkle:format="{notes_format}">{escape(embedded_notes)}</description>
       <enclosure url="{archive_url or expected_url}" length="{len(dmg_bytes)}"
                  sparkle:edSignature="fixture-signature" />
       <sparkle:version>{version}</sparkle:version>
@@ -49,9 +58,11 @@ end
             appcast_path = fixture_dir / "appcast.xml"
             dmg_path = fixture_dir / filename
             cask_path = fixture_dir / "personastack.rb"
+            notes_path = fixture_dir / "release-notes.md"
             appcast_path.write_text(appcast, encoding="utf-8")
             dmg_path.write_bytes(dmg_bytes)
             cask_path.write_text(cask, encoding="utf-8")
+            notes_path.write_text(notes, encoding="utf-8")
             return subprocess.run(
                 [
                     sys.executable,
@@ -61,6 +72,7 @@ end
                     tap_tag,
                     str(dmg_path),
                     str(cask_path),
+                    str(notes_path),
                 ],
                 check=False,
                 capture_output=True,
@@ -78,6 +90,25 @@ end
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("immutable tap artifact", result.stderr)
+
+    def test_rejects_link_only_authored_notes(self) -> None:
+        result = self.run_validator(notes="# PersonaStack 1.2.3\n\n- **Full Changelog**: https://github.com/example/compare/v1...v2\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not only links", result.stderr)
+
+    def test_rejects_stale_embedded_notes(self) -> None:
+        result = self.run_validator(embedded_notes="**Full Changelog**: https://github.com/example/compare/v1...v2")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("differ from the authored", result.stderr)
+
+    def test_rejects_incorrect_markdown_format(self) -> None:
+        result = self.run_validator(notes_format="plain-text")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must use Markdown", result.stderr)
+
+    def test_accepts_xml_sensitive_authored_notes(self) -> None:
+        result = self.run_validator(notes="# PersonaStack 1.2.3\n\n- Fixed downloads & update notices when progress is < 100%.\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

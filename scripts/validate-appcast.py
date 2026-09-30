@@ -6,12 +6,13 @@ import hashlib
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from release_notes import validate_release_notes
 
 
 def main() -> int:
-    if len(sys.argv) != 6:
-        raise SystemExit("usage: validate-appcast.py APPCAST VERSION TAP_TAG DMG CASK")
-    feed_path, version, tap_tag, dmg_path, cask_path = sys.argv[1:]
+    if len(sys.argv) != 7:
+        raise SystemExit("usage: validate-appcast.py APPCAST VERSION TAP_TAG DMG CASK NOTES_FILE")
+    feed_path, version, tap_tag, dmg_path, cask_path, notes_path = sys.argv[1:]
     contents = Path(feed_path).read_text(encoding="utf-8")
     namespace = "http://www.andymatuschak.org/xml-namespaces/sparkle"
     root = ET.fromstring(contents)
@@ -51,8 +52,18 @@ def main() -> int:
         raise SystemExit("cask does not enable application updates")
     if "<!-- sparkle-signatures:\n" not in contents or "edSignature:" not in contents:
         raise SystemExit("appcast has no signed-feed signature")
-    if not item.findtext("description"):
+    description = item.find("description")
+    if description is None or not description.text:
         raise SystemExit("release notes are not embedded in the appcast")
+    if description.get(f"{{{namespace}}}format") != "markdown":
+        raise SystemExit("embedded release notes must use Markdown")
+    expected_notes = Path(notes_path).read_text(encoding="utf-8").strip()
+    try:
+        validate_release_notes(expected_notes, version)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    if description.text.strip() != expected_notes:
+        raise SystemExit("embedded release notes differ from the authored changelog")
     return 0
 
 
