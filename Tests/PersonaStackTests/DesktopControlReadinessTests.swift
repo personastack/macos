@@ -52,13 +52,21 @@ import PersonaStackCore
         "bundle_identifier": "ai.personastack.desktop", "configured_bundle_identifier": "ai.personastack.desktop",
         "identity_source": "parent_application", "parent_process_id": Int32(1000), "executable_path": executable.path,
     ]
-    func report(_ identity: [String: Any], status: String = "pass") throws -> Data {
+    // Pinned provider contract: cua-driver-rs-v0.29.1,
+    // crates/platform-macos/src/tools/health_report.rs (MacosHealthProvider).
+    func report(_ identity: [String: Any], status: String = "pass", platform: String = "darwin",
+                version: String = "0.29.1", schema: String = "1") throws -> Data {
         try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": 1, "result": ["structuredContent": [
-            "schema_version": "1", "driver_version": "0.29.1", "platform": "macos",
+            "schema_version": schema, "driver_version": version, "platform": platform,
             "checks": [["name": "bundle_identity", "status": status, "data": identity]],
         ]]])
     }
     #expect(DesktopControlRuntime.validCuaHostIdentity(try report(validIdentity), executableURL: executable, hostPID: 1000))
+    for platform in ["macos", "linux", "win32", ""] {
+        #expect(!DesktopControlRuntime.validCuaHostIdentity(try report(validIdentity, platform: platform), executableURL: executable, hostPID: 1000))
+    }
+    #expect(!DesktopControlRuntime.validCuaHostIdentity(try report(validIdentity, version: "0.29.2"), executableURL: executable, hostPID: 1000))
+    #expect(!DesktopControlRuntime.validCuaHostIdentity(try report(validIdentity, schema: "2"), executableURL: executable, hostPID: 1000))
     for field in validIdentity.keys {
         var invalid = validIdentity
         invalid.removeValue(forKey: field)
@@ -70,6 +78,13 @@ import PersonaStackCore
     var wrongApp = validIdentity
     wrongApp["bundle_identifier"] = "com.trycua.driver"
     #expect(!DesktopControlRuntime.validCuaHostIdentity(try report(wrongApp), executableURL: executable, hostPID: 1000))
+    for (field, value) in [("configured_bundle_identifier", "com.trycua.driver"),
+                           ("identity_source", "current_process"),
+                           ("executable_path", "/unreviewed/cua-driver")] {
+        var invalid = validIdentity
+        invalid[field] = value
+        #expect(!DesktopControlRuntime.validCuaHostIdentity(try report(invalid), executableURL: executable, hostPID: 1000))
+    }
     #expect(!DesktopControlRuntime.validCuaHostIdentity(try report(validIdentity, status: "fail"), executableURL: executable, hostPID: 1000))
 }
 

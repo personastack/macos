@@ -1445,7 +1445,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         guard let structured = toolResult(response)?["structuredContent"] as? [String: Any],
               structured["schema_version"] as? String == CuaDriverCompatibility.schemaVersion,
               structured["driver_version"] as? String == CuaDriverCompatibility.version,
-              structured["platform"] as? String == "macos",
+              structured["platform"] as? String == "darwin",
               let checks = structured["checks"] as? [[String: Any]] else { return false }
         let identity = checks.filter { $0["name"] as? String == "bundle_identity" }
         guard identity.count == 1, identity[0]["status"] as? String == "pass",

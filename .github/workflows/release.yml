@@ -46,7 +46,7 @@ jobs:
         run: |
           swift package resolve
           swift test --disable-xctest --skip-update -j 2 \
-            --filter '(LocalRun|[Pp]ermission|[Pp]rotected|[Vv]olume|[Vv]oice|[Mm]icrophone|[Dd]irectory)'
+            --filter '(LocalRun|[Pp]ermission|[Pp]rotected|[Vv]olume|[Vv]oice|[Mm]icrophone|[Dd]irectory|[Cc]ua|[Dd]esktopControl)'
       - name: Build unsigned installer
         env:
           PERSONASTACK_DEFAULT_URL: https://my.personastack.ai/user/personas

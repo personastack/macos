@@ -213,7 +213,7 @@ for line in sys.stdin:
         name = request['params']['name']
         if name == 'health_report':
             assert request['params']['arguments'] == {'include':['bundle_identity']}
-            result = {'structuredContent':{'schema_version':'1','driver_version':'0.29.1','platform':'macos','checks':[{'name':'bundle_identity','status':'pass','data':{'bundle_identifier':'ai.personastack.desktop','configured_bundle_identifier':'ai.personastack.desktop','identity_source':'parent_application','parent_process_id':host,'executable_path':os.path.realpath(__file__)}}]}}
+            result = {'structuredContent':{'schema_version':'1','driver_version':'0.29.1','platform':'darwin','checks':[{'name':'bundle_identity','status':'pass','data':{'bundle_identifier':'ai.personastack.desktop','configured_bundle_identifier':'ai.personastack.desktop','identity_source':'parent_application','parent_process_id':host,'executable_path':os.path.realpath(__file__)}}]}}
         elif name == 'check_permissions':
             assert request['params']['arguments'] == {'prompt':False,'probe_direct_capture':False}
             result = {'structuredContent':{'accessibility':True,'screen_recording':True,'source':{'attribution':'host','host_bundle_id':'ai.personastack.desktop','embedded':True,'disclaim_env':False,'pid':daemon,'responsible_ppid':host}}}
@@ -293,6 +293,44 @@ private final class RuntimeInputTarget: DesktopInputPermissionTarget {
             (try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any])?["name"] as? String
         }
     }
+}
+
+@Test @MainActor func cuaPermissionGrantRetryUsesDarwinHealthAndPreservesOwnership() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-grant-retry-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let executable = try makeRuntimeDriverFixture(root)
+    let credentials = PermissionPreparationCredentialStore(installation: nil)
+    var granted = false
+    let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
+        credentials: credentials, readiness: "paused", paused: true, sessionLockState: .unlocked,
+        hostPermissions: { (granted, granted) })
+    do {
+        // An identifiable owned service is valid even before OS grants exist.
+        try await runtime.prepareCuaPermissions()
+        let denied = try await runtime.cuaPermissionSnapshot()
+        #expect(denied.hostAttributionValid && !denied.accessibility && !denied.screenRecording)
+        #expect(!runtime.isCuaReady())
+
+        granted = true
+        try await runtime.restartCuaAfterPermissionChange()
+        let allowed = try await runtime.cuaPermissionSnapshot()
+        #expect(allowed.hostAttributionValid && allowed.accessibility && allowed.screenRecording)
+        #expect(allowed.verificationKey != denied.verificationKey)
+        #expect(!runtime.isCuaReady())
+        try await runtime.verifyCuaCapabilitiesForPermissions()
+        #expect(runtime.isCuaReady())
+
+        // Revocation removes functional proof without misclassifying the host.
+        granted = false
+        let revoked = try await runtime.cuaPermissionSnapshot()
+        #expect(revoked.hostAttributionValid && !revoked.accessibility && !revoked.screenRecording)
+        #expect(!runtime.isCuaReady())
+        #expect(credentials.readCount == 0)
+        #expect(!runtime.hasActiveInstallation && !runtime.gatewayConnected && !runtime.hasPendingRelayReconnectForTesting)
+        #expect(runtime.paused && runtime.readiness == "paused")
+        await runtime.shutdownForQuit()
+    } catch { await runtime.shutdownForQuit(); throw error }
 }
 
 @Test @MainActor func permissionInputUsesOnlyTheOwnedWindowAndNeverStartsEnrollment() async throws {
