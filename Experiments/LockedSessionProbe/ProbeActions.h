@@ -3,6 +3,7 @@
 
 #include <Security/Authorization.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
+#include "ProbeIdentity.h"
 
 #define PROBE_RIGHT "ai.personastack.locked-session-probe"
 

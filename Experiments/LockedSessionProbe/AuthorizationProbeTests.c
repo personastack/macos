@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include "ProbeIdentity.h"
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -11,6 +13,23 @@
         abort(); \
     } \
 } while (0)
+
+typedef struct { const char *name; char instance[37]; uint64_t mechanism; } LogEvent;
+static LogEvent events[512];
+static size_t event_count;
+
+void probe_record_event(const char *name, const char *build, const char *instance, uint64_t mechanism) {
+    CHECK(event_count < sizeof(events) / sizeof(events[0]));
+    CHECK(strcmp(build, probe_build_id()) == 0 && strlen(build) == 64);
+    CHECK(strlen(instance) == 36);
+    for (size_t index = 0; index < 36; index++) {
+        CHECK((instance[index] >= '0' && instance[index] <= '9') ||
+              (instance[index] >= 'a' && instance[index] <= 'f') || instance[index] == '-');
+    }
+    events[event_count] = (LogEvent){.name = name, .mechanism = mechanism};
+    memcpy(events[event_count].instance, instance, 37);
+    event_count++;
+}
 
 typedef struct {
     unsigned int decisions;
@@ -186,6 +205,29 @@ static void test_destroy_without_invocation(void) {
     verify_engine(engine);
 }
 
+static void test_exact_identity_and_invocation_chain(void) {
+    size_t before = event_count;
+    AuthorizationCallbacks table = callbacks();
+    Fixture first = create_fixture(&table);
+    Fixture second = create_fixture(&table);
+    CHECK(strcmp(events[before].instance, events[before + 1].instance) != 0);
+    CHECK(strcmp(events[before].name, "plugin_loaded") == 0 && events[before].mechanism == 0);
+    FakeEngine engine = {.expected_decisions = 1};
+    AuthorizationMechanismRef mechanism = create_mechanism(first, &engine);
+    CHECK(first.interface->MechanismInvoke(mechanism) == errAuthorizationSuccess);
+    const char *names[] = {"mechanism_created", "mechanism_invoked", "denial_returned"};
+    for (size_t index = 0; index < 3; index++) {
+        LogEvent event = events[before + 2 + index];
+        CHECK(strcmp(event.name, names[index]) == 0);
+        CHECK(strcmp(event.instance, events[before].instance) == 0);
+        CHECK(event.mechanism != 0 && event.mechanism == events[before + 2].mechanism);
+    }
+    CHECK(first.interface->MechanismDestroy(mechanism) == errAuthorizationSuccess);
+    CHECK(first.interface->PluginDestroy(first.plugin) == errAuthorizationSuccess);
+    CHECK(second.interface->PluginDestroy(second.plugin) == errAuthorizationSuccess);
+    verify_engine(engine);
+}
+
 typedef struct {
     // The initial member is also the engine seen by the ordinary strict fakes.
     FakeEngine engine;
@@ -259,6 +301,7 @@ int main(void) {
     test_callback_errors_and_copied_callbacks();
     test_base_callback_table();
     test_destroy_without_invocation();
+    test_exact_identity_and_invocation_chain();
     test_reentrant_destruction(0, errAuthorizationSuccess);
     test_reentrant_destruction(0, errAuthorizationInternal);
     test_reentrant_destruction(1, errAuthorizationSuccess);

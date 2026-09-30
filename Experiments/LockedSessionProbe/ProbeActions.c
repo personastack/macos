@@ -47,6 +47,7 @@ int probe_parse(int argc, const char *const *argv, ProbeOptions *options) {
 }
 
 int probe_run(ProbeOptions options, ProbeHooks hooks) {
+    printf("probe_build_id=%s\n", probe_build_id());
     if (options.action == ProbeHelp) {
         usage();
         return 0;
@@ -102,8 +103,18 @@ static int wait_seconds(unsigned int seconds) {
 }
 
 static IOReturn declare_activity(IOPMUserActiveType type, IOPMAssertionID *identifier) {
-    return IOPMAssertionDeclareUserActivity(CFSTR("PersonaStack dedicated-Mac diagnostic"),
-                                          type, identifier);
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0) return kIOReturnError;
+    printf("activity_type=%s\nactivity_started_unix=%lld.%09ld\n",
+           type == kIOPMUserActiveRemote ? "remote" : "local",
+           (long long)now.tv_sec, now.tv_nsec);
+    fflush(stdout);
+    IOReturn status = IOPMAssertionDeclareUserActivity(CFSTR("PersonaStack dedicated-Mac diagnostic"),
+                                                     type, identifier);
+    if (clock_gettime(CLOCK_REALTIME, &now) == 0) {
+        printf("activity_returned_unix=%lld.%09ld\n", (long long)now.tv_sec, now.tv_nsec);
+    }
+    return status;
 }
 
 int main(int argc, const char *argv[]) {

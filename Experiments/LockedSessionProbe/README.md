@@ -17,7 +17,9 @@ bash build.sh "$probe_parent/kit"
 
 Compilation is serial at `nice -n 15`. The kit contains an arm64/x86_64 plug-in, a universal CLI, an offline plist composer, and this procedure. C tests use strict fake engines and activity calls under AddressSanitizer and UndefinedBehaviorSanitizer. Python tests check policy composition and removal. The only real CLI command executed by the build is `--help`.
 
-The plug-in and CLI use development ad-hoc signatures. This does not establish Developer ID, notarization, host loading, or OS compatibility. Record the source commit and SHA-256 of both binaries before transferring the kit. Do not merge this plug-in into the production app or publish it through the production updater.
+The plug-in and CLI use development ad-hoc signatures. This does not establish Developer ID, notarization, host loading, or OS compatibility. `SOURCE.json` binds a clean source revision, source inventory, deterministic build ID, both loaded-image UUIDs and every shipped artifact hash. A dirty source build records no revision and cannot pass receipt verification. Build only the committed source before transferring the kit. Do not merge this plug-in into the production app or publish it through the production updater.
+
+The diagnostic bundle's build version is now 2. Increase `BUILD_VERSION` in `receipt.py` when publishing another changed probe. The build and manifest use that single version. macOS can load a previous copy under `StagedPlugins`. A current installed path alone does not identify the loaded code. Every event includes its compiled build ID, a random plug-in instance ID and a process-local mechanism ID. The receipt checker also requires the loaded image UUID and exact sender bytes. Never remove Apple's staged files or disable SIP to make the test pass. [Apple staging discussion](https://developer.apple.com/forums/thread/835581).
 
 ## Dedicated-Mac procedure
 
@@ -41,11 +43,16 @@ The plug-in and CLI use development ad-hoc signatures. This does not establish D
 5. On that dedicated Mac, run the explicit preflight:
 
    ```sh
+   probe_preflight_start=$(date +%s)
    ./personastack-locked-session-probe --validate-plugin --dedicated-mac
-   log show --last 2m --style json --predicate 'subsystem == "ai.personastack.locked-session-probe"'
+   probe_preflight_end=$(date +%s)
+   python3 receipt.py inspect --kit . --start "$probe_preflight_start" \
+     --end "$((probe_preflight_end + 1))" --require-load --dedicated-mac
    ```
 
-   The expected authorization result is Denied. That status alone is insufficient. Require `plugin_loaded`, `mechanism_created`, `mechanism_invoked`, and `denial_returned` from the actual system authorization host with our installed bundle as the sender image. Logs emitted by the fake test executable do not qualify. Capture the host identity and timestamps. If the bundle fails to load, the sender cannot be verified, or the result is canceled/internal error, stop. Leave the real screensaver policy unchanged.
+   The expected authorization result is Denied. That status alone is insufficient. The receipt collects a fixed subsystem/category directly through `/usr/bin/log`. It accepts no caller-supplied log file as authentic OS evidence. It requires one ordered `plugin_loaded`, `mechanism_created`, `mechanism_invoked`, `denial_returned` sequence with matching build, instance, mechanism, host, sender and image UUID. The privileged mechanism must come from Apple's authorizationhost. SecurityAgent UI and fake test executables do not qualify. The candidate host path was checked against this development Mac's public Apple code-signing metadata. Other host paths and missing JSON fields remain unqualified until their OS layout is reviewed. Signature checks do not invoke an authorization request.
+
+   The checker verifies only the exact owned installed or staged sender executable. It refuses symlink components, wrong ownership, writable binaries, stale bytes and image UUID mismatches. It reads no other vendor's plug-in or private data. Collection has a 15-second timeout and bounded scratch output. The interval must be positive and at most 120 seconds. If the bundle fails to load, the sender cannot be verified, or the authorization result is canceled/internal error, stop. Leave the real screensaver policy unchanged. Preserve the content-free receipt and exact OS build. A receipt is event correlation. It does not authenticate the transaction's purpose or prove unlock.
 
 6. Review the original and candidate again. Re-read the live screensaver policy immediately before an administrator applies the candidate. If it changed, compose a new candidate from the new baseline. An administrator may write only the reviewed `system.login.screensaver` candidate. This is an explicit system-wide test change. The kit provides no installer or automatic authdb writer.
 
@@ -57,7 +64,9 @@ The plug-in and CLI use development ad-hoc signatures. This does not establish D
    ./personastack-locked-session-probe --remote-activity-after 20 --dedicated-mac
    ```
 
-   During the delay, use macOS's own Lock Screen command. Do not type or click at the locked Mac until the trial ends. No synthetic input or per-task approval is part of this test. The CLI makes one public activity call and releases only the assertion returned on success. An interrupted delay makes no activity call. Compare the actual authorization-host logs with the trial time. Record whether the real screensaver mechanism was invoked. The probe never authorizes an unlock. Ordinary authentication or another original policy branch can still succeed. Disable automatic authentication for the trial and record any unlock separately. An unexpected unlock is not a successful result for this probe.
+   During the delay, use macOS's own Lock Screen command. Do not type or click at the locked Mac until the trial ends. No synthetic input or per-task approval is part of this test. The CLI makes one public activity call and releases only the assertion returned on success. An interrupted delay makes no activity call. It prints the compiled build ID, activity type and exact activity-call timestamps. Use `activity_started_unix` as the receipt's `--start`. Use an `--end` just after the completed activity observation. Collect before removing or replacing the plug-in. Requiring a new `plugin_loaded` event is unnecessary for later trials in an already loaded host, so omit `--require-load`. Creation, invocation and denial must still be present for one consistent mechanism in that trial interval.
+
+   The operator must establish that the Mac was actually locked before that timestamp. The operator must also establish no local input, automatic authentication or other authorization request during the interval. A receipt alone cannot prove those facts. Record whether the real screensaver mechanism was invoked. The probe never authorizes an unlock. Ordinary authentication or another original policy branch can still succeed. Disable automatic authentication for the trial and record any unlock separately. An unexpected unlock is not a successful result for this probe.
 
 9. Unlock manually. If remote activity did not invoke the mechanism, a separate trial may use `--local-activity-after 20 --dedicated-mac`. Record which activity type was used. Success for a local activity type does not establish remote-task behavior. Do not infer unlock, usable capture/input, Keychain access, privacy-cover safety, or relock from either trial.
 
@@ -74,6 +83,6 @@ The plug-in and CLI use development ad-hoc signatures. This does not establish D
 
 ## Results and remaining gates
 
-Report source commit, binary hashes, OS build, activity type/status, verified authorization-host and sender-image identities, event timestamps, normal manual-unlock result, and removal result. No passwords, credentials, screenshots, or file contents belong in the report.
+Report source commit, build ID, binary hashes, OS build, activity type/status, verified authorization-host and sender-image identities/UUIDs, event timestamps, normal manual-unlock result, and removal result. No passwords, credentials, screenshots, or file contents belong in the report. The in-process event analyzer is fixture coverage only. Only the explicit dedicated-Mac collector can produce an OS-collected invocation receipt. No actual host loading or OS log collection is performed by the build.
 
 A positive result qualifies only transaction initiation for that tested OS build and bundle identity. A negative result rules out this public trigger on that configuration. Full Desktop Control still needs an authenticated native grant path, bounded consent, every-display privacy, local-takeover handling, capture/input and Keychain proof, reliable return to the OS lock, signed packaging, and physical update-retention tests. The native checklist must keep Locked-Screen Control unqualified until those gates pass.
