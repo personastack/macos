@@ -100,6 +100,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        DesktopLoginItemRegistration.enableOnFirstLaunch()
         DesktopNotificationCoordinator.shared.install()
         DesktopUpdater.shared.start()
         guard UserDefaults.standard.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey) else { return }

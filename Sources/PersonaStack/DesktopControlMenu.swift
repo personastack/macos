@@ -57,6 +57,7 @@ struct DesktopControlMenu: View {
         Label(relayStatus, systemImage: relayEnabled ? "dot.radiowaves.left.and.right" : "pause.circle")
             .foregroundStyle(relayEnabled ? .green : .secondary)
             .onReceive(status.objectWillChange) { _ in
+                DesktopLoginItemRegistration.clearResolvedApprovalError()
                 let savedRepairError = UserDefaults.standard.string(forKey: "desktopControlRepairError") ?? ""
                 if repairError != savedRepairError { repairError = savedRepairError }
                 let savedLoginItemError = UserDefaults.standard.string(forKey: "desktopControlLoginItemError") ?? ""
