@@ -27,7 +27,9 @@ brew install --cask personastack/tap/personastack
 
 Open PersonaStack from Applications and sign in. Requires macOS 14 or later.
 
-The current app is unsigned. If macOS blocks its first launch, choose **Open Anyway** in **System Settings → Privacy & Security**.
+The app uses a persistent self-signed certificate. It is not Developer ID signed or notarized. If macOS blocks its first launch, choose **Open Anyway** in **System Settings → Privacy & Security**.
+
+After updating from an unsigned build, reapprove permissions once. For Accessibility, remove the old PersonaStack entry in Privacy & Security and add PersonaStack.app from Applications. For Screen Recording and Microphone, turn PersonaStack off and on. Relaunch if macOS requests it, then retry the Setup buttons.
 
 ## Updates
 

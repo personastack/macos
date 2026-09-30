@@ -2,6 +2,9 @@
 set -eu
 umask 077
 
+# Use the macOS OpenSSL implementation for PKCS12 compatibility with Security.framework.
+openssl_bin=/usr/bin/openssl
+
 root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 : "${PERSONASTACK_CODESIGN_IDENTITY:?certificate signing identity is required}"
 : "${PERSONASTACK_CODESIGN_KEYCHAIN:?signing keychain is required}"
@@ -55,17 +58,17 @@ basicConstraints = critical,CA:false
 keyUsage = critical,digitalSignature
 extendedKeyUsage = codeSigning
 CONFIG
-fixture_password=$(openssl rand -hex 32)
+fixture_password=$("$openssl_bin" rand -hex 32)
 export PERSONASTACK_SIGNING_FIXTURE_PASSWORD="$fixture_password"
-openssl req -new -newkey rsa:2048 -nodes -x509 -days 1 -sha256 \
+"$openssl_bin" req -new -newkey rsa:2048 -nodes -x509 -days 1 -sha256 \
   -config "$fixture_dir/certificate.cnf" -keyout "$fixture_dir/key.pem" -out "$fixture_dir/certificate.pem" >/dev/null 2>&1
-openssl pkcs12 -export -inkey "$fixture_dir/key.pem" -in "$fixture_dir/certificate.pem" \
+"$openssl_bin" pkcs12 -export -inkey "$fixture_dir/key.pem" -in "$fixture_dir/certificate.pem" \
   -out "$fixture_dir/foreign.p12" -passout env:PERSONASTACK_SIGNING_FIXTURE_PASSWORD
 security create-keychain -p "$fixture_password" "$fixture_dir/foreign.keychain-db"
 security unlock-keychain -p "$fixture_password" "$fixture_dir/foreign.keychain-db"
 security import "$fixture_dir/foreign.p12" -k "$fixture_dir/foreign.keychain-db" -P "$fixture_password" -T /usr/bin/codesign >/dev/null
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$fixture_password" "$fixture_dir/foreign.keychain-db" >/dev/null
-foreign_identity=$(openssl x509 -in "$fixture_dir/certificate.pem" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')
+foreign_identity=$("$openssl_bin" x509 -in "$fixture_dir/certificate.pem" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')
 make_bundle foreign /usr/bin/true 1.0.2
 codesign --force --timestamp=none --identifier ai.personastack.desktop \
   --keychain "$fixture_dir/foreign.keychain-db" --sign "$foreign_identity" "$fixture_dir/foreign.app"
