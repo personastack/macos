@@ -68,6 +68,17 @@ security create-keychain -p "$fixture_password" "$fixture_dir/foreign.keychain-d
 security unlock-keychain -p "$fixture_password" "$fixture_dir/foreign.keychain-db"
 security import "$fixture_dir/foreign.p12" -k "$fixture_dir/foreign.keychain-db" -P "$fixture_password" -T /usr/bin/codesign >/dev/null
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$fixture_password" "$fixture_dir/foreign.keychain-db" >/dev/null
+# codesign also searches the user keychain list when constructing the certificate chain.
+# Preserve existing entries. Deleting this temporary keychain removes only its entry.
+python3 - "$fixture_dir/foreign.keychain-db" <<'PYTHON'
+import shlex
+import subprocess
+import sys
+
+keychains = shlex.split(subprocess.check_output(["security", "list-keychains", "-d", "user"], text=True))
+if sys.argv[1] not in keychains:
+    subprocess.run(["security", "list-keychains", "-d", "user", "-s", *keychains, sys.argv[1]], check=True)
+PYTHON
 foreign_identity=$("$openssl_bin" x509 -in "$fixture_dir/certificate.pem" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')
 make_bundle foreign /usr/bin/true 1.0.2
 codesign --force --timestamp=none --identifier ai.personastack.desktop \

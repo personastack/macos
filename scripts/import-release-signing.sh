@@ -26,5 +26,16 @@ security import "$identity_dir/identity.p12" -k "$keychain" \
   -P "$PERSONASTACK_CODESIGN_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
   -k "$PERSONASTACK_CODESIGN_CERTIFICATE_PASSWORD" "$keychain" >/dev/null
+# codesign also searches the user keychain list when constructing the certificate chain.
+# Preserve existing entries. Deleting this temporary keychain removes only its entry.
+python3 - "$keychain" <<'PYTHON'
+import shlex
+import subprocess
+import sys
+
+keychains = shlex.split(subprocess.check_output(["security", "list-keychains", "-d", "user"], text=True))
+if sys.argv[1] not in keychains:
+    subprocess.run(["security", "list-keychains", "-d", "user", "-s", *keychains, sys.argv[1]], check=True)
+PYTHON
 identity=$("$openssl_bin" x509 -inform DER -in "$certificate" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')
 printf 'PERSONASTACK_CODESIGN_IDENTITY=%s\nPERSONASTACK_CODESIGN_KEYCHAIN=%s\n' "$identity" "$keychain" >> "$GITHUB_ENV"
