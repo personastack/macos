@@ -45,7 +45,15 @@ jobs:
       - name: Test native release changes
         run: |
           swift package resolve
+          # -j limits compilation only. Bound Swift Testing's process fixtures
+          # separately so scheduler starvation cannot defeat interrupt deadlines.
+          if swift test --help-hidden | grep -q -- '--experimental-maximum-parallelization-width'; then
+            test_scheduling=(--experimental-maximum-parallelization-width 2)
+          else
+            test_scheduling=(--no-parallel)
+          fi
           swift test --disable-xctest --skip-update -j 2 \
+            "${test_scheduling[@]}" \
             --filter '(LocalRun|[Pp]ermission|[Pp]rotected|[Vv]olume|[Vv]oice|[Mm]icrophone|[Dd]irectory|[Cc]ua|[Dd]esktopControl)'
       - name: Build unsigned installer
         env:
