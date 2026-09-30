@@ -1,3 +1,4 @@
+import AppKit
 import Darwin
 import Foundation
 import Testing
@@ -107,6 +108,9 @@ struct DesktopDirectoryPermissionTests {
         let descriptor = Darwin.open(file.path, O_RDONLY | O_CLOEXEC)
         #expect(descriptor >= 0)
         defer { _ = Darwin.close(descriptor) }
+        let directory = Darwin.open(root.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        #expect(directory >= 0)
+        defer { _ = Darwin.close(directory) }
         var identity = stat()
         #expect(fstat(descriptor, &identity) == 0)
         let moved = root.appendingPathComponent("moved")
@@ -114,10 +118,60 @@ struct DesktopDirectoryPermissionTests {
         let replacement = Data("replacement fixture".utf8)
         try replacement.write(to: file)
         #expect(throws: DesktopFileSystemError.destinationExists) {
-            try DesktopFileSystem.removeDirectoryVerificationFile(file, identity: identity)
+            try DesktopFileSystem.removeDirectoryVerificationFile(directory: directory, name: "probe", identity: identity)
         }
         #expect(try Data(contentsOf: file) == replacement)
         #expect(try Data(contentsOf: moved) == Data("owned marker".utf8))
+    }
+
+    @Test func selectedVolumeMismatchHasNoFileSideEffects() async throws {
+        let root = try directoryPermissionFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = Darwin.open(root.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        #expect(directory >= 0)
+        defer { _ = Darwin.close(directory) }
+        var mounted = statfs()
+        #expect(fstatfs(directory, &mounted) == 0)
+        let wrong = DesktopFileSystemVolumeID(first: mounted.f_fsid.val.0 &+ 1, second: mounted.f_fsid.val.1)
+        let files = DesktopFileSystem()
+        await #expect(throws: DesktopFileSystemError.patchMismatch) {
+            try await files.verifyDirectoryAccess(path: root.path, expectedVolumeID: wrong)
+        }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: root.path).isEmpty)
+    }
+
+    @Test func readOnlyCheckListsWithoutCreatingOrReadingExistingFiles() async throws {
+        let root = try directoryPermissionFixture()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let existing = root.appendingPathComponent("existing")
+        try Data("unchanged fixture".utf8).write(to: existing)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: existing.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: root.path)
+        try await DesktopFileSystem().verifyDirectoryAccess(path: root.path, readOnly: true)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: root.path) == ["existing"])
+    }
+
+    @Test func markerStaysInOpenedDirectoryAfterItsPathIsReplaced() throws {
+        let root = try directoryPermissionFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let selected = root.appendingPathComponent("selected", isDirectory: true)
+        let moved = root.appendingPathComponent("moved", isDirectory: true)
+        try FileManager.default.createDirectory(at: selected, withIntermediateDirectories: false)
+        let directory = Darwin.open(selected.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        #expect(directory >= 0)
+        defer { _ = Darwin.close(directory) }
+        try FileManager.default.moveItem(at: selected, to: moved)
+        try FileManager.default.createDirectory(at: selected, withIntermediateDirectories: false)
+        let marker = UUID()
+        let foreign = selected.appendingPathComponent(".personastack-permission-check-\(marker.uuidString)")
+        let original = Data("replacement mount fixture".utf8)
+        try original.write(to: foreign)
+        try DesktopFileSystem.verifyDirectoryAccess(descriptor: directory, probeID: marker, expectedVolumeID: nil, readOnly: false)
+        #expect(try Data(contentsOf: foreign) == original)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: moved.path).isEmpty)
     }
 }
 
@@ -248,4 +302,43 @@ struct DesktopDirectoryPermissionTests {
     pending?.resume()
     #expect(await check.value.state == .checking)
     #expect(await service.adapter.observe(.desktopFiles).state == .checking)
+}
+
+@Test @MainActor func directoryPermissionVolumeServiceInvalidatesProofBeforeMountPolling() async {
+    let notifications = NotificationCenter()
+    let mount = DesktopVolumePermissionMount(url: URL(fileURLWithPath: "/fake-mounted-volume"),
+        fileSystemIDFirst: 1, fileSystemIDSecond: 2, fileSystemType: "apfs", flags: UInt32(MNT_LOCAL | MNT_REMOVABLE))
+    var selections = 0
+    var checks = 0
+    let service = DesktopPermissionChecklist(selectedProfile: { .production }, volumeSnapshot: { [mount] },
+        chooseVolume: { id, mounts in
+            #expect(id == .removableVolumes && mounts == [mount])
+            selections += 1
+            return mount
+        }, verifyVolume: { selected in
+            #expect(selected == mount)
+            checks += 1
+        }, mountNotificationCenter: notifications)
+    let hooks = service.adapter.hooks
+    service.adapter.hooks.observe = { id in
+        if id == .removableVolumes || id == .networkVolumes { return await hooks.observe(id) }
+        return .init(.ready, detail: "Fake independent capability")
+    }
+    let model = service.window.coordinator
+    model.open()
+    await model.refresh()
+    #expect(!model.canFinish && selections == 0 && checks == 0)
+    model.setup(.removableVolumes)
+    while model.busyPermission != nil { await Task.yield() }
+    #expect(model.canFinish && selections == 1 && checks == 1)
+    notifications.post(name: NSWorkspace.didUnmountNotification, object: nil)
+    #expect(!model.canFinish)
+    #expect(model.rows.first { $0.id == .removableVolumes }?.state == .checking)
+    await model.refresh()
+    #expect(!model.canFinish && selections == 1 && checks == 1)
+    #expect(await service.adapter.setup(.removableVolumes).state == .ready)
+    service.cancelVerification()
+    #expect(await service.adapter.observe(.removableVolumes).state == .checking)
+    #expect(selections == 2 && checks == 2)
+    model.cancel()
 }

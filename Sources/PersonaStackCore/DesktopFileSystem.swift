@@ -64,6 +64,13 @@ public struct DesktopFileRead: Sendable {
     public let truncated: Bool
 }
 
+public struct DesktopFileSystemVolumeID: Equatable, Sendable {
+    public let first: Int32
+    public let second: Int32
+
+    public init(first: Int32, second: Int32) { self.first = first; self.second = second }
+}
+
 /// Per-control-session access to files on the logged-in macOS user account.
 /// The owning relay must authorize each call before forwarding it here.
 public actor DesktopFileSystem {
@@ -140,15 +147,35 @@ public actor DesktopFileSystem {
 
     /// Deliberate local permission check. Only the exclusively created marker is
     /// read. Existing directory entries contribute metadata, never file content.
-    public func verifyDirectoryAccess(path: String, probeID: UUID = UUID()) throws {
+    public func verifyDirectoryAccess(path: String, probeID: UUID = UUID(),
+                                      expectedVolumeID: DesktopFileSystemVolumeID? = nil,
+                                      readOnly: Bool = false) throws {
         try Task.checkCancellation()
         guard let input = Self.url(path) else { throw DesktopFileSystemError.invalidPath }
-        let directory = input.resolvingSymlinksInPath().standardizedFileURL
-        _ = try list(path: directory.path, limit: 1)
+        let directory = expectedVolumeID == nil ? input.resolvingSymlinksInPath().standardizedFileURL : input.standardizedFileURL
+        let descriptor = Darwin.open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else { throw Self.operationError(errno, fallback: .notDirectory) }
+        defer { _ = Darwin.close(descriptor) }
+        try Self.verifyDirectoryAccess(descriptor: descriptor, probeID: probeID,
+                                       expectedVolumeID: expectedVolumeID, readOnly: readOnly)
+    }
+
+    static func verifyDirectoryAccess(descriptor directory: Int32, probeID: UUID,
+                                      expectedVolumeID: DesktopFileSystemVolumeID?, readOnly: Bool) throws {
         try Task.checkCancellation()
-        let probe = directory.appendingPathComponent(".personastack-permission-check-\(probeID.uuidString)")
-        let descriptor = probe.path.withCString {
-            Darwin.open($0, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        if let expectedVolumeID {
+            var volume = statfs()
+            guard fstatfs(directory, &volume) == 0 else { throw operationError(errno, fallback: .notDirectory) }
+            guard DesktopFileSystemVolumeID(first: volume.f_fsid.val.0, second: volume.f_fsid.val.1) == expectedVolumeID else {
+                throw DesktopFileSystemError.patchMismatch
+            }
+        }
+        try verifyDirectoryListing(descriptor: directory)
+        try Task.checkCancellation()
+        if readOnly { return }
+        let probe = ".personastack-permission-check-\(probeID.uuidString)"
+        let descriptor = probe.withCString {
+            openat(directory, $0, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR)
         }
         guard descriptor >= 0 else {
             throw Self.operationError(errno, fallback: .invalidPath, exists: .destinationExists)
@@ -158,7 +185,7 @@ public actor DesktopFileSystem {
         guard fstat(descriptor, &identity) == 0 else { throw DesktopFileSystemError.notRegularFile }
         var removed = false
         defer {
-            if !removed { try? Self.removeDirectoryVerificationFile(probe, identity: identity) }
+            if !removed { try? Self.removeDirectoryVerificationFile(directory: directory, name: probe, identity: identity) }
             try? handle.close()
         }
         try Task.checkCancellation()
@@ -169,18 +196,32 @@ public actor DesktopFileSystem {
             throw DesktopFileSystemError.patchMismatch
         }
         try Task.checkCancellation()
-        try Self.removeDirectoryVerificationFile(probe, identity: identity)
+        try Self.removeDirectoryVerificationFile(directory: directory, name: probe, identity: identity)
         removed = true
         try handle.close()
     }
 
-    /// Refuse cleanup when the path no longer names the inode we created.
-    static func removeDirectoryVerificationFile(_ path: URL, identity: stat) throws {
+    private static func verifyDirectoryListing(descriptor: Int32) throws {
+        let copy = dup(descriptor)
+        guard copy >= 0 else { throw operationError(errno, fallback: .notDirectory) }
+        guard let directory = fdopendir(copy) else {
+            let failure = errno
+            _ = Darwin.close(copy)
+            throw operationError(failure, fallback: .notDirectory)
+        }
+        defer { closedir(directory) }
+        errno = 0
+        _ = readdir(directory)
+        guard errno == 0 else { throw operationError(errno, fallback: .notDirectory) }
+    }
+
+    /// Refuse cleanup when the selected directory's entry no longer names our inode.
+    static func removeDirectoryVerificationFile(directory: Int32, name: String, identity: stat) throws {
         var current = stat()
-        guard lstat(path.path, &current) == 0 else { throw operationError(errno, fallback: .invalidPath) }
+        guard fstatat(directory, name, &current, AT_SYMLINK_NOFOLLOW) == 0 else { throw operationError(errno, fallback: .invalidPath) }
         guard current.st_dev == identity.st_dev, current.st_ino == identity.st_ino,
               (current.st_mode & S_IFMT) == S_IFREG else { throw DesktopFileSystemError.destinationExists }
-        guard unlink(path.path) == 0 else { throw operationError(errno, fallback: .invalidPath) }
+        guard unlinkat(directory, name, 0) == 0 else { throw operationError(errno, fallback: .invalidPath) }
     }
 
     public func search(root: String, nameContains: String? = nil, nameGlob: String? = nil,

@@ -170,7 +170,7 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         case .systemAudio: return .init(.notNeeded, detail: "The current Cua recorder captures screen video without system audio.")
         case .automation: return .init(.notNeeded, detail: "No target-specific Apple Events integration is configured.")
         case .removableVolumes, .networkVolumes:
-            return .init(.notNeeded, detail: "No \(id.title.lowercased()) are selected for remote file access.")
+            return .init(.checking, detail: "Mounted volumes have not been inspected. Use PersonaStack's permission checklist to verify selected resources.")
         case .directCapture:
             return .init(.checking, detail: "Use Setup Direct Capture to verify the actual screen-capture operation.")
         default:

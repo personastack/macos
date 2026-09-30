@@ -7,6 +7,7 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     let coordinator: DesktopPermissionChecklistCoordinator
     private var window: NSWindow?
     private var activationObserver: NSObjectProtocol?
+    private var volumeSelection: (id: UUID, window: NSWindow)?
     var onCancel: (() -> Void)?
     var onPresent: (() -> Void)?
 
@@ -52,6 +53,45 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         coordinator.cancel()
         onCancel?()
+    }
+
+    func chooseVolume(_ id: DesktopPermissionID, mounts: [DesktopVolumePermissionMount],
+                      observation: (DesktopVolumePermissionMount) -> DesktopPermissionObservation) async -> DesktopVolumePermissionMount? {
+        guard let window, coordinator.isVisible, !mounts.isEmpty, volumeSelection == nil, !Task.isCancelled else { return nil }
+        let selectionID = UUID()
+        let alert = NSAlert()
+        alert.messageText = "Setup \(id.title)"
+        alert.informativeText = "Choose a volume to check. PersonaStack will list its root. On writable volumes it will also create, read and remove one disposable file. Existing file contents stay unread. Read-only volumes get a listing check only."
+        alert.icon = NSImage(named: NSImage.applicationIconName)
+        alert.addButton(withTitle: "Check Volume")
+        alert.addButton(withTitle: "Cancel")
+        let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 380, height: 28))
+        for mount in mounts {
+            let status = observation(mount)
+            picker.addItem(withTitle: "\(mount.url.path) · \(status.state.title)\(mount.isReadOnly ? " · Read-only" : "")")
+            picker.lastItem?.toolTip = "\(mount.url.path)\n\(status.detail)"
+        }
+        picker.setAccessibilityLabel("Mounted volume")
+        alert.accessoryView = picker
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else { continuation.resume(returning: nil); return }
+                volumeSelection = (selectionID, alert.window)
+                alert.beginSheetModal(for: window) { [weak self] response in
+                    if self?.volumeSelection?.id == selectionID { self?.volumeSelection = nil }
+                    let index = picker.indexOfSelectedItem
+                    continuation.resume(returning: response == .alertFirstButtonReturn && mounts.indices.contains(index) ? mounts[index] : nil)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in self?.cancelVolumeSelection(id: selectionID) }
+        }
+    }
+
+    func cancelVolumeSelection(id: UUID? = nil) {
+        guard let selected = volumeSelection, id == nil || selected.id == id else { return }
+        volumeSelection = nil
+        selected.window.sheetParent?.endSheet(selected.window, returnCode: .cancel)
     }
 
     private func show() {

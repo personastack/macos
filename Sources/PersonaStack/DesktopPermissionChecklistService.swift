@@ -16,8 +16,34 @@ final class DesktopPermissionChecklist {
     private let directoryURL: (FileManager.SearchPathDirectory) -> URL?
     private let verifyDirectory: @MainActor (URL) async throws -> Void
     private let selectedProfile: () -> DesktopEnvironmentConfiguration?
+    private let volumeSnapshot: () throws -> [DesktopVolumePermissionMount]
+    private let chooseVolume: (@MainActor (DesktopPermissionID, [DesktopVolumePermissionMount]) async -> DesktopVolumePermissionMount?)?
+    private let verifyVolume: (@MainActor (DesktopVolumePermissionMount) async throws -> Void)?
+    private lazy var volumeCheck = makeVolumeCheck()
+
+    private func makeVolumeCheck() -> DesktopVolumePermissionCheck {
+        DesktopVolumePermissionCheck(
+        snapshot: volumeSnapshot,
+        choose: { [weak self] id, mounts in
+            guard let self else { return nil }
+            if let choose = self.chooseVolume { return await choose(id, mounts) }
+            return await self.window.chooseVolume(id, mounts: mounts) { self.volumeCheck.observation(for: $0) }
+        },
+        verify: { [weak self] mount in
+            guard let self else { throw CancellationError() }
+            if let verify = self.verifyVolume { try await verify(mount); return }
+            let files = DesktopFileSystem()
+            try await files.verifyDirectoryAccess(path: mount.url.path, probeID: UUID(),
+                expectedVolumeID: .init(first: mount.fileSystemIDFirst, second: mount.fileSystemIDSecond),
+                readOnly: mount.isReadOnly)
+        }, contextKey: { [weak self] in
+            guard let self else { return "retired" }
+            return "\(self.ownerKey):\(self.verificationGeneration)"
+        })
+    }
     private var explicitObservations: [DesktopPermissionID: DesktopPermissionObservation] = [:]
     private var activationObserver: NSObjectProtocol?
+    private var mountObservers: [NSObjectProtocol] = []
     private let voiceVerifier = DesktopVoicePermissionVerifier()
     private var verificationGeneration = UUID()
     private var inputTest: DesktopInputPermissionWindow?
@@ -26,6 +52,7 @@ final class DesktopPermissionChecklist {
         verificationGeneration = UUID()
         explicitObservations.removeAll()
         window.coordinator.invalidateVerification(.microphone)
+        invalidateVolumeVerification()
         inputTest?.invalidate()
         inputTest = nil
         voiceVerifier.invalidate()
@@ -36,13 +63,19 @@ final class DesktopPermissionChecklist {
          }, verifyDirectory: (@MainActor (URL) async throws -> Void)? = nil,
          selectedProfile: @escaping () -> DesktopEnvironmentConfiguration? = {
              try? LaunchConfiguration.selectedEnvironment()
-         }) {
+         }, volumeSnapshot: @escaping () throws -> [DesktopVolumePermissionMount] = DesktopVolumePermissionCheck.passiveMountedVolumes,
+         chooseVolume: (@MainActor (DesktopPermissionID, [DesktopVolumePermissionMount]) async -> DesktopVolumePermissionMount?)? = nil,
+         verifyVolume: (@MainActor (DesktopVolumePermissionMount) async throws -> Void)? = nil,
+         mountNotificationCenter: NotificationCenter = NSWorkspace.shared.notificationCenter) {
         self.directoryURL = directoryURL
         self.verifyDirectory = verifyDirectory ?? { url in
             let files = DesktopFileSystem()
             try await files.verifyDirectoryAccess(path: url.path)
         }
         self.selectedProfile = selectedProfile
+        self.volumeSnapshot = volumeSnapshot
+        self.chooseVolume = chooseVolume
+        self.verifyVolume = verifyVolume
         let adapter = DesktopPermissionChecklistSystemAdapter()
         self.adapter = adapter
         window = DesktopPermissionChecklistWindow(coordinator: DesktopPermissionChecklistCoordinator(adapter: adapter))
@@ -57,8 +90,23 @@ final class DesktopPermissionChecklist {
         ) { [weak self] _ in
             Task { @MainActor in
                 self?.explicitObservations.removeAll()
+                self?.invalidateVolumeVerification()
                 await self?.window.coordinator.refresh()
             }
+        }
+        for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification, NSWorkspace.didRenameVolumeNotification] {
+            mountObservers.append(mountNotificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.invalidateVolumeVerification() }
+                Task { @MainActor in await self?.window.coordinator.refresh() }
+            })
+        }
+    }
+
+    private func invalidateVolumeVerification() {
+        volumeCheck.invalidate()
+        window.cancelVolumeSelection()
+        for id in [DesktopPermissionID.removableVolumes, .networkVolumes] {
+            window.coordinator.invalidateVerification(id)
         }
     }
 
@@ -87,6 +135,7 @@ final class DesktopPermissionChecklist {
             return .init(.notNeeded, detail: "This macOS version has no Local Network privacy approval.")
         case .desktopFiles, .documentsFiles, .downloadsFiles:
             return evidence(id, detail: "Use Setup \(id.title) to verify listing and read/write access with a disposable file. No existing file content is read.")
+        case .removableVolumes, .networkVolumes: return volumeCheck.observe(id)
         case .awakeDuringRemoteWork:
             return evidence(id, detail: "Use Setup Awake During Remote Work to verify idle sleep prevention. PersonaStack holds it only during a remote task.")
         default: return nil
@@ -152,6 +201,7 @@ final class DesktopPermissionChecklist {
             }
             return observeUpdates()
         case .desktopFiles, .documentsFiles, .downloadsFiles: return await setupDirectory(id)
+        case .removableVolumes, .networkVolumes: return await volumeCheck.setup(id)
         case .localNetwork, .messagingConnection: return await setupConnection(id)
         case .notifications:
             let result = await adapter.observe(.notifications)
