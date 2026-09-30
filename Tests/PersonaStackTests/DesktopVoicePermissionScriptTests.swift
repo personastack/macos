@@ -47,7 +47,7 @@ private final class VoiceScriptFixture {
     }
     func cancel(id: String = "fixture-id") {
         context.setObject(id, forKeyedSubscript: "expectedID" as NSString)
-        context.evaluateScript(DesktopVoicePermissionScript.cancel)
+        context.evaluateScript("(function(expectedID) {\n" + DesktopVoicePermissionScript.cancel + "\n})(expectedID)")
     }
     func value(_ expression: String) -> String { context.evaluateScript(expression)?.toString() ?? "undefined" }
 }
