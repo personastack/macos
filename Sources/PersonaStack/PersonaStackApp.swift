@@ -492,6 +492,15 @@ struct PersonaStackWebView: NSViewRepresentable {
             webView = nil
         }
 
+        func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+                     initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType,
+                     decisionHandler: @escaping @MainActor @Sendable (WKPermissionDecision) -> Void) {
+            decisionHandler(DesktopMediaCapturePermission.decide(
+                origin: origin, frame: frame, type: type, appURL: appURL,
+                activeView: !isRetired && webView === self.webView
+            ))
+        }
+
         func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
                      initiatedByFrame frame: WKFrameInfo,
                      completionHandler: @escaping @MainActor @Sendable ([URL]?) -> Void) {

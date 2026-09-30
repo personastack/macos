@@ -64,6 +64,9 @@ struct DesktopControlMenu: View {
                 if loginItemError != savedLoginItemError { loginItemError = savedLoginItemError }
             }
         Divider()
+        Button("Permissions and Setup…") {
+            DesktopPermissionChecklist.shared.window.presentForRepair()
+        }
         if relayEnabled || DesktopControlRuntime.shared.hasPendingEnvironmentSwitch {
             Button(status.isRepairing ? "Repairing Cua Service…" : "Repair Cua Service") {
                 Task { await repairCua() }

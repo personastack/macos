@@ -21,12 +21,12 @@ struct CuaDriverInstallerTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let installationRoot = root.appendingPathComponent("CuaDriver-\(CuaDriverCompatibility.version)", isDirectory: true)
         let app = installationRoot.appendingPathComponent("CuaDriver.app", isDirectory: true)
-        try FileManager.default.createDirectory(at: app.appendingPathComponent("Contents", isDirectory: true), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: app.appendingPathComponent("Contents/MacOS", isDirectory: true), withIntermediateDirectories: true)
         let info = try PropertyListSerialization.data(
             fromPropertyList: ["CFBundleIdentifier": "com.trycua.driver"], format: .xml, options: 0
         )
         try info.write(to: app.appendingPathComponent("Contents/Info.plist"))
-        let executable = installationRoot.appendingPathComponent("cua-driver")
+        let executable = app.appendingPathComponent("Contents/MacOS/cua-driver")
         try Data("fake executable".utf8).write(to: executable)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         let runner = FixedCuaProcessRunner()
@@ -40,6 +40,7 @@ struct CuaDriverInstallerTests {
         #expect(runner.invocations == [
             ["--verify", "--deep", "--strict", app.path],
             ["-dv", "--verbose=4", app.path],
+            ["-a", "256", executable.path],
             ["manifest", "--pretty"],
             ["list-tools"]
         ])
@@ -82,6 +83,7 @@ struct CuaDriverInstallerTests {
         #expect(runner.invocations == [
             ["--verify", "--deep", "--strict", application.path],
             ["-dv", "--verbose=4", application.path],
+            ["-a", "256", executable.path],
             ["manifest", "--pretty"],
             ["list-tools"]
         ])
@@ -106,6 +108,23 @@ struct CuaDriverInstallerTests {
         #expect(installed.executableURL == compatibleExecutable)
         #expect(try String(contentsOf: outdatedExecutable, encoding: .utf8) == "untouched external executable")
         #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("CuaDriver-\(CuaDriverCompatibility.version)").path))
+    }
+
+    @Test
+    func executableChecksumIsCheckedBeforeAnyDriverCommandRuns() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let changed = root.appendingPathComponent("changed/CuaDriver.app", isDirectory: true)
+        let reviewed = root.appendingPathComponent("reviewed/CuaDriver.app", isDirectory: true)
+        let changedExecutable = try makeFakeApplication(at: changed)
+        _ = try makeFakeApplication(at: reviewed)
+        let runner = FixedCuaProcessRunner(mismatchedChecksumPaths: [changedExecutable.path])
+        let installer = CuaDriverInstaller(supportDirectory: root, processRunner: runner,
+                                           externalApplicationURLs: [changed, reviewed])
+        let installed = try await installer.validateOrInstall()
+        #expect(installed.applicationURL == reviewed)
+        #expect(runner.driverInvocationPaths.allSatisfy { $0 != changedExecutable.path })
+        #expect(try String(contentsOf: changedExecutable, encoding: .utf8) == "untouched external executable")
     }
 
     @Test
@@ -153,10 +172,13 @@ struct CuaDriverInstallerTests {
 private final class FixedCuaProcessRunner: CuaProcessRunning, @unchecked Sendable {
     private let lock = NSLock()
     private let outdatedExecutablePaths: Set<String>
+    private let mismatchedChecksumPaths: Set<String>
     private var calls: [[String]] = []
+    private var driverPaths: [String] = []
 
-    init(outdatedExecutablePaths: Set<String> = []) {
+    init(outdatedExecutablePaths: Set<String> = [], mismatchedChecksumPaths: Set<String> = []) {
         self.outdatedExecutablePaths = outdatedExecutablePaths
+        self.mismatchedChecksumPaths = mismatchedChecksumPaths
     }
 
     var invocations: [[String]] {
@@ -165,9 +187,16 @@ private final class FixedCuaProcessRunner: CuaProcessRunning, @unchecked Sendabl
         return calls
     }
 
+    var driverInvocationPaths: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return driverPaths
+    }
+
     func run(_ executable: URL, arguments: [String]) throws -> CuaProcessResult {
         lock.lock()
         calls.append(arguments)
+        if arguments == ["manifest", "--pretty"] || arguments == ["list-tools"] { driverPaths.append(executable.path) }
         lock.unlock()
         if arguments.first == "--verify" { return CuaProcessResult(status: 0, stdout: Data(), stderr: Data()) }
         if arguments.first == "-dv" {
@@ -176,6 +205,10 @@ private final class FixedCuaProcessRunner: CuaProcessRunning, @unchecked Sendabl
                 stdout: Data(),
                 stderr: Data("Identifier=com.trycua.driver\nTeamIdentifier=YCK386LBJ7\n".utf8)
             )
+        }
+        if arguments.first == "-a" {
+            let hash = mismatchedChecksumPaths.contains(arguments.last ?? "") ? "unreviewed" : CuaDriverCompatibility.executableSHA256
+            return CuaProcessResult(status: 0, stdout: Data("\(hash)  reviewed-executable".utf8), stderr: Data())
         }
         if arguments == ["manifest", "--pretty"] {
             let version = outdatedExecutablePaths.contains(executable.path) ? "0.28.1" : CuaDriverCompatibility.version

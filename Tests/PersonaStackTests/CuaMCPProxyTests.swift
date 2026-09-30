@@ -308,6 +308,103 @@ struct CuaMCPProxyTests {
         await #expect(throws: CuaMCPProxyError.serviceMismatch) { try await proxy.start() }
     }
 
+    @Test
+    func nativeHostDiagnosticHasFixedArgumentsAndCannotBeCalledAsARemoteTool() async throws {
+        let script = #"""
+        #!/usr/bin/python3
+        import json, sys
+        for line in sys.stdin:
+            request = json.loads(line)
+            if request.get("method") == "notifications/initialized":
+                continue
+            result = {"structuredContent": request.get("params", {})}
+            print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
+        """#
+        let executable = try executableScript(script)
+        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
+        let proxy = CuaMCPProxy(executableURL: executable)
+        do {
+            _ = try await proxy.start()
+            await #expect(throws: CuaMCPProxyError.invalidToolName) {
+                try await proxy.callTool(name: "health_report", argumentsJSON: Data("{}".utf8))
+            }
+            let report = try await proxy.hostIdentityReport()
+            let envelope = try #require(JSONSerialization.jsonObject(with: report) as? [String: Any])
+            let result = try #require(envelope["result"] as? [String: Any])
+            let called = try #require(result["structuredContent"] as? [String: Any])
+            #expect(called["name"] as? String == "health_report")
+            #expect((called["arguments"] as? [String: Any])?["include"] as? [String] == ["bundle_identity"])
+            await proxy.stop()
+        } catch {
+            await proxy.stop()
+            throw error
+        }
+    }
+
+    @Test @MainActor
+    func ownedDaemonKeepsTheHostParentAndPrivateEndpointThenStopsOnLifetimeEOF() async throws {
+        let script = #"""
+        #!/usr/bin/python3
+        import json, os, pathlib, socket, sys
+        path = sys.argv[sys.argv.index("--socket") + 1]
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(path)
+        listener.listen(16)
+        pathlib.Path(path).with_name("launch.json").write_text(json.dumps({
+            "argv": sys.argv[1:], "ppid": os.getppid(),
+            "embedded": os.environ.get("CUA_DRIVER_EMBEDDED"),
+            "host": os.environ.get("CUA_DRIVER_HOST_BUNDLE_ID")
+        }))
+        sys.stdin.buffer.read()
+        listener.close()
+        """#
+        let executable = try executableScript(script)
+        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
+        let service = CuaEmbeddedService(executableURL: executable)
+        do {
+            try await service.start(isCurrent: {})
+            #expect(service.isRunning)
+            #expect(CuaSocketIdentity.parentPID(of: service.processIdentifier) == Darwin.getpid())
+            #expect(CuaSocketIdentity.peerPID(at: service.socketURL) == service.processIdentifier)
+            let attributes = try FileManager.default.attributesOfItem(atPath: service.directoryURL.path)
+            #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o700)
+            let launchFile = service.directoryURL.appendingPathComponent("launch.json")
+            let deadline = ContinuousClock.now + .seconds(2)
+            while !FileManager.default.fileExists(atPath: launchFile.path), ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let recorded = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: launchFile)) as? [String: Any])
+            #expect(recorded["ppid"] as? Int32 == Darwin.getpid())
+            #expect(recorded["embedded"] as? String == "1")
+            #expect(recorded["host"] as? String == "ai.personastack.desktop")
+            #expect(recorded["argv"] as? [String] == CuaEmbeddedService.arguments(
+                socketURL: service.socketURL, pidFileURL: service.directoryURL.appendingPathComponent("daemon.pid")))
+            #expect(await service.stop())
+            #expect(!service.isRunning)
+            #expect(!FileManager.default.fileExists(atPath: service.directoryURL.path))
+            #expect(await service.stop())
+        } catch {
+            _ = await service.stop()
+            throw error
+        }
+    }
+
+    @Test @MainActor
+    func cancelledDaemonStartupCannotLeaveTheOwnedChildOrEndpointRunning() async throws {
+        let executable = try executableScript("#!/usr/bin/python3\nimport time\ntime.sleep(20)\n")
+        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
+        let service = CuaEmbeddedService(executableURL: executable)
+        var checks = 0
+        await #expect(throws: CancellationError.self) {
+            try await service.start {
+                checks += 1
+                if checks > 1 { throw CancellationError() }
+            }
+        }
+        #expect(!service.isRunning)
+        #expect(!FileManager.default.fileExists(atPath: service.directoryURL.path))
+    }
+
     private func executableScript(_ body: String) throws -> URL {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("cua-mcp-proxy-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)

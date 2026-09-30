@@ -6,13 +6,17 @@ public enum CuaDriverCompatibility {
     public static let bundleIdentifier = "com.trycua.driver"
     public static let teamIdentifier = "YCK386LBJ7"
     public static let archiveSHA256 = "ee376d59ef37afac29a10c60c71469ac85fdc8844d1884bd317edd8def29055a"
+    public static let executableSHA256 = "620ec8d215661050fad8e33a09e06cdd4573b80cef13d2952f5d27d0536ac096"
+    public static let hostBundleIdentifier = "ai.personastack.desktop"
     public static let archiveURL = URL(string: "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.29.1/cua-driver-rs-0.29.1-darwin-universal.tar.gz")!
     public static let managedServiceEnvironment = [
         "CUA_DRIVER_RS_TELEMETRY_ENABLED": "0",
         "CUA_DRIVER_RS_UPDATE_CHECK": "false",
+        "CUA_DRIVER_EMBEDDED": "1",
+        "CUA_DRIVER_HOST_BUNDLE_ID": hostBundleIdentifier,
     ]
-    // Cua refuses OS permission prompts from an MCP client. Its signed app
-    // owns onboarding; the embedded proxy only reads the daemon's TCC state.
+    // PersonaStack owns OS permission requests. Neither the embedded daemon
+    // nor its MCP proxy may prompt during a status refresh.
     public static let permissionProbeArgumentsJSON = Data(#"{"prompt":false,"probe_direct_capture":false}"#.utf8)
     private static let inheritedEnvironmentKeys: Set<String> = [
         "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
@@ -100,5 +104,35 @@ public enum CuaDriverCompatibility {
             let name = line[..<separator].trimmingCharacters(in: .whitespaces)
             return name.isEmpty ? nil : name
         })
+    }
+}
+
+public struct CuaDriverPermissionSnapshot: Equatable, Sendable {
+    public let accessibility: Bool
+    public let screenRecording: Bool
+    public let hostAttributionValid: Bool
+    public let verificationKey: String
+
+    public init(accessibility: Bool, screenRecording: Bool, hostAttributionValid: Bool, verificationKey: String = "") {
+        self.accessibility = accessibility
+        self.screenRecording = screenRecording
+        self.hostAttributionValid = hostAttributionValid
+        self.verificationKey = verificationKey
+    }
+
+    public static func parse(_ structured: [String: Any], daemonPID: Int32, hostPID: Int32, verificationKey: String = "") throws -> Self {
+        guard let accessibility = structured["accessibility"] as? Bool,
+              let screenRecording = structured["screen_recording"] as? Bool,
+              let source = structured["source"] as? [String: Any] else {
+            throw CuaMCPProxyError.functionalProbeFailed
+        }
+        let hostValid = source["attribution"] as? String == "host"
+            && source["host_bundle_id"] as? String == CuaDriverCompatibility.hostBundleIdentifier
+            && source["embedded"] as? Bool == true
+            && source["disclaim_env"] as? Bool == false
+            && source["pid"] as? Int32 == daemonPID
+            && source["responsible_ppid"] as? Int32 == hostPID
+        return Self(accessibility: accessibility, screenRecording: screenRecording, hostAttributionValid: hostValid,
+                    verificationKey: verificationKey)
     }
 }

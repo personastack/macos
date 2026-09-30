@@ -45,17 +45,18 @@ private actor DesktopControlCompletionFlag {
 @MainActor
 struct DesktopControlCommandExecutorTests {
     @Test
-    func cuaServiceLaunchUsesTheSignedAppBundleServeModeWithoutFrontingIt() {
-        let configuration = DesktopControlRuntime.cuaServiceLaunchConfiguration(
-            inheritedEnvironment: ["HOME": "/tmp/profile", "PERSONASTACK_MACHINE_TOKEN": "do-not-forward"]
-        )
-        #expect(configuration.arguments == ["serve"])
-        #expect(configuration.activates == false)
-        #expect(configuration.addsToRecentItems == false)
-        #expect(configuration.environment == [
-            "HOME": "/tmp/profile",
-            "CUA_DRIVER_RS_TELEMETRY_ENABLED": "0",
-            "CUA_DRIVER_RS_UPDATE_CHECK": "false",
+    func cuaDaemonLaunchIsEmbeddedAndUsesOnlyItsPrivateEndpointAndLifetimePipe() {
+        let socket = URL(fileURLWithPath: "/tmp/private-cua/control.sock")
+        let pid = URL(fileURLWithPath: "/tmp/private-cua/daemon.pid")
+        #expect(CuaEmbeddedService.arguments(socketURL: socket, pidFileURL: pid) == [
+            "serve", "--embedded", "--parent-liveness-stdio", "--socket", socket.path, "--pid-file", pid.path,
+        ])
+        #expect(CuaDriverCompatibility.processEnvironment(from: [
+            "HOME": "/tmp/profile", "PERSONASTACK_MACHINE_TOKEN": "do-not-forward",
+            "CUA_DRIVER_EMBEDDED": "0", "CUA_DRIVER_HOST_BUNDLE_ID": "attacker.bundle",
+        ]) == [
+            "HOME": "/tmp/profile", "CUA_DRIVER_RS_TELEMETRY_ENABLED": "0", "CUA_DRIVER_RS_UPDATE_CHECK": "false",
+            "CUA_DRIVER_EMBEDDED": "1", "CUA_DRIVER_HOST_BUNDLE_ID": "ai.personastack.desktop",
         ])
     }
 

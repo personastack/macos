@@ -1,4 +1,6 @@
 import AppKit
+import ApplicationServices
+import CoreGraphics
 import Darwin
 import Foundation
 import os
@@ -15,7 +17,7 @@ extension CuaDriverInstaller: DesktopControlDriverInstalling {}
 
 private struct DesktopControlOwnedCuaStopError: LocalizedError {
     var errorDescription: String? {
-        "Desktop Control disconnected, but PersonaStack could not stop the CuaDriver service it started. Quit CuaDriver.app to finish local cleanup."
+        "Desktop Control disconnected, but PersonaStack could not stop its desktop control service. Quit PersonaStack to finish local cleanup."
     }
 }
 
@@ -43,11 +45,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private let preferences: UserDefaults
     private let configurationProvider: () throws -> DesktopEnvironmentConfiguration
     private let confirmForegroundSetup: @MainActor () -> Bool
-    private var cuaApplication: NSRunningApplication?
-    private var ownedCuaApplication: NSRunningApplication?
-    private var ownedCuaApplicationURL: URL?
-    private var selectedCuaApplicationURL: URL?
-    private var stopCuaApplication: @MainActor (NSRunningApplication, URL) async -> Bool = DesktopControlRuntime.terminateOwnedCuaApplication
+    private var cuaService: CuaEmbeddedService?
+    private var selectedCuaExecutableURL: URL?
+    private var verifiedCuaHostGeneration: UUID?
+    private var verifiedCuaCapabilitiesGeneration: UUID?
+    private let hostPermissions: @MainActor () -> (accessibility: Bool, screenRecording: Bool)
+    private var stopCuaService: @MainActor (CuaEmbeddedService) async -> Bool = { await $0.stop() }
     private var proxy: CuaMCPProxy?
     private var startingProxy: CuaMCPProxy?
     private var gateway: DesktopControlGatewayConnection?
@@ -77,18 +80,23 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                  relayStateReader: (any DesktopControlRelayStateReading)? = nil,
                  preferences: UserDefaults = .standard,
                  configurationProvider: @escaping () throws -> DesktopEnvironmentConfiguration = { try LaunchConfiguration.selectedEnvironment() },
-                 confirmForegroundSetup: @escaping @MainActor () -> Bool = DesktopControlRuntime.showForegroundSetupConfirmation) {
+                 confirmForegroundSetup: @escaping @MainActor () -> Bool = DesktopControlRuntime.showForegroundSetupConfirmation,
+                 hostPermissions: @escaping @MainActor () -> (accessibility: Bool, screenRecording: Bool) = {
+                     (AXIsProcessTrusted(), CGPreflightScreenCaptureAccess())
+                 }) {
         self.installer = installer
         self.credentials = credentials
         self.relayStateReader = relayStateReader
         self.preferences = preferences
         self.configurationProvider = configurationProvider
         self.confirmForegroundSetup = confirmForegroundSetup
+        self.hostPermissions = hostPermissions
         sessionLock.onChange = { [weak self] state in
             guard let self else { return }
             self.lockGeneration = UUID()
             let lockGeneration = self.lockGeneration
             if state != .unlocked {
+                self.verifiedCuaCapabilitiesGeneration = nil
                 self.readiness = "locked"
                 self.executorCleanupInProgress = true
                 if self.proxy != nil || self.startingProxy != nil { self.proxyInterruptedForLock = true }
@@ -122,12 +130,15 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                                relayStateReader: (any DesktopControlRelayStateReading)? = nil,
                                preferences: UserDefaults = .standard,
                                configurationProvider: @escaping () throws -> DesktopEnvironmentConfiguration = { .production },
-                               ownedCuaApplication: NSRunningApplication? = nil,
-                               stopCuaApplication: (@MainActor (NSRunningApplication, URL) async -> Bool)? = nil,
-                               confirmForegroundSetup: @escaping @MainActor () -> Bool = { true }) -> DesktopControlRuntime {
+                               ownedCuaService: CuaEmbeddedService? = nil,
+                               stopCuaService: (@MainActor (CuaEmbeddedService) async -> Bool)? = nil,
+                               confirmForegroundSetup: @escaping @MainActor () -> Bool = { true },
+                               hostPermissions: @escaping @MainActor () -> (accessibility: Bool, screenRecording: Bool) = {
+                                   (AXIsProcessTrusted(), CGPreflightScreenCaptureAccess())
+                               }) -> DesktopControlRuntime {
         let runtime = DesktopControlRuntime(installer: installer, credentials: credentials, relayStateReader: relayStateReader,
                                             preferences: preferences, configurationProvider: configurationProvider,
-                                            confirmForegroundSetup: confirmForegroundSetup)
+                                            confirmForegroundSetup: confirmForegroundSetup, hostPermissions: hostPermissions)
         if let executor { runtime.executor = executor }
         runtime.proxy = proxy
         runtime.gatewayConnectionID = connectionID
@@ -137,9 +148,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         runtime.paused = paused
         runtime.executorCleanupInProgress = cleanupInProgress
         runtime.executorCleanupFailed = cleanupFailed
-        runtime.ownedCuaApplication = ownedCuaApplication
-        if ownedCuaApplication != nil { runtime.ownedCuaApplicationURL = Bundle.main.bundleURL }
-        if let stopCuaApplication { runtime.stopCuaApplication = stopCuaApplication }
+        runtime.cuaService = ownedCuaService
+        if let stopCuaService { runtime.stopCuaService = stopCuaService }
         if let sessionLockState { runtime.sessionLock.receive(sessionLockState) }
         return runtime
     }
@@ -153,6 +163,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     func waitForLockCleanupForTesting() async { await lockCleanupTask?.value }
 
     func heartbeatReadinessForTesting() async -> String? { await heartbeatReadiness() }
+    var hasPendingRelayReconnectForTesting: Bool { reconnectTask != nil }
 #endif
 
     func beginResume() throws -> UUID {
@@ -229,6 +240,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let remainPaused = paused && !resumeRelay
         await stopLocalControl(generation: generation)
         try requireCurrentLifecycle(generation)
+        guard await stopOwnedCuaService() else { throw DesktopControlOwnedCuaStopError() }
+        try requireCurrentLifecycle(generation)
         do {
             do {
                 try await startCua(forceRepairInstall: false, startPaused: remainPaused, generation: generation)
@@ -252,8 +265,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         }
     }
 
-    private func startCua(forceRepairInstall: Bool, startPaused: Bool, generation: UUID) async throws {
+    private func startCua(forceRepairInstall: Bool, startPaused: Bool, generation: UUID, verifyCapabilities: Bool = true) async throws {
         try requireCurrentLifecycle(generation)
+        let wasVerifiedReady = isCuaReady() && readiness == "ready"
         if proxy == nil {
             do {
                 let installation = try await installer.validateOrInstall(
@@ -267,22 +281,13 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                     }
                 )
                 try requireCurrentLifecycle(generation)
-                let socketURL = Self.cuaSocketURL()
-                let (application, launched) = try await launchCuaService(
-                    at: installation.applicationURL, socketURL: socketURL, generation: generation
-                )
-                cuaApplication = application
-                if launched {
-                    ownedCuaApplication = application
-                    ownedCuaApplicationURL = installation.applicationURL
-                }
-                selectedCuaApplicationURL = installation.applicationURL
+                let service = try await launchCuaService(executableURL: installation.executableURL, generation: generation)
+                selectedCuaExecutableURL = installation.executableURL
                 try requireCurrentLifecycle(generation)
-
                 let candidate = CuaMCPProxy(
                     executableURL: installation.executableURL,
-                    socketURL: socketURL,
-                    expectedDaemonPID: application.processIdentifier
+                    socketURL: service.socketURL,
+                    expectedDaemonPID: service.processIdentifier
                 )
                 startingProxy = candidate
                 do {
@@ -293,7 +298,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                     let validatedTools = try await candidate.validateToolCatalog(catalog)
                     try requireCurrentLifecycle(generation)
                     tools = validatedTools
-                    try await verifyCuaReadiness(candidate, generation: generation)
+                    try await verifyCuaHostIdentity(candidate, generation: generation)
                     try requireCurrentLifecycle(generation)
                     proxy = candidate
                     startingProxy = nil
@@ -306,15 +311,25 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                 }
             } catch {
                 if generation == lifecycleGeneration {
-                    await publishReadinessFailure(error, generation: generation)
+                    if verifyCapabilities { await publishReadinessFailure(error, generation: generation) }
+                    else { readiness = Self.readiness(for: error) }
                 }
                 throw error
             }
         }
         try requireCurrentLifecycle(generation)
+        if verifyCapabilities, let proxy {
+            do { try await verifyCuaReadiness(proxy, generation: generation) }
+            catch {
+                await publishReadinessFailure(error, generation: generation)
+                throw error
+            }
+        }
+        try requireCurrentLifecycle(generation)
         paused = startPaused
-        readiness = startPaused ? "paused" : (sessionLock.allowsControl ? "ready" : "locked")
-        if let saved = try? await readSavedInstallation() {
+        readiness = startPaused ? "paused" : (sessionLock.allowsControl ? (verifyCapabilities || wasVerifiedReady ? "ready" : "permission_required") : "locked")
+        // Permission-only startup never reads enrollment or activates a relay.
+        if verifyCapabilities, let saved = try? await readSavedInstallation() {
             try requireCurrentLifecycle(generation)
             activeInstallation = saved
             await gateway?.setReadiness(readiness)
@@ -579,11 +594,86 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     func isCuaReady() -> Bool {
-        guard proxy != nil, !tools.isEmpty,
-              let cuaApplication, !cuaApplication.isTerminated,
-              let selectedCuaApplicationURL,
-              Self.matchesSelectedApplication(cuaApplication.bundleURL, selectedCuaApplicationURL) else { return false }
-        return CuaSocketIdentity.peerPID(at: Self.cuaSocketURL()) == cuaApplication.processIdentifier
+        let permissions = hostPermissions()
+        guard permissions.accessibility && permissions.screenRecording else {
+            verifiedCuaCapabilitiesGeneration = nil
+            return false
+        }
+        return isOwnedCuaRunning() && verifiedCuaCapabilitiesGeneration == cuaService?.generation
+    }
+
+    private func isOwnedCuaRunning() -> Bool {
+        guard proxy != nil, !tools.isEmpty, let cuaService, cuaService.isRunning,
+              verifiedCuaHostGeneration == cuaService.generation,
+              let selectedCuaExecutableURL else { return false }
+        return cuaService.executableURL.resolvingSymlinksInPath().standardizedFileURL
+            == selectedCuaExecutableURL.resolvingSymlinksInPath().standardizedFileURL
+    }
+
+    /// Explicit native setup only. It never attaches or replaces enrollment.
+    func prepareCuaPermissions() async throws {
+        guard !disconnecting, !environmentSwitchPending, !repairInProgress else { throw CancellationError() }
+        let preflightGeneration = lifecycleGeneration
+        let ownedDaemonRunning = isOwnedCuaRunning()
+        if let existing = proxy {
+            let running = await existing.isProcessRunning()
+            try requireCurrentLifecycle(preflightGeneration)
+            if ownedDaemonRunning && running { return }
+            verifiedCuaCapabilitiesGeneration = nil
+            await existing.stop()
+            try requireCurrentLifecycle(preflightGeneration)
+            guard proxy === existing else { throw CancellationError() }
+            proxy = nil
+            tools = []
+        }
+        if !ownedDaemonRunning {
+            guard await stopOwnedCuaService() else { throw DesktopControlOwnedCuaStopError() }
+            try requireCurrentLifecycle(preflightGeneration)
+        }
+        let remainPaused = paused
+        let generation = try beginResume()
+        try confirmForegroundSession()
+        try await startPermissionCua(generation: generation, remainPaused: remainPaused)
+    }
+
+    /// Read-only. It cannot install a runtime or request an OS permission.
+    func cuaPermissionSnapshot() async throws -> CuaDriverPermissionSnapshot {
+        guard let proxy, let service = cuaService, service.isRunning else { throw CuaMCPProxyError.notStarted }
+        return try await readCuaPermissionSnapshot(proxy, service: service, generation: lifecycleGeneration, timeout: 5)
+    }
+
+    func restartCuaAfterPermissionChange() async throws {
+        guard !repairInProgress else { throw CancellationError() }
+        let remainPaused = paused
+        let generation = try beginResume()
+        try confirmForegroundSession()
+        await stopLocalControl(generation: generation)
+        try requireCurrentLifecycle(generation)
+        guard await stopOwnedCuaService() else { throw DesktopControlOwnedCuaStopError() }
+        try requireCurrentLifecycle(generation)
+        try await startPermissionCua(generation: generation, remainPaused: remainPaused)
+    }
+
+    private func startPermissionCua(generation: UUID, remainPaused: Bool) async throws {
+        do {
+            try await startCua(forceRepairInstall: false, startPaused: remainPaused, generation: generation, verifyCapabilities: false)
+        } catch {
+            if generation == lifecycleGeneration, remainPaused {
+                paused = true
+                readiness = "paused"
+                await gateway?.setReadiness("paused")
+            }
+            throw error
+        }
+    }
+
+    /// Called only by an explicit native setup action that explained capture.
+    func verifyCuaCapabilitiesForPermissions() async throws {
+        guard sessionLock.allowsControl, let proxy else { throw CuaMCPProxyError.permissionsRequired }
+        let generation = lifecycleGeneration
+        try await verifyCuaReadiness(proxy, generation: generation, timeout: 15)
+        try requireCurrentLifecycle(generation)
+        guard sessionLock.allowsControl else { throw CuaMCPProxyError.permissionsRequired }
     }
 
     func probeNativeCapabilities(generation: UUID) async throws {
@@ -605,72 +695,28 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         try requireCurrentLifecycle(generation)
     }
 
-    static func cuaServiceLaunchConfiguration(
-        inheritedEnvironment: [String: String] = ProcessInfo.processInfo.environment,
-        socketURL: URL? = nil
-    ) -> NSWorkspace.OpenConfiguration {
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.arguments = ["serve"] + (socketURL.map { ["--socket", $0.path] } ?? [])
-        configuration.activates = false
-        configuration.addsToRecentItems = false
-        configuration.environment = CuaDriverCompatibility.processEnvironment(from: inheritedEnvironment)
-        return configuration
-    }
-
-    static func cuaSocketURL(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
-        homeDirectory.appendingPathComponent("Library/Caches/cua-driver/cua-driver.sock")
-    }
-
-    static func matchesSelectedApplication(_ runningURL: URL?, _ selectedURL: URL) -> Bool {
-        runningURL?.resolvingSymlinksInPath().standardizedFileURL ==
-            selectedURL.resolvingSymlinksInPath().standardizedFileURL
-    }
-
-    private func launchCuaService(at applicationURL: URL, socketURL: URL,
-                                  generation: UUID) async throws -> (NSRunningApplication, Bool) {
-        let running = NSWorkspace.shared.runningApplications.filter {
-            $0.bundleIdentifier == CuaDriverCompatibility.bundleIdentifier && !$0.isTerminated
-        }
-        guard running.count <= 1,
-              running.allSatisfy({ Self.matchesSelectedApplication($0.bundleURL, applicationURL) }) else {
-            throw CuaMCPProxyError.serviceMismatch
-        }
-        let application: NSRunningApplication
-        if let existing = running.first {
-            application = existing
-        } else {
-            guard CuaSocketIdentity.peerPID(at: socketURL) == nil else {
+    private func launchCuaService(executableURL: URL, generation: UUID) async throws -> CuaEmbeddedService {
+        if let existing = cuaService {
+            guard existing.isRunning,
+                  existing.executableURL.resolvingSymlinksInPath() == executableURL.resolvingSymlinksInPath() else {
                 throw CuaMCPProxyError.serviceMismatch
             }
-            application = try await NSWorkspace.shared.openApplication(
-                at: applicationURL,
-                configuration: Self.cuaServiceLaunchConfiguration(socketURL: socketURL)
-            )
-            ownedCuaApplication = application
-            ownedCuaApplicationURL = applicationURL
+            return existing
         }
-        guard Self.matchesSelectedApplication(application.bundleURL, applicationURL),
-              application.processIdentifier > 0 else { throw CuaMCPProxyError.serviceMismatch }
-        let deadline = ProcessInfo.processInfo.systemUptime + 10
-        repeat {
+        let service = CuaEmbeddedService(executableURL: executableURL)
+        cuaService = service
+        do {
+            try await service.start { try self.requireCurrentLifecycle(generation) }
             try requireCurrentLifecycle(generation)
-            guard !application.isTerminated else { throw CuaMCPProxyError.processExited }
-            if let peerPID = CuaSocketIdentity.peerPID(at: socketURL) {
-                guard peerPID == application.processIdentifier else { throw CuaMCPProxyError.serviceMismatch }
-                return (application, running.isEmpty)
-            }
-            try await Task.sleep(for: .milliseconds(50))
-        } while ProcessInfo.processInfo.systemUptime < deadline
-        throw CuaMCPProxyError.timeout
+            guard cuaService === service else { throw CancellationError() }
+            return service
+        } catch {
+            if await service.stop(), cuaService === service { cuaService = nil }
+            throw error
+        }
     }
 
-    private func hasRunningCuaService() -> Bool {
-        NSWorkspace.shared.runningApplications.contains { application in
-            guard application.bundleIdentifier == CuaDriverCompatibility.bundleIdentifier,
-                  !application.isTerminated else { return false }
-            return true
-        }
-    }
+    private func hasRunningCuaService() -> Bool { cuaService != nil }
 
     private func beginReconnectLoop(for installation: DesktopControlInstallation) {
         guard !environmentSwitchPending, reconnectTask == nil else { return }
@@ -1010,38 +1056,19 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func stopOwnedCuaService() async -> Bool {
-        guard let ownedCuaApplication else {
-            cuaApplication = nil
-            selectedCuaApplicationURL = nil
+        guard let service = cuaService else {
+            selectedCuaExecutableURL = nil
+            verifiedCuaHostGeneration = nil
+            verifiedCuaCapabilitiesGeneration = nil
             return true
         }
-        guard let ownedCuaApplicationURL else { return false }
-        guard await stopCuaApplication(ownedCuaApplication, ownedCuaApplicationURL) else { return false }
-        guard self.ownedCuaApplication === ownedCuaApplication else { return true }
-        self.ownedCuaApplication = nil
-        self.ownedCuaApplicationURL = nil
-        if cuaApplication === ownedCuaApplication {
-            cuaApplication = nil
-            selectedCuaApplicationURL = nil
-        }
+        guard await stopCuaService(service) else { return false }
+        guard cuaService === service else { return true }
+        cuaService = nil
+        selectedCuaExecutableURL = nil
+        verifiedCuaHostGeneration = nil
+        verifiedCuaCapabilitiesGeneration = nil
         return true
-    }
-
-    private static func terminateOwnedCuaApplication(_ application: NSRunningApplication, selectedURL: URL) async -> Bool {
-        guard matchesSelectedApplication(application.bundleURL, selectedURL), application.processIdentifier > 0 else { return false }
-        if application.isTerminated { return true }
-        if let peerPID = CuaSocketIdentity.peerPID(at: cuaSocketURL()), peerPID != application.processIdentifier { return false }
-        let quitRequested = application.terminate()
-        let deadline = ProcessInfo.processInfo.systemUptime + 2
-        var signaled = false
-        while !application.isTerminated && ProcessInfo.processInfo.systemUptime < deadline {
-            if !signaled && (!quitRequested || ProcessInfo.processInfo.systemUptime >= deadline - 1) {
-                _ = Darwin.kill(application.processIdentifier, SIGTERM)
-                signaled = true
-            }
-            try? await Task.sleep(for: .milliseconds(50))
-        }
-        return application.isTerminated
     }
 
     static func readiness(for error: Error) -> String {
@@ -1150,7 +1177,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private func heartbeatReadiness() async -> String? {
         await markExitedCuaProxyUnavailable()
         if Self.shouldProbeGuiRecovery(readiness: readiness, paused: paused,
-                                       unlocked: sessionLock.allowsControl, cuaReady: isCuaReady()),
+                                       unlocked: sessionLock.allowsControl, cuaReady: isOwnedCuaRunning()),
            let proxy {
             let generation = lifecycleGeneration
             let previousReadiness = readiness
@@ -1188,6 +1215,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private func markExitedCuaProxyUnavailable() async {
         guard readiness == "ready", let currentProxy = proxy else { return }
         guard !(await currentProxy.isProcessRunning()), readiness == "ready", proxy === currentProxy else { return }
+        verifiedCuaCapabilitiesGeneration = nil
         readiness = "cua_unavailable"
     }
 
@@ -1207,9 +1235,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func readinessAfterGuiFailure(generation: UUID) async -> String {
-        guard generation == lifecycleGeneration, isCuaReady(), let proxy else { return "cua_unavailable" }
+        verifiedCuaCapabilitiesGeneration = nil
+        guard generation == lifecycleGeneration, isOwnedCuaRunning(), let proxy else { return "cua_unavailable" }
         do {
-            try await verifyCuaPermissions(proxy, generation: generation, timeout: 5)
+            try await verifyCuaReadiness(proxy, generation: generation, timeout: 5)
             return generation == lifecycleGeneration
                 ? Self.reconciledGuiReadiness(permissionProbeSucceeded: true, failureReadiness: "cua_unavailable")
                 : readiness
@@ -1228,16 +1257,16 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     private func replaceFailedCuaProxy(_ failed: CuaMCPProxy, generation: UUID) async throws {
         try requireCurrentLifecycle(generation)
-        guard proxy === failed, startingProxy == nil, isCuaReady(),
-              let application = cuaApplication, let selectedCuaApplicationURL else {
+        guard proxy === failed, startingProxy == nil, isOwnedCuaRunning(),
+              let service = cuaService, let selectedCuaExecutableURL else {
             throw CuaMCPProxyError.serviceMismatch
         }
         if !(await failed.isProcessRunning()) {
             await failed.stop()
         }
         let candidate = CuaMCPProxy(
-            executableURL: selectedCuaApplicationURL.deletingLastPathComponent().appendingPathComponent("cua-driver"),
-            socketURL: Self.cuaSocketURL(), expectedDaemonPID: application.processIdentifier
+            executableURL: selectedCuaExecutableURL,
+            socketURL: service.socketURL, expectedDaemonPID: service.processIdentifier
         )
         startingProxy = candidate
         do {
@@ -1246,9 +1275,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             let catalog = try await candidate.listTools()
             try requireCurrentLifecycle(generation)
             let validatedTools = try await candidate.validateToolCatalog(catalog)
+            try await verifyCuaHostIdentity(candidate, generation: generation)
             try await verifyCuaReadiness(candidate, generation: generation, timeout: 25)
             try requireCurrentLifecycle(generation)
-            guard proxy === failed, startingProxy === candidate, isCuaReady() else {
+            guard proxy === failed, startingProxy === candidate, isOwnedCuaRunning() else {
                 throw CuaMCPProxyError.serviceMismatch
             }
             proxy = candidate
@@ -1309,57 +1339,108 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     private func verifyCuaReadiness(_ candidate: CuaMCPProxy, generation: UUID,
                                     timeout: Int32 = 60) async throws {
+        guard let service = cuaService else { throw CuaMCPProxyError.notStarted }
+        verifiedCuaCapabilitiesGeneration = nil
         try await verifyCuaPermissions(candidate, generation: generation, timeout: timeout)
 
-        // Permission setup remains available while the initial lock state is
-        // unknown. Actual screen probes wait for an observed unlock.
+        // Permission checks can run before the first observed unlock. Capture
+        // and accessibility proof must both finish in the unlocked session.
         guard sessionLock.allowsControl else { return }
-
+        let probeLockGeneration = lockGeneration
         let screenshot = try await candidate.callTool(
-            name: "get_desktop_state",
-            argumentsJSON: Data("{}".utf8), timeout: timeout
+            name: "get_desktop_state", argumentsJSON: Data("{}".utf8), timeout: timeout
         )
         try requireCurrentLifecycle(generation)
         guard let screenshotResult = Self.toolResult(screenshot),
-              let screenshotContent = screenshotResult["content"] as? [[String: Any]],
-              screenshotContent.contains(where: { $0["type"] as? String == "image" && $0["mimeType"] as? String == "image/png" }) else {
+              let content = screenshotResult["content"] as? [[String: Any]],
+              content.contains(where: Self.hasCapturePixels) else {
             throw CuaMCPProxyError.functionalProbeFailed
         }
-
         let accessibility = try await candidate.callTool(
-            name: "get_accessibility_tree",
-            argumentsJSON: Data("{}".utf8), timeout: timeout
+            name: "get_accessibility_tree", argumentsJSON: Data("{}".utf8), timeout: timeout
         )
         try requireCurrentLifecycle(generation)
-        guard let accessibilityResult = Self.toolResult(accessibility),
-              let accessibilityContent = accessibilityResult["content"] as? [[String: Any]],
-              !accessibilityContent.isEmpty else {
+        guard let result = Self.toolResult(accessibility),
+              let content = result["content"] as? [[String: Any]],
+              content.contains(where: { $0["type"] as? String == "text" && !($0["text"] as? String ?? "").isEmpty }) else {
             throw CuaMCPProxyError.functionalProbeFailed
         }
+        guard cuaService === service, service.isRunning, sessionLock.allowsControl,
+              lockGeneration == probeLockGeneration else { throw CancellationError() }
+        let permissions = hostPermissions()
+        guard permissions.accessibility && permissions.screenRecording else { throw CuaMCPProxyError.permissionsRequired }
+        verifiedCuaCapabilitiesGeneration = service.generation
+    }
+
+    private static func hasCapturePixels(_ item: [String: Any]) -> Bool {
+        guard item["type"] as? String == "image", item["mimeType"] as? String == "image/png",
+              let base64 = item["data"] as? String, let data = Data(base64Encoded: base64),
+              let image = NSBitmapImageRep(data: data) else { return false }
+        return image.pixelsWide > 0 && image.pixelsHigh > 0
     }
 
     private func verifyCuaPermissions(_ candidate: CuaMCPProxy, generation: UUID,
                                       timeout: Int32 = 60) async throws {
-        let permissions = try await candidate.callTool(
-            name: "check_permissions",
-            argumentsJSON: CuaDriverCompatibility.permissionProbeArgumentsJSON,
-            timeout: timeout
-        )
+        guard let service = cuaService else { throw CuaMCPProxyError.notStarted }
+        let snapshot = try await readCuaPermissionSnapshot(candidate, service: service, generation: generation, timeout: timeout)
+        guard snapshot.hostAttributionValid else { throw CuaMCPProxyError.serviceMismatch }
+        guard snapshot.accessibility && snapshot.screenRecording else { throw CuaMCPProxyError.permissionsRequired }
+    }
+
+    private func verifyCuaHostIdentity(_ candidate: CuaMCPProxy, generation: UUID) async throws {
+        guard let service = cuaService, service.isRunning else { throw CuaMCPProxyError.serviceMismatch }
+        let response = try await candidate.hostIdentityReport()
         try requireCurrentLifecycle(generation)
-        let permissionResult = Self.toolResult(permissions)
-        let structured = permissionResult?["structuredContent"] as? [String: Any]
-        let envelope = (try? JSONSerialization.jsonObject(with: permissions)) as? [String: Any]
-        let rawResult = envelope?["result"] as? [String: Any]
-        let rpcError = envelope?["error"] != nil
-        let toolError = rawResult?["isError"] as? Bool == true
-        let hasStructured = structured != nil
-        let accessibility = structured?["accessibility"] as? Bool == true
-        let screenRecording = structured?["screen_recording"] as? Bool == true
-        if let failure = Self.permissionProbeFailure(rpcError: rpcError, toolError: toolError,
-                                                     hasStructured: hasStructured, accessibility: accessibility,
-                                                     screenRecording: screenRecording) {
-            logger.error("Cua permission probe failed rpcError=\(rpcError, privacy: .public) toolError=\(toolError, privacy: .public) structured=\(hasStructured, privacy: .public) accessibility=\(accessibility, privacy: .public) screenRecording=\(screenRecording, privacy: .public)")
-            throw failure
+        guard cuaService === service, service.isRunning,
+              Self.validCuaHostIdentity(response, executableURL: service.executableURL, hostPID: Darwin.getpid()) else {
+            throw CuaMCPProxyError.serviceMismatch
+        }
+        verifiedCuaHostGeneration = service.generation
+    }
+
+    static func validCuaHostIdentity(_ response: Data, executableURL: URL, hostPID: Int32) -> Bool {
+        guard let structured = toolResult(response)?["structuredContent"] as? [String: Any],
+              structured["schema_version"] as? String == CuaDriverCompatibility.schemaVersion,
+              structured["driver_version"] as? String == CuaDriverCompatibility.version,
+              structured["platform"] as? String == "macos",
+              let checks = structured["checks"] as? [[String: Any]] else { return false }
+        let identity = checks.filter { $0["name"] as? String == "bundle_identity" }
+        guard identity.count == 1, identity[0]["status"] as? String == "pass",
+              let data = identity[0]["data"] as? [String: Any],
+              data["bundle_identifier"] as? String == CuaDriverCompatibility.hostBundleIdentifier,
+              data["configured_bundle_identifier"] as? String == CuaDriverCompatibility.hostBundleIdentifier,
+              data["identity_source"] as? String == "parent_application",
+              data["parent_process_id"] as? Int32 == hostPID,
+              let executable = data["executable_path"] as? String else { return false }
+        return URL(fileURLWithPath: executable).resolvingSymlinksInPath().standardizedFileURL
+            == executableURL.resolvingSymlinksInPath().standardizedFileURL
+    }
+
+    private func readCuaPermissionSnapshot(_ candidate: CuaMCPProxy, service: CuaEmbeddedService, generation: UUID,
+                                          timeout: Int32) async throws -> CuaDriverPermissionSnapshot {
+        guard service.isRunning, verifiedCuaHostGeneration == service.generation else { throw CuaMCPProxyError.serviceMismatch }
+        do {
+            let permissions = try await candidate.callTool(
+                name: "check_permissions",
+                argumentsJSON: CuaDriverCompatibility.permissionProbeArgumentsJSON,
+                timeout: timeout
+            )
+            try requireCurrentLifecycle(generation)
+            guard cuaService === service, service.isRunning,
+                  let structured = Self.toolResult(permissions)?["structuredContent"] as? [String: Any] else {
+                throw CuaMCPProxyError.functionalProbeFailed
+            }
+            let snapshot = try CuaDriverPermissionSnapshot.parse(structured, daemonPID: service.processIdentifier, hostPID: Darwin.getpid(),
+                verificationKey: "\(CuaDriverCompatibility.version):\(service.generation.uuidString):\(service.processIdentifier)")
+            let native = hostPermissions()
+            let accessibility = snapshot.accessibility && native.accessibility
+            let screenRecording = snapshot.screenRecording && native.screenRecording
+            if !snapshot.hostAttributionValid || !accessibility || !screenRecording { verifiedCuaCapabilitiesGeneration = nil }
+            return CuaDriverPermissionSnapshot(accessibility: accessibility, screenRecording: screenRecording,
+                                               hostAttributionValid: snapshot.hostAttributionValid, verificationKey: snapshot.verificationKey)
+        } catch {
+            if cuaService === service { verifiedCuaCapabilitiesGeneration = nil }
+            throw error
         }
     }
 

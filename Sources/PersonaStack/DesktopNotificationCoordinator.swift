@@ -33,6 +33,35 @@ final class DesktopNotificationCoordinator: NSObject, UNUserNotificationCenterDe
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
+    func verifyPermissionDelivery() async throws -> Bool {
+        let content = UNMutableNotificationContent()
+        content.title = "PersonaStack"
+        content.body = "Notifications are working on this Mac."
+        let request = UNNotificationRequest(identifier: "personastack-permission-test-\(UUID().uuidString)", content: content, trigger: nil)
+        defer { center.removeDeliveredNotifications(withIdentifiers: [request.identifier]) }
+        return try await Self.probePermissionDelivery(
+            request: request,
+            submit: { [center] request in try await center.add(request) },
+            deliveredIDs: { [center] in await center.deliveredNotifications().map(\.request.identifier) }
+        )
+    }
+
+    static func probePermissionDelivery(
+        request: UNNotificationRequest,
+        submit: @MainActor (UNNotificationRequest) async throws -> Void,
+        deliveredIDs: @MainActor () async -> [String],
+        wait: @MainActor () async throws -> Void = { try await Task.sleep(for: .milliseconds(200)) }
+    ) async throws -> Bool {
+        try Task.checkCancellation()
+        try await submit(request)
+        for _ in 0..<10 {
+            try Task.checkCancellation()
+            if await deliveredIDs().contains(request.identifier) { return true }
+            try await wait()
+        }
+        return false
+    }
+
     func postUpdateAvailable(version: String) {
         let content = UNMutableNotificationContent()
         content.title = "PersonaStack update available"

@@ -22,13 +22,13 @@ extension CuaMCPProxyError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .permissionsRequired:
-            return "Grant Accessibility and Screen Recording to CuaDriver.app, then retry setup."
+            return "Grant Accessibility and Screen Recording to PersonaStack in its permissions checklist, then retry setup."
         case .functionalProbeFailed:
-            return "CuaDriver.app did not return a usable screenshot and accessibility snapshot. Check its permissions and retry."
+            return "PersonaStack could not verify screen capture and accessibility. Check its permissions checklist and retry."
         case .serviceRunning:
             return "Quit CuaDriver.app, then retry Desktop Control repair. Repair will not terminate the running service or replace its managed files."
         case .serviceMismatch:
-            return "CuaDriver.app does not own the selected local service. Quit the other Cua service, then retry Desktop Control setup."
+            return "PersonaStack could not verify its desktop control service. Retry the permissions setup or repair Desktop Control."
         default:
             return "The local Cua service could not complete its setup check. Retry setup or repair Cua."
         }
@@ -61,14 +61,13 @@ public actor CuaMCPProxy {
         guard !started else { throw CuaMCPProxyError.alreadyStarted }
         try verifyDaemonIdentity()
         process.executableURL = executableURL
-        // Cua can auto-launch an app by name if its
-        // selected socket disappears. The proxy-only embedded flag disables
-        // that fallback; the already-running signed app remains the GUI owner.
+        // The proxy may only connect to the daemon directly hosted by
+        // PersonaStack. Embedded mode forbids standalone-app fallback.
         process.arguments = ["mcp"] + (socketURL.map { ["--socket", $0.path, "--embedded"] } ?? [])
         process.environment = Self.allowedChildEnvironment()
         process.standardInput = input
         process.standardOutput = output
-        process.standardError = FileHandle.standardError
+        process.standardError = FileHandle.nullDevice
         do { try process.run() }
         catch { throw CuaMCPProxyError.processExited }
         started = true
@@ -105,6 +104,15 @@ public actor CuaMCPProxy {
 
     public func callTool(name: String, argumentsJSON: Data, timeout: Int32 = 60) throws -> Data {
         guard CuaDriverCompatibility.exposedTools.contains(name) else { throw CuaMCPProxyError.invalidToolName }
+        return try invokeTool(name: name, argumentsJSON: argumentsJSON, timeout: timeout)
+    }
+
+    /// Native-only diagnostic. Remote callers cannot select a health surface.
+    public func hostIdentityReport() throws -> Data {
+        try invokeTool(name: "health_report", argumentsJSON: Data(#"{"include":["bundle_identity"]}"#.utf8), timeout: 5)
+    }
+
+    private func invokeTool(name: String, argumentsJSON: Data, timeout: Int32) throws -> Data {
         guard let arguments = try? JSONSerialization.jsonObject(with: argumentsJSON),
               arguments is [String: Any] else { throw CuaMCPProxyError.invalidArguments }
         let params = try JSONSerialization.data(withJSONObject: ["name": name, "arguments": arguments])
@@ -306,6 +314,14 @@ private final class CuaProxyInterruption: @unchecked Sendable {
 /// Read the kernel-reported PID of the process serving one Unix socket.
 /// A socket filename or Cua's shared PID file is not an ownership proof.
 public enum CuaSocketIdentity {
+    public static func parentPID(of pid: Int32) -> Int32? {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size,
+              info.pbi_uid == Darwin.getuid(), info.pbi_ppid > 0 else { return nil }
+        return Int32(info.pbi_ppid)
+    }
+
     public static func peerPID(at socketURL: URL) -> Int32? {
         guard socketURL.isFileURL else { return nil }
         var address = sockaddr_un()
@@ -340,5 +356,99 @@ public enum CuaSocketIdentity {
         guard Darwin.getsockopt(descriptor, SOL_LOCAL, LOCAL_PEERPID, &pid, &length) == 0,
               length == MemoryLayout<pid_t>.size, pid > 0 else { return nil }
         return pid
+    }
+}
+
+/// Owns one daemon child and a private endpoint. macOS grants belong to the
+/// PersonaStack host that spawns it, never a LaunchServices-started Cua app.
+@MainActor
+public final class CuaEmbeddedService {
+    public let generation = UUID()
+    public let executableURL: URL
+    public let socketURL: URL
+    public let directoryURL: URL
+    private let process = Process()
+    private let lifetime = Pipe()
+    private var launched = false
+    private var ownsDirectory = false
+
+    public init(executableURL: URL) {
+        self.executableURL = executableURL
+        directoryURL = URL(fileURLWithPath: "/tmp/ps-cua-\(UUID().uuidString)", isDirectory: true)
+        socketURL = directoryURL.appendingPathComponent("control.sock")
+    }
+
+    public var processIdentifier: Int32 { process.processIdentifier }
+    public var isRunning: Bool {
+        launched && process.isRunning
+            && CuaSocketIdentity.parentPID(of: process.processIdentifier) == Darwin.getpid()
+            && CuaSocketIdentity.peerPID(at: socketURL) == process.processIdentifier
+    }
+
+    public static func arguments(socketURL: URL, pidFileURL: URL) -> [String] {
+        ["serve", "--embedded", "--parent-liveness-stdio", "--socket", socketURL.path, "--pid-file", pidFileURL.path]
+    }
+
+    public func start(isCurrent: @MainActor () throws -> Void) async throws {
+        guard !launched else { throw CuaMCPProxyError.alreadyStarted }
+        try isCurrent()
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        ownsDirectory = true
+        process.executableURL = executableURL
+        process.arguments = Self.arguments(socketURL: socketURL, pidFileURL: directoryURL.appendingPathComponent("daemon.pid"))
+        process.environment = CuaDriverCompatibility.processEnvironment(from: ProcessInfo.processInfo.environment)
+        process.standardInput = lifetime
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            launched = true
+            let deadline = ContinuousClock.now + .seconds(10)
+            repeat {
+                try isCurrent()
+                guard process.isRunning else { throw CuaMCPProxyError.processExited }
+                guard CuaSocketIdentity.parentPID(of: process.processIdentifier) == Darwin.getpid() else {
+                    throw CuaMCPProxyError.serviceMismatch
+                }
+                if let peerPID = CuaSocketIdentity.peerPID(at: socketURL) {
+                    guard peerPID == process.processIdentifier else { throw CuaMCPProxyError.serviceMismatch }
+                    return
+                }
+                try await Task.sleep(for: .milliseconds(50))
+            } while ContinuousClock.now < deadline
+            throw CuaMCPProxyError.timeout
+        } catch {
+            _ = await stop()
+            throw error
+        }
+    }
+
+    public func stop() async -> Bool {
+        try? lifetime.fileHandleForWriting.close()
+        if launched && process.isRunning {
+            // EOF lets the embedded daemon settle its owned work first.
+            let gracefulDeadline = ContinuousClock.now + .seconds(1)
+            while process.isRunning && ContinuousClock.now < gracefulDeadline {
+                try? await Task.sleep(for: .milliseconds(25))
+            }
+            if process.isRunning { process.terminate() }
+            let terminateDeadline = ContinuousClock.now + .seconds(1)
+            while process.isRunning && ContinuousClock.now < terminateDeadline {
+                try? await Task.sleep(for: .milliseconds(25))
+            }
+            if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
+            let killDeadline = ContinuousClock.now + .milliseconds(500)
+            while process.isRunning && ContinuousClock.now < killDeadline {
+                try? await Task.sleep(for: .milliseconds(25))
+            }
+            guard !process.isRunning else { return false }
+        }
+        if ownsDirectory {
+            do { try FileManager.default.removeItem(at: directoryURL) }
+            catch { return false }
+            ownsDirectory = false
+        }
+        return true
     }
 }

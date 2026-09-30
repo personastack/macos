@@ -26,6 +26,18 @@
   <true/>
   <key>NSMicrophoneUsageDescription</key>
   <string>Record audio attachments when you choose the microphone in persona chat.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Connect PersonaStack Desktop to your selected PersonaStack services on your local network.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Access Desktop files when you authorize PersonaStack Desktop Control.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>Access Documents files when you authorize PersonaStack Desktop Control.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>Access Downloads files when you authorize PersonaStack Desktop Control.</string>
+  <key>NSRemovableVolumesUsageDescription</key>
+  <string>Access selected removable volumes when you authorize PersonaStack Desktop Control.</string>
+  <key>NSNetworkVolumesUsageDescription</key>
+  <string>Access selected network volumes when you authorize PersonaStack Desktop Control.</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
   <key>NSAppTransportSecurity</key>

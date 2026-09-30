@@ -33,8 +33,7 @@ public struct SystemCuaProcessRunner: CuaProcessRunning {
         let stderr = Pipe()
         process.executableURL = executable
         process.arguments = arguments
-        let allowedEnvironment = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"]
-        process.environment = ProcessInfo.processInfo.environment.filter { allowedEnvironment.contains($0.key) }
+        process.environment = CuaDriverCompatibility.processEnvironment(from: ProcessInfo.processInfo.environment)
         process.standardOutput = stdout
         process.standardError = stderr
         try process.run()
@@ -217,7 +216,7 @@ public actor CuaDriverInstaller {
 
         let payload = extracted.appendingPathComponent("cua-driver-rs-\(CuaDriverCompatibility.version)-darwin-universal", isDirectory: true)
         let application = payload.appendingPathComponent("CuaDriver.app", isDirectory: true)
-        let executable = payload.appendingPathComponent("cua-driver")
+        let executable = application.appendingPathComponent("Contents/MacOS/cua-driver")
         guard fileManager.fileExists(atPath: application.path), fileManager.isExecutableFile(atPath: executable.path) else {
             throw CuaDriverInstallError.invalidLayout
         }
@@ -235,7 +234,7 @@ public actor CuaDriverInstaller {
         }
         return CuaDriverInstallation(
             applicationURL: installRoot.appendingPathComponent("CuaDriver.app", isDirectory: true),
-            executableURL: installRoot.appendingPathComponent("cua-driver"),
+            executableURL: installRoot.appendingPathComponent("CuaDriver.app/Contents/MacOS/cua-driver"),
             version: validated.version,
             toolNames: validated.toolNames
         )
@@ -243,7 +242,7 @@ public actor CuaDriverInstaller {
 
     private func validate(at root: URL) throws -> CuaDriverInstallation {
         let application = root.appendingPathComponent("CuaDriver.app", isDirectory: true)
-        let executable = root.appendingPathComponent("cua-driver")
+        let executable = application.appendingPathComponent("Contents/MacOS/cua-driver")
         guard fileManager.fileExists(atPath: application.path), fileManager.isExecutableFile(atPath: executable.path) else {
             throw CuaDriverInstallError.invalidLayout
         }
@@ -273,6 +272,13 @@ public actor CuaDriverInstaller {
         guard let info = NSDictionary(contentsOf: infoURL),
               info["CFBundleIdentifier"] as? String == CuaDriverCompatibility.bundleIdentifier else {
             throw CuaDriverInstallError.invalidLayout
+        }
+        let checksum = try processRunner.run(URL(fileURLWithPath: "/usr/bin/shasum"),
+                                             arguments: ["-a", "256", executableURL.path])
+        guard checksum.status == 0,
+              String(decoding: checksum.stdout, as: UTF8.self).split(whereSeparator: \.isWhitespace).first
+                == Substring(CuaDriverCompatibility.executableSHA256) else {
+            throw CuaDriverInstallError.checksumMismatch
         }
         let manifestResult = try run(executableURL, ["manifest", "--pretty"])
         guard let manifestData = Self.jsonObject(in: manifestResult.stdout) else {

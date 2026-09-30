@@ -15,6 +15,11 @@ private final class FakeDesktopUpdateClient: DesktopUpdateClient {
         self.preferences = preferences
     }
 
+    var automaticallyChecksForUpdates: Bool {
+        get { preferences.object(forKey: "SUEnableAutomaticChecks") as? Bool ?? true }
+        set { preferences.set(newValue, forKey: "SUEnableAutomaticChecks") }
+    }
+
     var automaticallyDownloadsUpdates: Bool {
         get { preferences.bool(forKey: automaticDownloadsKey) }
         set { preferences.set(newValue, forKey: automaticDownloadsKey) }
@@ -40,6 +45,13 @@ private final class RestartConfirmationState {
         #expect(client.didStart)
         #expect(updater.isAvailable)
         #expect(!updater.automaticallyDownloadsUpdates)
+
+        updater.automaticallyChecksForUpdates = false
+        #expect(!client.automaticallyChecksForUpdates)
+        #expect(!preferences.bool(forKey: "SUEnableAutomaticChecks"))
+        updater.automaticallyChecksForUpdates = true
+        #expect(client.automaticallyChecksForUpdates)
+        #expect(preferences.bool(forKey: "SUEnableAutomaticChecks"))
 
         updater.automaticallyDownloadsUpdates = true
         #expect(preferences.bool(forKey: "SUAutomaticallyUpdate"))

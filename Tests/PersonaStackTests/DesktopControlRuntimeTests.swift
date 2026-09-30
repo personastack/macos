@@ -28,10 +28,30 @@ private actor DesktopControlInstallerFixture: DesktopControlDriverInstalling {
     }
 }
 
+@MainActor
+private final class FinishedDesktopControlPermissionFixture: DesktopControlPermissionPresenting {
+    private(set) var isFinishing = false
+    func presentForSetup() async throws { isFinishing = true }
+    func completeSetup() { isFinishing = false }
+    func failSetup(message: String) { isFinishing = false }
+    func cancel() { isFinishing = false }
+}
+
 private struct EmptyDesktopControlCredentialStore: DesktopControlCredentialStoring {
     func save(_ installation: DesktopControlInstallation) throws {}
     func load() throws -> DesktopControlInstallation? { nil }
     func delete() throws {}
+}
+
+private final class PermissionPreparationCredentialStore: DesktopControlCredentialStoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private var reads = 0
+    let installation: DesktopControlInstallation
+    init(installation: DesktopControlInstallation) { self.installation = installation }
+    var readCount: Int { lock.withLock { reads } }
+    func load() throws -> DesktopControlInstallation? { lock.withLock { reads += 1; return installation } }
+    func save(_ installation: DesktopControlInstallation) throws { Issue.record("Permission preparation cannot save enrollment") }
+    func delete() throws { Issue.record("Permission preparation cannot delete enrollment") }
 }
 
 private struct DeniedDesktopControlCredentialStore: DesktopControlCredentialStoring {
@@ -95,6 +115,199 @@ private final class SuspendedDesktopControlCredentialStore: DesktopControlCreden
     #expect(!denied.hasActiveInstallation)
     #expect(await installer.repairArguments.isEmpty)
     #expect(DesktopControlEnrollmentError.credentialStoreUnavailable.localizedDescription.contains("Keychain"))
+}
+
+@Test @MainActor func passivePermissionSnapshotCannotInstallOrUnpauseTheRelay() async {
+    let installer = DesktopControlInstallerFixture(errors: [])
+    let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: EmptyDesktopControlCredentialStore(),
+                                                       readiness: "paused", paused: true)
+    await #expect(throws: CuaMCPProxyError.notStarted) { try await runtime.cuaPermissionSnapshot() }
+    #expect(runtime.paused)
+    #expect(runtime.readiness == "paused")
+    #expect(await installer.repairArguments.isEmpty)
+}
+
+@Test @MainActor func nativePermissionPreparationFailurePreservesPauseAndDoesNotEnroll() async {
+    let installer = DesktopControlInstallerFixture(errors: [CuaDriverInstallError.invalidLayout])
+    let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: EmptyDesktopControlCredentialStore(),
+                                                       readiness: "paused", paused: true, sessionLockState: .unlocked)
+    await #expect(throws: CuaDriverInstallError.invalidLayout) { try await runtime.prepareCuaPermissions() }
+    #expect(runtime.paused)
+    #expect(runtime.readiness == "paused")
+    #expect(!runtime.hasActiveInstallation)
+    #expect(!runtime.gatewayConnected)
+    #expect(await installer.repairArguments == [false])
+}
+
+@Test @MainActor func nativePermissionVerificationKeepsTheLockedSessionFence() async {
+    let installer = DesktopControlInstallerFixture(errors: [])
+    let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: EmptyDesktopControlCredentialStore(),
+                                                       readiness: "locked", sessionLockState: .locked)
+    await #expect(throws: DesktopControlEnrollmentError.nativeCapabilitiesUnavailable) { try await runtime.prepareCuaPermissions() }
+    await #expect(throws: CuaMCPProxyError.permissionsRequired) { try await runtime.verifyCuaCapabilitiesForPermissions() }
+    #expect(await installer.repairArguments.isEmpty)
+    #expect(runtime.readiness == "locked")
+}
+
+private struct EmbeddedRuntimeDriverFixture: DesktopControlDriverInstalling {
+    let executable: URL
+    func validateOrInstall(repair: Bool,
+                          commitManagedInstall: (@MainActor @Sendable (URL, URL, Bool) throws -> Void)?) async throws -> CuaDriverInstallation {
+        CuaDriverInstallation(applicationURL: executable.deletingLastPathComponent(), executableURL: executable,
+                              version: CuaDriverCompatibility.version, toolNames: CuaDriverCompatibility.requiredTools)
+    }
+}
+
+/// Only this fixture's socket, generated pixels, and AX text are observed.
+/// It never calls Cua, TCC, or a user's desktop.
+private func makeRuntimeDriverFixture(_ root: URL) throws -> URL {
+    let executable = root.appendingPathComponent("driver.py")
+    let script = #"""
+#!/usr/bin/python3
+import base64, json, os, socket, struct, sys, threading, time, zlib
+args = sys.argv[1:]
+path = args[args.index('--socket') + 1]
+if args[0] == 'serve':
+    root = os.path.dirname(os.path.realpath(__file__))
+    def watch_fixture_exit():
+        while True:
+            if os.path.exists(os.path.join(root, 'exit-daemon')): os._exit(0)
+            time.sleep(0.01)
+    threading.Thread(target=watch_fixture_exit, daemon=True).start()
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(path)
+    listener.listen(16)
+    def drain_connections():
+        while True:
+            connection, _ = listener.accept()
+            connection.close()
+    threading.Thread(target=drain_connections, daemon=True).start()
+    with open(args[args.index('--pid-file') + 1], 'w') as out: out.write(str(os.getpid()))
+    sys.stdin.buffer.read()
+    listener.close()
+    sys.exit(0)
+pid_path = os.path.join(os.path.dirname(path), 'daemon.pid')
+for attempt in range(100):
+    if os.path.exists(pid_path): break
+    time.sleep(0.01)
+with open(pid_path) as source: daemon = int(source.read())
+host = os.getppid()
+root = os.path.dirname(os.path.realpath(__file__))
+def chunk(kind, data):
+    return struct.pack('>I',len(data))+kind+data+struct.pack('>I',zlib.crc32(kind+data)&0xffffffff)
+png = b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',1,1,8,2,0,0,0))+chunk(b'IDAT',zlib.compress(b'\x00\x00\x00\x00'))+chunk(b'IEND',b'')
+names = ['get_desktop_state','get_accessibility_tree','get_window_state','move_cursor','click','type_text','press_key','launch_app','list_apps','list_windows']
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request: continue
+    method = request['method']
+    if method == 'initialize': result = {'protocolVersion':'2024-11-05','capabilities':{},'serverInfo':{'name':'fixture','version':'1'}}
+    elif method == 'tools/list': result = {'tools':[{'name':name} for name in names]}
+    elif method == 'tools/call':
+        name = request['params']['name']
+        if name == 'health_report':
+            assert request['params']['arguments'] == {'include':['bundle_identity']}
+            result = {'structuredContent':{'schema_version':'1','driver_version':'0.29.1','platform':'macos','checks':[{'name':'bundle_identity','status':'pass','data':{'bundle_identifier':'ai.personastack.desktop','configured_bundle_identifier':'ai.personastack.desktop','identity_source':'parent_application','parent_process_id':host,'executable_path':os.path.realpath(__file__)}}]}}
+        elif name == 'check_permissions':
+            assert request['params']['arguments'] == {'prompt':False,'probe_direct_capture':False}
+            result = {'structuredContent':{'accessibility':True,'screen_recording':True,'source':{'attribution':'host','host_bundle_id':'ai.personastack.desktop','embedded':True,'disclaim_env':False,'pid':daemon,'responsible_ppid':host}}}
+        elif name == 'get_desktop_state':
+            if os.path.exists(os.path.join(root,'exit-proxy')): os._exit(1)
+            pixels = 'bad' if os.path.exists(os.path.join(root,'invalid-pixels')) else base64.b64encode(png).decode()
+            result = {'content':[{'type':'image','mimeType':'image/png','data':pixels}]}
+        elif name == 'get_accessibility_tree': result = {'content':[{'type':'text','text':'{"application":"fixture","children":[]}'}]}
+        else: raise RuntimeError('unplanned tool: '+name)
+    else: raise RuntimeError('unplanned method: '+method)
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
+"""#
+    try Data(script.utf8).write(to: executable)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+    return executable
+}
+
+@Test @MainActor func permissionPreparationCannotAdvertiseGuiReadyWithoutCurrentGrantsAndPixels() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-runtime-fixture-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let executable = try makeRuntimeDriverFixture(root)
+    var grants = false
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: Data(#"{"installation_id":"saved-preflight","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8))
+    let credentials = PermissionPreparationCredentialStore(installation: installation)
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: EmbeddedRuntimeDriverFixture(executable: executable), credentials: credentials,
+        readiness: "paused", paused: true, sessionLockState: .unlocked, hostPermissions: { (grants, grants) }
+    )
+    do {
+        try await runtime.prepareCuaPermissions()
+        let initial = try await runtime.cuaPermissionSnapshot()
+        #expect(initial.hostAttributionValid && !initial.accessibility && !initial.screenRecording)
+        #expect(!runtime.isCuaReady())
+        #expect(runtime.paused && runtime.readiness == "paused")
+        #expect(!runtime.hasActiveInstallation && !runtime.gatewayConnected)
+        await #expect(throws: CuaMCPProxyError.permissionsRequired) { try await runtime.verifyCuaCapabilitiesForPermissions() }
+        try await runtime.prepareCuaPermissions()
+        #expect(try await runtime.cuaPermissionSnapshot().verificationKey == initial.verificationKey)
+        grants = true
+        #expect(!runtime.isCuaReady())
+        try await runtime.verifyCuaCapabilitiesForPermissions()
+        #expect(runtime.isCuaReady())
+        #expect(runtime.paused && runtime.readiness == "paused")
+        grants = false
+        #expect(!runtime.isCuaReady())
+        grants = true
+        #expect(!runtime.isCuaReady())
+        let exitProxy = root.appendingPathComponent("exit-proxy")
+        try Data().write(to: exitProxy)
+        await #expect(throws: CuaMCPProxyError.processExited) { try await runtime.verifyCuaCapabilitiesForPermissions() }
+        #expect(!runtime.isCuaReady())
+        try FileManager.default.removeItem(at: exitProxy)
+        try await runtime.prepareCuaPermissions()
+        #expect(try await runtime.cuaPermissionSnapshot().verificationKey == initial.verificationKey)
+        #expect(runtime.paused && runtime.readiness == "paused")
+        try await runtime.verifyCuaCapabilitiesForPermissions()
+        #expect(runtime.isCuaReady())
+        let exitDaemon = root.appendingPathComponent("exit-daemon")
+        try Data().write(to: exitDaemon)
+        for _ in 0..<100 {
+            if (try? await runtime.cuaPermissionSnapshot()) == nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(!runtime.isCuaReady())
+        try FileManager.default.removeItem(at: exitDaemon)
+        try await runtime.prepareCuaPermissions()
+        let replacement = try await runtime.cuaPermissionSnapshot()
+        #expect(replacement.verificationKey != initial.verificationKey)
+        #expect(runtime.paused && runtime.readiness == "paused")
+        #expect(!runtime.isCuaReady())
+        try await runtime.verifyCuaCapabilitiesForPermissions()
+        #expect(runtime.isCuaReady())
+        try Data().write(to: root.appendingPathComponent("invalid-pixels"))
+        await #expect(throws: CuaMCPProxyError.functionalProbeFailed) { try await runtime.verifyCuaCapabilitiesForPermissions() }
+        #expect(!runtime.isCuaReady())
+        try await runtime.restartCuaAfterPermissionChange()
+        #expect(try await runtime.cuaPermissionSnapshot().verificationKey != initial.verificationKey)
+        #expect(runtime.paused && runtime.readiness == "paused")
+        #expect(!runtime.isCuaReady())
+        #expect(credentials.readCount == 0)
+        #expect(!runtime.hasActiveInstallation && !runtime.gatewayConnected && !runtime.hasPendingRelayReconnectForTesting)
+        await runtime.shutdownForQuit()
+    } catch {
+        await runtime.shutdownForQuit()
+        throw error
+    }
+}
+
+@Test @MainActor func permissionPreparationFailureCannotReadSavedEnrollmentOrReconnect() async throws {
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: Data(#"{"installation_id":"saved-preflight","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8))
+    let credentials = PermissionPreparationCredentialStore(installation: installation)
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: [CuaDriverInstallError.invalidLayout]),
+        credentials: credentials, readiness: "paused", paused: true, sessionLockState: .unlocked
+    )
+    await #expect(throws: CuaDriverInstallError.invalidLayout) { try await runtime.prepareCuaPermissions() }
+    #expect(credentials.readCount == 0)
+    #expect(!runtime.hasActiveInstallation && !runtime.gatewayConnected && !runtime.hasPendingRelayReconnectForTesting)
+    #expect(runtime.paused && runtime.readiness == "paused")
 }
 
 @Test @MainActor func heartbeatStopsReportingReadyAfterEmbeddedCuaProxyExits() async {
@@ -182,8 +395,8 @@ private struct SavedDesktopControlCredentialStore: DesktopControlCredentialStori
         installer: DesktopControlInstallerFixture(errors: []),
         credentials: SavedDesktopControlCredentialStore(installation: installation),
         installation: installation, connected: true, readiness: "ready",
-        ownedCuaApplication: NSRunningApplication.current,
-        stopCuaApplication: { _, _ in cuaStops += 1; return true })
+        ownedCuaService: CuaEmbeddedService(executableURL: URL(fileURLWithPath: "/fake/cua")),
+        stopCuaService: { _ in cuaStops += 1; return true })
     let generation = try runtime.beginResume()
 
     await runtime.shutdownForQuit()
@@ -202,8 +415,8 @@ private struct SavedDesktopControlCredentialStore: DesktopControlCredentialStori
         let runtime = DesktopControlRuntime.makeForTesting(
             installer: DesktopControlInstallerFixture(errors: []),
             credentials: EmptyDesktopControlCredentialStore(),
-            ownedCuaApplication: ownsCua ? NSRunningApplication.current : nil,
-            stopCuaApplication: { _, _ in cuaStops += 1; return true }
+            ownedCuaService: ownsCua ? CuaEmbeddedService(executableURL: URL(fileURLWithPath: "/fake/cua")) : nil,
+            stopCuaService: { _ in cuaStops += 1; return true }
         )
 
         try await runtime.disconnect()
@@ -217,15 +430,15 @@ private struct SavedDesktopControlCredentialStore: DesktopControlCredentialStori
     let runtime = DesktopControlRuntime.makeForTesting(
         installer: DesktopControlInstallerFixture(errors: []),
         credentials: EmptyDesktopControlCredentialStore(),
-        ownedCuaApplication: NSRunningApplication.current,
-        stopCuaApplication: { _, _ in false }
+        ownedCuaService: CuaEmbeddedService(executableURL: URL(fileURLWithPath: "/fake/cua")),
+        stopCuaService: { _ in false }
     )
 
     do {
         try await runtime.disconnect()
         Issue.record("expected local Cua cleanup failure")
     } catch {
-        #expect(error.localizedDescription.contains("could not stop the CuaDriver service"))
+        #expect(error.localizedDescription.contains("PersonaStack could not stop its desktop control service"))
     }
     #expect(!runtime.gatewayConnected)
 }
@@ -240,8 +453,8 @@ private struct SavedDesktopControlCredentialStore: DesktopControlCredentialStori
         installation: installation,
         connected: true,
         readiness: "ready",
-        ownedCuaApplication: NSRunningApplication.current,
-        stopCuaApplication: { _, _ in cuaStops += 1; return true }
+        ownedCuaService: CuaEmbeddedService(executableURL: URL(fileURLWithPath: "/fake/cua")),
+        stopCuaService: { _ in cuaStops += 1; return true }
     )
 
     try await runtime.prepareForEnvironmentSwitch()
@@ -308,8 +521,8 @@ private struct SavedDesktopControlCredentialStore: DesktopControlCredentialStori
         installation: installation,
         connected: true,
         readiness: "ready",
-        ownedCuaApplication: NSRunningApplication.current,
-        stopCuaApplication: { _, _ in false }
+        ownedCuaService: CuaEmbeddedService(executableURL: URL(fileURLWithPath: "/fake/cua")),
+        stopCuaService: { _ in false }
     )
 
     await #expect(throws: DesktopControlEnvironmentSwitchError.cleanupFailed) {
@@ -337,8 +550,8 @@ private struct SavedDesktopControlCredentialStore: DesktopControlCredentialStori
         installation: installation,
         connected: true,
         readiness: "ready",
-        ownedCuaApplication: NSRunningApplication.current,
-        stopCuaApplication: { _, _ in false }
+        ownedCuaService: CuaEmbeddedService(executableURL: URL(fileURLWithPath: "/fake/cua")),
+        stopCuaService: { _ in false }
     )
 
     await #expect(throws: DesktopControlEnvironmentSwitchError.cleanupFailed) {
@@ -471,10 +684,13 @@ private final class DesktopControlSetupRuntimeFixture: DesktopControlSetupRuntim
         runtime: runtime,
         enrollment: enrollment,
         credentials: SavedDesktopControlCredentialStore(installation: installation),
-        configurationProvider: { .production }
+        configurationProvider: { .production },
+        permissionPresenter: FinishedDesktopControlPermissionFixture()
     )
     let page = DesktopControlSetupManager.Page(appURL: appURL)
     page.setupScope.synchronize("workspace-setup-session")
+
+    _ = try await manager.apply(.permissions(scope: "workspace-setup-session", phase: .open, message: nil), page: page)
 
     do {
         _ = try await manager.apply(
@@ -592,13 +808,16 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
         CuaMCPProxyError.permissionsRequired,
     ])
     let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: EmptyDesktopControlCredentialStore())
-    let manager = DesktopControlSetupManager(runtime: runtime, credentials: EmptyDesktopControlCredentialStore())
+    let manager = DesktopControlSetupManager(runtime: runtime, credentials: EmptyDesktopControlCredentialStore(),
+                                            permissionPresenter: FinishedDesktopControlPermissionFixture())
     let page = DesktopControlSetupManager.Page(appURL: URL(string: "https://personastack.ai")!)
     page.setupScope.synchronize("workspace-setup-session")
     let command = DesktopControlSetupCommand.prepare(
         scope: "workspace-setup-session",
         enrollmentTicket: String(repeating: "a", count: 43)
     )
+
+    _ = try await manager.apply(.permissions(scope: "workspace-setup-session", phase: .open, message: nil), page: page)
 
     for _ in 0..<2 {
         do {
@@ -674,8 +893,8 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
             connectionID: UUID(), installation: installation, connected: true,
             readiness: "ready", relayStateReader: DesktopControlRelayStateFixture(active: hasActiveConfig),
             preferences: preferences,
-            ownedCuaApplication: ownsCua ? NSRunningApplication.current : nil,
-            stopCuaApplication: { _, _ in cuaStops += 1; return true }
+            ownedCuaService: ownsCua ? CuaEmbeddedService(executableURL: URL(fileURLWithPath: "/fake/cua")) : nil,
+            stopCuaService: { _ in cuaStops += 1; return true }
         )
 
         await runtime.finishSetupIfIdle()
@@ -700,8 +919,8 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
         credentials: SavedDesktopControlCredentialStore(installation: installation),
         connectionID: UUID(), installation: installation, connected: true,
         readiness: "ready", relayStateReader: DesktopControlRelayStateFixture(active: false),
-        preferences: preferences, ownedCuaApplication: NSRunningApplication.current,
-        stopCuaApplication: { _, _ in cuaStops += 1; return false }
+        preferences: preferences, ownedCuaService: CuaEmbeddedService(executableURL: URL(fileURLWithPath: "/fake/cua")),
+        stopCuaService: { _ in cuaStops += 1; return false }
     )
 
     await runtime.finishSetupIfIdle()
@@ -764,11 +983,13 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
         preferences: preferences,
         registerLoginItem: { loginItemRegistrations += 1 },
         loginItemStatus: { loginItemRegistrations > 0 ? .enabled : .notRegistered },
-        configurationProvider: { .production }
+        configurationProvider: { .production },
+        permissionPresenter: FinishedDesktopControlPermissionFixture()
     )
     let page = DesktopControlSetupManager.Page(appURL: appURL)
     let scope = "workspace-setup-session"
     page.setupScope.synchronize(scope)
+    _ = try await manager.apply(.permissions(scope: scope, phase: .open, message: nil), page: page)
     let setupGeneration = page.setupScope.generation
     let body: [String: Any] = [
         "version": "1", "action": "prepare", "scope": scope,
@@ -851,10 +1072,12 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
         credentials: SavedDesktopControlCredentialStore(installation: installation),
         preferences: preferences,
         registerLoginItem: {},
-        loginItemStatus: { .requiresApproval }
+        loginItemStatus: { .requiresApproval },
+        permissionPresenter: FinishedDesktopControlPermissionFixture()
     )
     let page = DesktopControlSetupManager.Page(appURL: appURL)
     page.setupScope.synchronize("workspace-setup-session")
+    _ = try await manager.apply(.permissions(scope: "workspace-setup-session", phase: .open, message: nil), page: page)
     do {
         _ = try await manager.apply(.prepare(scope: "workspace-setup-session", enrollmentTicket: String(repeating: "a", count: 43)), page: page)
         Issue.record("setup should wait for login item approval")

@@ -14,6 +14,7 @@ enum ScheduledUpdateStage: Sendable {
 @MainActor
 protocol DesktopUpdateClient: AnyObject {
     var canCheckForUpdates: Bool { get }
+    var automaticallyChecksForUpdates: Bool { get set }
     var automaticallyDownloadsUpdates: Bool { get set }
     func start() throws
     func checkForUpdates()
@@ -28,6 +29,10 @@ private final class SparkleUpdateClient: DesktopUpdateClient {
     }
 
     var canCheckForUpdates: Bool { updater.canCheckForUpdates }
+    var automaticallyChecksForUpdates: Bool {
+        get { updater.automaticallyChecksForUpdates }
+        set { updater.automaticallyChecksForUpdates = newValue }
+    }
     var automaticallyDownloadsUpdates: Bool {
         get { updater.automaticallyDownloadsUpdates }
         set { updater.automaticallyDownloadsUpdates = newValue }
@@ -140,6 +145,15 @@ final class DesktopUpdater: NSObject, ObservableObject {
             self.updater = nil
             userDriver = nil
             statusMessage = "Automatic updates couldn't start. Check the connection and try again."
+        }
+    }
+
+    var automaticallyChecksForUpdates: Bool {
+        get { updater?.automaticallyChecksForUpdates ?? (preferences.object(forKey: "SUEnableAutomaticChecks") as? Bool ?? true) }
+        set {
+            preferences.set(newValue, forKey: "SUEnableAutomaticChecks")
+            updater?.automaticallyChecksForUpdates = newValue
+            objectWillChange.send()
         }
     }
 
