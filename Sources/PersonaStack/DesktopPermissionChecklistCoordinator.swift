@@ -173,7 +173,7 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
 
     private func retainedSetupFailure(_ value: DesktopPermissionObservation, id: DesktopPermissionID,
                                       explicit: Bool) -> DesktopPermissionObservation? {
-        if explicit, value.state == .failed {
+        if explicit, [.failed, .restartRequired, .verificationRequired, .denied, .restricted, .unsupported].contains(value.state) {
             setupFailures[id] = SetupFailure(observation: value)
         } else if !explicit, var failure = setupFailures[id] {
             if !failure.anchored {

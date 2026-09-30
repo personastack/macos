@@ -218,6 +218,7 @@ for line in sys.stdin:
             assert request['params']['arguments'] == {'prompt':False,'probe_direct_capture':False}
             result = {'structuredContent':{'accessibility':True,'screen_recording':True,'source':{'attribution':'host','host_bundle_id':'ai.personastack.desktop','embedded':True,'disclaim_env':False,'pid':daemon,'responsible_ppid':host}}}
         elif name == 'get_desktop_state':
+            assert not os.path.exists(os.path.join(root, 'screen-denied')), 'AX verification must not capture a screen'
             if os.path.exists(os.path.join(root,'exit-proxy')): os._exit(1)
             pixels = 'bad' if os.path.exists(os.path.join(root,'invalid-pixels')) else base64.b64encode(png).decode()
             result = {'content':[{'type':'image','mimeType':'image/png','data':pixels}]}
@@ -333,19 +334,21 @@ private final class RuntimeInputTarget: DesktopInputPermissionTarget {
     } catch { await runtime.shutdownForQuit(); throw error }
 }
 
-@Test @MainActor func permissionInputUsesOnlyTheOwnedWindowAndNeverStartsEnrollment() async throws {
+@Test(arguments: [false, true]) @MainActor func permissionInputUsesOnlyTheOwnedWindowAndNeverStartsEnrollment(screenGranted: Bool) async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-input-fixture-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
     defer { try? FileManager.default.removeItem(at: root) }
+    if !screenGranted { try Data().write(to: root.appendingPathComponent("screen-denied")) }
     let executable = try makeRuntimeDriverFixture(root)
     let credentials = PermissionPreparationCredentialStore(installation: nil)
     let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
-        credentials: credentials, readiness: "paused", paused: true, sessionLockState: .unlocked, hostPermissions: { (true, true) })
+        credentials: credentials, readiness: "paused", paused: true, sessionLockState: .unlocked, hostPermissions: { (true, screenGranted) })
     do {
         try await runtime.prepareCuaPermissions()
-        try await runtime.verifyCuaCapabilitiesForPermissions()
+        if screenGranted { try await runtime.verifyCuaCapabilitiesForPermissions() }
         let target = RuntimeInputTarget(root: root)
         try await runtime.verifyCuaInputForPermissions(target: target)
+        #expect(runtime.isCuaReady() == screenGranted)
         #expect(target.calls == ["get_window_state", "click", "get_window_state", "type_text"])
         #expect(target.clickCount == 1 && target.text == target.expectedText && target.invalidated)
         #expect(credentials.readCount == 0)

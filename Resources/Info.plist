@@ -24,6 +24,8 @@
   <string>14.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>Share your screen when you set up or use PersonaStack Desktop Control.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Record audio attachments when you choose the microphone in persona chat.</string>
   <key>NSLocalNetworkUsageDescription</key>

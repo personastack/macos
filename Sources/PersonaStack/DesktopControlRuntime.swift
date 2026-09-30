@@ -689,10 +689,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             target.invalidate()
             if inputPermissionTarget === target { inputPermissionTarget = nil }
         }
-        guard sessionLock.allowsControl, isCuaReady(), let proxy, let service = cuaService,
+        guard sessionLock.allowsControl, hostPermissions().accessibility, isOwnedCuaRunning(), let proxy, let service = cuaService,
               !disconnecting, !environmentSwitchPending, !repairInProgress,
               !executorCleanupInProgress, !executorCleanupFailed else { throw CuaMCPProxyError.permissionsRequired }
         let generation = lifecycleGeneration
+        let snapshot = try await readCuaPermissionSnapshot(proxy, service: service, generation: generation, timeout: 5)
+        guard snapshot.hostAttributionValid, snapshot.accessibility else { throw CuaMCPProxyError.permissionsRequired }
         let lock = lockGeneration
         let executor = self.executor
         let id: UUID
@@ -706,7 +708,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             try requireCurrentLifecycle(generation)
             try executor.requireNativeVerification(id)
             guard self.executor === executor, self.proxy === proxy, cuaService === service,
-                  service.isRunning, isCuaReady(), sessionLock.allowsControl, lockGeneration == lock,
+                  service.isRunning, hostPermissions().accessibility, isOwnedCuaRunning(), sessionLock.allowsControl, lockGeneration == lock,
                   !repairInProgress, !executorCleanupInProgress, !executorCleanupFailed else { throw CancellationError() }
         }
         try requireCurrent()

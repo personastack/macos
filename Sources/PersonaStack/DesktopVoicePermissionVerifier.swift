@@ -1,4 +1,5 @@
 import Foundation
+import PersonaStackCore
 import WebKit
 
 @MainActor
@@ -9,38 +10,66 @@ protocol DesktopVoicePermissionPage: AnyObject {
 
 @MainActor
 final class DesktopVoicePermissionWebPage: DesktopVoicePermissionPage {
-    private weak var view: WKWebView?
+    typealias Evaluate = (String, [String: Any], @escaping (Result<Any, Error>) -> Void) -> Void
+    private let evaluate: Evaluate
+    private let isCapturing: () -> Bool
 
-    init(view: WKWebView) { self.view = view }
+    init(view: WKWebView) {
+        isCapturing = { [weak view] in view.map { $0.microphoneCaptureState != WKMediaCaptureState.none } ?? true }
+        evaluate = { [weak view] script, arguments, completion in
+            guard let view else { completion(.failure(DesktopVoicePermissionError.pageChanged)); return }
+            view.callAsyncJavaScript(script, arguments: arguments, in: nil, in: .page) { result in completion(result) }
+        }
+    }
+
+    init(isCapturing: @escaping () -> Bool, evaluate: @escaping Evaluate) {
+        self.isCapturing = isCapturing
+        self.evaluate = evaluate
+    }
 
     func test(id: String, completion: @escaping (Result<Bool, Error>) -> Void) {
-        guard let view else {
-            completion(.failure(DesktopVoicePermissionError.pageChanged))
-            return
-        }
-        view.callAsyncJavaScript("""
-            if (window.top !== window || !window.isSecureContext) return false;
-            const owner = window.personastackVoicePermission;
-            if (!owner || owner.version !== '1' || typeof owner.test !== 'function') return false;
-            return await owner.test(testID) === true;
-            """, arguments: ["testID": id], in: nil, in: .page) { result in
-                switch result {
-                case .success(let value): completion(.success(value as? Bool == true))
-                case .failure(let error): completion(.failure(error))
-                }
+        guard !isCapturing() else { completion(.failure(DesktopVoicePermissionError.busy)); return }
+        evaluate(DesktopVoicePermissionScript.test, ["testID": id]) { result in
+            switch result {
+            case .success(let value):
+                if value as? String == "ready" { completion(.success(true)) }
+                else { completion(.failure(DesktopVoicePermissionError(result: value as? String))) }
+            case .failure: completion(.failure(DesktopVoicePermissionError.recordingFailed))
             }
+        }
     }
 
     func cancel(id: String) {
-        view?.callAsyncJavaScript("""
-            const owner = window.personastackVoicePermission;
-            if (owner && owner.version === '1' && typeof owner.cancel === 'function') owner.cancel(expectedID);
-            """, arguments: ["expectedID": id], in: nil, in: .page, completionHandler: nil)
+        evaluate(DesktopVoicePermissionScript.cancel, ["expectedID": id]) { _ in }
     }
 }
 
 enum DesktopVoicePermissionError: Error {
-    case busy, timedOut, pageChanged
+    case busy, timedOut, pageChanged, unsupported, denied, noInput, recordingFailed
+
+    init(result: String?) {
+        switch result {
+        case "busy": self = .busy
+        case "timedOut": self = .timedOut
+        case "cancelled": self = .pageChanged
+        case "unsupported": self = .unsupported
+        case "denied": self = .denied
+        case "noInput": self = .noInput
+        default: self = .recordingFailed
+        }
+    }
+
+    var observation: DesktopPermissionObservation {
+        switch self {
+        case .busy: .init(.verificationRequired, detail: "Finish the current voice recording, then retry Setup Microphone.")
+        case .timedOut: .init(.failed, detail: "The microphone test timed out. Check the selected audio input and retry.")
+        case .pageChanged: .init(.checking, detail: "The page or microphone changed. Retry Setup Microphone.")
+        case .unsupported: .init(.unsupported, detail: "This page cannot record audio. Open the selected HTTPS PersonaStack app and retry.")
+        case .denied: .init(.denied, detail: "WebKit could not access the microphone. Allow PersonaStack microphone access, reload the app page, and retry.")
+        case .noInput: .init(.failed, detail: "No live microphone input is available. Choose an input in Sound settings and retry.")
+        case .recordingFailed: .init(.failed, detail: "The microphone recorder produced no usable audio. Finish any voice recording, check the audio input, and retry.")
+        }
+    }
 }
 
 /// Bounds the native continuation independently of the page's recording timer.

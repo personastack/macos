@@ -494,3 +494,24 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     #expect(await check.value.state == .checking)
     #expect(await service.adapter.observe(.documentsFiles).state == .verificationRequired)
 }
+
+@Test @MainActor func permissionChecklistRetainsActionablePrerequisiteAndWebKitDenialAcrossPassiveGrantReadback() async {
+    for state in [DesktopPermissionState.verificationRequired, .denied, .unsupported] {
+        let fake = PermissionChecklistFake()
+        fake.values[.microphone] = .init(.ready, detail: "OS grant", verificationKey: "same-device-page", requiresVerification: true)
+        fake.setupValues[.microphone] = .init(state, detail: "Specific functional recovery")
+        let model = DesktopPermissionChecklistCoordinator(adapter: fake)
+        model.open()
+        await model.refresh()
+        model.setup(.microphone)
+        while model.busyPermission != nil { await Task.yield() }
+        await model.refresh()
+        #expect(model.rows.first { $0.id == .microphone }?.state == state)
+        #expect(model.rows.first { $0.id == .microphone }?.observation.detail == "Specific functional recovery")
+        fake.values[.microphone] = .init(.ready, detail: "New document", verificationKey: "new-device-page", requiresVerification: true)
+        await model.refresh()
+        #expect(model.rows.first { $0.id == .microphone }?.state == .verificationRequired)
+        #expect(model.rows.first { $0.id == .microphone }?.observation.detail == "New document")
+        model.cancel()
+    }
+}

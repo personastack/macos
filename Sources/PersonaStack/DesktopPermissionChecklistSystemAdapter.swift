@@ -3,6 +3,7 @@ import AppKit
 import AVFoundation
 import CoreGraphics
 import ServiceManagement
+import ScreenCaptureKit
 import UserNotifications
 import PersonaStackCore
 
@@ -14,19 +15,43 @@ struct DesktopPermissionChecklistHooks {
     var setup: (DesktopPermissionID) async -> DesktopPermissionObservation? = { _ in nil }
 }
 
+/// Injectable OS boundary. Passive reads never request access. ScreenCaptureKit
+/// is deliberately attempted by Setup even when CoreGraphics preflight is false.
+@MainActor
+struct DesktopPermissionSystemAccess {
+    var accessibility: () -> Bool = { AXIsProcessTrusted() }
+    var requestAccessibility: () -> Void = {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+    }
+    var screenRecording: () -> Bool = { CGPreflightScreenCaptureAccess() }
+    var requestScreenRecording: () async -> Bool = {
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+            return !content.displays.isEmpty
+        } catch { return false }
+    }
+    var microphone: () -> AVAuthorizationStatus = { AVCaptureDevice.authorizationStatus(for: .audio) }
+    var requestMicrophone: () async -> Bool = { await AVCaptureDevice.requestAccess(for: .audio) }
+    var hasMicrophone: () -> Bool = { AVCaptureDevice.default(for: .audio) != nil }
+}
+
 @MainActor
 final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistAdapting {
     var hooks: DesktopPermissionChecklistHooks
+    let access: DesktopPermissionSystemAccess
     private let providedNotificationCenter: UNUserNotificationCenter?
     private var notificationCenter: UNUserNotificationCenter { providedNotificationCenter ?? .current() }
     private let openSettings: (String) -> Void
 
     init(hooks: DesktopPermissionChecklistHooks = .init(),
+         access: DesktopPermissionSystemAccess = .init(),
          notificationCenter: UNUserNotificationCenter? = nil,
          openSettings: @escaping (String) -> Void = { section in
              if let url = URL(string: "x-apple.systempreferences:\(section)") { NSWorkspace.shared.open(url) }
          }) {
         self.hooks = hooks
+        self.access = access
         self.providedNotificationCenter = notificationCenter
         self.openSettings = openSettings
     }
@@ -35,9 +60,9 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         if let value = await hooks.observe(permission) { return value }
         switch permission {
         case .accessibility:
-            return grant(AXIsProcessTrusted(), permission: permission)
-        case .screenRecording:
-            return grant(CGPreflightScreenCaptureAccess(), permission: permission)
+            return grant(access.accessibility(), permission: permission)
+        case .screenRecording, .directCapture:
+            return grant(access.screenRecording(), permission: permission)
         case .microphone:
             return microphoneObservation()
         case .notifications:
@@ -55,14 +80,22 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         guard !Task.isCancelled else { return .init(.checking, detail: "Setup cancelled.") }
         switch permission {
         case .accessibility:
-            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-            if !AXIsProcessTrustedWithOptions(options) { openPrivacy("Accessibility") }
-        case .screenRecording:
-            if !CGRequestScreenCaptureAccess() { openPrivacy("ScreenCapture") }
+            access.requestAccessibility()
+            // AX's prompt return value is synchronous. Approval is asynchronous.
+            if !access.accessibility() { openPrivacy("Accessibility") }
+        case .screenRecording, .directCapture:
+            // CGRequestScreenCaptureAccess can return false without registering
+            // the app on newer macOS. A real host SCK request owns that prompt.
+            let capturable = await access.requestScreenRecording()
+            guard !Task.isCancelled else { return .init(.checking, detail: "Setup cancelled.") }
+            if capturable && !access.screenRecording() {
+                return .init(.restartRequired, detail: "macOS allowed the screen request, but PersonaStack's current process still reports the old grant. Quit and reopen PersonaStack, then retry Setup \(permission.title).")
+            }
+            if !capturable { openPrivacy("ScreenCapture") }
         case .microphone:
-            if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
-                _ = await AVCaptureDevice.requestAccess(for: .audio)
-            } else if AVCaptureDevice.authorizationStatus(for: .audio) == .denied {
+            if access.microphone() == .notDetermined {
+                _ = await access.requestMicrophone()
+            } else if access.microphone() == .denied {
                 openPrivacy("Microphone")
             }
         case .notifications:
@@ -120,13 +153,13 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
     }
 
     private func microphoneObservation() -> DesktopPermissionObservation {
-        let status = AVCaptureDevice.authorizationStatus(for: .audio)
+        let status = access.microphone()
         switch status {
         case .notDetermined: return .init(.notGranted, detail: "Allow microphone input for voice messages.")
         case .denied: return Self.privacyDenialObservation(.microphone)
         case .restricted: return .init(.restricted, detail: "macOS restricts microphone access. Contact your Mac administrator.")
         case .authorized:
-            guard AVCaptureDevice.default(for: .audio) != nil else {
+            guard access.hasMicrophone() else {
                 return .init(.failed, detail: "No microphone is available. Connect an audio input and retry.")
             }
             return .init(.ready, detail: "Microphone access is allowed. Use Setup Microphone to verify voice input.",
