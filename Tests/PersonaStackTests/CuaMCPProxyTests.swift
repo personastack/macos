@@ -44,14 +44,46 @@ struct CuaMCPProxyTests {
                 result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.29.1"}}
             else:
                 result = {"content":[{"type":"image","mimeType":"image/png","data":"A" * (9 * 1024 * 1024)}]}
+                # Exercise multiple buffered lines before the large response.
+                print(json.dumps({"jsonrpc":"2.0","method":"notifications/progress"}), flush=True)
+                print(json.dumps({"jsonrpc":"2.0","id":-1,"result":{}}), flush=True)
             print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
         """#
         let executable = try executableScript(script)
         defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
         let proxy = CuaMCPProxy(executableURL: executable)
         _ = try await proxy.start()
-        let response = try await proxy.callTool(name: "get_desktop_state", argumentsJSON: Data("{}".utf8))
-        #expect(response.count > 8 * 1024 * 1024)
+        for _ in 0..<2 {
+            let response = try await proxy.callTool(name: "get_desktop_state", argumentsJSON: Data("{}".utf8), timeout: 5)
+            #expect(response.count > 8 * 1024 * 1024)
+        }
+        await proxy.stop()
+    }
+
+    @Test
+    func rejectsOversizedUnterminatedLocalResponse() async throws {
+        let script = #"""
+        #!/usr/bin/python3
+        import json, sys
+        for line in sys.stdin:
+            request = json.loads(line)
+            if request.get("method") == "notifications/initialized":
+                continue
+            if request.get("method") == "initialize":
+                result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.29.1"}}
+                print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
+            else:
+                sys.stdout.write("A" * (33 * 1024 * 1024))
+                sys.stdout.flush()
+        """#
+        let executable = try executableScript(script)
+        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
+        let proxy = CuaMCPProxy(executableURL: executable)
+        _ = try await proxy.start()
+        await #expect(throws: CuaMCPProxyError.responseTooLarge) {
+            try await proxy.callTool(name: "get_desktop_state", argumentsJSON: Data("{}".utf8), timeout: 5)
+        }
+        #expect(await !proxy.isProcessRunning())
         await proxy.stop()
     }
 

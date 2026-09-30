@@ -47,6 +47,7 @@ public actor CuaMCPProxy {
     private let input = Pipe()
     private let output = Pipe()
     private var bufferedOutput = Data()
+    private var scannedOutputBytes = 0
     private var requestID: Int64 = 0
     private var started = false
     private let interruption = CuaProxyInterruption()
@@ -149,6 +150,7 @@ public actor CuaMCPProxy {
         }
         started = false
         bufferedOutput.removeAll(keepingCapacity: false)
+        scannedOutputBytes = 0
     }
 
     private func request(method: String, parameters: String, timeout: Int32) throws -> Data {
@@ -265,9 +267,21 @@ public actor CuaMCPProxy {
     }
 
     private func takeBufferedLine() -> Data? {
-        guard let end = bufferedOutput.firstIndex(of: 0x0A) else { return nil }
+        let offset: Int? = bufferedOutput.withUnsafeBytes { bytes in
+            guard scannedOutputBytes < bytes.count, let base = bytes.baseAddress,
+                  let newline = Darwin.memchr(base.advanced(by: scannedOutputBytes), 0x0A, bytes.count - scannedOutputBytes) else {
+                return nil
+            }
+            return base.distance(to: UnsafeRawPointer(newline))
+        }
+        guard let offset else {
+            scannedOutputBytes = bufferedOutput.count
+            return nil
+        }
+        let end = bufferedOutput.startIndex + offset
         let line = Data(bufferedOutput[..<end])
         bufferedOutput.removeSubrange(...end)
+        scannedOutputBytes = 0
         return line
     }
 
