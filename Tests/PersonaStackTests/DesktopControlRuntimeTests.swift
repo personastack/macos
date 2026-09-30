@@ -180,6 +180,11 @@ if args[0] == 'serve':
     def drain_connections():
         while True:
             connection, _ = listener.accept()
+            # Match the real daemon's connection lifetime. Closing before the
+            # client reads LOCAL_PEERPID races the identity check under load.
+            connection.settimeout(1)
+            try: connection.recv(1)
+            except socket.timeout: pass
             connection.close()
     threading.Thread(target=drain_connections, daemon=True).start()
     with open(args[args.index('--pid-file') + 1], 'w') as out: out.write(str(os.getpid()))
