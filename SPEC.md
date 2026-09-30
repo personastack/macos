@@ -32,7 +32,7 @@ PersonaStack for macOS presents a selected PersonaStack web surface in a dedicat
 
 ## Version 0.1.4 behavior
 
-- The Dock and application icon uses the PersonaStack mark on its dark rounded background. The menu bar uses a separate transparent near-white P asset at a 24-point canvas size. Preserve the white menu bar glyph rather than tinting it as a system symbol.
+- The Dock and application icon uses the PersonaStack mark on its dark rounded background. The menu bar uses a separate transparent near-white P asset at a 21.6-point canvas size. Preserve the white menu bar glyph rather than tinting it as a system symbol.
 - The menu bar dropdown heading is **PersonaStack**.
 - Clicking the app's Dock icon brings the main PersonaStack window forward, restores it when minimized, and reopens it when closed. A chat or stack pop-out must not replace the main window as the Dock reopen target. The menu bar's Open PersonaStack action uses the same behavior.
 - Use a transparent full-size native title bar backed by the website's dark canvas color `#0a0a14`. Fill the titlebar safe area with that color and keep the standard close, minimize, and full-screen controls. The main window joins macOS full-screen Spaces through its native green window control. Control-Command-F toggles the key window's native full-screen state from the View menu, including while WebKit has focus.

@@ -10,7 +10,7 @@ struct PersonaStackApp: App {
     @ObservedObject private var serverSettings = DesktopEnvironmentSettings.shared
     private let menuBarIcon: NSImage = {
         let image = NSImage(named: "MenuBarIcon") ?? NSImage()
-        image.size = NSSize(width: 24, height: 24)
+        image.size = NSSize(width: 21.6, height: 21.6)
         return image
     }()
     init() {
