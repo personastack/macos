@@ -302,6 +302,38 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
 }
 
 
+@Test @MainActor func permissionChecklistDesktopServiceFailuresStayInTheirRowsWhileMicrophoneVerifies() async {
+    let fake = PermissionChecklistFake()
+    let serviceFailure = CuaMCPProxyError.serviceMismatch.localizedDescription
+    let desktopRows: [DesktopPermissionID] = [.accessibility, .screenRecording, .directCapture]
+    for id in desktopRows {
+        fake.values[id] = .init(.ready, detail: "OS grant present", verificationKey: "desktop-grant", requiresVerification: true)
+        fake.setupValues[id] = .init(.failed, detail: serviceFailure)
+    }
+    fake.values[.microphone] = .init(.ready, detail: "Audio grant present", verificationKey: "audio-device-page", requiresVerification: true)
+    fake.setupValues[.microphone] = .init(.ready, detail: "Voice recording verified", verificationKey: "audio-device-page", requiresVerification: true, verified: true)
+    let model = DesktopPermissionChecklistCoordinator(adapter: fake)
+    model.open()
+    defer { model.cancel() }
+    await model.refresh()
+    for id in desktopRows {
+        model.setup(id)
+        while model.busyPermission != nil { await Task.yield() }
+    }
+    model.setup(.microphone)
+    while model.busyPermission != nil { await Task.yield() }
+    for _ in 0..<3 { await model.refresh() }
+    for id in desktopRows {
+        #expect(model.rows.first { $0.id == id }?.state == .failed)
+        #expect(model.rows.first { $0.id == id }?.observation.detail == serviceFailure)
+    }
+    let microphone = model.rows.first { $0.id == .microphone }
+    #expect(microphone?.isComplete == true)
+    #expect(microphone?.observation.detail == "Voice recording verified")
+    #expect(fake.requested == desktopRows + [.microphone])
+    #expect(!model.canFinish)
+}
+
 @Test @MainActor func permissionChecklistFailureSurvivesPollingUntilRetryOrGrantChange() async {
     for id in [DesktopPermissionID.accessibility, .screenRecording, .microphone, .notifications, .localNetwork, .launchAtLogin] {
         let fake = PermissionChecklistFake()

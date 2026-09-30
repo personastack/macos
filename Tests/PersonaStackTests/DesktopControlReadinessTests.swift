@@ -4,6 +4,28 @@ import PersonaStackCore
 
 @testable import PersonaStack
 
+private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
+    private(set) var stateReads = 0
+    let installation: DesktopControlInstallation
+    init(installation: DesktopControlInstallation) { self.installation = installation }
+
+    func configurationState(installation: DesktopControlInstallation, appURL: URL) async throws -> DesktopControlConfigurationState {
+        #expect(installation.installationID == self.installation.installationID)
+        #expect(appURL == DesktopEnvironmentConfiguration.production.appURL)
+        stateReads += 1
+        return .init(hasActiveConfig: false, hasConfig: false)
+    }
+
+    private func unplanned() throws -> Never {
+        Issue.record("A status read must not enroll, attach, reconnect, or report readiness")
+        throw DesktopControlEnrollmentError.invalidRequest
+    }
+    func enroll(ticket: String, appURL: URL, commitCredential: (@MainActor @Sendable (DesktopControlInstallation) throws -> Void)?) async throws -> DesktopControlInstallation { try unplanned() }
+    func reportReady(installation: DesktopControlInstallation, appURL: URL) async throws { try unplanned() }
+    func attach(ticket: String, installation: DesktopControlInstallation, appURL: URL) async throws { try unplanned() }
+    func hasActiveConfig(installation: DesktopControlInstallation, appURL: URL) async throws -> Bool { try unplanned() }
+}
+
 @MainActor
 @Test func cuaFailuresMapToFiniteDesktopReadiness() {
     #expect(DesktopControlRuntime.readiness(for: CuaMCPProxyError.permissionsRequired) == "permission_required")
@@ -229,22 +251,26 @@ import PersonaStackCore
     let appURL = URL(string: "https://my.personastack.ai")!
     let payload = Data(#"{"installation_id":"install-status-cache","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8)
     var installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
-    try installation.bindEnvironment(appURL)
+    try installation.bindEnvironment(appURL, configuration: .production)
     let credentials = CountingDesktopCredentials(installation: installation)
     let runtime = DesktopControlRuntime.makeForTesting(installer: ReadinessInstaller(), credentials: credentials)
-    let manager = DesktopControlSetupManager(runtime: runtime)
+    let enrollment = ReadinessStateEnrollment(installation: installation)
+    let manager = DesktopControlSetupManager(runtime: runtime, enrollment: enrollment, configurationProvider: { .production })
     let page = DesktopControlSetupManager.Page(appURL: appURL)
 
     for _ in 0..<2 {
         let state = try await manager.apply(.state(scope: ""), page: page)
         #expect(state["installation_id"] as? String == installation.installationID)
+        #expect(state["configuration_in_use"] as? Bool == false)
     }
     #expect(credentials.readCount == 1)
+    #expect(await enrollment.stateReads == 2)
 
     page.setupScope.synchronize("workspace-setup")
     await #expect(throws: DesktopControlEnrollmentError.invalidRequest) {
         _ = try await manager.apply(.state(scope: ""), page: page)
     }
+    #expect(await enrollment.stateReads == 2)
 }
 
 @MainActor

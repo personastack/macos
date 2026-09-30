@@ -129,14 +129,14 @@ struct CuaDriverInstallerTests {
 
     @Test
     func processRunnerDrainsLargeStderrWhileReadingStdout() throws {
-        let start = ProcessInfo.processInfo.systemUptime
+        // This owns bounded output and pipe draining. The stalled-command test
+        // owns the short timeout contract. Allow parallel CI scheduling here.
         #expect(throws: CuaDriverInstallError.processFailed("Cua validation output exceeded limit")) {
-            try SystemCuaProcessRunner(timeout: 3, outputLimit: 256).run(
+            try SystemCuaProcessRunner(timeout: 10, outputLimit: 256).run(
                 URL(fileURLWithPath: "/bin/sh"),
                 arguments: ["-c", "head -c 2000000 /dev/zero >&2; printf ready"]
             )
         }
-        #expect(ProcessInfo.processInfo.systemUptime - start < 3)
     }
 
     @Test
