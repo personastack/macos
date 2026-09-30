@@ -32,7 +32,7 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     init(adapter: any DesktopPermissionChecklistAdapting) { self.adapter = adapter }
 
     var canFinish: Bool {
-        isVisible && refreshedForCurrentPresentation && !isFinishing && !needsNewSetupRequest && busyPermission == nil && rows.allSatisfy(\.isComplete)
+        isVisible && refreshedForCurrentPresentation && !isFinishing && !needsNewSetupRequest && busyPermission == nil && rows.filter(\.isRequiredForUnlockedSetup).allSatisfy(\.isComplete)
     }
     var isAwaitingFinish: Bool { continuation != nil }
 
@@ -117,7 +117,7 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         guard isVisible else { return }
         isFinishing = false
         needsNewSetupRequest = true
-        completionError = "\(message) Click Set Up Permissions on the Desktop Control page to retry."
+        completionError = "\(message) Return to the Desktop Control page to retry setup."
         Task { await refresh() }
     }
 

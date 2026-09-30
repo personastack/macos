@@ -88,7 +88,7 @@ private struct DesktopPermissionChecklistView: View {
                 Text("Allow PersonaStack to work on this Mac")
                     .font(.title2.weight(.semibold))
             }
-            Text("Each Setup button opens the macOS approval or verifies that capability. Status updates here when you return.")
+            Text("Set up Desktop Control while this Mac is unlocked. Locked-screen control is unavailable in this release. Each Setup button opens approval or verifies a capability. Status updates here when you return.")
                 .foregroundStyle(.secondary)
             ScrollView {
                 LazyVStack(spacing: 0) {
@@ -123,6 +123,9 @@ private struct DesktopPermissionChecklistView: View {
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
                 Text(row.id.title).font(.headline)
+                if !row.isRequiredForUnlockedSetup {
+                    Text("Not required for unlocked control").font(.caption).foregroundStyle(.secondary)
+                }
                 Text(row.state.title).font(.caption.weight(.semibold))
                 Text(row.observation.detail).font(.caption).foregroundStyle(.secondary)
             }

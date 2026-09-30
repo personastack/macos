@@ -42,6 +42,10 @@ private actor PermissionBridgeEnrollment: DesktopControlSetupEnrollment {
     private(set) var calls: [String] = []
     let installation: DesktopControlInstallation
     let allowed: Set<String>
+    private var rejectEnrollment = false
+    private var delayEnrollment = false
+    private var pendingEnrollment: CheckedContinuation<Void, Never>?
+    var isEnrollmentPending: Bool { pendingEnrollment != nil }
     private var configuration = DesktopControlConfigurationState(hasActiveConfig: true, hasConfig: true)
     init(installation: DesktopControlInstallation, allowed: Set<String> = []) { self.installation = installation; self.allowed = allowed }
     private func require(_ name: String) throws {
@@ -52,6 +56,10 @@ private actor PermissionBridgeEnrollment: DesktopControlSetupEnrollment {
         try require("enroll")
         #expect(ticket == String(repeating: "a", count: 43))
         #expect(appURL == DesktopEnvironmentConfiguration.production.appURL)
+        if delayEnrollment {
+            await withCheckedContinuation { pendingEnrollment = $0 }
+        }
+        if rejectEnrollment { throw DesktopControlEnrollmentError.rejected }
         try await commitCredential?(installation)
         return installation
     }
@@ -61,6 +69,9 @@ private actor PermissionBridgeEnrollment: DesktopControlSetupEnrollment {
         try require("configurationState")
         return configuration
     }
+    func setRejectEnrollment(_ value: Bool) { rejectEnrollment = value }
+    func suspendRejectedEnrollment() { delayEnrollment = true; rejectEnrollment = true }
+    func releaseEnrollment() { let pending = pendingEnrollment; pendingEnrollment = nil; pending?.resume() }
     func setConfiguration(hasConfig: Bool, active: Bool) { configuration = .init(hasActiveConfig: active, hasConfig: hasConfig) }
     func hasActiveConfig(installation: DesktopControlInstallation, appURL: URL) async throws -> Bool { try require("hasActiveConfig"); return true }
 }
@@ -186,7 +197,13 @@ private struct PermissionBridgeFixture {
 @Test @MainActor func permissionBridgePrepareBeforeNativeFinishHasZeroProtectedReadsOrMutations() async throws {
     let fixture = try PermissionBridgeFixture()
     defer { fixture.cleanup() }
-    let response = await fixture.send(fixture.prepare)
+    let pending = Task { await fixture.send(fixture.prepare) }
+    try await fixture.waitForOpen()
+    #expect(fixture.credentials.counts.reads == 0 && fixture.credentials.counts.saves == 0)
+    #expect(fixture.runtime.calls.isEmpty)
+    #expect(await fixture.enrollment.calls.isEmpty)
+    fixture.presenter.completeWithoutFinish()
+    let response = await pending.value
     #expect(!response.ok && response.error?.contains("native permission checklist") == true)
     #expect(fixture.credentials.counts.reads == 0 && fixture.credentials.counts.saves == 0)
     #expect(fixture.runtime.calls.isEmpty)
@@ -356,4 +373,69 @@ private struct PermissionBridgeFixture {
     let complete = await fixture.send(fixture.permissions("completed"))
     #expect(complete.ok && fixture.presenter.completions == 1)
     #expect(await fixture.enrollment.calls == ["enroll", "reportReady", "configurationState", "configurationState", "configurationState"])
+}
+
+@Test @MainActor func permissionBridgeLegacyPrepareWaitsForFinishBeforeEnrollment() async throws {
+    let fixture = try PermissionBridgeFixture(allowEnrollment: true)
+    defer { fixture.cleanup() }
+    let pending = Task { await fixture.send(fixture.prepare) }
+    try await fixture.waitForOpen()
+    #expect(fixture.credentials.counts.reads == 0 && fixture.credentials.counts.saves == 0)
+    #expect(await fixture.enrollment.calls.isEmpty)
+    fixture.presenter.finish()
+    let response = await pending.value
+    #expect(response.ok && response.installationID == "permission-fixture")
+    #expect(fixture.credentials.counts.saves == 1)
+    #expect(await fixture.enrollment.calls == ["enroll", "reportReady"])
+    #expect(fixture.runtime.calls == ["begin", "resumeForSetup", "probe", "connect"])
+    #expect(fixture.presenter.completions == 0 && fixture.presenter.isFinishing)
+    // The old page saves through its existing API then navigates. Scope change
+    // clears the permission presentation without asserting native completion.
+    let navigation = await fixture.send(["version": "1", "action": "sync", "scope": "next-page"])
+    #expect(navigation.ok && !fixture.presenter.isFinishing)
+    #expect(fixture.presenter.completions == 0)
+}
+
+@Test @MainActor func permissionBridgeLegacyRejectedTicketHasNoCredentialSaveAndAllowsFreshRetry() async throws {
+    let fixture = try PermissionBridgeFixture(allowEnrollment: true)
+    defer { fixture.cleanup() }
+    await fixture.enrollment.setRejectEnrollment(true)
+    fixture.presenter.autoFinish = true
+    let response = await fixture.send(fixture.prepare)
+    #expect(!response.ok)
+    #expect(fixture.credentials.counts.saves == 0)
+    #expect(await fixture.enrollment.calls == ["enroll"])
+    #expect(fixture.runtime.calls == ["begin", "resumeForSetup", "probe"])
+    #expect(fixture.presenter.failures.count == 1 && !fixture.presenter.isFinishing)
+    #expect(fixture.presenter.failures[0].contains("fresh setup reference"))
+    #expect(fixture.presenter.completions == 0)
+    await fixture.enrollment.setRejectEnrollment(false)
+    let refreshed = await fixture.send(["version": "1", "action": "sync", "scope": "workspace-session"])
+    #expect(refreshed.ok)
+    let retry = await fixture.send(fixture.prepare)
+    #expect(retry.ok && fixture.presenter.opens == 2 && fixture.credentials.counts.saves == 1)
+}
+
+@Test @MainActor func permissionBridgeLateLegacyFailureCannotClearNewerSamePagePermissionRequest() async throws {
+    let fixture = try PermissionBridgeFixture(allowEnrollment: true)
+    defer { fixture.cleanup() }
+    await fixture.enrollment.suspendRejectedEnrollment()
+    fixture.presenter.autoFinish = true
+    let old = Task { await fixture.send(fixture.prepare) }
+    while !(await fixture.enrollment.isEnrollmentPending) { await Task.yield() }
+    let newScope = "new-workspace-session"
+    let synchronization = await fixture.send(["version": "1", "action": "sync", "scope": newScope])
+    #expect(synchronization.ok)
+    fixture.presenter.autoFinish = false
+    let fresh = Task { await fixture.send(fixture.permissions("open", scope: newScope)) }
+    try await fixture.waitForOpen()
+    await fixture.enrollment.releaseEnrollment()
+    #expect(!(await old.value).ok)
+    #expect(fixture.presenter.isWaiting && fixture.presenter.failures.isEmpty)
+    #expect(fixture.credentials.counts.saves == 0 && fixture.presenter.completions == 0)
+    fixture.presenter.finish()
+    let response = await fresh.value
+    #expect(response.ok && response.prerequisitesReady)
+    #expect(fixture.presenter.isFinishing)
+    #expect(await fixture.enrollment.calls == ["enroll"])
 }

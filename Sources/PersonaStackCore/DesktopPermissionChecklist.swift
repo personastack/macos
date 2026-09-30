@@ -73,6 +73,11 @@ public struct DesktopPermissionRow: Identifiable, Equatable, Sendable {
         return observation.state
     }
     public var isComplete: Bool { state.satisfiesSetup }
+    /// This release enrolls unlocked control. Unqualified full-access rows stay
+    /// visible with their real state and cannot be mistaken for granted access.
+    public var isRequiredForUnlockedSetup: Bool {
+        id != .lockedScreenControl && id != .fullDiskAccess
+    }
     public var setupTitle: String { "Setup \(id.title)" }
 
     public init(id: DesktopPermissionID, observation: DesktopPermissionObservation) {

@@ -31,6 +31,7 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
 @Test @MainActor func permissionChecklistRefreshNeverRequestsPermissions() async {
     let fake = PermissionChecklistFake()
     fake.values[.lockedScreenControl] = .init(.unsupported, detail: "No qualified helper")
+    fake.values[.accessibility] = .init(.denied, detail: "Approval required")
     let model = DesktopPermissionChecklistCoordinator(adapter: fake)
     model.open()
     await model.refresh()
@@ -114,7 +115,7 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     model.failSetup("Connection failed")
     #expect(!model.isFinishing)
     #expect(model.completionError.contains("Connection failed"))
-    #expect(model.completionError.contains("Set Up Permissions"))
+    #expect(model.completionError.contains("Desktop Control page to retry setup"))
     #expect(model.needsNewSetupRequest && !model.canFinish)
     model.cancel()
 }
@@ -197,4 +198,42 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     #expect(DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(.lockedScreenControl).state == .unsupported)
     #expect(DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(.fullDiskAccess).state == .unsupported)
     #expect(DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(.speechRecognition).state == .notNeeded)
+}
+
+@Test @MainActor func permissionChecklistUnlockedEnrollmentKeepsUnavailableFullAccessVisible() async throws {
+    let fake = PermissionChecklistFake()
+    for id in [DesktopPermissionID.lockedScreenControl, .fullDiskAccess] {
+        fake.values[id] = DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(id)
+    }
+    let model = DesktopPermissionChecklistCoordinator(adapter: fake)
+    model.open()
+    await model.refresh()
+    #expect(model.canFinish)
+    for row in model.rows where !row.isRequiredForUnlockedSetup {
+        #expect(row.state == .unsupported)
+        #expect(!row.isComplete)
+    }
+    let request = Task { try await model.waitForFinish() }
+    while !model.isAwaitingFinish { await Task.yield() }
+    model.finish()
+    try await request.value
+    #expect(model.isFinishing)
+    #expect(fake.requested.isEmpty)
+    model.cancel()
+}
+
+@Test @MainActor func permissionChecklistUnlockedSetupStillRequiresEveryImplementedCapability() async {
+    for id in DesktopPermissionID.allCases where id != .lockedScreenControl && id != .fullDiskAccess {
+        for state in DesktopPermissionState.allCases where !state.satisfiesSetup {
+            let fake = PermissionChecklistFake()
+            fake.values[id] = .init(state, detail: "Incomplete")
+            let model = DesktopPermissionChecklistCoordinator(adapter: fake)
+            model.open()
+            await model.refresh()
+            #expect(!model.canFinish, "Incomplete \(id) \(state) must block enrollment")
+            model.finish()
+            #expect(!model.isFinishing)
+            model.cancel()
+        }
+    }
 }

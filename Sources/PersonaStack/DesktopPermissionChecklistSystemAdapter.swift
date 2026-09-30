@@ -155,9 +155,9 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
     static func unconfiguredObservation(_ id: DesktopPermissionID) -> DesktopPermissionObservation {
         switch id {
         case .lockedScreenControl:
-            return .init(.unsupported, detail: "Locked-screen control has no proven helper in this release. Full setup cannot finish yet.")
+            return .init(.unsupported, detail: "Locked-screen control is unavailable in this release. Remote control stops when macOS locks.")
         case .fullDiskAccess:
-            return .init(.unsupported, detail: "Enable PersonaStack in Full Disk Access. A qualified protected-file check is still required to prove access.")
+            return .init(.unsupported, detail: "Enable PersonaStack in Full Disk Access for broader file access. This release cannot verify that grant. File commands still report access denied for protected resources.")
         case .inputMonitoring:
             return .init(.notNeeded, detail: "Ordinary mouse and keyboard control does not require Input Monitoring. No locked-control listener is installed.")
         case .camera: return .init(.notNeeded, detail: "PersonaStack does not use camera capture.")

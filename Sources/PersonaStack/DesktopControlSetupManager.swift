@@ -158,6 +158,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         var setupScope = DesktopControlSetupScope()
         fileprivate var permissionGeneration: UUID?
         fileprivate var didPrepare = false
+        fileprivate var requiresExplicitPermissions = false
         private(set) var isRetired = false
 
         init(appURL: URL) { self.appURL = appURL }
@@ -310,91 +311,116 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
                 "relay_paused": runtime.paused,
             ]
         case .permissions(let scope, let phase, let message):
+            page.requiresExplicitPermissions = true
             return try await permissions(scope: scope, phase: phase, message: message, page: page)
         case .prepare(let scope, let ticket):
-            let generation = page.setupScope.generation
-            try page.setupScope.require(scope, generation: generation)
-            try requireFinishedPermissions(page: page, generation: generation)
-            let saved = try await savedInstallation(credentials: credentials, appURL: page.appURL)
-            try requireCurrentScope(scope, generation: generation, page: page)
-            try requireFinishedPermissions(page: page, generation: generation)
-            if let saved {
-                try await runtime.disconnect()
-                try requireCurrentScope(scope, generation: generation, page: page)
-                try await enrollment.attach(ticket: ticket, installation: saved, appURL: page.appURL)
-                try requireCurrentScope(scope, generation: generation, page: page)
+            let legacy = !page.requiresExplicitPermissions && page.permissionGeneration == nil && permissionPage == nil
+            if legacy {
+                // Older hosted pages acquire the existing five-minute ticket first.
+                // Keep the native Finish gate. The API still owns ticket expiry.
+                _ = try await permissions(scope: scope, phase: .open, message: nil, page: page)
             }
-            var runtimeGeneration = try runtime.beginResume()
-            do {
-                try await runtime.resumeForSetup(generation: runtimeGeneration)
-            } catch {
-                try requireCurrentScope(scope, generation: generation, page: page)
-                try requireCurrentLifecycle(runtimeGeneration)
-                guard DesktopControlRuntime.shouldForceRepair(after: error) else { throw error }
-                runtimeGeneration = try await runtime.repair(resumeRelay: true, expectedGeneration: runtimeGeneration)
+            let legacyRequest = legacy ? permissionRequest : nil
+            let legacyGeneration = page.setupScope.generation
+            do { return try await prepare(scope: scope, ticket: ticket, page: page, credentials: credentials) }
+            catch {
+                if legacy, let legacyRequest, permissionRequest == legacyRequest,
+                   permissionPage === page, page.setupScope.generation == legacyGeneration {
+                    permissionPresenter.failSetup(message: "Desktop Control could not finish. Retry setup to obtain a fresh setup reference.")
+                    page.permissionGeneration = nil
+                    page.didPrepare = false
+                    permissionPage = nil
+                    permissionRequest = nil
+                }
+                throw error
             }
-            do { try await runtime.probeNativeCapabilities(generation: runtimeGeneration) }
-            catch is CancellationError { throw CancellationError() }
-            catch { throw DesktopControlEnrollmentError.nativeCapabilitiesUnavailable }
-            try requireCurrentScope(scope, generation: generation, page: page)
-            try requireCurrentLifecycle(runtimeGeneration)
-            if loginItemStatus() != .enabled {
-                do { try registerLoginItem() }
-                catch { throw DesktopControlEnrollmentError.serviceRegistrationFailed }
-            }
-            guard loginItemStatus() == .enabled else {
-                throw DesktopControlLoginItemApprovalError()
-            }
-            try requireCurrentScope(scope, generation: generation, page: page)
-            try requireCurrentLifecycle(runtimeGeneration)
-            let installation: DesktopControlInstallation
-            if let saved {
-                try saved.requireEnvironment(page.appURL)
-                installation = saved
-                try await enrollment.reportReady(installation: installation, appURL: page.appURL)
-                try requireCurrentScope(scope, generation: generation, page: page)
-                try requireCurrentLifecycle(runtimeGeneration)
-            } else {
-                let enrollmentRuntimeGeneration = runtimeGeneration
-                installation = try await enrollment.enroll(
-                    ticket: ticket,
-                    appURL: page.appURL,
-                    commitCredential: { [weak self] installation in
-                        guard let self else { throw CancellationError() }
-                        try self.requireCurrentScope(scope, generation: generation, page: page)
-                        try self.requireCurrentLifecycle(enrollmentRuntimeGeneration)
-                        try credentials.save(installation)
-                    }
-                )
-                try requireCurrentScope(scope, generation: generation, page: page)
-                try requireCurrentLifecycle(runtimeGeneration)
-                try await enrollment.reportReady(installation: installation, appURL: page.appURL)
-                try requireCurrentScope(scope, generation: generation, page: page)
-                try requireCurrentLifecycle(runtimeGeneration)
-            }
-            try requireCurrentScope(scope, generation: generation, page: page)
-            try requireCurrentLifecycle(runtimeGeneration)
-            await runtime.connect(installation: installation, expectedGeneration: runtimeGeneration)
-            try requireCurrentScope(scope, generation: generation, page: page)
-            try requireCurrentLifecycle(runtimeGeneration)
-            let configuration = try configurationProvider()
-            guard let pageOrigin = try? DesktopControlEnvironment.origin(page.appURL), pageOrigin == configuration.appOrigin else {
-                throw DesktopControlEnrollmentError.invalidRequest
-            }
-            preferences.set(true, forKey: DesktopControlPreferenceKeys.relayEnabled(configuration))
-            preferences.set(false, forKey: DesktopControlPreferenceKeys.relayPaused(configuration))
-            page.didPrepare = true
-            return [
-                "ok": true,
-                "operating_system": "macos",
-                "installation_id": installation.installationID,
-                "cua_ready": runtime.isCuaReady(),
-                "native_executor_ready": runtime.nativeExecutorReady,
-                "gateway_connected": runtime.gatewayConnected,
-                "relay_paused": runtime.paused,
-                "suggested_name": Self.suggestedComputerName(),
-            ]
         }
+    }
+
+    private func prepare(scope: String, ticket: String, page: Page,
+                         credentials: any DesktopControlCredentialStoring) async throws -> [String: Any] {
+        let generation = page.setupScope.generation
+        try page.setupScope.require(scope, generation: generation)
+        try requireFinishedPermissions(page: page, generation: generation)
+        let saved = try await savedInstallation(credentials: credentials, appURL: page.appURL)
+        try requireCurrentScope(scope, generation: generation, page: page)
+        try requireFinishedPermissions(page: page, generation: generation)
+        if let saved {
+            try await runtime.disconnect()
+            try requireCurrentScope(scope, generation: generation, page: page)
+            try await enrollment.attach(ticket: ticket, installation: saved, appURL: page.appURL)
+            try requireCurrentScope(scope, generation: generation, page: page)
+        }
+        var runtimeGeneration = try runtime.beginResume()
+        do {
+            try await runtime.resumeForSetup(generation: runtimeGeneration)
+        } catch {
+            try requireCurrentScope(scope, generation: generation, page: page)
+            try requireCurrentLifecycle(runtimeGeneration)
+            guard DesktopControlRuntime.shouldForceRepair(after: error) else { throw error }
+            runtimeGeneration = try await runtime.repair(resumeRelay: true, expectedGeneration: runtimeGeneration)
+        }
+        do { try await runtime.probeNativeCapabilities(generation: runtimeGeneration) }
+        catch is CancellationError { throw CancellationError() }
+        catch { throw DesktopControlEnrollmentError.nativeCapabilitiesUnavailable }
+        try requireCurrentScope(scope, generation: generation, page: page)
+        try requireCurrentLifecycle(runtimeGeneration)
+        if loginItemStatus() != .enabled {
+            do { try registerLoginItem() }
+            catch { throw DesktopControlEnrollmentError.serviceRegistrationFailed }
+        }
+        guard loginItemStatus() == .enabled else {
+            throw DesktopControlLoginItemApprovalError()
+        }
+        try requireCurrentScope(scope, generation: generation, page: page)
+        try requireCurrentLifecycle(runtimeGeneration)
+        let installation: DesktopControlInstallation
+        if let saved {
+            try saved.requireEnvironment(page.appURL)
+            installation = saved
+            try await enrollment.reportReady(installation: installation, appURL: page.appURL)
+            try requireCurrentScope(scope, generation: generation, page: page)
+            try requireCurrentLifecycle(runtimeGeneration)
+        } else {
+            let enrollmentRuntimeGeneration = runtimeGeneration
+            installation = try await enrollment.enroll(
+                ticket: ticket,
+                appURL: page.appURL,
+                commitCredential: { [weak self] installation in
+                    guard let self else { throw CancellationError() }
+                    try self.requireCurrentScope(scope, generation: generation, page: page)
+                    try self.requireCurrentLifecycle(enrollmentRuntimeGeneration)
+                    try credentials.save(installation)
+                }
+            )
+            try requireCurrentScope(scope, generation: generation, page: page)
+            try requireCurrentLifecycle(runtimeGeneration)
+            try await enrollment.reportReady(installation: installation, appURL: page.appURL)
+            try requireCurrentScope(scope, generation: generation, page: page)
+            try requireCurrentLifecycle(runtimeGeneration)
+        }
+        try requireCurrentScope(scope, generation: generation, page: page)
+        try requireCurrentLifecycle(runtimeGeneration)
+        await runtime.connect(installation: installation, expectedGeneration: runtimeGeneration)
+        try requireCurrentScope(scope, generation: generation, page: page)
+        try requireCurrentLifecycle(runtimeGeneration)
+        let configuration = try configurationProvider()
+        guard let pageOrigin = try? DesktopControlEnvironment.origin(page.appURL), pageOrigin == configuration.appOrigin else {
+            throw DesktopControlEnrollmentError.invalidRequest
+        }
+        preferences.set(true, forKey: DesktopControlPreferenceKeys.relayEnabled(configuration))
+        preferences.set(false, forKey: DesktopControlPreferenceKeys.relayPaused(configuration))
+        page.didPrepare = true
+        return [
+            "ok": true,
+            "operating_system": "macos",
+            "installation_id": installation.installationID,
+            "cua_ready": runtime.isCuaReady(),
+            "native_executor_ready": runtime.nativeExecutorReady,
+            "gateway_connected": runtime.gatewayConnected,
+            "relay_paused": runtime.paused,
+            "suggested_name": Self.suggestedComputerName(),
+        ]
     }
 
     private static var scopeReply: [String: Any] {
