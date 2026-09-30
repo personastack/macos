@@ -26,11 +26,12 @@ public enum DesktopPermissionID: String, CaseIterable, Identifiable, Sendable {
 }
 
 public enum DesktopPermissionState: String, Sendable, CaseIterable {
-    case checking, ready, notGranted, denied, restricted, restartRequired, failed, unsupported, notNeeded
+    case checking, verificationRequired, ready, notGranted, denied, restricted, restartRequired, failed, unsupported, notNeeded
 
     public var title: String {
         switch self {
         case .checking: "Checking"
+        case .verificationRequired: "Needs verification"
         case .ready: "Ready"
         case .notGranted: "Not granted"
         case .denied: "Denied"
@@ -69,7 +70,7 @@ public struct DesktopPermissionRow: Identifiable, Equatable, Sendable {
     public let id: DesktopPermissionID
     public var observation: DesktopPermissionObservation
     public var state: DesktopPermissionState {
-        if observation.state == .ready && observation.requiresVerification && !observation.verified { return .checking }
+        if observation.state == .ready && observation.requiresVerification && !observation.verified { return .verificationRequired }
         return observation.state
     }
     public var isComplete: Bool { state.satisfiesSetup }

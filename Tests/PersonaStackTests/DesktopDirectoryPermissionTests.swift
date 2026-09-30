@@ -234,7 +234,7 @@ struct DesktopDirectoryPermissionTests {
     }, verifyDirectory: { verified.append($0) }, selectedProfile: { .production })
     for (id, directory) in [(DesktopPermissionID.desktopFiles, FileManager.SearchPathDirectory.desktopDirectory),
                             (.documentsFiles, .documentDirectory), (.downloadsFiles, .downloadsDirectory)] {
-        #expect(await service.adapter.observe(id).state == .checking)
+        #expect(await service.adapter.observe(id).state == .verificationRequired)
         let result = await service.adapter.setup(id)
         #expect(result.state == .ready && result.verified)
         #expect(result.requiresVerification && result.verificationKey != nil)
@@ -260,9 +260,9 @@ struct DesktopDirectoryPermissionTests {
     #expect(failure.state == .failed && !failure.verified)
     #expect(await service.adapter.observe(.desktopFiles) == failure)
     #expect(checks == 2)
-    #expect(await service.adapter.observe(.documentsFiles).state == .checking)
+    #expect(await service.adapter.observe(.documentsFiles).state == .verificationRequired)
     service.cancelVerification()
-    #expect(await service.adapter.observe(.desktopFiles).state == .checking)
+    #expect(await service.adapter.observe(.desktopFiles).state == .verificationRequired)
     #expect(checks == 2)
 }
 
@@ -289,7 +289,7 @@ struct DesktopDirectoryPermissionTests {
     pending?.resume()
     let result = await check.value
     #expect(result.state == .checking && !result.verified)
-    #expect(await service.adapter.observe(.downloadsFiles).state == .checking)
+    #expect(await service.adapter.observe(.downloadsFiles).state == .verificationRequired)
 }
 
 @Test @MainActor func directoryPermissionServiceCancellationCannotStoreProof() async {
@@ -301,7 +301,7 @@ struct DesktopDirectoryPermissionTests {
     check.cancel()
     pending?.resume()
     #expect(await check.value.state == .checking)
-    #expect(await service.adapter.observe(.desktopFiles).state == .checking)
+    #expect(await service.adapter.observe(.desktopFiles).state == .verificationRequired)
 }
 
 @Test @MainActor func directoryPermissionVolumeServiceInvalidatesProofBeforeMountPolling() async {
@@ -333,7 +333,7 @@ struct DesktopDirectoryPermissionTests {
     #expect(model.canFinish && selections == 1 && checks == 1)
     notifications.post(name: NSWorkspace.didUnmountNotification, object: nil)
     #expect(!model.canFinish)
-    #expect(model.rows.first { $0.id == .removableVolumes }?.state == .checking)
+    #expect(model.rows.first { $0.id == .removableVolumes }?.state == .verificationRequired)
     await model.refresh()
     #expect(!model.canFinish && selections == 1 && checks == 1)
     #expect(await service.adapter.setup(.removableVolumes).state == .ready)

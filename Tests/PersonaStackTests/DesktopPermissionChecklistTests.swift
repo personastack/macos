@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 import ServiceManagement
@@ -13,9 +14,15 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     var requested: [DesktopPermissionID] = []
     var pendingSetup: CheckedContinuation<DesktopPermissionObservation, Never>?
     var delaySetup = false
+    var suspendedObservation: DesktopPermissionID?
+    var pendingObservation: CheckedContinuation<DesktopPermissionObservation, Never>?
 
     func observe(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation {
         observed.append(permission)
+        if suspendedObservation == permission {
+            suspendedObservation = nil
+            return await withCheckedContinuation { pendingObservation = $0 }
+        }
         return values[permission] ?? .init(.ready, detail: "Ready")
     }
 
@@ -26,6 +33,34 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
         }
         return setupValues[permission] ?? values[permission] ?? .init(.ready, detail: "Ready")
     }
+}
+
+@Test @MainActor func permissionChecklistWindowStartsAtUsableSizeAndPreservesResizing() async throws {
+    _ = NSApplication.shared
+    let fake = PermissionChecklistFake()
+    let model = DesktopPermissionChecklistCoordinator(adapter: fake)
+    let owner = DesktopPermissionChecklistWindow(coordinator: model)
+    let window = owner.makeWindowIfNeeded()
+    defer { model.cancel(); window.close() }
+    let view = try #require(window.contentView)
+    view.layoutSubtreeIfNeeded()
+    #expect(view.bounds.size == NSSize(width: 670, height: 740))
+    #expect(window.contentMinSize == NSSize(width: 560, height: 460))
+    #expect(!window.isVisible)
+
+    model.open()
+    await model.refresh()
+    view.layoutSubtreeIfNeeded()
+    #expect(model.rows.count == DesktopPermissionID.allCases.count)
+    #expect(view.bounds.size == NSSize(width: 670, height: 740))
+    #expect(fake.requested.isEmpty)
+
+    window.setContentSize(NSSize(width: 800, height: 600))
+    await model.refresh()
+    view.layoutSubtreeIfNeeded()
+    #expect(owner.makeWindowIfNeeded() === window)
+    #expect(view.bounds.size == NSSize(width: 800, height: 600))
+    #expect(!window.isVisible)
 }
 
 @Test @MainActor func permissionChecklistRefreshNeverRequestsPermissions() async {
@@ -52,7 +87,7 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     let allowed = DesktopPermissionRow(id: .screenRecording,
                                       observation: .init(.ready, detail: "Allowed", requiresVerification: true))
     #expect(!allowed.isComplete)
-    #expect(allowed.state == .checking)
+    #expect(allowed.state == .verificationRequired)
 }
 
 @Test @MainActor func permissionChecklistExplicitProofSurvivesPollingOnlyForItsCurrentKey() async {
@@ -96,7 +131,7 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     let requests = fake.requested
     model.invalidateVerification(.microphone)
     #expect(!model.canFinish)
-    #expect(model.rows.first { $0.id == .microphone }?.state == .checking)
+    #expect(model.rows.first { $0.id == .microphone }?.state == .verificationRequired)
     model.finish()
     #expect(!model.isFinishing)
     await model.refresh()
@@ -264,4 +299,108 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
             model.cancel()
         }
     }
+}
+
+
+@Test @MainActor func permissionChecklistFailureSurvivesPollingUntilRetryOrGrantChange() async {
+    for id in [DesktopPermissionID.accessibility, .screenRecording, .microphone, .notifications, .localNetwork, .launchAtLogin] {
+        let fake = PermissionChecklistFake()
+        let state: DesktopPermissionState = id == .launchAtLogin ? .notGranted : (id == .localNetwork ? .verificationRequired : .ready)
+        fake.values[id] = .init(state, detail: "Approval alone is not functional proof", verificationKey: "owner-grant-A", requiresVerification: true)
+        fake.setupValues[id] = .init(.failed, detail: "The actual operation failed")
+        let model = DesktopPermissionChecklistCoordinator(adapter: fake)
+        model.open()
+        await model.refresh()
+        #expect(model.rows.first { $0.id == id }?.state == (state == .ready ? .verificationRequired : state))
+        model.setup(id)
+        while model.busyPermission != nil { await Task.yield() }
+        for _ in 0..<3 { await model.refresh() }
+        #expect(model.rows.first { $0.id == id }?.state == .failed)
+        #expect(model.rows.first { $0.id == id }?.observation.detail == "The actual operation failed")
+        #expect(fake.requested == [id] && !model.canFinish)
+
+        fake.values[id] = .init(.ready, detail: "Changed owner or grant", verificationKey: "owner-grant-B", requiresVerification: true)
+        await model.refresh()
+        #expect(model.rows.first { $0.id == id }?.state == .verificationRequired)
+        fake.setupValues[id] = .init(.ready, detail: "Operation verified", verificationKey: "owner-grant-B", requiresVerification: true, verified: true)
+        model.setup(id)
+        while model.busyPermission != nil { await Task.yield() }
+        await model.refresh()
+        #expect(model.rows.first { $0.id == id }?.state == .ready)
+        #expect(model.rows.first { $0.id == id }?.observation.detail == "Operation verified")
+        #expect(fake.requested == [id, id])
+        fake.values[id] = .init(.denied, detail: "Permission revoked")
+        await model.refresh()
+        #expect(model.rows.first { $0.id == id }?.state == .denied && !model.canFinish)
+        model.cancel()
+    }
+}
+
+@Test @MainActor func permissionChecklistOlderRefreshCannotReplaceCompletedSetup() async {
+    let fake = PermissionChecklistFake()
+    fake.values[.accessibility] = .init(.ready, detail: "Allowed", verificationKey: "current", requiresVerification: true)
+    fake.setupValues[.accessibility] = .init(.ready, detail: "Actual input verified", verificationKey: "current", requiresVerification: true, verified: true)
+    let model = DesktopPermissionChecklistCoordinator(adapter: fake)
+    model.open()
+    await model.refresh()
+    fake.suspendedObservation = .accessibility
+    let oldRefresh = Task { await model.refresh() }
+    while fake.pendingObservation == nil { await Task.yield() }
+    model.setup(.accessibility)
+    while model.busyPermission != nil { await Task.yield() }
+    fake.pendingObservation?.resume(returning: .init(.denied, detail: "Stale denial"))
+    fake.pendingObservation = nil
+    await oldRefresh.value
+    #expect(model.rows.first { $0.id == .accessibility }?.state == .ready)
+    #expect(model.rows.first { $0.id == .accessibility }?.observation.detail == "Actual input verified")
+    #expect(fake.requested == [.accessibility])
+    model.cancel()
+}
+
+@Test @MainActor func permissionChecklistInvalidationRejectsPendingSetupProof() async {
+    let fake = PermissionChecklistFake()
+    fake.delaySetup = true
+    fake.values[.microphone] = .init(.ready, detail: "Allowed", verificationKey: "same-device", requiresVerification: true)
+    let model = DesktopPermissionChecklistCoordinator(adapter: fake)
+    model.open()
+    await model.refresh()
+    model.setup(.microphone)
+    while fake.pendingSetup == nil { await Task.yield() }
+    model.invalidateVerification(.microphone)
+    fake.pendingSetup?.resume(returning: .init(.ready, detail: "Stale proof", verificationKey: "same-device", requiresVerification: true, verified: true))
+    fake.pendingSetup = nil
+    while model.busyPermission != nil { await Task.yield() }
+    #expect(model.rows.first { $0.id == .microphone }?.state == .verificationRequired)
+    #expect(!model.canFinish)
+    model.cancel()
+}
+
+@Test @MainActor func permissionChecklistActivationKeepsPowerProofAndExpiresProtectedResourceProof() async {
+    let notifications = NotificationCenter()
+    var powerChecks = 0
+    var directoryChecks = 0
+    let service = DesktopPermissionChecklist(directoryURL: { _ in URL(fileURLWithPath: "/fake-directory") },
+        verifyDirectory: { _ in directoryChecks += 1 }, selectedProfile: { .production },
+        verifyPowerAvailability: { powerChecks += 1; return true }, activationNotificationCenter: notifications)
+    let power = await service.adapter.setup(.awakeDuringRemoteWork)
+    #expect(power.state == .ready)
+    #expect(await service.adapter.setup(.desktopFiles).state == .ready)
+    notifications.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+    #expect(await service.adapter.observe(.awakeDuringRemoteWork) == power)
+    #expect(await service.adapter.observe(.desktopFiles).state == .verificationRequired)
+    #expect(powerChecks == 1 && directoryChecks == 1)
+}
+
+@Test @MainActor func permissionChecklistActivationFencesPendingDirectoryProof() async {
+    let notifications = NotificationCenter()
+    var pending: CheckedContinuation<Void, Never>?
+    let service = DesktopPermissionChecklist(directoryURL: { _ in URL(fileURLWithPath: "/fake-directory") },
+        verifyDirectory: { _ in await withCheckedContinuation { pending = $0 } }, selectedProfile: { .production },
+        activationNotificationCenter: notifications)
+    let check = Task { await service.adapter.setup(.documentsFiles) }
+    while pending == nil { await Task.yield() }
+    notifications.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+    pending?.resume()
+    #expect(await check.value.state == .checking)
+    #expect(await service.adapter.observe(.documentsFiles).state == .verificationRequired)
 }

@@ -25,6 +25,14 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     private var setupTask: Task<Void, Never>?
     private var continuation: CheckedContinuation<Void, Error>?
     private var verificationKeys: [DesktopPermissionID: String] = [:]
+    private var rowRevisions: [DesktopPermissionID: UUID] = [:]
+    private struct SetupFailure {
+        let observation: DesktopPermissionObservation
+        var passiveKey: String?
+        var passiveState: DesktopPermissionState?
+        var anchored = false
+    }
+    private var setupFailures: [DesktopPermissionID: SetupFailure] = [:]
     private var refreshing = false
     private var refreshedForCurrentPresentation = false
     private(set) var isVisible = false
@@ -82,8 +90,10 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
             guard generation == expected, isVisible, !Task.isCancelled else { return }
             // A check cannot race a deliberate functional verification.
             guard busyPermission != id else { continue }
+            let revision = rowRevisions[id]
             let observation = await adapter.observe(id)
-            guard generation == expected, isVisible, busyPermission != id else { continue }
+            guard generation == expected, isVisible, busyPermission != id,
+                  rowRevisions[id] == revision else { continue }
             apply(observation, id: id, explicit: false)
         }
         if generation == expected, isVisible, !Task.isCancelled { refreshedForCurrentPresentation = true }
@@ -91,13 +101,18 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
 
     func setup(_ id: DesktopPermissionID) {
         guard isVisible, !isFinishing, busyPermission == nil else { return }
+        rowRevisions[id] = UUID()
+        setupFailures.removeValue(forKey: id)
         busyPermission = id
         let expected = generation
+        let revision = rowRevisions[id]
         setupTask = Task { [weak self] in
             guard let self, self.generation == expected, self.isVisible, !Task.isCancelled else { return }
             let observation = await self.adapter.setup(id)
             guard self.generation == expected, self.isVisible, !Task.isCancelled else { return }
-            self.apply(observation, id: id, explicit: true)
+            if self.rowRevisions[id] == revision {
+                self.apply(observation, id: id, explicit: true)
+            }
             self.busyPermission = nil
             self.setupTask = nil
             await self.refresh()
@@ -133,6 +148,8 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         needsNewSetupRequest = false
         busyPermission = nil
         verificationKeys.removeAll()
+        setupFailures.removeAll()
+        rowRevisions.removeAll()
         refreshedForCurrentPresentation = false
         resetObservations()
         let pending = continuation
@@ -147,13 +164,39 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     }
 
     func invalidateVerification(_ id: DesktopPermissionID) {
+        rowRevisions[id] = UUID()
         verificationKeys.removeValue(forKey: id)
+        setupFailures.removeValue(forKey: id)
         guard let index = rows.firstIndex(where: { $0.id == id }) else { return }
-        rows[index].observation = .init(.checking, detail: "Use Setup \(id.title) to verify access again.")
+        rows[index].observation = .init(.verificationRequired, detail: "Use Setup \(id.title) to verify access again.")
+    }
+
+    private func retainedSetupFailure(_ value: DesktopPermissionObservation, id: DesktopPermissionID,
+                                      explicit: Bool) -> DesktopPermissionObservation? {
+        if explicit, value.state == .failed {
+            setupFailures[id] = SetupFailure(observation: value)
+        } else if !explicit, var failure = setupFailures[id] {
+            if !failure.anchored {
+                failure.passiveKey = value.verificationKey
+                failure.passiveState = value.state
+                failure.anchored = true
+            }
+            let incomplete = !value.state.satisfiesSetup || (value.requiresVerification && !value.verified)
+            if incomplete, value.state == failure.passiveState, value.verificationKey == failure.passiveKey {
+                setupFailures[id] = failure
+                return failure.observation
+            }
+            setupFailures.removeValue(forKey: id)
+        }
+        return nil
     }
 
     private func apply(_ value: DesktopPermissionObservation, id: DesktopPermissionID, explicit: Bool) {
         guard let index = rows.firstIndex(where: { $0.id == id }) else { return }
+        if let failure = retainedSetupFailure(value, id: id, explicit: explicit) {
+            rows[index].observation = failure
+            return
+        }
         if value.state != .ready || verificationKeys[id] != value.verificationKey {
             verificationKeys.removeValue(forKey: id)
         }
@@ -161,7 +204,10 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
             verificationKeys[id] = key
         }
         let verified = value.verified || (value.verificationKey != nil && verificationKeys[id] == value.verificationKey)
-        rows[index].observation = .init(value.state, detail: value.detail, verificationKey: value.verificationKey,
+        let previous = rows[index].observation
+        let detail = !explicit && verified && !value.verified && previous.verified &&
+            previous.verificationKey == value.verificationKey ? previous.detail : value.detail
+        rows[index].observation = .init(value.state, detail: detail, verificationKey: value.verificationKey,
                                         requiresVerification: value.requiresVerification, verified: verified)
     }
 }

@@ -22,6 +22,8 @@ final class DesktopPermissionChecklist {
     private let verifyVolume: (@MainActor (DesktopVolumePermissionMount) async throws -> Void)?
     private let protectedAccessAction: (@MainActor () async -> DesktopProtectedAccessSetupAction)?
     private let verifyProtectedAccess: @MainActor () async throws -> Void
+    private let verifyPowerAvailability: () -> Bool
+    private var resourceVerificationGeneration = UUID()
     private var protectedAccessGeneration = UUID()
     private var protectedAccessAttempt: UUID?
     private lazy var volumeCheck = makeVolumeCheck()
@@ -55,6 +57,7 @@ final class DesktopPermissionChecklist {
 
     func cancelVerification() {
         verificationGeneration = UUID()
+        resourceVerificationGeneration = UUID()
         explicitObservations.removeAll()
         invalidateProtectedAccessVerification()
         window.coordinator.invalidateVerification(.microphone)
@@ -75,6 +78,7 @@ final class DesktopPermissionChecklist {
          mountNotificationCenter: NotificationCenter = NSWorkspace.shared.notificationCenter,
          protectedAccessAction: (@MainActor () async -> DesktopProtectedAccessSetupAction)? = nil,
          verifyProtectedAccess: (@MainActor () async throws -> Void)? = nil,
+         verifyPowerAvailability: @escaping () -> Bool = { DesktopControlPowerAssertion.verifyAvailability() },
          activationNotificationCenter: NotificationCenter = .default) {
         self.directoryURL = directoryURL
         self.verifyDirectory = verifyDirectory ?? { url in
@@ -86,6 +90,7 @@ final class DesktopPermissionChecklist {
         self.chooseVolume = chooseVolume
         self.verifyVolume = verifyVolume
         self.protectedAccessAction = protectedAccessAction
+        self.verifyPowerAvailability = verifyPowerAvailability
         self.verifyProtectedAccess = verifyProtectedAccess ?? {
             let files = DesktopFileSystem()
             try await files.verifyProtectedDirectoryAccess(home: FileManager.default.homeDirectoryForCurrentUser)
@@ -102,12 +107,19 @@ final class DesktopPermissionChecklist {
         activationObserver = activationNotificationCenter.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.invalidateProtectedAccessVerification() }
-            Task { @MainActor in
-                self?.explicitObservations.removeAll()
+            MainActor.assumeIsolated {
+                self?.invalidateProtectedAccessVerification()
                 self?.invalidateVolumeVerification()
-                await self?.window.coordinator.refresh()
+                self?.resourceVerificationGeneration = UUID()
+                // Settings can revoke resources with no public grant-state API.
+                // An unrelated activation does not invalidate the power check.
+                for id in [DesktopPermissionID.desktopFiles, .documentsFiles, .downloadsFiles,
+                           .localNetwork, .messagingConnection] {
+                    self?.explicitObservations.removeValue(forKey: id)
+                    self?.window.coordinator.invalidateVerification(id)
+                }
             }
+            Task { @MainActor in await self?.window.coordinator.refresh() }
         }
         for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification, NSWorkspace.didRenameVolumeNotification] {
             mountObservers.append(mountNotificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
@@ -171,8 +183,17 @@ final class DesktopPermissionChecklist {
     }
 
     private func evidence(_ id: DesktopPermissionID, detail: String) -> DesktopPermissionObservation {
-        if let result = explicitObservations[id], result.verificationKey == ownerKey { return result }
-        return .init(.checking, detail: detail)
+        let key = evidenceKey(id)
+        if let result = explicitObservations[id], result.verificationKey == key { return result }
+        return .init(.verificationRequired, detail: detail, verificationKey: key)
+    }
+
+    private func evidenceKey(_ id: DesktopPermissionID) -> String {
+        switch id {
+        case .desktopFiles, .documentsFiles, .downloadsFiles, .localNetwork, .messagingConnection:
+            return "\(ownerKey):\(resourceVerificationGeneration)"
+        default: return ownerKey
+        }
     }
 
     private func observeCua(_ id: DesktopPermissionID) async -> DesktopPermissionObservation {
@@ -181,7 +202,8 @@ final class DesktopPermissionChecklist {
             return .init(.notGranted, detail: "Allow PersonaStack in Privacy & Security → \(id == .accessibility ? "Accessibility" : "Screen & System Audio Recording").")
         }
         guard let snapshot = try? await DesktopControlRuntime.shared.cuaPermissionSnapshot(), snapshot.hostAttributionValid else {
-            return .init(.checking, detail: "Use Setup \(id.title) to start PersonaStack's owned desktop runtime and verify access.")
+            return .init(.verificationRequired, detail: "Use Setup \(id.title) to start PersonaStack's owned desktop runtime and verify access.",
+                         verificationKey: "\(ownerKey):desktop-runtime-unavailable")
         }
         let granted = id == .accessibility ? snapshot.accessibility : snapshot.screenRecording
         return .init(granted ? .ready : .restartRequired,
@@ -243,7 +265,7 @@ final class DesktopPermissionChecklist {
                              verificationKey: result.verificationKey, requiresVerification: true, verified: true)
             } catch { return .init(.failed, detail: "The test notification could not be delivered. Review notification settings and retry.") }
         case .awakeDuringRemoteWork:
-            guard DesktopControlPowerAssertion.verifyAvailability() else {
+            guard verifyPowerAvailability() else {
                 return .init(.failed, detail: "PersonaStack could not verify idle sleep prevention. Retry setup after the Mac recovers.")
             }
             let value = DesktopPermissionObservation(.ready, detail: "PersonaStack verified that it can prevent idle system sleep during remote work.",
@@ -271,6 +293,9 @@ final class DesktopPermissionChecklist {
             try Task.checkCancellation()
             let result = await observeCua(id)
             guard result.state == .ready else { return result }
+            guard AXIsProcessTrusted(), CGPreflightScreenCaptureAccess() else {
+                return .init(.failed, detail: "Desktop verification needs both Accessibility and Screen Recording for PersonaStack. Enable both, then retry Setup \(id.title).")
+            }
             try await runtime.verifyCuaCapabilitiesForPermissions()
             try Task.checkCancellation()
             if id == .accessibility {
@@ -287,7 +312,8 @@ final class DesktopPermissionChecklist {
             return Self.finishCuaVerification(id, initial: result, current: verified)
         } catch is CancellationError { return .init(.checking, detail: "Setup cancelled.") }
         catch let error as DesktopInputPermissionVerificationError { return .init(.failed, detail: error.localizedDescription) }
-        catch { return .init(.failed, detail: "Desktop access could not be verified. Review PersonaStack's permissions and retry. A full app relaunch may be needed.") }
+        catch let error as CuaMCPProxyError { return .init(.failed, detail: error.localizedDescription) }
+        catch { return .init(.failed, detail: "PersonaStack's desktop runtime could not verify access. Enable both Accessibility and Screen Recording for PersonaStack, relaunch the app if macOS requests it, then retry Setup \(id.title).") }
     }
 
     static func finishCuaVerification(_ id: DesktopPermissionID, initial: DesktopPermissionObservation,
@@ -340,7 +366,7 @@ final class DesktopPermissionChecklist {
         case .documentsFiles: directory = .documentDirectory
         default: directory = .downloadsDirectory
         }
-        let key = ownerKey
+        let key = evidenceKey(id)
         explicitObservations.removeValue(forKey: id)
         guard let url = directoryURL(directory) else {
             return directoryResult(id, state: .failed, detail: "The selected directory is unavailable on this Mac.", key: key)
@@ -375,7 +401,7 @@ final class DesktopPermissionChecklist {
         switch action {
         case .cancel: return .init(.checking, detail: "Protected-access check cancelled. Full Disk Access remains unverified.")
         case .settings:
-            return protectedAccessResult(.notGranted, detail: "Add the installed PersonaStack app in Full Disk Access settings. Relaunch if macOS asks, then retry Setup Full Disk Access. The grant remains unverified.", attempt: attempt, key: key)
+            return protectedAccessResult(.notGranted, detail: "In Full Disk Access settings, click + and select PersonaStack.app from Applications, then enable it. Relaunch if macOS asks, then retry Setup Full Disk Access. The grant remains unverified.", attempt: attempt, key: key)
         case .check: break
         }
         do {
@@ -408,7 +434,7 @@ final class DesktopPermissionChecklist {
 
     private func directoryResult(_ id: DesktopPermissionID, state: DesktopPermissionState,
                                  detail: String, key: String) -> DesktopPermissionObservation {
-        guard !Task.isCancelled, key == ownerKey else {
+        guard !Task.isCancelled, key == evidenceKey(id) else {
             return .init(.checking, detail: "Setup changed or was cancelled. Retry the file access check.")
         }
         let result = DesktopPermissionObservation(state, detail: detail, verificationKey: key,
@@ -419,7 +445,7 @@ final class DesktopPermissionChecklist {
 
     private func setupConnection(_ id: DesktopPermissionID) async -> DesktopPermissionObservation {
         guard let profile else { return .init(.notGranted, detail: "Configure the selected server environment first.") }
-        let key = ownerKey
+        let key = evidenceKey(id)
         let endpoints = id == .localNetwork ? [profile.appURL, profile.gatewayURL, profile.mcpURL] : [profile.appURL]
         do {
             for endpoint in endpoints {
@@ -431,7 +457,7 @@ final class DesktopPermissionChecklist {
                 guard response is HTTPURLResponse else { throw URLError(.badServerResponse) }
             }
             try Task.checkCancellation()
-            guard key == ownerKey else { return .init(.checking, detail: "The selected server environment changed. Retry setup.") }
+            guard key == evidenceKey(id) else { return .init(.checking, detail: "The selected server environment changed. Retry setup.") }
             let value = DesktopPermissionObservation(.ready, detail: "The configured service endpoints responded. Account and relay authorization are verified by the existing setup flow.",
                                                      verificationKey: key, requiresVerification: true, verified: true)
             explicitObservations[id] = value

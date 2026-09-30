@@ -82,7 +82,7 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     func protectedAccessSetupAction() async -> DesktopProtectedAccessSetupAction {
         let alert = NSAlert()
         alert.messageText = "Setup Full Disk Access"
-        alert.informativeText = "Add the installed PersonaStack app in System Settings → Privacy & Security → Full Disk Access. macOS may require a relaunch. Check Access attempts one directory read in your Library/Mail folder. Entry names are discarded. No file contents are read or changed. A successful check proves this operation only. Full Disk Access remains unqualified in this release."
+        alert.informativeText = "In System Settings → Privacy & Security → Full Disk Access, click + and select PersonaStack.app from Applications. PersonaStack may not appear until you add it. Turn its switch on and relaunch if macOS requests it. Check Access attempts one directory read in your Library/Mail folder. Entry names are discarded. No file contents are read or changed. A successful check proves this operation only. Full Disk Access remains unqualified in this release."
         alert.icon = NSImage(named: NSImage.applicationIconName)
         alert.addButton(withTitle: "Check Access")
         alert.addButton(withTitle: "Open Settings")
@@ -120,22 +120,30 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
 
     private func show() {
         if !coordinator.isVisible { onPresent?() }
-        if window == nil {
-            let content = DesktopPermissionChecklistView(coordinator: coordinator,
-                cancel: { [weak self] in self?.cancel() }, finish: { [weak self] in self?.finish() })
-            let value = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 670, height: 740),
-                                 styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-            value.title = "Set Up Desktop Control"
-            value.contentViewController = NSHostingController(rootView: content)
-            value.minSize = NSSize(width: 560, height: 460)
-            value.isReleasedWhenClosed = false
-            value.delegate = self
-            value.center()
-            window = value
-        }
+        let value = makeWindowIfNeeded()
         coordinator.open()
         NSApp.activate(ignoringOtherApps: true)
-        window?.makeKeyAndOrderFront(nil)
+        value.makeKeyAndOrderFront(nil)
+    }
+
+    func makeWindowIfNeeded() -> NSWindow {
+        if let window { return window }
+        let content = DesktopPermissionChecklistView(coordinator: coordinator,
+            cancel: { [weak self] in self?.cancel() }, finish: { [weak self] in self?.finish() })
+        let value = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 670, height: 740),
+                             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        value.title = "Set Up Desktop Control"
+        let hosting = NSHostingController(rootView: content)
+        // The native window owns its frame, including later user resizing.
+        hosting.sizingOptions = []
+        value.contentViewController = hosting
+        value.contentMinSize = NSSize(width: 560, height: 460)
+        value.setContentSize(NSSize(width: 670, height: 740))
+        value.isReleasedWhenClosed = false
+        value.delegate = self
+        value.center()
+        window = value
+        return value
     }
 }
 
