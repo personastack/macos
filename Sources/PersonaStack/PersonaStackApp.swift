@@ -8,6 +8,11 @@ import WebKit
 struct PersonaStackApp: App {
     @NSApplicationDelegateAdaptor(PersonaStackTerminationDelegate.self) private var terminationDelegate
     @ObservedObject private var serverSettings = DesktopEnvironmentSettings.shared
+    private let menuBarIcon: NSImage = {
+        let image = NSImage(named: "MenuBarIcon") ?? NSImage()
+        image.size = NSSize(width: 24, height: 24)
+        return image
+    }()
     init() {
         let foregroundUpdateRelaunch = UserDefaults.standard.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
         guard let configuration = try? LaunchConfiguration.selectedEnvironment(),
@@ -58,9 +63,13 @@ struct PersonaStackApp: App {
             }
         }
 
-        MenuBarExtra("PersonaStack Desktop", systemImage: "cursorarrow.motionlines") {
+        MenuBarExtra {
             DesktopControlMenu()
             DesktopUpdatesMenuSection()
+        } label: {
+            Image(nsImage: menuBarIcon)
+                .renderingMode(.original)
+                .accessibilityLabel("PersonaStack Desktop")
         }
         .menuBarExtraStyle(.menu)
 

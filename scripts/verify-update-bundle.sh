@@ -9,6 +9,8 @@ framework="$bundle/Contents/Frameworks/Sparkle.framework"
 
 test -d "$bundle/Contents/MacOS"
 test -x "$bundle/Contents/MacOS/PersonaStack"
+test -s "$bundle/Contents/Resources/AppIcon.icns"
+test -s "$bundle/Contents/Resources/MenuBarIcon.png"
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" = "$version"
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = "$version"
 test "$(/usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$plist")" = 'https://raw.githubusercontent.com/personastack/homebrew-tap/main/appcast.xml'

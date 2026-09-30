@@ -54,6 +54,7 @@ lipo -create \
   -output "$bundle_dir/Contents/MacOS/PersonaStack"
 cp "$root_dir/Resources/Info.plist" "$bundle_dir/Contents/Info.plist"
 cp "$root_dir/Resources/AppIcon.icns" "$bundle_dir/Contents/Resources/AppIcon.icns"
+cp "$root_dir/Resources/MenuBarIcon.png" "$bundle_dir/Contents/Resources/MenuBarIcon.png"
 cp "$root_dir/.build/checkouts/Sparkle/LICENSE" "$bundle_dir/Contents/Resources/Sparkle-LICENSE.txt"
 sparkle_framework="$root_dir/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
 if [ ! -d "$sparkle_framework" ]; then
