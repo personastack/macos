@@ -93,7 +93,10 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     private var timeoutTask: Task<Void, Never>?
 
     override init() {
-        shutdown = { await DesktopControlRuntime.shared.shutdownForQuit() }
+        shutdown = {
+            await LocalRunManager.shared.shutdown()
+            await DesktopControlRuntime.shared.shutdownForQuit()
+        }
         reply = { $0.reply(toApplicationShouldTerminate: true) }
         timeout = .seconds(10)
         super.init()
@@ -150,6 +153,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         }
         timeoutTask = Task { @MainActor in
             try? await Task.sleep(for: timeout)
+            guard !LocalRunManager.shared.hasActiveSessions else { return }
             finish(sender)
         }
         return .terminateLater
@@ -213,6 +217,7 @@ final class MainWebViewHost {
         configuration.userContentController.addScriptMessageHandler(ChatWindowManager.shared, contentWorld: .page, name: "personastackChat")
         configuration.userContentController.addScriptMessageHandler(StackWindowManager.shared, contentWorld: .page, name: "personastackStack")
         configuration.userContentController.addScriptMessageHandler(LocalSessionManager.shared, contentWorld: .page, name: "personastackLocalSession")
+        configuration.userContentController.addScriptMessageHandler(LocalRunManager.shared, contentWorld: .page, name: "personastackLocalRun")
         configuration.userContentController.addScriptMessageHandler(DesktopControlSetupManager.shared, contentWorld: .page, name: "personastackDesktopControl")
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
@@ -223,6 +228,7 @@ final class MainWebViewHost {
         ChatWindowManager.shared.register(webView, appURL: appURL)
         StackWindowManager.shared.register(webView, appURL: appURL)
         LocalSessionManager.shared.register(webView, appURL: appURL)
+        LocalRunManager.shared.register(webView, appURL: appURL)
         DesktopControlSetupManager.shared.register(webView, appURL: appURL)
 
         let backgroundWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1, height: 1),
@@ -253,12 +259,13 @@ final class MainWebViewHost {
         ChatWindowManager.shared.unregister(webView)
         StackWindowManager.shared.unregister(webView)
         LocalSessionManager.shared.invalidate(webView)
+        LocalRunManager.shared.invalidate(webView)
         DesktopControlSetupManager.shared.unregister(webView)
         coordinator.retire()
         webView.stopLoading()
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
-        for name in ["personastackConcern", "personastackChat", "personastackStack", "personastackLocalSession", "personastackDesktopControl"] {
+        for name in ["personastackConcern", "personastackChat", "personastackStack", "personastackLocalSession", "personastackLocalRun", "personastackDesktopControl"] {
             webView.configuration.userContentController.removeScriptMessageHandler(forName: name)
         }
         webView.removeFromSuperview()
@@ -410,6 +417,7 @@ struct PersonaStackWebView: NSViewRepresentable {
                 ChatWindowManager.shared.invalidateSession()
                 StackWindowManager.shared.invalidateSession()
                 LocalSessionManager.shared.invalidateSession()
+                LocalRunManager.shared.invalidateSession()
             }
 
             if navigationAction.targetFrame == nil {
