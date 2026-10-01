@@ -1739,7 +1739,7 @@ func permissionSetupConfirmsSessionAfterAutomaticCheck(warm: Bool, first: Deskto
     access.requestScreenRecording = { true }
     access.microphone = { .denied }
     let service = DesktopPermissionChecklist(access: access, cuaRuntime: runtime,
-        inputTarget: { RuntimeInputTarget(root: root) }, selectedProfile: { .production },
+        selectedProfile: { .production },
         verifyProtectedAccess: {}, activationNotificationCenter: NotificationCenter())
     let hooks = service.adapter.hooks
     service.adapter.hooks.observe = { id in
@@ -1755,12 +1755,18 @@ func permissionSetupConfirmsSessionAfterAutomaticCheck(warm: Bool, first: Deskto
         model.startPresentationVerification()
         while model.verificationBusyPermission != nil { await Task.yield() }
         #expect(confirmations == 0 && runtime.requiresForegroundSessionConfirmation)
-        #expect(model.rows.first { $0.id == .accessibility }?.state == .verificationRequired)
+        #expect(model.rows.first { $0.id == .accessibility }?.state == .ready)
+        #expect(model.rows.first { $0.id == .screenRecording }?.state == .verificationRequired)
+        #expect(model.canFinish)
         for id in [first, first == .accessibility ? .screenRecording : .accessibility] {
+            let previousConfirmations = confirmations
             model.setup(id)
             while model.busyPermission != nil { await Task.yield() }
             #expect(model.rows.first { $0.id == id }?.isComplete == true)
+            if id == .accessibility { #expect(confirmations == previousConfirmations) }
         }
+        let calls = try runtimeFixtureCalls(root)
+        #expect(!calls.contains("click") && !calls.contains("type_text"))
         #expect(confirmations == 1 && !runtime.requiresForegroundSessionConfirmation)
         #expect(model.canFinish && runtime.paused && !runtime.gatewayConnected && !runtime.hasActiveInstallation)
         #expect(credentials.readCount == 0 && !runtime.hasPendingRelayReconnectForTesting)
