@@ -32,6 +32,7 @@ private actor DesktopControlInstallerFixture: DesktopControlDriverInstalling {
 private final class FinishedDesktopControlPermissionFixture: DesktopControlPermissionPresenting {
     private(set) var isFinishing = false
     func presentForSetup() async throws { isFinishing = true }
+    func presentForRepair() {}
     func completeSetup() { isFinishing = false }
     func failSetup(message: String) { isFinishing = false }
     func cancel() { isFinishing = false }

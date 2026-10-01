@@ -124,6 +124,7 @@ private final class PermissionBridgePresenter: DesktopControlPermissionPresentin
     var isFinishing = false
     var autoFinish = false
     private(set) var opens = 0
+    private(set) var repairs = 0
     private(set) var completions = 0
     private(set) var cancellations = 0
     private(set) var failures: [String] = []
@@ -134,6 +135,7 @@ private final class PermissionBridgePresenter: DesktopControlPermissionPresentin
         if autoFinish { isFinishing = true; return }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in pending = continuation }
     }
+    func presentForRepair() { repairs += 1 }
     func finish() { isFinishing = true; let value = pending; pending = nil; value?.resume() }
     func completeWithoutFinish() { let value = pending; pending = nil; value?.resume() }
     func completeSetup() { completions += 1; isFinishing = false }
@@ -220,6 +222,51 @@ private struct PermissionBridgeFixture {
         }
         throw PermissionBridgeFixtureError.readbackDidNotStart
     }
+}
+
+@Test(arguments: ["workspace-session", ""]) @MainActor
+func permissionBridgeRepairOpensWindowWithoutEnrollmentOrRuntimeMutation(_ scope: String) async throws {
+    let fixture = try PermissionBridgeFixture()
+    defer { fixture.cleanup() }
+    fixture.page.setupScope.synchronize(scope)
+    let response = await fixture.send(fixture.permissions("repair", scope: scope))
+    #expect(response.ok && !response.prerequisitesReady)
+    #expect(fixture.presenter.repairs == 1 && fixture.presenter.opens == 0)
+    #expect(!fixture.presenter.isFinishing)
+    let completion = await fixture.send(fixture.permissions("completed", scope: scope))
+    #expect(!completion.ok && completion.code == "permissions_incomplete")
+    #expect(fixture.credentials.counts.reads == 0 && fixture.credentials.counts.saves == 0)
+    #expect(fixture.runtime.calls.isEmpty)
+    #expect(await fixture.enrollment.calls.isEmpty)
+}
+
+@Test @MainActor func permissionBridgeRepairRejectsBusyWithoutCancellingEnrollment() async throws {
+    let fixture = try PermissionBridgeFixture()
+    defer { fixture.cleanup() }
+    let pending = Task { await fixture.send(fixture.permissions("open")) }
+    try await fixture.waitForOpen()
+    let response = await fixture.send(fixture.permissions("repair"))
+    #expect(!response.ok && response.code == "setup_busy")
+    #expect(fixture.presenter.repairs == 0 && fixture.presenter.cancellations == 0)
+    #expect(fixture.presenter.isWaiting)
+    fixture.presenter.finish()
+    #expect(await pending.value.prerequisitesReady)
+    #expect(fixture.credentials.counts.reads == 0 && fixture.runtime.calls.isEmpty)
+    #expect(await fixture.enrollment.calls.isEmpty)
+}
+
+@Test(arguments: ["stale", "retired", "extra-message"]) @MainActor
+func permissionBridgeRepairRejectsInvalidPageAndPayload(_ reason: String) async throws {
+    let fixture = try PermissionBridgeFixture()
+    defer { fixture.cleanup() }
+    if reason == "stale" { fixture.page.setupScope.synchronize("new-scope") }
+    if reason == "retired" { fixture.page.retire() }
+    let response = await fixture.send(fixture.permissions("repair", message: reason == "extra-message" ? "unexpected" : nil))
+    #expect(!response.ok)
+    #expect(fixture.presenter.repairs == 0 && fixture.presenter.opens == 0)
+    #expect(fixture.credentials.counts.reads == 0 && fixture.credentials.counts.saves == 0)
+    #expect(fixture.runtime.calls.isEmpty)
+    #expect(await fixture.enrollment.calls.isEmpty)
 }
 
 @Test @MainActor func permissionBridgeStateAdvertisesChecklistWithoutEnrollmentOrRuntimeMutation() async throws {

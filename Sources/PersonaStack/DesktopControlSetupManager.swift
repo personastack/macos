@@ -54,7 +54,7 @@ struct DesktopControlSetupScope {
 
 enum DesktopControlSetupCommand: Equatable {
     enum PermissionPhase: String {
-        case open, completed, failed
+        case open, completed, failed, repair
     }
 
     case sync(scope: String)
@@ -76,8 +76,9 @@ enum DesktopControlSetupCommand: Equatable {
             guard Set(object.keys) == ["version", "action", "scope"] else { throw DesktopControlEnrollmentError.invalidRequest }
             return .state(scope: scope)
         case "permissions":
-            guard !scope.isEmpty, let phaseValue = object["phase"] as? String,
-                  let phase = PermissionPhase(rawValue: phaseValue) else {
+            guard let phaseValue = object["phase"] as? String,
+                  let phase = PermissionPhase(rawValue: phaseValue),
+                  !scope.isEmpty || phase == .repair else {
                 throw DesktopControlEnrollmentError.invalidRequest
             }
             let message = object["message"] as? String
@@ -117,6 +118,7 @@ enum DesktopControlSetupCommand: Equatable {
 protocol DesktopControlPermissionPresenting: AnyObject {
     var isFinishing: Bool { get }
     func presentForSetup() async throws
+    func presentForRepair()
     func completeSetup()
     func failSetup(message: String)
     func cancel()
@@ -304,7 +306,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
                 "relay_paused": runtime.paused,
             ]
         case .permissions(let scope, let phase, let message):
-            page.requiresExplicitPermissions = true
+            if phase != .repair { page.requiresExplicitPermissions = true }
             return try await permissions(scope: scope, phase: phase, message: message, page: page)
         case .prepare(let scope, let ticket):
             let legacy = !page.requiresExplicitPermissions && page.permissionGeneration == nil && permissionPage == nil
@@ -416,6 +418,11 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         let generation = page.setupScope.generation
         guard !page.isRetired, page.setupScope.value == scope else {
             throw DesktopControlPermissionBridgeError.scopeChanged
+        }
+        if phase == .repair {
+            guard permissionPage == nil else { throw DesktopControlPermissionBridgeError.busy }
+            permissionPresenter.presentForRepair()
+            return ["ok": true, "version": "1"]
         }
         if phase == .open {
             guard permissionPage == nil else { throw DesktopControlPermissionBridgeError.busy }
