@@ -193,7 +193,10 @@ private struct PermissionOnlyAdapter: DesktopPermissionChecklistAdapting {
     var access = DesktopPermissionSystemAccess()
     access.accessibility = { granted }
     access.requestAccessibility = { requested += 1 }
-    let adapter = DesktopPermissionChecklistSystemAdapter(access: access, openSettings: { section in
+    let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(setup: { _ in
+        Issue.record("Pending AX approval must not start the desktop runtime or verifier")
+        return nil
+    }), access: access, openSettings: { section in
         #expect(section == "com.apple.preference.security?Privacy_Accessibility")
         settings += 1
     })

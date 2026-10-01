@@ -1,7 +1,23 @@
+import AppKit
 import Foundation
 import Testing
 import PersonaStackCore
 @testable import PersonaStack
+
+// Cua tag cua-driver-rs-v0.29.1, commit 7a8f66ad04e62fccb18cca9965f2964fcaee124e.
+// Public MCP projection: cua-driver-core/src/tool.rs::publish_action_result and
+// action_record.rs::from_legacy/public_result. These intentionally omit the
+// platform handler's private path, verified, characters and requested_chars.
+private enum Cua0291InputReplies {
+    static let click = Data(#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"Accessibility action delivered; verify its effect."}],"structuredContent":{"route":"accessibility","effect":"unverifiable","delivery":{"mode":"background"},"summary":"Accessibility action delivered; verify its effect."}}}"#.utf8)
+    static let typeText = Data(#"{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"Text value confirmed."}],"structuredContent":{"route":"accessibility","effect":"confirmed","delivery":{"mode":"background","delivered_count":34},"evidence":[{"kind":"value_readback"}],"summary":"Text value confirmed."}}}"#.utf8)
+
+    static func payload(_ data: Data) throws -> [String: Any] {
+        let reply = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let result = try #require(reply["result"] as? [String: Any])
+        return try #require(result["structuredContent"] as? [String: Any])
+    }
+}
 
 @MainActor
 private final class InputPermissionTarget: DesktopInputPermissionTarget {
@@ -28,6 +44,8 @@ private final class InputPermissionCalls {
     var afterCall: ((String) -> Void)?
     var deliverClick = true
     var deliverText = true
+    var snapshotCount = 0
+    var currentSnapshot = ""
 
     init(_ target: InputPermissionTarget) { self.target = target }
 
@@ -41,8 +59,8 @@ private final class InputPermissionCalls {
         let index = names.count
         names.append(name)
         var payload: [String: Any]
-        switch (index, name) {
-        case (0, "get_window_state"), (2, "get_window_state"):
+        switch name {
+        case "get_window_state":
             #expect(Set(arguments.keys) == ["session", "pid", "window_id", "include_screenshot", "include_accessibility_tree",
                                           "max_elements", "max_depth", "timeout_ms"])
             #expect(arguments["include_screenshot"] as? Bool == false)
@@ -50,7 +68,9 @@ private final class InputPermissionCalls {
             #expect(arguments["max_elements"] as? Int == 32)
             #expect(arguments["max_depth"] as? Int == 8)
             #expect(arguments["timeout_ms"] as? Int == 1000)
-            let snapshot = index == 0 ? "s00000001" : "s00000002"
+            snapshotCount += 1
+            let snapshot = String(format: "s%08x", snapshotCount)
+            currentSnapshot = snapshot
             payload = ["pid": target.pid, "window_id": target.windowID, "snapshot_id": snapshot,
                        "truncated": false, "elements_complete": false,
                        "elements": [
@@ -59,24 +79,25 @@ private final class InputPermissionCalls {
                         ["element_index": 4, "element_token": "\(snapshot):4", "role": "AXTextField",
                          "label": DesktopInputPermissionVerifier.fieldLabel, "enabled": true],
                        ]]
-        case (1, "click"):
+        case "click":
+            #expect(names.filter { $0 == "click" }.count == 1)
             #expect(Set(arguments.keys) == ["session", "pid", "window_id", "element_token", "action", "button", "delivery_mode"])
-            #expect(arguments["element_token"] as? String == "s00000001:3")
+            #expect(arguments["element_token"] as? String == "\(currentSnapshot):3")
             #expect(arguments["action"] as? String == "press")
             #expect(arguments["button"] as? String == "left")
             #expect(arguments["delivery_mode"] as? String == "background")
             if deliverClick { target.clickCount += 1 }
-            payload = ["path": "ax", "verified": false, "effect": "unverifiable"]
-        case (3, "type_text"):
+            payload = try Cua0291InputReplies.payload(Cua0291InputReplies.click)
+        case "type_text":
+            #expect(names.filter { $0 == "type_text" }.count == 1)
             #expect(Set(arguments.keys) == ["session", "pid", "window_id", "element_token", "text", "scope", "delay_ms", "delivery_mode"])
-            #expect(arguments["element_token"] as? String == "s00000002:4")
+            #expect(arguments["element_token"] as? String == "\(currentSnapshot):4")
             #expect(arguments["text"] as? String == target.expectedText)
             #expect(arguments["scope"] as? String == "window")
             #expect(arguments["delay_ms"] as? Int == 0)
             #expect(arguments["delivery_mode"] as? String == "background")
             if deliverText { target.text = target.expectedText }
-            payload = ["path": "ax", "effect": "confirmed", "verified": true,
-                       "characters": target.expectedText.count, "requested_chars": target.expectedText.count]
+            payload = try Cua0291InputReplies.payload(Cua0291InputReplies.typeText)
         default:
             Issue.record("Unexpected permission tool call: \(name)")
             throw CuaMCPProxyError.invalidToolName
@@ -107,10 +128,118 @@ struct DesktopInputPermissionTests {
     @Test func ownedWindowInputRequiresFreshTokensAndNativeEffects() async throws {
         let target = InputPermissionTarget()
         let calls = InputPermissionCalls(target)
-        try await DesktopInputPermissionVerifier.verify(target: target, call: calls.call, isCurrent: {})
+        try await DesktopInputPermissionVerifier.verify(target: target, call: { name, arguments in
+            let reply = try await calls.call(name, arguments)
+            switch name {
+            case "click": return Cua0291InputReplies.click
+            case "type_text": return Cua0291InputReplies.typeText
+            default: return reply
+            }
+        }, isCurrent: {}, settle: {})
         #expect(calls.names == ["get_window_state", "click", "get_window_state", "type_text"])
         #expect(target.clickCount == 1)
         #expect(target.text == target.expectedText)
+        #expect(target.invalidated)
+    }
+
+    @Test func nativeTextCellExportsTheLabelConsumedByThePinnedDriver() throws {
+        let field = DesktopInputPermissionWindow.makeVerificationField()
+        let children = try #require(field.accessibilityChildren())
+        let cell = try #require(children.first as? NSTextFieldCell)
+        #expect(cell.accessibilityRole() == .textField)
+        #expect(cell.accessibilityTitle() == DesktopInputPermissionVerifier.fieldLabel)
+        #expect(cell.accessibilityLabel() == DesktopInputPermissionVerifier.fieldLabel)
+        #expect(cell.isAccessibilityEnabled())
+        // Exercise AppKit's real cell-backed value, not a mirrored fake string.
+        cell.setAccessibilityValue("Disposable native value")
+        #expect(field.stringValue == "Disposable native value")
+    }
+
+    @Test func verificationWindowExportsDialogScopeWithoutPresentingIt() {
+        _ = NSApplication.shared
+        let window = DesktopInputPermissionWindow.makeVerificationWindow()
+        #expect(window.accessibilitySubrole() == .dialog)
+        #expect(!window.isVisible)
+    }
+
+    @Test func nativeCallbacksMaySettleAfterTheToolReplyWithoutRepeatingInput() async throws {
+        let target = InputPermissionTarget()
+        let calls = InputPermissionCalls(target)
+        calls.deliverClick = false
+        calls.deliverText = false
+        var waits = 0
+        try await DesktopInputPermissionVerifier.verify(target: target, call: calls.call, isCurrent: {}, settle: {
+            waits += 1
+            #expect(!target.invalidated)
+            if calls.names.last == "click" { target.clickCount = 1 }
+            if calls.names.last == "type_text" { target.text = target.expectedText }
+        })
+        #expect(waits == 2)
+        #expect(calls.names == ["get_window_state", "click", "get_window_state", "type_text"])
+        #expect(target.invalidated)
+    }
+
+    @Test(arguments: ["ax_window_unresolved:", "ax_tree_empty:"])
+    func newlyPresentedWindowMaySettleBeforeAnyInput(reason: String) async throws {
+        let target = InputPermissionTarget()
+        let calls = InputPermissionCalls(target)
+        calls.transform = { name, original in
+            guard name == "get_window_state", calls.names.count == 1 else { return original }
+            return ["result": ["structuredContent": ["pid": target.pid, "window_id": target.windowID,
+                "truncated": false, "degraded": true, "degraded_reason": reason, "elements": [] as [String]]]]
+        }
+        var waits = 0
+        try await DesktopInputPermissionVerifier.verify(target: target, call: calls.call, isCurrent: {}, settle: {
+            waits += 1
+            #expect(target.clickCount == 0 && target.text.isEmpty && !target.invalidated)
+        })
+        #expect(waits == 1)
+        #expect(calls.names == ["get_window_state", "get_window_state", "click", "get_window_state", "type_text"])
+    }
+
+    @Test func unresolvedWindowStopsAfterBoundedReadsWithNoInput() async {
+        let target = InputPermissionTarget()
+        let calls = InputPermissionCalls(target)
+        calls.transform = { _, _ in
+            ["result": ["structuredContent": ["pid": target.pid, "window_id": target.windowID,
+                "truncated": false, "degraded": true, "degraded_reason": "ax_window_unresolved:", "elements": [] as [String]]]]
+        }
+        await #expect(throws: DesktopInputPermissionVerificationError.failed(.button, .snapshot)) {
+            try await DesktopInputPermissionVerifier.verify(target: target, call: calls.call, isCurrent: {}, settle: {})
+        }
+        #expect(calls.names == ["get_window_state", "get_window_state", "get_window_state"])
+        #expect(target.clickCount == 0 && target.text.isEmpty && target.invalidated)
+    }
+
+    @Test func cancellationDuringNativeSettleStopsBeforeTextAndInvalidatesWindow() async {
+        let target = InputPermissionTarget()
+        let calls = InputPermissionCalls(target)
+        calls.deliverClick = false
+        let task = Task { @MainActor in
+            try await DesktopInputPermissionVerifier.verify(target: target, call: calls.call, isCurrent: {}, settle: {
+                withUnsafeCurrentTask { $0?.cancel() }
+            })
+        }
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(calls.names == ["get_window_state", "click"])
+        #expect(target.text.isEmpty && target.invalidated)
+    }
+
+    @Test func failureNamesTheStageWithoutEchoingRuntimeContent() async {
+        let target = InputPermissionTarget()
+        let calls = InputPermissionCalls(target)
+        calls.deliverClick = false
+        calls.transform = { name, reply in
+            if name == "click" { return ["result": ["isError": true, "content": [["type": "text", "text": "private upstream content"]]]] }
+            return reply
+        }
+        let failure = DesktopInputPermissionVerificationError.failed(.click, .rejected)
+        await #expect(throws: failure) {
+            try await DesktopInputPermissionVerifier.verify(target: target, call: calls.call, isCurrent: {}, settle: {})
+        }
+        #expect(failure.localizedDescription == "Accessibility verification stopped while clicking the test button: the desktop runtime rejected the operation. Retry Setup Accessibility.")
+        #expect(calls.names == ["get_window_state", "click"])
+        #expect(target.clickCount == 0 && target.text.isEmpty)
         #expect(target.invalidated)
     }
 
@@ -143,8 +272,8 @@ struct DesktopInputPermissionTests {
             response["result"] = result
             return response
         }
-        await #expect(throws: CuaMCPProxyError.functionalProbeFailed) {
-            try await DesktopInputPermissionVerifier.verify(target: target, call: calls.call, isCurrent: {})
+        await #expect(throws: DesktopInputPermissionVerificationError.self) {
+            try await DesktopInputPermissionVerifier.verify(target: target, call: calls.call, isCurrent: {}, settle: {})
         }
         #expect(calls.names == ["get_window_state"])
         #expect(target.clickCount == 0)
@@ -152,7 +281,7 @@ struct DesktopInputPermissionTests {
         #expect(target.invalidated)
     }
 
-    @Test(arguments: ["native_click", "native_text", "click_path", "click_noop", "text_path", "text_unverified", "text_count", "reused_snapshot"])
+    @Test(arguments: ["native_click", "native_text", "click_path", "click_noop", "click_delivery", "text_path", "text_unverified", "text_count", "text_evidence", "text_refused", "legacy_reply", "reused_snapshot"])
     func toolAcknowledgmentAloneDoesNotProveInput(reason: String) async {
         let target = InputPermissionTarget()
         let calls = InputPermissionCalls(target)
@@ -162,21 +291,25 @@ struct DesktopInputPermissionTests {
             var response = original
             var result = try #require(response["result"] as? [String: Any])
             var payload = try #require(result["structuredContent"] as? [String: Any])
-            if name == "click", reason == "click_path" { payload["path"] = "cgevent" }
+            if name == "click", reason == "click_path" { payload["route"] = "synthetic_events" }
             if name == "click", reason == "click_noop" { payload["effect"] = "suspected_noop" }
-            if name == "type_text", reason == "text_path" { payload["path"] = "key_events" }
-            if name == "type_text", reason == "text_unverified" { payload["verified"] = false }
-            if name == "type_text", reason == "text_count" { payload["characters"] = 1 }
+            if name == "type_text", reason == "text_path" { payload["route"] = "synthetic_events" }
+            if name == "type_text", reason == "text_unverified" { payload["effect"] = "unverifiable" }
+            if name == "type_text", reason == "text_count" { payload["delivery"] = ["mode": "background", "delivered_count": 1] }
+            if name == "click", reason == "click_delivery" { payload["delivery"] = ["mode": "foreground"] }
+            if name == "click", reason == "legacy_reply" { payload = ["path": "ax", "verified": false, "effect": "unverifiable"] }
+            if name == "type_text", reason == "text_evidence" { payload.removeValue(forKey: "evidence") }
+            if name == "type_text", reason == "text_refused" { payload["effect"] = "refused"; payload["error"] = ["code": "permission_denied"] }
             if name == "get_window_state", calls.names.count == 3, reason == "reused_snapshot" { payload["snapshot_id"] = "s00000001" }
             result["structuredContent"] = payload
             response["result"] = result
             return response
         }
-        await #expect(throws: CuaMCPProxyError.functionalProbeFailed) {
-            try await DesktopInputPermissionVerifier.verify(target: target, call: calls.call, isCurrent: {})
+        await #expect(throws: DesktopInputPermissionVerificationError.self) {
+            try await DesktopInputPermissionVerifier.verify(target: target, call: calls.call, isCurrent: {}, settle: {})
         }
         #expect(target.invalidated)
-        if ["native_click", "click_path", "click_noop"].contains(reason) { #expect(calls.names.count == 2) }
+        if ["native_click", "click_path", "click_noop", "click_delivery", "legacy_reply"].contains(reason) { #expect(calls.names.count == 2) }
         if reason == "reused_snapshot" { #expect(calls.names.count == 3) }
     }
 
@@ -185,7 +318,7 @@ struct DesktopInputPermissionTests {
         let calls = InputPermissionCalls(target)
         calls.afterCall = { name in if name == "click" { withUnsafeCurrentTask { $0?.cancel() } } }
         let task = Task { @MainActor in
-            try await DesktopInputPermissionVerifier.verify(target: target, call: calls.call, isCurrent: {})
+            try await DesktopInputPermissionVerifier.verify(target: target, call: calls.call, isCurrent: {}, settle: {})
         }
         await #expect(throws: CancellationError.self) { try await task.value }
         #expect(calls.names == ["get_window_state", "click"])

@@ -82,7 +82,10 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         case .accessibility:
             access.requestAccessibility()
             // AX's prompt return value is synchronous. Approval is asynchronous.
-            if !access.accessibility() { openPrivacy("Accessibility") }
+            guard access.accessibility() else {
+                openPrivacy("Accessibility")
+                return Self.privacyDenialObservation(permission)
+            }
         case .screenRecording, .directCapture:
             // CGRequestScreenCaptureAccess can return false without registering
             // the app on newer macOS. A real host SCK request owns that prompt.

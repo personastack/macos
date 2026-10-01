@@ -245,14 +245,15 @@ for line in sys.stdin:
                 assert arguments['element_token'] == 's%08x:3' % input_snapshots
                 assert arguments['action'] == 'press' and arguments['button'] == 'left' and arguments['delivery_mode'] == 'background'
                 with open(os.path.join(root, 'input-clicked'), 'w') as out: out.write('1')
-                result = {'structuredContent':{'path':'ax','verified':False,'effect':'unverifiable'}}
+                # The canonical MCP dispatcher projects the private AX payload to ActionResult.
+                result = {'structuredContent':{'route':'accessibility','effect':'unverifiable','delivery':{'mode':'background'}}}
             else:
                 assert set(arguments) == base | {'element_token','text','scope','delay_ms','delivery_mode'}
                 assert arguments['element_token'] == 's%08x:4' % input_snapshots
                 assert arguments['scope'] == 'window' and arguments['delay_ms'] == 0 and arguments['delivery_mode'] == 'background'
                 assert arguments['text'] == target['expected_text']
                 with open(os.path.join(root, 'input-text'), 'w') as out: out.write(arguments['text'])
-                result = {'structuredContent':{'path':'ax','effect':'confirmed','verified':True,'characters':len(arguments['text']),'requested_chars':len(arguments['text'])}}
+                result = {'structuredContent':{'route':'accessibility','effect':'confirmed','delivery':{'mode':'background','delivered_count':len(arguments['text'])},'evidence':[{'kind':'value_readback'}]}}
         else: raise RuntimeError('unplanned tool: '+name)
     else: raise RuntimeError('unplanned method: '+method)
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
