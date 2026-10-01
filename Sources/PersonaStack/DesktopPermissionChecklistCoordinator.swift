@@ -46,7 +46,8 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         var anchored = false
     }
     private var setupFailures: [DesktopPermissionID: SetupFailure] = [:]
-    private var refreshing = false
+    private var refreshOperationTask: Task<Void, Never>?
+    private var refreshRequested = false
     private(set) var isVisible = false
 
     init(adapter: any DesktopPermissionChecklistAdapting) { self.adapter = adapter }
@@ -126,10 +127,33 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     }
 
     func refresh() async {
-        guard isVisible, !isFinishing, !refreshing else { return }
-        refreshing = true
-        let expected = generation
-        defer { if generation == expected { refreshing = false } }
+        guard isVisible, !isFinishing, !Task.isCancelled else { return }
+        // Every caller waits for current readback. A request arriving mid-pass
+        // also needs one subsequent pass for rows that were already observed.
+        refreshRequested = true
+        let task: Task<Void, Never>
+        if let current = refreshOperationTask { task = current }
+        else {
+            let expected = generation
+            task = Task { [weak self] in
+                guard let self else { return }
+                defer {
+                    if self.generation == expected { self.refreshOperationTask = nil }
+                }
+                while self.generation == expected, self.isVisible, !self.isFinishing,
+                      !Task.isCancelled, self.refreshRequested {
+                    self.refreshRequested = false
+                    await self.refreshRows(expected: expected)
+                }
+            }
+            refreshOperationTask = task
+        }
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: { task.cancel() }
+    }
+
+    private func refreshRows(expected: UUID) async {
         for id in DesktopPermissionID.allCases {
             guard generation == expected, isVisible, !isFinishing, !Task.isCancelled else { return }
             // A check cannot race a deliberate functional verification.
@@ -172,6 +196,8 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     func finish() {
         guard canFinish else { return }
         isFinishing = true
+        refreshRequested = false
+        refreshOperationTask?.cancel()
         observationTask?.cancel()
         observationTask = nil
         setupTask?.cancel()
@@ -197,6 +223,9 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     func cancel() {
         generation = UUID()
         refreshTask?.cancel()
+        refreshOperationTask?.cancel()
+        refreshOperationTask = nil
+        refreshRequested = false
         observationTask?.cancel()
         observationTask = nil
         setupTask?.cancel()
@@ -206,7 +235,6 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         automaticSetupTask = nil
         automaticSetupStarted = false
         isVisible = false
-        refreshing = false
         isFinishing = false
         needsNewSetupRequest = false
         busyPermission = nil

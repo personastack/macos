@@ -526,6 +526,38 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     }
 }
 
+@Test @MainActor func permissionChecklistOverlappingRefreshWaitsForChangedGrantReadback() async {
+    let fake = PermissionChecklistFake()
+    fake.values[.accessibility] = .init(.ready, detail: "Verified input", verified: true)
+    fake.suspendedObservation = .screenRecording
+    let model = DesktopPermissionChecklistCoordinator(adapter: fake)
+    defer { model.cancel() }
+    let first = Task {
+        model.open()
+        await model.refresh()
+    }
+    while fake.pendingObservation == nil { await Task.yield() }
+    #expect(model.canFinish)
+    fake.values[.accessibility] = .init(.denied, detail: "Grant revoked during refresh")
+    var secondStarted = false
+    var secondFinished = false
+    let second = Task {
+        secondStarted = true
+        await model.refresh()
+        secondFinished = true
+    }
+    while !secondStarted { await Task.yield() }
+    #expect(!secondFinished)
+    fake.pendingObservation?.resume(returning: .init(.ready, detail: "Optional check finished"))
+    fake.pendingObservation = nil
+    await first.value
+    await second.value
+    #expect(secondFinished && !model.canFinish)
+    #expect(model.rows.first { $0.id == .accessibility }?.state == .denied)
+    #expect(fake.observed.filter { $0 == .accessibility }.count == 2)
+    #expect(fake.requested.isEmpty)
+}
+
 @Test @MainActor func permissionChecklistAccessibilityEnablesFinishBeforeOptionalRefreshCompletes() async throws {
     let fake = PermissionChecklistFake()
     fake.values[.accessibility] = .init(.ready, detail: "Input verified", requiresVerification: true, verified: true)
@@ -543,12 +575,19 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     let enrollment = Task { try await model.waitForFinish() }
     while !model.isAwaitingFinish { await Task.yield() }
     #expect(model.canFinish)
+    var overlapStarted = false
+    let overlap = Task {
+        overlapStarted = true
+        await model.refresh()
+    }
+    while !overlapStarted { await Task.yield() }
     window.finish()
     try await enrollment.value
     #expect(model.isFinishing && model.isVisible)
     fake.pendingObservation?.resume(returning: .init(.failed, detail: "Optional capture failed"))
     fake.pendingObservation = nil
     await refresh.value
+    await overlap.value
     // Enrollment keeps this window open. Finish alone must fence subsequent
     // authorized Local Network and Full Disk Access observations and probes.
     #expect(model.isFinishing && model.isVisible)

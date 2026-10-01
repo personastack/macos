@@ -5,7 +5,7 @@ import Testing
 @testable import PersonaStack
 @testable import PersonaStackCore
 
-private func protectedAccessFixture() throws -> URL {
+func protectedAccessFixture() throws -> URL {
     // Foundation preserves the /var alias on macOS. The strict probe must get
     // a real path even for these disposable test fixtures.
     guard let canonical = realpath(FileManager.default.temporaryDirectory.path, nil) else {

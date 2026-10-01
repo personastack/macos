@@ -195,9 +195,8 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
 }
 
 @Test @MainActor func protectedAccessReadyRefreshUsesRealOwnerAndNeverRepeatsAfterDenial() async throws {
-    let home = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent(UUID().uuidString)
+    let home = try protectedAccessFixture()
     let mail = home.appendingPathComponent("Library/Mail")
-    try FileManager.default.createDirectory(at: mail, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: home) }
     var probes = 0
     let service = DesktopPermissionChecklist(selectedProfile: { .production }, protectedAccessAction: { .check },
