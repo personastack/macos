@@ -91,7 +91,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                  configurationProvider: @escaping () throws -> DesktopEnvironmentConfiguration = { try LaunchConfiguration.selectedEnvironment() },
                  confirmForegroundSetup: @escaping @MainActor () -> Bool = DesktopControlRuntime.showForegroundSetupConfirmation,
                  hostPermissions: @escaping @MainActor () -> (accessibility: Bool, screenRecording: Bool) = {
-                     (AXIsProcessTrusted(), CGPreflightScreenCaptureAccess())
+                     (DesktopAccessibilityPermission.isGranted(), CGPreflightScreenCaptureAccess())
                  }) {
         self.installer = installer
         self.credentials = credentials
@@ -145,7 +145,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                                stopCuaService: (@MainActor (CuaEmbeddedService) async -> Bool)? = nil,
                                confirmForegroundSetup: @escaping @MainActor () -> Bool = { true },
                                hostPermissions: @escaping @MainActor () -> (accessibility: Bool, screenRecording: Bool) = {
-                                   (AXIsProcessTrusted(), CGPreflightScreenCaptureAccess())
+                                   (DesktopAccessibilityPermission.isGranted(), CGPreflightScreenCaptureAccess())
                                }) -> DesktopControlRuntime {
         let runtime = DesktopControlRuntime(installer: installer, credentials: credentials, relayStateReader: relayStateReader,
                                             preferences: preferences, configurationProvider: configurationProvider,

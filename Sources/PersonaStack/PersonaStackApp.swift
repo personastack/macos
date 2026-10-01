@@ -14,6 +14,10 @@ struct PersonaStackApp: App {
         return image
     }()
     init() {
+        if CommandLine.arguments.contains("--personastack-permission-diagnostics") {
+            DesktopAccessibilityPermission.printDiagnostics()
+            exit(0)
+        }
         let foregroundUpdateRelaunch = UserDefaults.standard.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
         guard let configuration = try? LaunchConfiguration.selectedEnvironment(),
               UserDefaults.standard.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(configuration)) else { return }

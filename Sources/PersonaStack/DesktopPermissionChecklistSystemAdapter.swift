@@ -20,7 +20,7 @@ struct DesktopPermissionChecklistHooks {
 /// is deliberately attempted by Setup even when CoreGraphics preflight is false.
 @MainActor
 struct DesktopPermissionSystemAccess {
-    var accessibility: () -> Bool = { AXIsProcessTrusted() }
+    var accessibility: () -> Bool = { DesktopAccessibilityPermission.isGranted() }
     var requestAccessibility: () -> Void = {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
@@ -181,7 +181,7 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
                      verificationKey: "\(Bundle.main.bundleIdentifier ?? "unpackaged"):screen-capture:accessibility-missing")
     }
 
-    /// The OS trust check is the complete Accessibility permission check.
+    /// Read OS trust and content-free AX access without exercising input.
     /// Runtime health and action delivery remain owned by DesktopControlRuntime.
     func accessibilityObservation() -> DesktopPermissionObservation {
         guard access.accessibility() else { return Self.privacyDenialObservation(.accessibility) }
