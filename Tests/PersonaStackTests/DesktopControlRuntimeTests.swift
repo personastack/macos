@@ -2071,8 +2071,8 @@ private struct InterleavedKeychainCredentialStore: DesktopControlCredentialStori
 
 @Test(arguments: [false, true], [DesktopControlEnrollmentError.credentialAccessRequired.localizedDescription,
                                 DesktopControlEnrollmentError.credentialStoreUnavailable.localizedDescription,
-                                "macOS Keychain could not access the Desktop Control installation. Choose Retry Remote Control from the PersonaStack menu.",
-                                "Desktop Control needs Keychain access. Choose Retry Remote Control from the PersonaStack menu. If macOS asks, choose Always Allow to remember this app.",
+                                "macOS Keychain could not access the Desktop Control installation. Old recovery instructions.",
+                                "Desktop Control needs Keychain access. Old recovery instructions.",
                                 "Cua permissions need attention", "Waiting for PersonaStack connection"]) @MainActor
 func nativeKeychainAuthorizationClearsOnlyItsProfilesCredentialError(alreadyCached: Bool, message: String) async throws {
     let suite = "keychain-error-clear-\(UUID().uuidString)"
@@ -2087,6 +2087,7 @@ func nativeKeychainAuthorizationClearsOnlyItsProfilesCredentialError(alreadyCach
     let runtime = DesktopControlRuntime.makeForTesting(
         installer: DesktopControlInstallerFixture(errors: []), credentials: credentials,
         installation: alreadyCached ? installation : nil, preferences: preferences)
+    preferences.set(message, forKey: errorKey)
     try await runtime.authorizeSavedInstallation(generation: runtime.beginResume())
     let isCredentialError = message == DesktopControlEnrollmentError.credentialAccessRequired.localizedDescription
         || message == DesktopControlEnrollmentError.credentialStoreUnavailable.localizedDescription
@@ -2095,6 +2096,29 @@ func nativeKeychainAuthorizationClearsOnlyItsProfilesCredentialError(alreadyCach
     #expect(preferences.string(forKey: otherProfileKey) == DesktopControlEnrollmentError.credentialAccessRequired.localizedDescription)
     #expect(credentials.counts.authorizations == (alreadyCached ? 0 : 1))
     #expect(credentials.counts.reads == 0)
+}
+
+@Test @MainActor func obsoleteKeychainMessagesAreClearedAtStartupWithoutReadingCredentials() throws {
+    let suite = "obsolete-keychain-message-\(UUID().uuidString)"
+    let preferences = try #require(UserDefaults(suiteName: suite))
+    defer { preferences.removePersistentDomain(forName: suite) }
+    let oldAccess = "Desktop Control needs Keychain access. Old recovery instructions."
+    let oldStore = "macOS Keychain could not access the Desktop Control installation. Old recovery instructions."
+    let obsoleteKeys = [DesktopControlPreferenceKeys.relayError(.production),
+                        DesktopControlPreferenceKeys.relayError(.lan),
+                        "desktopControlRelayError", "desktopControlRepairError"]
+    for (index, key) in obsoleteKeys.enumerated() {
+        preferences.set(index.isMultiple(of: 2) ? oldAccess : oldStore, forKey: key)
+    }
+    preferences.set("Waiting for PersonaStack connection", forKey: "desktopControlRelayError.other")
+    preferences.set(oldAccess, forKey: "unrelatedPreference")
+    let credentials = AuthorizingDesktopControlCredentialStore(installation: try boundKeychainRecoveryInstallation())
+    _ = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []), credentials: credentials, preferences: preferences)
+    for key in obsoleteKeys { #expect(preferences.string(forKey: key) == "") }
+    #expect(preferences.string(forKey: "desktopControlRelayError.other") == "Waiting for PersonaStack connection")
+    #expect(preferences.string(forKey: "unrelatedPreference") == oldAccess)
+    #expect(credentials.counts.reads == 0 && credentials.counts.authorizations == 0)
 }
 
 private struct DeferredLaunchCredentialStore: DesktopControlCredentialStoring {

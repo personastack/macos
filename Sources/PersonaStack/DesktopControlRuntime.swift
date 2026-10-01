@@ -100,6 +100,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         self.configurationProvider = configurationProvider
         self.confirmForegroundSetup = confirmForegroundSetup
         self.hostPermissions = hostPermissions
+        Self.clearObsoleteCredentialErrors(in: preferences)
         sessionLock.onChange = { [weak self] state in
             guard let self else { return }
             self.lockGeneration = UUID()
@@ -243,10 +244,23 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private func clearCredentialAccessError(configuration: DesktopEnvironmentConfiguration) {
         let key = DesktopControlPreferenceKeys.relayError(configuration)
         let credentialErrors = [DesktopControlEnrollmentError.credentialAccessRequired.localizedDescription,
-                                DesktopControlEnrollmentError.credentialStoreUnavailable.localizedDescription,
-                                "macOS Keychain could not access the Desktop Control installation. Choose Retry Remote Control from the PersonaStack menu.",
-                                "Desktop Control needs Keychain access. Choose Retry Remote Control from the PersonaStack menu. If macOS asks, choose Always Allow to remember this app."]
-        if let message = preferences.string(forKey: key), credentialErrors.contains(message) {
+                                DesktopControlEnrollmentError.credentialStoreUnavailable.localizedDescription]
+        if let message = preferences.string(forKey: key),
+           credentialErrors.contains(message) || Self.isObsoleteCredentialError(message) {
+            preferences.set("", forKey: key)
+        }
+    }
+
+    private static func isObsoleteCredentialError(_ message: String) -> Bool {
+        message.hasPrefix("Desktop Control needs Keychain access.")
+            || message.hasPrefix("macOS Keychain could not access the Desktop Control installation.")
+    }
+
+    private static func clearObsoleteCredentialErrors(in preferences: UserDefaults) {
+        for (key, value) in preferences.dictionaryRepresentation() {
+            guard key == "desktopControlRelayError" || key.hasPrefix("desktopControlRelayError.")
+                    || key == "desktopControlRepairError",
+                  let message = value as? String, isObsoleteCredentialError(message) else { continue }
             preferences.set("", forKey: key)
         }
     }
