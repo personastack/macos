@@ -9,12 +9,17 @@ public enum DesktopPermissionID: String, CaseIterable, Identifiable, Sendable {
 
     public var id: String { rawValue }
 
+    /// OS approvals used by the current desktop and voice features. Folder
+    /// grants are covered by Full Disk Access. Unused capabilities stay out.
+    public static let setupPermissions: [Self] = [.accessibility, .screenRecording, .fullDiskAccess, .microphone, .localNetwork]
+    public static let automaticSetup: [Self] = [.launchAtLogin, .notifications, .automaticUpdates, .awakeDuringRemoteWork]
+
     public var title: String {
         Self.titles[self] ?? rawValue
     }
 
     private static let titles: [Self: String] = [
-        .accessibility: "Accessibility", .screenRecording: "Screen Recording", .directCapture: "Direct Capture",
+        .accessibility: "Accessibility", .screenRecording: "Screen Capture", .directCapture: "Direct Capture",
         .microphone: "Microphone", .notifications: "Notifications", .launchAtLogin: "Launch at Login",
         .backgroundOperation: "Background Operation", .localNetwork: "Local Network", .desktopFiles: "Desktop Files",
         .documentsFiles: "Documents Files", .downloadsFiles: "Downloads Files", .removableVolumes: "Removable Volumes",
@@ -74,10 +79,10 @@ public struct DesktopPermissionRow: Identifiable, Equatable, Sendable {
         return observation.state
     }
     public var isComplete: Bool { state.satisfiesSetup }
-    /// This release enrolls unlocked control. Unqualified full-access rows stay
-    /// visible with their real state and cannot be mistaken for granted access.
+    /// Full Disk Access remains unqualified. Convenience settings and unused
+    /// permissions do not gate the current unlocked-control setup.
     public var isRequiredForUnlockedSetup: Bool {
-        id != .lockedScreenControl && id != .fullDiskAccess
+        [.accessibility, .screenRecording, .microphone, .localNetwork].contains(id)
     }
     public var setupTitle: String { "Setup \(id.title)" }
 

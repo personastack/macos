@@ -175,8 +175,7 @@ private struct PermissionBridgeFixture {
         suite = "permission-bridge-\(UUID().uuidString)"
         preferences = try #require(UserDefaults(suiteName: suite))
         manager = DesktopControlSetupManager(runtime: runtime, enrollment: enrollment, credentials: credentials,
-            preferences: preferences, registerLoginItem: { Issue.record("Unplanned login registration") },
-            loginItemStatus: { .enabled }, configurationProvider: { configuration }, permissionPresenter: presenter)
+            preferences: preferences, configurationProvider: { configuration }, permissionPresenter: presenter)
         page = DesktopControlSetupManager.Page(appURL: configuration.appURL)
         page.setupScope.synchronize("workspace-session")
     }

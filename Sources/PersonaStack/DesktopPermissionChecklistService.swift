@@ -279,16 +279,6 @@ final class DesktopPermissionChecklist {
         case .removableVolumes, .networkVolumes: return await volumeCheck.setup(id)
         case .fullDiskAccess: return await setupProtectedAccess()
         case .localNetwork, .messagingConnection: return await setupConnection(id)
-        case .notifications:
-            let result = await adapter.observe(.notifications)
-            guard result.state == .ready else { return result }
-            do {
-                guard try await DesktopNotificationCoordinator.shared.verifyPermissionDelivery() else {
-                    return .init(.failed, detail: "macOS did not confirm the test notification. Review notification settings and retry.")
-                }
-                return .init(.ready, detail: "macOS confirmed PersonaStack's test notification.",
-                             verificationKey: result.verificationKey, requiresVerification: true, verified: true)
-            } catch { return .init(.failed, detail: "The test notification could not be delivered. Review notification settings and retry.") }
         case .awakeDuringRemoteWork:
             guard verifyPowerAvailability() else {
                 return .init(.failed, detail: "PersonaStack could not verify idle sleep prevention. Retry setup after the Mac recovers.")

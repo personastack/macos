@@ -34,25 +34,31 @@ struct DesktopPermissionSystemAccess {
     var microphone: () -> AVAuthorizationStatus = { AVCaptureDevice.authorizationStatus(for: .audio) }
     var requestMicrophone: () async -> Bool = { await AVCaptureDevice.requestAccess(for: .audio) }
     var hasMicrophone: () -> Bool = { AVCaptureDevice.default(for: .audio) != nil }
+    var notificationSettings: () async -> (authorization: UNAuthorizationStatus, alerts: UNNotificationSetting, sounds: UNNotificationSetting) = {
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        return (settings.authorizationStatus, settings.alertSetting, settings.soundSetting)
+    }
+    var requestNotifications: () async throws -> Void = {
+        _ = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+    }
+    var loginStatus: () -> SMAppService.Status = { SMAppService.mainApp.status }
+    var registerLogin: () throws -> Void = { try SMAppService.mainApp.register() }
+    var openLoginSettings: () -> Void = { SMAppService.openSystemSettingsLoginItems() }
 }
 
 @MainActor
 final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistAdapting {
     var hooks: DesktopPermissionChecklistHooks
     let access: DesktopPermissionSystemAccess
-    private let providedNotificationCenter: UNUserNotificationCenter?
-    private var notificationCenter: UNUserNotificationCenter { providedNotificationCenter ?? .current() }
     private let openSettings: (String) -> Void
 
     init(hooks: DesktopPermissionChecklistHooks = .init(),
          access: DesktopPermissionSystemAccess = .init(),
-         notificationCenter: UNUserNotificationCenter? = nil,
          openSettings: @escaping (String) -> Void = { section in
              if let url = URL(string: "x-apple.systempreferences:\(section)") { NSWorkspace.shared.open(url) }
          }) {
         self.hooks = hooks
         self.access = access
-        self.providedNotificationCenter = notificationCenter
         self.openSettings = openSettings
     }
 
@@ -66,17 +72,26 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         case .microphone:
             return microphoneObservation()
         case .notifications:
-            let settings = await notificationCenter.notificationSettings()
-            return Self.notificationObservation(authorization: settings.authorizationStatus,
-                                                alerts: settings.alertSetting, sounds: settings.soundSetting)
+            return await observeNotifications()
         case .launchAtLogin:
-            return Self.loginObservation(SMAppService.mainApp.status)
+            return Self.loginObservation(access.loginStatus())
         default:
             return Self.unconfiguredObservation(permission)
         }
     }
 
     func setup(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation {
+        await setup(permission, automatic: false)
+    }
+
+    func setupAutomatically(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation {
+        guard DesktopPermissionID.automaticSetup.contains(permission) else {
+            return await observe(permission)
+        }
+        return await setup(permission, automatic: true)
+    }
+
+    private func setup(_ permission: DesktopPermissionID, automatic: Bool) async -> DesktopPermissionObservation {
         guard !Task.isCancelled else { return .init(.checking, detail: "Setup cancelled.") }
         switch permission {
         case .accessibility:
@@ -102,20 +117,9 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
                 openPrivacy("Microphone")
             }
         case .notifications:
-            let settings = await notificationCenter.notificationSettings()
-            if settings.authorizationStatus == .notDetermined {
-                do { _ = try await notificationCenter.requestAuthorization(options: [.alert, .sound]) }
-                catch { return .init(.failed, detail: "macOS could not request notification approval. Try again.") }
-            } else {
-                openSettings("com.apple.Notifications-Settings.extension")
-            }
+            return await setupNotifications(automatic: automatic)
         case .launchAtLogin:
-            do {
-                if SMAppService.mainApp.status == .notRegistered { try SMAppService.mainApp.register() }
-                if SMAppService.mainApp.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
-            } catch {
-                return .init(.failed, detail: "PersonaStack could not register Launch at Login. Check Login Items and retry.")
-            }
+            return setupLogin(automatic: automatic)
         case .fullDiskAccess:
             if let value = await hooks.setup(permission) {
                 if let current = await hooks.observe(permission), current != value {
@@ -176,6 +180,35 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         openSettings("com.apple.preference.security?Privacy_\(name)")
     }
 
+    private func observeNotifications() async -> DesktopPermissionObservation {
+        let settings = await access.notificationSettings()
+        return Self.notificationObservation(authorization: settings.authorization, alerts: settings.alerts, sounds: settings.sounds)
+    }
+
+    private func setupNotifications(automatic: Bool) async -> DesktopPermissionObservation {
+        let settings = await access.notificationSettings()
+        guard !Task.isCancelled else { return .init(.checking, detail: "Setup cancelled.") }
+        if settings.authorization == .notDetermined {
+            do { try await access.requestNotifications() }
+            catch { return .init(.failed, detail: "macOS could not request notification approval. Try again.") }
+        }
+        guard !Task.isCancelled else { return .init(.checking, detail: "Setup cancelled.") }
+        let observed = await observeNotifications()
+        guard !Task.isCancelled else { return .init(.checking, detail: "Setup cancelled.") }
+        if observed.state != .ready && !automatic { openSettings("com.apple.Notifications-Settings.extension") }
+        return observed
+    }
+
+    private func setupLogin(automatic: Bool) -> DesktopPermissionObservation {
+        do {
+            if access.loginStatus() == .notRegistered { try access.registerLogin() }
+            if access.loginStatus() == .requiresApproval && !automatic { access.openLoginSettings() }
+            return Self.loginObservation(access.loginStatus())
+        } catch {
+            return .init(.failed, detail: "PersonaStack could not register Launch at Login. Check Login Items and retry.")
+        }
+    }
+
     static func privacyDenialObservation(_ permission: DesktopPermissionID) -> DesktopPermissionObservation {
         switch permission {
         case .accessibility:
@@ -213,9 +246,8 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
             guard alerts == .enabled && sounds == .enabled else {
                 return .init(.notGranted, detail: "Enable notification alerts and sounds for PersonaStack.")
             }
-            return .init(.ready, detail: "Alerts and sounds are allowed. Use Setup Notifications to send a test alert.",
-                         verificationKey: "notifications:\(authorization.rawValue):\(alerts.rawValue):\(sounds.rawValue)",
-                         requiresVerification: true)
+            return .init(.ready, detail: "macOS allows PersonaStack alerts and sounds.",
+                         verificationKey: "notifications:\(authorization.rawValue):\(alerts.rawValue):\(sounds.rawValue)")
         @unknown default: return .init(.checking, detail: "Notification authorization is unknown.")
         }
     }

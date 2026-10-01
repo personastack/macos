@@ -87,7 +87,6 @@ enum DesktopControlEnrollmentError: Error, Equatable {
     case invalidResponse
     case credentialStoreUnavailable
     case installationMissing
-    case serviceRegistrationFailed
     case nativeCapabilitiesUnavailable
     case revocationFailed
 }
@@ -105,8 +104,6 @@ extension DesktopControlEnrollmentError: LocalizedError {
             "macOS Keychain could not access the Desktop Control installation. Allow PersonaStack to use its Keychain item and retry."
         case .installationMissing:
             "This Mac has no Desktop Control enrollment. Open PersonaStack and set up Desktop Control again."
-        case .serviceRegistrationFailed:
-            "PersonaStack could not register its background login service. Check Login Items settings and retry."
         case .nativeCapabilitiesUnavailable:
             "PersonaStack could not verify local file access and streaming shell execution. Check macOS permissions and retry."
         case .revocationFailed:

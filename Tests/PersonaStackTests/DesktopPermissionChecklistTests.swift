@@ -109,7 +109,7 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
 @Test @MainActor func permissionChecklistReauthorizationStillRequiresGrantAndFunctionalProof() async {
     // Moving from an unsigned release may require fresh TCC approval.
     // Recovery guidance must never turn an enabled Settings entry into proof.
-    for id in [DesktopPermissionID.accessibility, .screenRecording, .directCapture, .microphone] {
+    for id in [DesktopPermissionID.accessibility, .screenRecording, .microphone] {
         let fake = PermissionChecklistFake()
         let denied = DesktopPermissionChecklistSystemAdapter.privacyDenialObservation(id)
         fake.values[id] = denied
@@ -315,7 +315,8 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     #expect(DesktopPermissionChecklistSystemAdapter.notificationObservation(authorization: .denied, alerts: .disabled, sounds: .disabled).state == .denied)
     #expect(DesktopPermissionChecklistSystemAdapter.notificationObservation(authorization: .authorized, alerts: .enabled, sounds: .disabled).state == .notGranted)
     let allowed = DesktopPermissionChecklistSystemAdapter.notificationObservation(authorization: .authorized, alerts: .enabled, sounds: .enabled)
-    #expect(allowed.requiresVerification && !allowed.verified)
+    #expect(!allowed.requiresVerification)
+    #expect(DesktopPermissionRow(id: .notifications, observation: allowed).isComplete)
     #expect(DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(.lockedScreenControl).state == .unsupported)
     #expect(DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(.fullDiskAccess).state == .unsupported)
     #expect(DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(.speechRecognition).state == .notNeeded)
@@ -330,7 +331,7 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     model.open()
     await model.refresh()
     #expect(model.canFinish)
-    for row in model.rows where !row.isRequiredForUnlockedSetup {
+    for row in model.rows where row.id == .lockedScreenControl || row.id == .fullDiskAccess {
         #expect(row.state == .unsupported)
         #expect(!row.isComplete)
     }
@@ -343,17 +344,18 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     model.cancel()
 }
 
-@Test @MainActor func permissionChecklistUnlockedSetupStillRequiresEveryImplementedCapability() async {
-    for id in DesktopPermissionID.allCases where id != .lockedScreenControl && id != .fullDiskAccess {
+@Test @MainActor func permissionChecklistOnlyRequiredPermissionsBlockFinish() async {
+    for id in DesktopPermissionID.allCases {
         for state in DesktopPermissionState.allCases where !state.satisfiesSetup {
             let fake = PermissionChecklistFake()
             fake.values[id] = .init(state, detail: "Incomplete")
             let model = DesktopPermissionChecklistCoordinator(adapter: fake)
             model.open()
             await model.refresh()
-            #expect(!model.canFinish, "Incomplete \(id) \(state) must block enrollment")
+            let required = [.accessibility, .screenRecording, .microphone, .localNetwork].contains(id)
+            #expect(model.canFinish == !required, "Finish policy for \(id) \(state)")
             model.finish()
-            #expect(!model.isFinishing)
+            #expect(model.isFinishing == !required)
             model.cancel()
         }
     }
@@ -407,7 +409,8 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
         for _ in 0..<3 { await model.refresh() }
         #expect(model.rows.first { $0.id == id }?.state == .failed)
         #expect(model.rows.first { $0.id == id }?.observation.detail == "The actual operation failed")
-        #expect(fake.requested == [id] && !model.canFinish)
+        #expect(fake.requested == [id])
+        #expect(model.canFinish == !DesktopPermissionRow(id: id, observation: .init(.failed, detail: "Failed")).isRequiredForUnlockedSetup)
 
         fake.values[id] = .init(.ready, detail: "Changed owner or grant", verificationKey: "owner-grant-B", requiresVerification: true)
         await model.refresh()
@@ -421,7 +424,8 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
         #expect(fake.requested == [id, id])
         fake.values[id] = .init(.denied, detail: "Permission revoked")
         await model.refresh()
-        #expect(model.rows.first { $0.id == id }?.state == .denied && !model.canFinish)
+        #expect(model.rows.first { $0.id == id }?.state == .denied)
+        #expect(model.canFinish == !DesktopPermissionRow(id: id, observation: .init(.denied, detail: "Denied")).isRequiredForUnlockedSetup)
         model.cancel()
     }
 }

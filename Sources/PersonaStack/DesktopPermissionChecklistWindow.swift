@@ -124,6 +124,7 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
         coordinator.open()
         NSApp.activate(ignoringOtherApps: true)
         value.makeKeyAndOrderFront(nil)
+        coordinator.startAutomaticSetup()
     }
 
     func makeWindowIfNeeded() -> NSWindow {
@@ -160,14 +161,23 @@ private struct DesktopPermissionChecklistView: View {
                 Text("Allow PersonaStack to work on this Mac")
                     .font(.title2.weight(.semibold))
             }
-            Text("Set up Desktop Control while this Mac is unlocked. Locked-screen control is unavailable in this release. Each Setup button opens approval or verifies a capability. Status updates here when you return.")
+            Text("Allow accessibility, screen capture and microphone access. Full Disk Access replaces separate folder approvals. Desktop Control works while this Mac is unlocked.")
                 .foregroundStyle(.secondary)
             Text("After an update, macOS may need you to approve access again. If a permission is already enabled in System Settings, follow its recovery steps below, then retry Setup.")
                 .font(.caption).foregroundStyle(.secondary)
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(coordinator.rows) { row in
+                    ForEach(coordinator.permissionRows) { row in
                         rowView(row)
+                        Divider()
+                    }
+                    Text("Automatic setup").font(.headline)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(.top, 20)
+                    Text("PersonaStack sets these up when you open this window. macOS may ask for approval. These settings do not block Desktop Control.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 6)
+                    ForEach(coordinator.automaticRows) { row in
+                        rowView(row, automatic: true)
                         Divider()
                     }
                 }
@@ -189,7 +199,7 @@ private struct DesktopPermissionChecklistView: View {
         .padding(24)
     }
 
-    private func rowView(_ row: DesktopPermissionRow) -> some View {
+    private func rowView(_ row: DesktopPermissionRow, automatic: Bool = false) -> some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: symbol(row.state))
                 .foregroundStyle(row.isComplete ? Color.green : Color.secondary)
@@ -197,19 +207,21 @@ private struct DesktopPermissionChecklistView: View {
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
                 Text(row.id.title).font(.headline)
-                if !row.isRequiredForUnlockedSetup {
-                    Text("Not required for unlocked control").font(.caption).foregroundStyle(.secondary)
+                if row.id == .fullDiskAccess {
+                    Text("Optional for setup. Broad file access remains unverified.").font(.caption).foregroundStyle(.secondary)
                 }
-                Text(row.state.title).font(.caption.weight(.semibold))
-                Text(row.observation.detail).font(.caption).foregroundStyle(.secondary)
+                if !automatic || !row.isComplete {
+                    Text(row.state.title).font(.caption.weight(.semibold))
+                    Text(row.observation.detail).font(.caption).foregroundStyle(.secondary)
+                }
             }
             Spacer(minLength: 8)
-            if !row.isComplete {
-                Button(row.setupTitle) { coordinator.setup(row.id) }
+            if !row.isComplete && (!automatic || (row.state != .checking && coordinator.automaticBusyPermission == nil)) {
+                Button(automatic ? "Retry" : row.setupTitle) { coordinator.setup(row.id) }
                     .disabled(coordinator.isFinishing || coordinator.busyPermission != nil)
                     .accessibilityLabel(row.setupTitle)
             }
-            if coordinator.busyPermission == row.id { ProgressView().controlSize(.small) }
+            if coordinator.busyPermission == row.id || coordinator.automaticBusyPermission == row.id { ProgressView().controlSize(.small) }
         }
         .padding(.vertical, 12)
     }

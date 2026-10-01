@@ -6,8 +6,16 @@ import PersonaStackCore
 protocol DesktopPermissionChecklistAdapting {
     /// Never prompts, captures, exercises input, or touches protected files.
     func observe(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation
-    /// Called only by an explicit native Setup button.
+    /// Called only by an explicit native Setup or Retry button.
     func setup(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation
+    /// Runs only when the user opens the native setup window.
+    func setupAutomatically(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation
+}
+
+extension DesktopPermissionChecklistAdapting {
+    func setupAutomatically(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation {
+        await setup(permission)
+    }
 }
 
 @MainActor
@@ -17,12 +25,15 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     }
     @Published private(set) var isFinishing = false
     @Published private(set) var busyPermission: DesktopPermissionID?
+    @Published private(set) var automaticBusyPermission: DesktopPermissionID?
     @Published private(set) var completionError = ""
     @Published private(set) var needsNewSetupRequest = false
     private let adapter: any DesktopPermissionChecklistAdapting
     private var generation = UUID()
     private var refreshTask: Task<Void, Never>?
     private var setupTask: Task<Void, Never>?
+    private var automaticSetupTask: Task<Void, Never>?
+    private var automaticSetupStarted = false
     private var continuation: CheckedContinuation<Void, Error>?
     private var verificationKeys: [DesktopPermissionID: String] = [:]
     private var rowRevisions: [DesktopPermissionID: UUID] = [:]
@@ -43,6 +54,39 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         isVisible && refreshedForCurrentPresentation && !isFinishing && !needsNewSetupRequest && busyPermission == nil && rows.filter(\.isRequiredForUnlockedSetup).allSatisfy(\.isComplete)
     }
     var isAwaitingFinish: Bool { continuation != nil }
+    var permissionRows: [DesktopPermissionRow] {
+        DesktopPermissionID.setupPermissions.compactMap { id in
+            rows.first { $0.id == id && !(id == .localNetwork && $0.state == .notNeeded) }
+        }
+    }
+    var automaticRows: [DesktopPermissionRow] {
+        DesktopPermissionID.automaticSetup.compactMap { id in rows.first { $0.id == id } }
+    }
+
+    func startAutomaticSetup() {
+        guard isVisible, !automaticSetupStarted, busyPermission == nil, !isFinishing else { return }
+        automaticSetupStarted = true
+        let expected = generation
+        automaticBusyPermission = DesktopPermissionID.automaticSetup.first
+        automaticSetupTask = Task { [weak self] in
+            guard let self else { return }
+            for id in DesktopPermissionID.automaticSetup {
+                guard self.generation == expected, self.isVisible, !Task.isCancelled else { return }
+                self.automaticBusyPermission = id
+                self.rowRevisions[id] = UUID()
+                let revision = self.rowRevisions[id]
+                let current = await self.adapter.observe(id)
+                guard self.generation == expected, self.isVisible, !Task.isCancelled else { return }
+                let value = DesktopPermissionRow(id: id, observation: current).isComplete
+                    ? current : await self.adapter.setupAutomatically(id)
+                guard self.generation == expected, self.isVisible, !Task.isCancelled else { return }
+                if self.rowRevisions[id] == revision { self.apply(value, id: id, explicit: true) }
+            }
+            self.automaticBusyPermission = nil
+            self.automaticSetupTask = nil
+            await self.refresh()
+        }
+    }
 
     func open() {
         guard !isVisible else { return }
@@ -89,10 +133,10 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         for id in DesktopPermissionID.allCases {
             guard generation == expected, isVisible, !Task.isCancelled else { return }
             // A check cannot race a deliberate functional verification.
-            guard busyPermission != id else { continue }
+            guard busyPermission != id, automaticBusyPermission != id else { continue }
             let revision = rowRevisions[id]
             let observation = await adapter.observe(id)
-            guard generation == expected, isVisible, busyPermission != id,
+            guard generation == expected, isVisible, busyPermission != id, automaticBusyPermission != id,
                   rowRevisions[id] == revision else { continue }
             apply(observation, id: id, explicit: false)
         }
@@ -100,7 +144,8 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     }
 
     func setup(_ id: DesktopPermissionID) {
-        guard isVisible, !isFinishing, busyPermission == nil else { return }
+        guard isVisible, !isFinishing, busyPermission == nil,
+              !(DesktopPermissionID.automaticSetup.contains(id) && automaticBusyPermission != nil) else { return }
         rowRevisions[id] = UUID()
         setupFailures.removeValue(forKey: id)
         busyPermission = id
@@ -122,6 +167,9 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     func finish() {
         guard canFinish else { return }
         isFinishing = true
+        automaticSetupTask?.cancel()
+        automaticSetupTask = nil
+        automaticBusyPermission = nil
         completionError = ""
         let pending = continuation
         continuation = nil
@@ -140,13 +188,17 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         generation = UUID()
         refreshTask?.cancel()
         setupTask?.cancel()
+        automaticSetupTask?.cancel()
         refreshTask = nil
         setupTask = nil
+        automaticSetupTask = nil
+        automaticSetupStarted = false
         isVisible = false
         refreshing = false
         isFinishing = false
         needsNewSetupRequest = false
         busyPermission = nil
+        automaticBusyPermission = nil
         verificationKeys.removeAll()
         setupFailures.removeAll()
         rowRevisions.removeAll()

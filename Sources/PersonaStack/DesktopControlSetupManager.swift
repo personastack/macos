@@ -1,6 +1,5 @@
 import AppKit
 import OSLog
-import ServiceManagement
 import SystemConfiguration
 import PersonaStackCore
 import WebKit
@@ -173,8 +172,6 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
     private let pages = NSMapTable<WKWebView, Page>.weakToStrongObjects()
     private let enrollment: any DesktopControlSetupEnrollment
     private let credentials: (any DesktopControlCredentialStoring)?
-    private let registerLoginItem: @MainActor () throws -> Void
-    private let loginItemStatus: @MainActor () -> SMAppService.Status
     private let preferences: UserDefaults
     private let runtime: any DesktopControlSetupRuntime
     private let configurationProvider: () throws -> DesktopEnvironmentConfiguration
@@ -199,8 +196,6 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         enrollment: any DesktopControlSetupEnrollment = DesktopControlEnrollmentClient(),
         credentials: (any DesktopControlCredentialStoring)? = nil,
         preferences: UserDefaults = .standard,
-        registerLoginItem: @escaping @MainActor () throws -> Void = { try SMAppService.mainApp.register() },
-        loginItemStatus: @escaping @MainActor () -> SMAppService.Status = { SMAppService.mainApp.status },
         configurationProvider: @escaping () throws -> DesktopEnvironmentConfiguration = { try LaunchConfiguration.selectedEnvironment() },
         permissionPresenter: (any DesktopControlPermissionPresenting)? = nil
     ) {
@@ -208,8 +203,6 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         self.enrollment = enrollment
         self.credentials = credentials
         self.preferences = preferences
-        self.registerLoginItem = registerLoginItem
-        self.loginItemStatus = loginItemStatus
         self.configurationProvider = configurationProvider
         self.cachedPermissionPresenter = permissionPresenter
         super.init()
@@ -363,15 +356,6 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         do { try await runtime.probeNativeCapabilities(generation: runtimeGeneration) }
         catch is CancellationError { throw CancellationError() }
         catch { throw DesktopControlEnrollmentError.nativeCapabilitiesUnavailable }
-        try requireCurrentScope(scope, generation: generation, page: page)
-        try requireCurrentLifecycle(runtimeGeneration)
-        if loginItemStatus() != .enabled {
-            do { try registerLoginItem() }
-            catch { throw DesktopControlEnrollmentError.serviceRegistrationFailed }
-        }
-        guard loginItemStatus() == .enabled else {
-            throw DesktopControlLoginItemApprovalError()
-        }
         try requireCurrentScope(scope, generation: generation, page: page)
         try requireCurrentLifecycle(runtimeGeneration)
         let installation: DesktopControlInstallation
@@ -532,11 +516,5 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
     private static func suggestedComputerName() -> String {
         let name = (SCDynamicStoreCopyComputerName(nil, nil) as String?)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return String(name.prefix(120))
-    }
-}
-
-private struct DesktopControlLoginItemApprovalError: LocalizedError {
-    var errorDescription: String? {
-        "Allow PersonaStack Desktop in System Settings → General → Login Items & Extensions, then retry setup."
     }
 }

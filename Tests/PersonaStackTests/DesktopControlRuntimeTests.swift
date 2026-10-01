@@ -1332,14 +1332,11 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     let defaultsName = "desktop-control-setup-test-\(UUID().uuidString)"
     let preferences = try #require(UserDefaults(suiteName: defaultsName))
     defer { preferences.removePersistentDomain(forName: defaultsName) }
-    var loginItemRegistrations = 0
     let manager = DesktopControlSetupManager(
         runtime: runtime,
         enrollment: enrollment,
         credentials: SavedDesktopControlCredentialStore(installation: installation),
         preferences: preferences,
-        registerLoginItem: { loginItemRegistrations += 1 },
-        loginItemStatus: { loginItemRegistrations > 0 ? .enabled : .notRegistered },
         configurationProvider: { .production },
         permissionPresenter: FinishedDesktopControlPermissionFixture()
     )
@@ -1373,7 +1370,6 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     #expect(denied.ok == false)
     #expect(denied.error == CuaMCPProxyError.permissionsRequired.localizedDescription)
     #expect(runtime.readiness == "permission_required")
-    #expect(loginItemRegistrations == 0)
 
     #expect(page.setupScope.generation == setupGeneration)
     #expect(page.setupScope.value == scope)
@@ -1393,7 +1389,6 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     #expect(runtime.nativeProbeCount == 1)
     #expect(runtime.repairAttempts == 0)
     #expect(runtime.connectedInstallationID == installation.installationID)
-    #expect(loginItemRegistrations == 1)
     #expect(preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(.production)))
     #expect(!(preferences.bool(forKey: DesktopControlPreferenceKeys.relayPaused(.production))))
     #expect(await enrollment.readyInstallationIDs == [installation.installationID])
@@ -1406,13 +1401,12 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     #expect(staleRetry.error == DesktopControlEnrollmentError.invalidRequest.localizedDescription)
     #expect(!staleRetry.ok)
     #expect(runtime.attempts == 2)
-    #expect(loginItemRegistrations == 1)
     #expect(await enrollment.readyInstallationIDs == [installation.installationID])
     #expect(await enrollment.attachedTicketInstallationIDs == [installation.installationID, installation.installationID])
     #expect(runtime.disconnectCalls == 2)
 }
 
-@Test @MainActor func setupDoesNotEnrollUntilLoginItemIsEnabled() async throws {
+@Test @MainActor func setupEnrollmentDoesNotRequireLoginServiceOwner() async throws {
     let payload = Data(#"{"installation_id":"installation-approval","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8)
     let appURL = URL(string: "https://my.personastack.ai")!
     var installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
@@ -1428,21 +1422,20 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
         enrollment: enrollment,
         credentials: SavedDesktopControlCredentialStore(installation: installation),
         preferences: preferences,
-        registerLoginItem: {},
-        loginItemStatus: { .requiresApproval },
+        configurationProvider: { .production },
         permissionPresenter: FinishedDesktopControlPermissionFixture()
     )
     let page = DesktopControlSetupManager.Page(appURL: appURL)
     page.setupScope.synchronize("workspace-setup-session")
     _ = try await manager.apply(.permissions(scope: "workspace-setup-session", phase: .open, message: nil), page: page)
-    do {
-        _ = try await manager.apply(.prepare(scope: "workspace-setup-session", enrollmentTicket: String(repeating: "a", count: 43)), page: page)
-        Issue.record("setup should wait for login item approval")
-    } catch {
-        #expect(error.localizedDescription.contains("Login Items & Extensions"))
-    }
-    #expect(await enrollment.readyInstallationIDs.isEmpty)
+    // Enrollment has no login-service dependency. Launch at Login belongs to
+    // automatic checklist setup and may remain unavailable without blocking it.
+    let response = try await manager.apply(.prepare(scope: "workspace-setup-session", enrollmentTicket: String(repeating: "a", count: 43)), page: page)
+    #expect(response["installation_id"] as? String == installation.installationID)
+    #expect(response["gateway_connected"] as? Bool == true)
+    #expect(runtime.nativeProbeCount == 1)
+    #expect(await enrollment.readyInstallationIDs == [installation.installationID])
     #expect(await enrollment.attachedTicketInstallationIDs == [installation.installationID])
-    #expect(!runtime.gatewayConnected)
-    #expect(!preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(.production)))
+    #expect(runtime.gatewayConnected)
+    #expect(preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(.production)))
 }
