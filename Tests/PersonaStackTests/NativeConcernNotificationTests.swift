@@ -3,6 +3,7 @@ import Foundation
 import Testing
 import UserNotifications
 import WebKit
+import PersonaStackCore
 @testable import PersonaStack
 
 struct NativeConcernNotificationTests {
@@ -14,7 +15,8 @@ struct NativeConcernNotificationTests {
             appURL: try #require(URL(string: "https://my.personastack.ai/user/personas")),
             notificationCoordinator: nil,
             configureNotificationCenter: { _ in },
-            scheduleNotification: { scheduledRequests.append($0) }
+            scheduleNotification: { scheduledRequests.append($0) },
+            concernNotificationsEnabled: { true }
         )
 
         coordinator.handleConcernMessage(
@@ -42,7 +44,8 @@ struct NativeConcernNotificationTests {
             appURL: try #require(URL(string: "https://my.personastack.ai/user/personas")),
             notificationCoordinator: nil,
             configureNotificationCenter: { _ in },
-            scheduleNotification: { scheduledRequests.append($0) }
+            scheduleNotification: { scheduledRequests.append($0) },
+            concernNotificationsEnabled: { true }
         )
         let acceptedPayload: [String: Any] = ["version": "1", "event": "created"]
         let validOrigin = URL(string: "https://my.personastack.ai")!
@@ -77,7 +80,8 @@ struct NativeConcernNotificationTests {
             appURL: appURL,
             notificationCoordinator: nil,
             configureNotificationCenter: { _ in },
-            scheduleNotification: { scheduledRequests.append($0) }
+            scheduleNotification: { scheduledRequests.append($0) },
+            concernNotificationsEnabled: { true }
         )
         let host = MainWebViewHost(appURL: appURL, loadPage: false,
                                    requestNotifications: false, coordinator: coordinator)
@@ -115,7 +119,8 @@ struct NativeConcernNotificationTests {
             appURL: try #require(URL(string: "https://my.personastack.ai/user/personas")),
             notificationCoordinator: nil,
             configureNotificationCenter: { _ in },
-            scheduleNotification: { scheduledRequests.append($0) }
+            scheduleNotification: { scheduledRequests.append($0) },
+            concernNotificationsEnabled: { true }
         )
         coordinator.retire()
 
@@ -129,4 +134,55 @@ struct NativeConcernNotificationTests {
 
         #expect(scheduledRequests.isEmpty)
     }
+}
+
+@Test @MainActor func concernNotificationsDefaultOnAndPersistImmediateOptOutAndReenable() throws {
+    let suite = "concern-notifications-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    #expect(DesktopConcernNotificationSettings.isEnabled(in: defaults))
+    var notifications: [UNNotificationRequest] = []
+    let appURL = try #require(URL(string: "https://my.personastack.ai"))
+    let coordinator = PersonaStackWebView.Coordinator(appURL: appURL,
+        notificationCoordinator: nil, configureNotificationCenter: { _ in },
+        scheduleNotification: { notifications.append($0) }, cancelPermissionVerification: {},
+        concernNotificationsEnabled: { DesktopConcernNotificationSettings.isEnabled(in: defaults) })
+    func created() {
+        coordinator.handleConcernMessage(name: "personastackConcern", isMainFrame: true,
+            host: appURL.host, body: ["version": "1", "event": "created"], appURL: appURL)
+    }
+    created()
+    #expect(notifications.count == 1)
+    defaults.set(false, forKey: DesktopConcernNotificationSettings.enabledKey)
+    let reloadedDefaults = try #require(UserDefaults(suiteName: suite))
+    #expect(!DesktopConcernNotificationSettings.isEnabled(in: reloadedDefaults))
+    created()
+    #expect(notifications.count == 1)
+    defaults.set(true, forKey: DesktopConcernNotificationSettings.enabledKey)
+    #expect(DesktopConcernNotificationSettings.isEnabled(in: reloadedDefaults))
+    #expect(notifications.count == 1)
+    created()
+    #expect(notifications.count == 2)
+    #expect(notifications.allSatisfy { $0.content.userInfo.isEmpty })
+    // The concern preference does not interfere with update action routing.
+    #expect(DesktopNotificationCoordinator.updateAction(requestIdentifier: "personastack-update-ready-1.0.0",
+        actionIdentifier: UNNotificationDefaultActionIdentifier) == .restart)
+}
+
+@Test @MainActor func menuBarReceiverRequestsNotificationAuthorizationBeforeAnyVisibleWindow() throws {
+    var authorizations = 0
+    let appURL = try #require(URL(string: "https://my.personastack.ai"))
+    let coordinator = PersonaStackWebView.Coordinator(appURL: appURL,
+        notificationCoordinator: nil, configureNotificationCenter: { _ in },
+        scheduleNotification: { _ in }, cancelPermissionVerification: {})
+    let host = MainWebViewHost(appURL: appURL, loadPage: false,
+        authorizeNotifications: { authorizations += 1 }, coordinator: coordinator)
+    defer { host.retire() }
+    #expect(host.webView.window != nil)
+    #expect(authorizations == 1)
+    let container = NSView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+    host.attach(to: container)
+    host.park(from: container)
+    host.attach(to: container)
+    #expect(authorizations == 1)
 }

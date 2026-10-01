@@ -84,6 +84,7 @@ class MenuBarLayoutTests(unittest.TestCase):
     def test_settings_own_configuration_and_update_preference(self):
         body = block(self.menu, "var body: some View")
         settings = block(body, 'Menu("Settings")')
+        self.assertIn("DesktopConcernNotificationsMenuItem()", settings)
         self.assertIn("DesktopServerSettingsMenuItem()", settings)
         self.assertIn("registerLoginItem()", block(settings, 'Button("Launch at Login")'))
         self.assertIn(".disabled(SMAppService.mainApp.status == .enabled)", settings)

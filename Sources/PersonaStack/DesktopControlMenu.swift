@@ -75,6 +75,7 @@ struct DesktopControlMenu: View {
         }
         Divider()
         Menu("Settings") {
+            DesktopConcernNotificationsMenuItem()
             DesktopServerSettingsMenuItem()
             Button("Launch at Login") {
                 registerLoginItem()

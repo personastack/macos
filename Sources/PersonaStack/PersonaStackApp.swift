@@ -94,6 +94,9 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         DesktopLoginItemRegistration.enableOnFirstLaunch()
         DesktopNotificationCoordinator.shared.install()
+        // The authenticated receiver belongs to the app, not Desktop Control
+        // enrollment or the visible main window.
+        _ = MainWebViewHost.shared
         DesktopUpdater.shared.start()
         guard UserDefaults.standard.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey) else { return }
         UserDefaults.standard.removeObject(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
@@ -192,10 +195,12 @@ final class MainWebViewHost {
     let coordinator: PersonaStackWebView.Coordinator
     private let backgroundWindow: NSWindow
     private let requestNotifications: Bool
+    private let authorizeNotifications: () -> Void
     private var notificationAuthorizationRequested = false
 
     init(appURL: URL, loadPage: Bool = true,
          requestNotifications: Bool = true,
+         authorizeNotifications: @escaping () -> Void = { DesktopNotificationCoordinator.shared.requestAuthorization() },
          coordinator suppliedCoordinator: PersonaStackWebView.Coordinator? = nil) {
         let coordinator = suppliedCoordinator ?? PersonaStackWebView.Coordinator(appURL: appURL)
         let configuration = WKWebViewConfiguration()
@@ -228,6 +233,8 @@ final class MainWebViewHost {
         self.webView = webView
         self.backgroundWindow = backgroundWindow
         self.requestNotifications = requestNotifications
+        self.authorizeNotifications = authorizeNotifications
+        requestNotificationAuthorizationIfNeeded()
         if loadPage { coordinator.start(appURL) }
     }
 
@@ -238,10 +245,13 @@ final class MainWebViewHost {
         webView.frame = container.bounds
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
-        if requestNotifications && !notificationAuthorizationRequested {
-            notificationAuthorizationRequested = true
-            DesktopNotificationCoordinator.shared.requestAuthorization()
-        }
+        requestNotificationAuthorizationIfNeeded()
+    }
+
+    private func requestNotificationAuthorizationIfNeeded() {
+        guard requestNotifications, !notificationAuthorizationRequested else { return }
+        notificationAuthorizationRequested = true
+        authorizeNotifications()
     }
 
     func retire() {
@@ -321,6 +331,7 @@ struct PersonaStackWebView: NSViewRepresentable {
         weak var webView: WKWebView?
         let appURL: URL
         private let scheduleNotification: (UNNotificationRequest) -> Void
+        private let concernNotificationsEnabled: () -> Bool
         private let cancelPermissionVerification: () -> Void
         private var popupWindows: [ObjectIdentifier: NSWindow] = [:]
         private(set) var isRetired = false
@@ -337,10 +348,12 @@ struct PersonaStackWebView: NSViewRepresentable {
             },
             cancelPermissionVerification: @escaping () -> Void = {
                 DesktopPermissionChecklist.shared.cancelVerification()
-            }
+            },
+            concernNotificationsEnabled: @escaping () -> Bool = { DesktopConcernNotificationSettings.isEnabled() }
         ) {
             self.appURL = appURL
             self.scheduleNotification = scheduleNotification
+            self.concernNotificationsEnabled = concernNotificationsEnabled
             self.cancelPermissionVerification = cancelPermissionVerification
             super.init()
             if let notificationCoordinator {
@@ -380,6 +393,7 @@ struct PersonaStackWebView: NSViewRepresentable {
 
         func handleConcernMessage(name: String, isMainFrame: Bool, host: String?, body: Any, appURL messageURL: URL? = nil) {
             guard !isRetired,
+                  concernNotificationsEnabled(),
                   name == "personastackConcern",
                   isMainFrame,
                   host?.lowercased() == self.appURL.host?.lowercased(),

@@ -254,6 +254,7 @@ struct DesktopServerSettingsCommands: Commands {
 
     var body: some Commands {
         CommandGroup(after: .appInfo) {
+            DesktopConcernNotificationsMenuItem()
             Button("Server Settings…") {
                 MainWebViewHost.showServerSettingsWindow { openWindow(id: "desktop-server-settings") }
             }
@@ -269,5 +270,14 @@ struct DesktopServerSettingsMenuItem: View {
         Button("Server Settings…") {
             MainWebViewHost.showServerSettingsWindow { openWindow(id: "desktop-server-settings") }
         }
+    }
+}
+
+/// Shared by the app menu and the menu-bar Settings menu.
+struct DesktopConcernNotificationsMenuItem: View {
+    @AppStorage(DesktopConcernNotificationSettings.enabledKey) private var enabled = true
+
+    var body: some View {
+        Toggle("Concern Notifications", isOn: $enabled)
     }
 }
