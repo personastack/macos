@@ -53,6 +53,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private var stopCuaService: @MainActor (CuaEmbeddedService) async -> Bool = { await $0.stop() }
     private var proxy: CuaMCPProxy?
     private var cuaStartup: (id: UUID, task: Task<Void, Error>)?
+    private var cuaShutdown: (id: UUID, task: Task<Bool, Never>)?
     private var startingProxy: CuaMCPProxy?
     private var gateway: DesktopControlGatewayConnection?
     private var pendingGateway: DesktopControlGatewayConnection?
@@ -280,12 +281,20 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         try requireCurrentStartup(generation)
         // A successor cannot adopt a daemon while its earlier startup still
         // owns initialization or cleanup, even if the socket already exists.
-        while let previous = cuaStartup {
-            previous.task.cancel()
-            startingProxy?.interrupt()
-            _ = await previous.task.result
-            if cuaStartup?.id == previous.id { cuaStartup = nil }
-            try requireCurrentStartup(generation)
+        while cuaStartup != nil || cuaShutdown != nil {
+            if let previous = cuaStartup {
+                previous.task.cancel()
+                startingProxy?.interrupt()
+                _ = await previous.task.result
+                if cuaStartup?.id == previous.id { cuaStartup = nil }
+                try requireCurrentStartup(generation)
+            }
+            if let shutdown = cuaShutdown {
+                let stopped = await shutdown.task.value
+                if cuaShutdown?.id == shutdown.id { cuaShutdown = nil }
+                try requireCurrentStartup(generation)
+                guard stopped else { throw DesktopControlOwnedCuaStopError() }
+            }
         }
         let id = UUID()
         let task = Task { @MainActor in
@@ -813,7 +822,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             guard cuaService === service else { throw CancellationError() }
             return service
         } catch {
-            if await service.stop(), cuaService === service { cuaService = nil }
+            if cuaService === service { _ = await stopOwnedCuaService() }
+            else { _ = await service.stop() }
             throw error
         }
     }
@@ -1165,6 +1175,17 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func stopOwnedCuaService() async -> Bool {
+        if let shutdown = cuaShutdown { return await shutdown.task.value }
+        let id = UUID()
+        // Shutdown outlives cancellation of a permission check. Publish its
+        // owner before yielding so startup cannot adopt a retiring daemon.
+        let task = Task { @MainActor in await self.stopCurrentCuaService() }
+        cuaShutdown = (id, task)
+        defer { if cuaShutdown?.id == id { cuaShutdown = nil } }
+        return await task.value
+    }
+
+    private func stopCurrentCuaService() async -> Bool {
         guard let service = cuaService else {
             selectedCuaExecutableURL = nil
             verifiedCuaHostGeneration = nil

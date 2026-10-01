@@ -127,6 +127,59 @@ private final class SuspendedDesktopControlCredentialStore: DesktopControlCreden
     #expect(await installer.repairArguments.isEmpty)
 }
 
+@Test(arguments: ["restart", "prepare"]) @MainActor
+func cuaFinishWaitsForPermissionTeardownBeforeSuccessorStartup(_ stage: String) async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-cancel-teardown-\(stage)-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let executable = try makeRuntimeDriverFixture(root)
+    let credentials = PermissionPreparationCredentialStore(installation: nil)
+    let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
+        credentials: credentials, sessionLockState: .unlocked, hostPermissions: { (true, false) })
+    await runtime.waitForSessionLockChangeForTesting()
+    try await runtime.resumeForSetup(generation: runtime.beginResume())
+    #expect(runtime.isCuaReady())
+    let originalKey = try await runtime.cuaPermissionSnapshot().verificationKey
+    // Pausing retires the proxy but retains the daemon. Preparation must then
+    // drain that unowned daemon before creating another permission runtime.
+    if stage == "prepare" { await runtime.pause() }
+    let cleanup = root.appendingPathComponent("pause-daemon-cleanup")
+    try Data().write(to: cleanup)
+    let model = DesktopPermissionChecklistCoordinator(adapter: StartupPermissionChecklistAdapter(runtime: runtime, restart: stage == "restart"))
+    model.open()
+    await model.refresh()
+    model.setup(.screenRecording)
+    for _ in 0..<100 {
+        if FileManager.default.fileExists(atPath: root.appendingPathComponent("daemon-stopping").path) { break }
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("daemon-stopping").path))
+    // Cancel after daemon shutdown has started. Cleanup must remain responsive
+    // and a successor must wait, even though no startup task owns this phase.
+    model.finish()
+    #expect(model.isFinishing)
+    let successor = Task { try await runtime.resumeForSetup(generation: runtime.beginResume()) }
+    for _ in 0..<10 { await Task.yield() }
+    for name in ["daemon-starts", "proxy-starts"] {
+        let starts = try String(contentsOf: root.appendingPathComponent(name), encoding: .utf8)
+        #expect(starts.split(separator: "\n").count == 1)
+    }
+    #expect(credentials.readCount == 1)
+    try FileManager.default.removeItem(at: cleanup)
+    do {
+        try await successor.value
+        #expect(runtime.isCuaReady() && runtime.readiness == "ready")
+        #expect(try await runtime.cuaPermissionSnapshot().verificationKey != originalKey)
+        let starts = try String(contentsOf: root.appendingPathComponent("daemon-starts"), encoding: .utf8)
+        #expect(starts.split(separator: "\n").count == 2)
+        #expect(credentials.readCount == 2)
+        for _ in 0..<10 { await Task.yield() }
+        #expect(runtime.isCuaReady() && model.isFinishing)
+        model.cancel()
+        await runtime.shutdownForQuit()
+    } catch { model.cancel(); await runtime.shutdownForQuit(); throw error }
+}
+
 @Test @MainActor func nativePermissionPreparationFailurePreservesPauseAndDoesNotEnroll() async {
     let installer = DesktopControlInstallerFixture(errors: [CuaDriverInstallError.invalidLayout])
     let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: EmptyDesktopControlCredentialStore(),
@@ -1548,13 +1601,20 @@ private actor SuspendedPermissionStartupInstaller: DesktopControlDriverInstallin
 
 @MainActor private final class StartupPermissionChecklistAdapter: DesktopPermissionChecklistAdapting {
     let runtime: DesktopControlRuntime
-    init(runtime: DesktopControlRuntime) { self.runtime = runtime }
+    let restart: Bool
+    init(runtime: DesktopControlRuntime, restart: Bool = false) {
+        self.runtime = runtime
+        self.restart = restart
+    }
     func observe(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation {
         .init(permission == .accessibility ? .ready : .notGranted, detail: "Fixture", requiresVerification: permission == .accessibility, verified: permission == .accessibility)
     }
     func setup(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation {
-        do { try await runtime.prepareCuaPermissions(); return .init(.ready, detail: "Started") }
-        catch { return .init(.checking, detail: "Cancelled") }
+        do {
+            if restart { try await runtime.restartCuaAfterPermissionChange() }
+            else { try await runtime.prepareCuaPermissions() }
+            return .init(.ready, detail: "Started")
+        } catch { return .init(.checking, detail: "Cancelled") }
     }
 }
 
