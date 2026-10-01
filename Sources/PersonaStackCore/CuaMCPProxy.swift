@@ -439,6 +439,8 @@ public final class CuaEmbeddedService {
     }
 
     public func stop() async -> Bool {
+        // Cleanup must still yield and drain the child when startup is cancelled.
+        if Task.isCancelled { return await Task { @MainActor in await self.stop() }.value }
         try? lifetime.fileHandleForWriting.close()
         if launched && process.isRunning {
             // EOF lets the embedded daemon settle its owned work first.

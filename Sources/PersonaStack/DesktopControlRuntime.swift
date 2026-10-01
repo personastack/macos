@@ -52,6 +52,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private let hostPermissions: @MainActor () -> (accessibility: Bool, screenRecording: Bool)
     private var stopCuaService: @MainActor (CuaEmbeddedService) async -> Bool = { await $0.stop() }
     private var proxy: CuaMCPProxy?
+    private var cuaStartup: (id: UUID, task: Task<Void, Error>)?
     private var startingProxy: CuaMCPProxy?
     private var gateway: DesktopControlGatewayConnection?
     private var pendingGateway: DesktopControlGatewayConnection?
@@ -276,7 +277,45 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func startCua(forceRepairInstall: Bool, startPaused: Bool, generation: UUID, verifyCapabilities: Bool = true) async throws {
+        try requireCurrentStartup(generation)
+        // A successor cannot adopt a daemon while its earlier startup still
+        // owns initialization or cleanup, even if the socket already exists.
+        while let previous = cuaStartup {
+            previous.task.cancel()
+            startingProxy?.interrupt()
+            _ = await previous.task.result
+            if cuaStartup?.id == previous.id { cuaStartup = nil }
+            try requireCurrentStartup(generation)
+        }
+        let id = UUID()
+        let task = Task { @MainActor in
+            try await self.startOwnedCua(forceRepairInstall: forceRepairInstall, startPaused: startPaused,
+                                         generation: generation, verifyCapabilities: verifyCapabilities)
+        }
+        cuaStartup = (id, task)
+        defer { if cuaStartup?.id == id { cuaStartup = nil } }
+        try await withTaskCancellationHandler {
+            do { try await task.value }
+            catch {
+                if task.isCancelled { throw CancellationError() }
+                throw error
+            }
+        } onCancel: {
+            task.cancel()
+            Task { @MainActor [weak self] in
+                guard self?.cuaStartup?.id == id else { return }
+                self?.startingProxy?.interrupt()
+            }
+        }
+    }
+
+    private func requireCurrentStartup(_ generation: UUID) throws {
+        try Task.checkCancellation()
         try requireCurrentLifecycle(generation)
+    }
+
+    private func startOwnedCua(forceRepairInstall: Bool, startPaused: Bool, generation: UUID, verifyCapabilities: Bool) async throws {
+        try requireCurrentStartup(generation)
         if verifyCapabilities { allowsAutomaticCuaRecovery = true }
         let wasVerifiedReady = isCuaReady() && readiness == "ready"
         if proxy == nil {
@@ -285,16 +324,16 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                     repair: forceRepairInstall,
                     commitManagedInstall: { [weak self] installRoot, payload, replacing in
                         guard let self else { throw CancellationError() }
-                        try self.requireCurrentLifecycle(generation)
+                        try self.requireCurrentStartup(generation)
                         guard !self.hasRunningCuaService() else { throw CuaMCPProxyError.serviceRunning }
                         if replacing { try FileManager.default.removeItem(at: installRoot) }
                         try FileManager.default.moveItem(at: payload, to: installRoot)
                     }
                 )
-                try requireCurrentLifecycle(generation)
+                try requireCurrentStartup(generation)
                 let service = try await launchCuaService(executableURL: installation.executableURL, generation: generation)
                 selectedCuaExecutableURL = installation.executableURL
-                try requireCurrentLifecycle(generation)
+                try requireCurrentStartup(generation)
                 let candidate = CuaMCPProxy(
                     executableURL: installation.executableURL,
                     socketURL: service.socketURL,
@@ -303,14 +342,14 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                 startingProxy = candidate
                 do {
                     _ = try await candidate.start()
-                    try requireCurrentLifecycle(generation)
+                    try requireCurrentStartup(generation)
                     let catalog = try await candidate.listTools()
-                    try requireCurrentLifecycle(generation)
+                    try requireCurrentStartup(generation)
                     let validatedTools = try await candidate.validateToolCatalog(catalog)
-                    try requireCurrentLifecycle(generation)
+                    try requireCurrentStartup(generation)
                     tools = validatedTools
                     try await verifyCuaHostIdentity(candidate, generation: generation)
-                    try requireCurrentLifecycle(generation)
+                    try requireCurrentStartup(generation)
                     proxy = candidate
                     startingProxy = nil
                 } catch {
@@ -321,30 +360,30 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                     throw error
                 }
             } catch {
-                if generation == lifecycleGeneration {
+                if !Task.isCancelled, generation == lifecycleGeneration {
                     if verifyCapabilities { await publishReadinessFailure(error, generation: generation) }
                     else { readiness = Self.readiness(for: error) }
                 }
                 throw error
             }
         }
-        try requireCurrentLifecycle(generation)
+        try requireCurrentStartup(generation)
         if verifyCapabilities, let proxy {
             do { try await verifyCuaReadiness(proxy, generation: generation) }
             catch {
-                await publishReadinessFailure(error, generation: generation)
+                if !Task.isCancelled { await publishReadinessFailure(error, generation: generation) }
                 throw error
             }
         }
-        try requireCurrentLifecycle(generation)
+        try requireCurrentStartup(generation)
         paused = startPaused
         readiness = startPaused ? "paused" : (sessionLock.allowsControl ? (verifyCapabilities || wasVerifiedReady ? "ready" : "permission_required") : "locked")
         // Permission-only startup never reads enrollment or activates a relay.
         if verifyCapabilities, let saved = try? await readSavedInstallation() {
-            try requireCurrentLifecycle(generation)
+            try requireCurrentStartup(generation)
             activeInstallation = saved
             await gateway?.setReadiness(readiness)
-            try requireCurrentLifecycle(generation)
+            try requireCurrentStartup(generation)
             beginReconnectLoop(for: saved)
         }
     }
@@ -684,7 +723,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         do {
             try await startCua(forceRepairInstall: false, startPaused: remainPaused, generation: generation, verifyCapabilities: false)
         } catch {
-            if generation == lifecycleGeneration, remainPaused {
+            if !Task.isCancelled, !(error is CancellationError), generation == lifecycleGeneration, remainPaused {
                 paused = true
                 readiness = "paused"
                 await gateway?.setReadiness("paused")
@@ -769,8 +808,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let service = CuaEmbeddedService(executableURL: executableURL)
         cuaService = service
         do {
-            try await service.start { try self.requireCurrentLifecycle(generation) }
-            try requireCurrentLifecycle(generation)
+            try await service.start { try self.requireCurrentStartup(generation) }
+            try requireCurrentStartup(generation)
             guard cuaService === service else { throw CancellationError() }
             return service
         } catch {
@@ -1467,6 +1506,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private func verifyCuaHostIdentity(_ candidate: CuaMCPProxy, generation: UUID) async throws {
         guard let service = cuaService, service.isRunning else { throw CuaMCPProxyError.serviceMismatch }
         let response = try await candidate.hostIdentityReport()
+        try Task.checkCancellation()
         try requireCurrentLifecycle(generation)
         guard cuaService === service, service.isRunning,
               Self.validCuaHostIdentity(response, executableURL: service.executableURL, hostPID: Darwin.getpid()) else {

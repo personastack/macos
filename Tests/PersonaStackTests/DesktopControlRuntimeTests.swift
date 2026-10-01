@@ -174,6 +174,22 @@ if args[0] == 'serve':
             if os.path.exists(os.path.join(root, 'exit-daemon')): os._exit(0)
             time.sleep(0.01)
     threading.Thread(target=watch_fixture_exit, daemon=True).start()
+    ended = threading.Event()
+    def read_lifetime():
+        sys.stdin.buffer.read()
+        ended.set()
+    threading.Thread(target=read_lifetime, daemon=True).start()
+    with open(os.path.join(root, 'daemon-starts'), 'a') as out: out.write(str(os.getpid())+'\n')
+    if os.path.exists(os.path.join(root, 'pause-daemon-start')):
+        open(os.path.join(root, 'daemon-starting'), 'w').close()
+        while os.path.exists(os.path.join(root, 'pause-daemon-start')) and not ended.is_set(): time.sleep(0.01)
+    def await_cleanup_release():
+        if os.path.exists(os.path.join(root, 'pause-daemon-cleanup')):
+            open(os.path.join(root, 'daemon-stopping'), 'w').close()
+            while os.path.exists(os.path.join(root, 'pause-daemon-cleanup')): time.sleep(0.01)
+    if ended.is_set():
+        await_cleanup_release()
+        sys.exit(0)
     listener = socket.socket(socket.AF_UNIX)
     listener.bind(path)
     listener.listen(16)
@@ -188,7 +204,8 @@ if args[0] == 'serve':
             connection.close()
     threading.Thread(target=drain_connections, daemon=True).start()
     with open(args[args.index('--pid-file') + 1], 'w') as out: out.write(str(os.getpid()))
-    sys.stdin.buffer.read()
+    ended.wait()
+    await_cleanup_release()
     listener.close()
     sys.exit(0)
 pid_path = os.path.join(os.path.dirname(path), 'daemon.pid')
@@ -207,7 +224,12 @@ for line in sys.stdin:
     request = json.loads(line)
     if 'id' not in request: continue
     method = request['method']
-    if method == 'initialize': result = {'protocolVersion':'2024-11-05','capabilities':{},'serverInfo':{'name':'fixture','version':'1'}}
+    if method == 'initialize':
+        with open(os.path.join(root, 'proxy-starts'), 'a') as out: out.write(str(os.getpid())+'\n')
+        if os.path.exists(os.path.join(root, 'pause-proxy-start')):
+            open(os.path.join(root, 'proxy-starting'), 'w').close()
+            while os.path.exists(os.path.join(root, 'pause-proxy-start')): time.sleep(0.01)
+        result = {'protocolVersion':'2024-11-05','capabilities':{},'serverInfo':{'name':'fixture','version':'1'}}
     elif method == 'tools/list': result = {'tools':[{'name':name} for name in names]}
     elif method == 'tools/call':
         name = request['params']['name']
@@ -1507,4 +1529,117 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
         #expect(runtime.isCuaReady())
         await runtime.shutdownForQuit()
     } catch { await runtime.shutdownForQuit(); throw error }
+}
+
+private actor SuspendedPermissionStartupInstaller: DesktopControlDriverInstalling {
+    let executable: URL
+    private(set) var calls = 0
+    private var pending: CheckedContinuation<Void, Never>?
+    init(executable: URL) { self.executable = executable }
+    func validateOrInstall(repair: Bool, commitManagedInstall: (@MainActor @Sendable (URL, URL, Bool) throws -> Void)?) async throws -> CuaDriverInstallation {
+        calls += 1
+        if calls == 1 { await withCheckedContinuation { pending = $0 } }
+        return CuaDriverInstallation(applicationURL: executable.deletingLastPathComponent(), executableURL: executable,
+                                    version: CuaDriverCompatibility.version, toolNames: CuaDriverCompatibility.requiredTools)
+    }
+    var isSuspended: Bool { pending != nil }
+    func release() { pending?.resume(); pending = nil }
+}
+
+@MainActor private final class StartupPermissionChecklistAdapter: DesktopPermissionChecklistAdapting {
+    let runtime: DesktopControlRuntime
+    init(runtime: DesktopControlRuntime) { self.runtime = runtime }
+    func observe(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation {
+        .init(permission == .accessibility ? .ready : .notGranted, detail: "Fixture", requiresVerification: permission == .accessibility, verified: permission == .accessibility)
+    }
+    func setup(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation {
+        do { try await runtime.prepareCuaPermissions(); return .init(.ready, detail: "Started") }
+        catch { return .init(.checking, detail: "Cancelled") }
+    }
+}
+
+@Test @MainActor func cuaFinishRetiresCancelledInstallerBeforeSuccessorStartup() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-cancel-installer-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let executable = try makeRuntimeDriverFixture(root)
+    let installer = SuspendedPermissionStartupInstaller(executable: executable)
+    let credentials = PermissionPreparationCredentialStore(installation: nil)
+    let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: credentials,
+        readiness: "paused", paused: true, sessionLockState: .unlocked, hostPermissions: { (true, false) })
+    await runtime.waitForSessionLockChangeForTesting()
+    let model = DesktopPermissionChecklistCoordinator(adapter: StartupPermissionChecklistAdapter(runtime: runtime))
+    model.open()
+    await model.refresh()
+    model.setup(.screenRecording)
+    for _ in 0..<100 {
+        if await installer.isSuspended { break }
+        await Task.yield()
+    }
+    #expect(await installer.isSuspended)
+    model.finish()
+    #expect(model.isFinishing && runtime.readiness == "paused")
+    let successor = Task { try await runtime.resumeForSetup(generation: runtime.beginResume()) }
+    for _ in 0..<20 { await Task.yield() }
+    #expect(await installer.calls == 1)
+    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("daemon-starts").path))
+    await installer.release()
+    do {
+        try await successor.value
+        #expect(await installer.calls == 2)
+        #expect(runtime.isCuaReady() && runtime.readiness == "ready")
+        #expect(credentials.readCount == 1)
+        #expect(try runtimeFixtureCalls(root) == ["health_report", "check_permissions", "get_accessibility_tree"])
+        model.cancel()
+        await runtime.shutdownForQuit()
+    } catch { model.cancel(); await runtime.shutdownForQuit(); throw error }
+}
+
+@Test(arguments: ["proxy", "daemon"]) @MainActor
+func cuaFinishWaitsForCancelledStartupCleanupBeforeSuccessorUsesDaemon(_ stage: String) async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-cancel-\(stage)-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let pause = root.appendingPathComponent("pause-\(stage)-start")
+    let cleanup = root.appendingPathComponent("pause-daemon-cleanup")
+    try Data().write(to: pause)
+    if stage == "daemon" { try Data().write(to: cleanup) }
+    let executable = try makeRuntimeDriverFixture(root)
+    let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
+        credentials: PermissionPreparationCredentialStore(installation: nil), readiness: "paused", paused: true,
+        sessionLockState: .unlocked, hostPermissions: { (true, false) })
+    await runtime.waitForSessionLockChangeForTesting()
+    let model = DesktopPermissionChecklistCoordinator(adapter: StartupPermissionChecklistAdapter(runtime: runtime))
+    model.open()
+    await model.refresh()
+    model.setup(.screenRecording)
+    for _ in 0..<200 {
+        if FileManager.default.fileExists(atPath: root.appendingPathComponent("\(stage)-starting").path) { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("\(stage)-starting").path))
+    model.finish()
+    let successor = Task { try await runtime.resumeForSetup(generation: runtime.beginResume()) }
+    if stage == "daemon" {
+        for _ in 0..<100 {
+            if FileManager.default.fileExists(atPath: root.appendingPathComponent("daemon-stopping").path) { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("daemon-stopping").path))
+        let starts = try String(contentsOf: root.appendingPathComponent("daemon-starts"), encoding: .utf8)
+        #expect(starts.split(separator: "\n").count == 1)
+        try FileManager.default.removeItem(at: cleanup)
+    }
+    try FileManager.default.removeItem(at: pause)
+    do {
+        try await successor.value
+        #expect(runtime.isCuaReady() && runtime.readiness == "ready")
+        #expect(model.isFinishing)
+        let calls = try runtimeFixtureCalls(root)
+        #expect(calls == ["health_report", "check_permissions", "get_accessibility_tree"])
+        for _ in 0..<10 { await Task.yield() }
+        #expect(runtime.isCuaReady())
+        model.cancel()
+        await runtime.shutdownForQuit()
+    } catch { model.cancel(); await runtime.shutdownForQuit(); throw error }
 }
