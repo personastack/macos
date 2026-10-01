@@ -59,6 +59,11 @@ struct DesktopControlMenu: View {
         }
         Divider()
         connectionStatus
+        if !loginItemError.isEmpty {
+            Text(loginItemError)
+                .font(.caption)
+                .foregroundStyle(.red)
+        }
         if let action = relayAction {
             Button(action.title) {
                 Task { await toggleRelay() }
@@ -75,11 +80,6 @@ struct DesktopControlMenu: View {
                 registerLoginItem()
             }
             .disabled(SMAppService.mainApp.status == .enabled)
-            if !loginItemError.isEmpty {
-                Text(loginItemError)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
             Divider()
             DesktopAutomaticUpdatesMenuItem()
         }

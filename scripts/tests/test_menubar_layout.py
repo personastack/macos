@@ -47,6 +47,7 @@ class MenuBarLayoutTests(unittest.TestCase):
         markers = [
             'Button("Open PersonaStack")',
             "connectionStatus",
+            "Text(loginItemError)",
             "Button(action.title)",
             'Menu("Desktop Control")',
             'Menu("Settings")',
@@ -86,7 +87,7 @@ class MenuBarLayoutTests(unittest.TestCase):
         self.assertIn("DesktopServerSettingsMenuItem()", settings)
         self.assertIn("registerLoginItem()", block(settings, 'Button("Launch at Login")'))
         self.assertIn(".disabled(SMAppService.mainApp.status == .enabled)", settings)
-        self.assertIn("Text(loginItemError)", settings)
+        self.assertNotIn("Text(loginItemError)", settings)
         self.assertIn("DesktopAutomaticUpdatesMenuItem()", settings)
         preference = block(self.updater, "struct DesktopAutomaticUpdatesMenuItem")
         self.assertIn("get: { updater.automaticallyDownloadsUpdates }", preference)
