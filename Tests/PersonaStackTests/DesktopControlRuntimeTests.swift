@@ -2084,3 +2084,100 @@ func pendingKeychainRecoveryRejectsOverlapAndCannotCommitAfterProfileOrLifecycle
     #expect(!runtime.hasActiveInstallation)
     _ = try runtime.beginResume()
 }
+
+private struct InterleavedKeychainCredentialStore: DesktopControlCredentialStoring {
+    let installation: DesktopControlInstallation
+    let failure: DesktopControlEnrollmentError
+    let passiveStarted = DispatchSemaphore(value: 0)
+    let continuePassive = DispatchSemaphore(value: 0)
+    let authorizationStarted = DispatchSemaphore(value: 0)
+    let continueAuthorization = DispatchSemaphore(value: 0)
+
+    func save(_ installation: DesktopControlInstallation) throws { Issue.record("Recovery must not replace credentials") }
+    func delete() throws { Issue.record("Recovery must not delete credentials") }
+
+    func load() throws -> DesktopControlInstallation? {
+        passiveStarted.signal()
+        guard waitForCredentialRead(continuePassive) else { throw CancellationError() }
+        throw failure
+    }
+
+    func loadWithUserInteraction() throws -> DesktopControlInstallation? {
+        authorizationStarted.signal()
+        guard waitForCredentialRead(continueAuthorization) else { throw CancellationError() }
+        return installation
+    }
+}
+
+@Test(arguments: [false, true], [DesktopControlEnrollmentError.credentialAccessRequired, .credentialStoreUnavailable]) @MainActor
+func concurrentPassiveKeychainFailureCannotLeaveRecoveredInstallationNeedingAttention(authorizationFirst: Bool,
+                                                                                     failure: DesktopControlEnrollmentError) async throws {
+    let suite = "keychain-interleaving-\(UUID().uuidString)"
+    let preferences = try #require(UserDefaults(suiteName: suite))
+    defer { preferences.removePersistentDomain(forName: suite) }
+    let credentials = InterleavedKeychainCredentialStore(installation: try boundKeychainRecoveryInstallation(), failure: failure)
+    defer {
+        credentials.continuePassive.signal()
+        credentials.continueAuthorization.signal()
+    }
+    let configuration = DesktopEnvironmentConfiguration.production
+    let errorKey = DesktopControlPreferenceKeys.relayError(configuration)
+    let otherProfileKey = DesktopControlPreferenceKeys.relayError(.lan)
+    preferences.set("Unrelated LAN connection failure", forKey: otherProfileKey)
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []), credentials: credentials,
+        readiness: "paused", paused: true, preferences: preferences)
+    let generation = try runtime.beginResume()
+    let authorization = Task { @MainActor in try await runtime.authorizeSavedInstallation(generation: generation) }
+    let authorizationStarted = await Task.detached { waitForCredentialRead(credentials.authorizationStarted) }.value
+    #expect(authorizationStarted)
+    let passive = Task { @MainActor in try await runtime.savedInstallation(for: configuration.appPageURL) }
+    let passiveStarted = await Task.detached { waitForCredentialRead(credentials.passiveStarted) }.value
+    #expect(passiveStarted)
+
+    if authorizationFirst {
+        credentials.continueAuthorization.signal()
+        try await authorization.value
+        #expect(runtime.hasActiveInstallation)
+        credentials.continuePassive.signal()
+        #expect(try await passive.value == credentials.installation)
+    } else {
+        credentials.continuePassive.signal()
+        await #expect(throws: failure) { try await passive.value }
+        #expect(preferences.string(forKey: errorKey) == failure.localizedDescription)
+        credentials.continueAuthorization.signal()
+        try await authorization.value
+    }
+
+    #expect(preferences.string(forKey: errorKey) ?? "" == "")
+    #expect(preferences.string(forKey: otherProfileKey) == "Unrelated LAN connection failure")
+    #expect(try await runtime.savedInstallation(for: configuration.appPageURL) == credentials.installation)
+    #expect(runtime.paused && runtime.readiness == "paused")
+    #expect(!runtime.gatewayConnected && !runtime.hasPendingRelayReconnectForTesting)
+    #expect(!preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(configuration)))
+}
+
+@Test(arguments: [false, true], [DesktopControlEnrollmentError.credentialAccessRequired.localizedDescription,
+                                DesktopControlEnrollmentError.credentialStoreUnavailable.localizedDescription,
+                                "Cua permissions need attention", "Waiting for PersonaStack connection"]) @MainActor
+func nativeKeychainAuthorizationClearsOnlyItsProfilesCredentialError(alreadyCached: Bool, message: String) async throws {
+    let suite = "keychain-error-clear-\(UUID().uuidString)"
+    let preferences = try #require(UserDefaults(suiteName: suite))
+    defer { preferences.removePersistentDomain(forName: suite) }
+    let installation = try boundKeychainRecoveryInstallation()
+    let credentials = AuthorizingDesktopControlCredentialStore(installation: installation)
+    let errorKey = DesktopControlPreferenceKeys.relayError(.production)
+    let otherProfileKey = DesktopControlPreferenceKeys.relayError(.lan)
+    preferences.set(message, forKey: errorKey)
+    preferences.set(DesktopControlEnrollmentError.credentialAccessRequired.localizedDescription, forKey: otherProfileKey)
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []), credentials: credentials,
+        installation: alreadyCached ? installation : nil, preferences: preferences)
+    try await runtime.authorizeSavedInstallation(generation: runtime.beginResume())
+    let isCredentialError = message == DesktopControlEnrollmentError.credentialAccessRequired.localizedDescription
+        || message == DesktopControlEnrollmentError.credentialStoreUnavailable.localizedDescription
+    #expect(preferences.string(forKey: errorKey) == (isCredentialError ? "" : message))
+    #expect(preferences.string(forKey: otherProfileKey) == DesktopControlEnrollmentError.credentialAccessRequired.localizedDescription)
+    #expect(credentials.counts.authorizations == (alreadyCached ? 0 : 1))
+    #expect(credentials.counts.reads == 0)
+}

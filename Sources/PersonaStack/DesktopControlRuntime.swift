@@ -208,6 +208,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let configuration = try configurationProvider()
         if let activeInstallation {
             try activeInstallation.requireEnvironment(configuration.appPageURL, configuration: configuration)
+            clearCredentialAccessError(configuration: configuration)
             return
         }
         let store = credentials
@@ -220,6 +221,16 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
               try configurationProvider() == configuration else { throw CancellationError() }
         try saved?.requireEnvironment(configuration.appPageURL, configuration: configuration)
         activeInstallation = saved
+        clearCredentialAccessError(configuration: configuration)
+    }
+
+    private func clearCredentialAccessError(configuration: DesktopEnvironmentConfiguration) {
+        let key = DesktopControlPreferenceKeys.relayError(configuration)
+        let credentialErrors = [DesktopControlEnrollmentError.credentialAccessRequired.localizedDescription,
+                                DesktopControlEnrollmentError.credentialStoreUnavailable.localizedDescription]
+        if let message = preferences.string(forKey: key), credentialErrors.contains(message) {
+            preferences.set("", forKey: key)
+        }
     }
 
     func resume(generation: UUID) async throws {
@@ -1218,6 +1229,13 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                   try configurationProvider() == configuration else { throw CancellationError() }
             if let credentialError = error as? DesktopControlEnrollmentError,
                credentialError == .credentialAccessRequired || credentialError == .credentialStoreUnavailable {
+                // An explicit authorization can finish while this passive read
+                // waits for Keychain. Its valid cache supersedes the older error.
+                if let activeInstallation {
+                    try activeInstallation.requireEnvironment(appURL, configuration: configuration)
+                    clearCredentialAccessError(configuration: configuration)
+                    return activeInstallation
+                }
                 preferences.set(credentialError.localizedDescription,
                                 forKey: DesktopControlPreferenceKeys.relayError(configuration))
             }
