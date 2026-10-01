@@ -25,7 +25,7 @@ enum DesktopInputPermissionVerificationError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .busy:
-            "Desktop Control is busy or recovering. Wait for the remote task to finish, then retry Setup Accessibility."
+            "Desktop Control is busy or recovering. Wait for the remote task to finish, then retry Setup."
         case let .failed(stage, reason):
             "Accessibility verification stopped while \(stage.rawValue): \(reason.rawValue). Retry Setup Accessibility."
         }

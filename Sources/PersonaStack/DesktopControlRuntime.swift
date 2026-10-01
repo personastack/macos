@@ -169,6 +169,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     func replaceExecutorForTesting(_ replacement: DesktopControlCommandExecutor) { executor = replacement }
 
+    /// Recreates the daemon left by enrolled app startup before the first
+    /// foreground session confirmation, without opening a gateway connection.
+    func startUnconfirmedPermissionRuntimeForTesting() async throws {
+        try await startPermissionCua(generation: lifecycleGeneration, remainPaused: paused)
+    }
+
     var lockCleanupStartedForTesting: Bool { executorCleanupInProgress && readiness == "locked" }
     var executorCleanupFailedForTesting: Bool { executorCleanupFailed }
 
@@ -721,6 +727,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         // A cached credential is not an active relay. Retain only existing relay recovery.
         allowsAutomaticCuaRecovery = gateway != nil || pendingGateway != nil || reconnectTask != nil
         let preflightGeneration = lifecycleGeneration
+        // The running daemon proves ownership, not an unlocked session. Explicit
+        // Setup must confirm even when it can reuse that daemon after app launch.
+        try confirmForegroundSession()
+        try requireCurrentStartup(preflightGeneration)
         let ownedDaemonRunning = isOwnedCuaRunning()
         if let existing = proxy {
             let running = await existing.isProcessRunning()
@@ -784,11 +794,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     /// Used by disclosed native checklist checks and explicit capture setup.
     func verifyCuaCapabilitiesForPermissions() async throws {
-        guard sessionLock.allowsControl, let proxy else { throw CuaMCPProxyError.permissionsRequired }
-        let generation = lifecycleGeneration
-        try await verifyCuaReadiness(proxy, generation: generation, timeout: 15, requireScreenCapture: true)
-        try requireCurrentLifecycle(generation)
-        guard sessionLock.allowsControl else { throw CuaMCPProxyError.permissionsRequired }
+        try await verifyCuaCapabilitiesAutomatically()
     }
 
     func verifyCuaCapabilitiesAutomatically() async throws {
