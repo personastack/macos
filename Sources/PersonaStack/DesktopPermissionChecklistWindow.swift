@@ -161,7 +161,7 @@ private struct DesktopPermissionChecklistView: View {
                 Text("Allow PersonaStack to work on this Mac")
                     .font(.title2.weight(.semibold))
             }
-            Text("Allow accessibility, screen capture and microphone access. Full Disk Access replaces separate folder approvals. Desktop Control works while this Mac is unlocked.")
+            Text("Verify Accessibility (Required), then finish setup. Screen Capture adds screenshot-based control. Microphone and file access are optional. Desktop Control works while this Mac is unlocked.")
                 .foregroundStyle(.secondary)
             Text("After an update, macOS may need you to approve access again. If a permission is already enabled in System Settings, follow its recovery steps below, then retry Setup.")
                 .font(.caption).foregroundStyle(.secondary)
@@ -206,7 +206,7 @@ private struct DesktopPermissionChecklistView: View {
                 .frame(width: 20)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
-                Text(row.id.title).font(.headline)
+                Text(row.displayTitle).font(.headline)
                 if row.id == .fullDiskAccess {
                     Text("Optional for setup. Broad file access remains unverified.").font(.caption).foregroundStyle(.secondary)
                 }

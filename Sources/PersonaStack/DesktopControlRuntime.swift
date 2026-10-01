@@ -610,7 +610,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     func isCuaReady() -> Bool {
         let permissions = hostPermissions()
-        guard permissions.accessibility && permissions.screenRecording else {
+        guard permissions.accessibility else {
             verifiedCuaCapabilitiesGeneration = nil
             return false
         }
@@ -627,6 +627,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     /// Explicit native setup only. It never attaches or replaces enrollment.
     func prepareCuaPermissions() async throws {
+        try Task.checkCancellation()
         guard !disconnecting, !environmentSwitchPending, !repairInProgress else { throw CancellationError() }
         // A cached credential is not an active relay. Retain only existing relay recovery.
         allowsAutomaticCuaRecovery = gateway != nil || pendingGateway != nil || reconnectTask != nil
@@ -634,10 +635,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let ownedDaemonRunning = isOwnedCuaRunning()
         if let existing = proxy {
             let running = await existing.isProcessRunning()
+            try Task.checkCancellation()
             try requireCurrentLifecycle(preflightGeneration)
             if ownedDaemonRunning && running { return }
             verifiedCuaCapabilitiesGeneration = nil
             await existing.stop()
+            try Task.checkCancellation()
             try requireCurrentLifecycle(preflightGeneration)
             guard proxy === existing else { throw CancellationError() }
             proxy = nil
@@ -645,6 +648,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         }
         if !ownedDaemonRunning {
             guard await stopOwnedCuaService() else { throw DesktopControlOwnedCuaStopError() }
+            try Task.checkCancellation()
             try requireCurrentLifecycle(preflightGeneration)
         }
         let remainPaused = paused
@@ -660,6 +664,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     func restartCuaAfterPermissionChange() async throws {
+        try Task.checkCancellation()
         guard !repairInProgress else { throw CancellationError() }
         // A cached credential is not an active relay. Retain only existing relay recovery.
         allowsAutomaticCuaRecovery = gateway != nil || pendingGateway != nil || reconnectTask != nil
@@ -667,8 +672,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let generation = try beginResume()
         try confirmForegroundSession()
         await stopLocalControl(generation: generation)
+        try Task.checkCancellation()
         try requireCurrentLifecycle(generation)
         guard await stopOwnedCuaService() else { throw DesktopControlOwnedCuaStopError() }
+        try Task.checkCancellation()
         try requireCurrentLifecycle(generation)
         try await startPermissionCua(generation: generation, remainPaused: remainPaused)
     }
@@ -690,7 +697,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     func verifyCuaCapabilitiesForPermissions() async throws {
         guard sessionLock.allowsControl, let proxy else { throw CuaMCPProxyError.permissionsRequired }
         let generation = lifecycleGeneration
-        try await verifyCuaReadiness(proxy, generation: generation, timeout: 15)
+        try await verifyCuaReadiness(proxy, generation: generation, timeout: 15, requireScreenCapture: true)
         try requireCurrentLifecycle(generation)
         guard sessionLock.allowsControl else { throw CuaMCPProxyError.permissionsRequired }
     }
@@ -1401,27 +1408,34 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func verifyCuaReadiness(_ candidate: CuaMCPProxy, generation: UUID,
-                                    timeout: Int32 = 60) async throws {
+                                    timeout: Int32 = 60, requireScreenCapture: Bool = false) async throws {
+        try Task.checkCancellation()
         guard let service = cuaService else { throw CuaMCPProxyError.notStarted }
-        verifiedCuaCapabilitiesGeneration = nil
-        try await verifyCuaPermissions(candidate, generation: generation, timeout: timeout)
+        if !requireScreenCapture { verifiedCuaCapabilitiesGeneration = nil }
+        try await verifyCuaPermissions(candidate, generation: generation, timeout: timeout, requireScreenCapture: requireScreenCapture)
 
-        // Permission checks can run before the first observed unlock. Capture
-        // and accessibility proof must both finish in the unlocked session.
+        try Task.checkCancellation()
+
+        // Accessibility is sufficient for element actions. Only explicit
+        // screen setup requests capture. All proof stays in the unlocked session.
         guard sessionLock.allowsControl else { return }
         let probeLockGeneration = lockGeneration
-        let screenshot = try await candidate.callTool(
-            name: "get_desktop_state", argumentsJSON: Data("{}".utf8), timeout: timeout
-        )
-        try requireCurrentLifecycle(generation)
-        guard let screenshotResult = Self.toolResult(screenshot),
-              let content = screenshotResult["content"] as? [[String: Any]],
-              content.contains(where: Self.hasCapturePixels) else {
-            throw CuaMCPProxyError.functionalProbeFailed
+        if requireScreenCapture {
+            let screenshot = try await candidate.callTool(
+                name: "get_desktop_state", argumentsJSON: Data("{}".utf8), timeout: timeout
+            )
+            try Task.checkCancellation()
+            try requireCurrentLifecycle(generation)
+            guard let screenshotResult = Self.toolResult(screenshot),
+                  let content = screenshotResult["content"] as? [[String: Any]],
+                  content.contains(where: Self.hasCapturePixels) else {
+                throw CuaMCPProxyError.functionalProbeFailed
+            }
         }
         let accessibility = try await candidate.callTool(
             name: "get_accessibility_tree", argumentsJSON: Data("{}".utf8), timeout: timeout
         )
+        try Task.checkCancellation()
         try requireCurrentLifecycle(generation)
         guard let result = Self.toolResult(accessibility),
               let content = result["content"] as? [[String: Any]],
@@ -1431,7 +1445,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         guard cuaService === service, service.isRunning, sessionLock.allowsControl,
               lockGeneration == probeLockGeneration else { throw CancellationError() }
         let permissions = hostPermissions()
-        guard permissions.accessibility && permissions.screenRecording else { throw CuaMCPProxyError.permissionsRequired }
+        guard permissions.accessibility && (!requireScreenCapture || permissions.screenRecording) else { throw CuaMCPProxyError.permissionsRequired }
         verifiedCuaCapabilitiesGeneration = service.generation
     }
 
@@ -1443,11 +1457,11 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func verifyCuaPermissions(_ candidate: CuaMCPProxy, generation: UUID,
-                                      timeout: Int32 = 60) async throws {
+                                      timeout: Int32 = 60, requireScreenCapture: Bool = false) async throws {
         guard let service = cuaService else { throw CuaMCPProxyError.notStarted }
         let snapshot = try await readCuaPermissionSnapshot(candidate, service: service, generation: generation, timeout: timeout)
         guard snapshot.hostAttributionValid else { throw CuaMCPProxyError.serviceMismatch }
-        guard snapshot.accessibility && snapshot.screenRecording else { throw CuaMCPProxyError.permissionsRequired }
+        guard snapshot.accessibility && (!requireScreenCapture || snapshot.screenRecording) else { throw CuaMCPProxyError.permissionsRequired }
     }
 
     private func verifyCuaHostIdentity(_ candidate: CuaMCPProxy, generation: UUID) async throws {
@@ -1481,6 +1495,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     private func readCuaPermissionSnapshot(_ candidate: CuaMCPProxy, service: CuaEmbeddedService, generation: UUID,
                                           timeout: Int32) async throws -> CuaDriverPermissionSnapshot {
+        try Task.checkCancellation()
         guard service.isRunning, verifiedCuaHostGeneration == service.generation else { throw CuaMCPProxyError.serviceMismatch }
         do {
             let permissions = try await candidate.callTool(
@@ -1488,6 +1503,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                 argumentsJSON: CuaDriverCompatibility.permissionProbeArgumentsJSON,
                 timeout: timeout
             )
+            try Task.checkCancellation()
             try requireCurrentLifecycle(generation)
             guard cuaService === service, service.isRunning,
                   let structured = Self.toolResult(permissions)?["structuredContent"] as? [String: Any] else {
@@ -1498,11 +1514,11 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             let native = hostPermissions()
             let accessibility = snapshot.accessibility && native.accessibility
             let screenRecording = snapshot.screenRecording && native.screenRecording
-            if !snapshot.hostAttributionValid || !accessibility || !screenRecording { verifiedCuaCapabilitiesGeneration = nil }
+            if !snapshot.hostAttributionValid || !accessibility { verifiedCuaCapabilitiesGeneration = nil }
             return CuaDriverPermissionSnapshot(accessibility: accessibility, screenRecording: screenRecording,
                                                hostAttributionValid: snapshot.hostAttributionValid, verificationKey: snapshot.verificationKey)
         } catch {
-            if cuaService === service { verifiedCuaCapabilitiesGeneration = nil }
+            if !Task.isCancelled, cuaService === service, lifecycleGeneration == generation { verifiedCuaCapabilitiesGeneration = nil }
             throw error
         }
     }
@@ -1510,7 +1526,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     static func permissionProbeFailure(rpcError: Bool, toolError: Bool, hasStructured: Bool,
                                        accessibility: Bool, screenRecording: Bool) -> CuaMCPProxyError? {
         if rpcError || toolError || !hasStructured { return .functionalProbeFailed }
-        if !accessibility || !screenRecording { return .permissionsRequired }
+        if !accessibility { return .permissionsRequired }
         return nil
     }
 

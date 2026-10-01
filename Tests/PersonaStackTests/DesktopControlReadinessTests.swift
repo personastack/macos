@@ -51,7 +51,7 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
     #expect(DesktopControlRuntime.permissionProbeFailure(rpcError: true, toolError: false,
         hasStructured: false, accessibility: false, screenRecording: false) == .functionalProbeFailed)
     #expect(DesktopControlRuntime.permissionProbeFailure(rpcError: false, toolError: false,
-        hasStructured: true, accessibility: true, screenRecording: false) == .permissionsRequired)
+        hasStructured: true, accessibility: true, screenRecording: false) == nil)
     #expect(DesktopControlRuntime.permissionProbeFailure(rpcError: false, toolError: false,
         hasStructured: true, accessibility: true, screenRecording: true) == nil)
 }

@@ -45,13 +45,12 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     }
     private var setupFailures: [DesktopPermissionID: SetupFailure] = [:]
     private var refreshing = false
-    private var refreshedForCurrentPresentation = false
     private(set) var isVisible = false
 
     init(adapter: any DesktopPermissionChecklistAdapting) { self.adapter = adapter }
 
     var canFinish: Bool {
-        isVisible && refreshedForCurrentPresentation && !isFinishing && !needsNewSetupRequest && busyPermission == nil && rows.filter(\.isRequiredForUnlockedSetup).allSatisfy(\.isComplete)
+        isVisible && !isFinishing && !needsNewSetupRequest && busyPermission != .accessibility && rows.filter(\.isRequiredForUnlockedSetup).allSatisfy(\.isComplete)
     }
     var isAwaitingFinish: Bool { continuation != nil }
     var permissionRows: [DesktopPermissionRow] {
@@ -91,7 +90,6 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     func open() {
         guard !isVisible else { return }
         isVisible = true
-        refreshedForCurrentPresentation = false
         resetObservations()
         completionError = ""
         let expected = generation
@@ -140,7 +138,6 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
                   rowRevisions[id] == revision else { continue }
             apply(observation, id: id, explicit: false)
         }
-        if generation == expected, isVisible, !Task.isCancelled { refreshedForCurrentPresentation = true }
     }
 
     func setup(_ id: DesktopPermissionID) {
@@ -167,6 +164,9 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     func finish() {
         guard canFinish else { return }
         isFinishing = true
+        setupTask?.cancel()
+        setupTask = nil
+        busyPermission = nil
         automaticSetupTask?.cancel()
         automaticSetupTask = nil
         automaticBusyPermission = nil
@@ -202,7 +202,6 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         verificationKeys.removeAll()
         setupFailures.removeAll()
         rowRevisions.removeAll()
-        refreshedForCurrentPresentation = false
         resetObservations()
         let pending = continuation
         continuation = nil

@@ -79,11 +79,12 @@ public struct DesktopPermissionRow: Identifiable, Equatable, Sendable {
         return observation.state
     }
     public var isComplete: Bool { state.satisfiesSetup }
-    /// Full Disk Access remains unqualified. Convenience settings and unused
-    /// permissions do not gate the current unlocked-control setup.
+    /// Accessibility supports Cua's element-addressed input and agent cursor.
+    /// Capture, voice, files and convenience settings are optional for setup.
     public var isRequiredForUnlockedSetup: Bool {
-        [.accessibility, .screenRecording, .microphone, .localNetwork].contains(id)
+        id == .accessibility
     }
+    public var displayTitle: String { id.title + (isRequiredForUnlockedSetup ? " (Required)" : "") }
     public var setupTitle: String { "Setup \(id.title)" }
 
     public init(id: DesktopPermissionID, observation: DesktopPermissionObservation) {

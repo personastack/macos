@@ -117,19 +117,19 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
         model.open()
         await model.refresh()
         #expect(model.rows.first { $0.id == id }?.state == denied.state)
-        #expect(!model.canFinish)
+        #expect(model.canFinish == (id != .accessibility))
         #expect(fake.requested.isEmpty)
 
         model.setup(id)
         while model.busyPermission != nil { await Task.yield() }
         #expect(model.rows.first { $0.id == id }?.state == denied.state)
-        #expect(!model.canFinish)
+        #expect(model.canFinish == (id != .accessibility))
 
         fake.values[id] = .init(.ready, detail: "macOS grant observed", verificationKey: "current-owner",
                                 requiresVerification: true)
         await model.refresh()
         #expect(model.rows.first { $0.id == id }?.state == .verificationRequired)
-        #expect(!model.canFinish)
+        #expect(model.canFinish == (id != .accessibility))
         #expect(fake.requested == [id])
 
         fake.setupValues[id] = .init(.ready, detail: "Operation verified", verificationKey: "current-owner",
@@ -142,7 +142,7 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
         fake.values[id] = denied
         await model.refresh()
         #expect(model.rows.first { $0.id == id }?.state == denied.state)
-        #expect(!model.canFinish)
+        #expect(model.canFinish == (id != .accessibility))
         #expect(fake.requested == [id, id])
         model.cancel()
     }
@@ -176,7 +176,7 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     model.cancel()
 }
 
-@Test @MainActor func permissionChecklistMicrophoneInvalidationBlocksFinishBeforePolling() async {
+@Test @MainActor func permissionChecklistOptionalMicrophoneInvalidationDoesNotBlockFinish() async {
     let fake = PermissionChecklistFake()
     fake.values[.microphone] = .init(.ready, detail: "Allowed", verificationKey: "device-document", requiresVerification: true)
     fake.setupValues[.microphone] = .init(.ready, detail: "Verified", verificationKey: "device-document", requiresVerification: true, verified: true)
@@ -188,12 +188,10 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     #expect(model.canFinish)
     let requests = fake.requested
     model.invalidateVerification(.microphone)
-    #expect(!model.canFinish)
+    #expect(model.canFinish)
     #expect(model.rows.first { $0.id == .microphone }?.state == .verificationRequired)
-    model.finish()
-    #expect(!model.isFinishing)
     await model.refresh()
-    #expect(!model.canFinish && fake.requested == requests)
+    #expect(model.canFinish && fake.requested == requests)
     model.setup(.microphone)
     while model.busyPermission != nil { await Task.yield() }
     #expect(model.canFinish && fake.requested == [.microphone, .microphone])
@@ -216,7 +214,7 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     model.open()
     await model.refresh()
     #expect(model.rows.first { $0.id == .microphone }?.state == .denied)
-    #expect(!model.canFinish)
+    #expect(model.canFinish)
     model.cancel()
 }
 
@@ -352,7 +350,7 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
             let model = DesktopPermissionChecklistCoordinator(adapter: fake)
             model.open()
             await model.refresh()
-            let required = [.accessibility, .screenRecording, .microphone, .localNetwork].contains(id)
+            let required = id == .accessibility
             #expect(model.canFinish == !required, "Finish policy for \(id) \(state)")
             model.finish()
             #expect(model.isFinishing == !required)
@@ -465,7 +463,7 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     fake.pendingSetup = nil
     while model.busyPermission != nil { await Task.yield() }
     #expect(model.rows.first { $0.id == .microphone }?.state == .verificationRequired)
-    #expect(!model.canFinish)
+    #expect(model.canFinish)
     model.cancel()
 }
 
@@ -518,4 +516,46 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
         #expect(model.rows.first { $0.id == .microphone }?.observation.detail == "New document")
         model.cancel()
     }
+}
+
+@Test @MainActor func permissionChecklistRequiredLabelsMatchMinimumFinishPolicy() {
+    for id in DesktopPermissionID.allCases {
+        let row = DesktopPermissionRow(id: id, observation: .init(.ready, detail: "Ready"))
+        #expect(row.isRequiredForUnlockedSetup == (id == .accessibility))
+        #expect(row.displayTitle == id.title + (id == .accessibility ? " (Required)" : ""))
+    }
+}
+
+@Test @MainActor func permissionChecklistAccessibilityEnablesFinishBeforeOptionalRefreshCompletes() async {
+    let fake = PermissionChecklistFake()
+    fake.values[.accessibility] = .init(.ready, detail: "Input verified", requiresVerification: true, verified: true)
+    fake.suspendedObservation = .screenRecording
+    let model = DesktopPermissionChecklistCoordinator(adapter: fake)
+    model.open()
+    while fake.pendingObservation == nil { await Task.yield() }
+    #expect(model.canFinish)
+    model.finish()
+    #expect(model.isFinishing)
+    fake.pendingObservation?.resume(returning: .init(.failed, detail: "Optional capture failed"))
+    fake.pendingObservation = nil
+    model.cancel()
+}
+
+@Test @MainActor func permissionChecklistFinishCancelsOptionalSetupAndFencesLateResult() async {
+    let fake = PermissionChecklistFake()
+    fake.delaySetup = true
+    fake.values[.microphone] = .init(.denied, detail: "Optional microphone denied")
+    let model = DesktopPermissionChecklistCoordinator(adapter: fake)
+    model.open()
+    await model.refresh()
+    model.setup(.microphone)
+    while fake.pendingSetup == nil { await Task.yield() }
+    #expect(model.canFinish)
+    model.finish()
+    #expect(model.isFinishing && model.busyPermission == nil)
+    fake.pendingSetup?.resume(returning: .init(.ready, detail: "Late microphone success"))
+    fake.pendingSetup = nil
+    for _ in 0..<10 { await Task.yield() }
+    #expect(model.rows.first { $0.id == .microphone }?.state == .denied)
+    model.cancel()
 }

@@ -302,6 +302,7 @@ final class DesktopPermissionChecklist {
         do {
             let runtime = cuaRuntime
             let old = try? await runtime.cuaPermissionSnapshot()
+            try Task.checkCancellation()
             if let old, old.accessibility != adapter.access.accessibility() || old.screenRecording != adapter.access.screenRecording() {
                 try await runtime.restartCuaAfterPermissionChange()
             } else { try await runtime.prepareCuaPermissions() }

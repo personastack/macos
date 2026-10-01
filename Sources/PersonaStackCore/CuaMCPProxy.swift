@@ -22,7 +22,7 @@ extension CuaMCPProxyError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .permissionsRequired:
-            return "Grant Accessibility and Screen Recording to PersonaStack in its permissions checklist, then retry setup."
+            return "Verify Accessibility in PersonaStack's permissions checklist. Screenshot-based control also needs Screen Capture."
         case .functionalProbeFailed:
             return "PersonaStack could not verify screen capture and accessibility. Check its permissions checklist and retry."
         case .serviceRunning:

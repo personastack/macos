@@ -11,8 +11,14 @@ private final class PermissionRequestRuntime: DesktopPermissionCuaRuntime {
     var hostAttributionValid = true
     var calls: [String] = []
     var captureFailure = false
+    var suspendSnapshot = false
+    var pendingSnapshot: CheckedContinuation<Void, Never>?
     func cuaPermissionSnapshot() async throws -> CuaDriverPermissionSnapshot {
-        .init(accessibility: accessibility, screenRecording: screenRecording,
+        if suspendSnapshot {
+            suspendSnapshot = false
+            await withCheckedContinuation { pendingSnapshot = $0 }
+        }
+        return .init(accessibility: accessibility, screenRecording: screenRecording,
               hostAttributionValid: hostAttributionValid, verificationKey: "owned-generation")
     }
     func prepareCuaPermissions() async throws { calls.append("prepare") }
@@ -207,4 +213,22 @@ private struct PermissionOnlyAdapter: DesktopPermissionChecklistAdapting {
     let observed = await adapter.observe(.accessibility)
     #expect(observed.state == .ready && observed.requiresVerification && !observed.verified)
     #expect(requested == 1 && settings == 1)
+}
+
+@Test @MainActor func permissionCancelledOptionalCaptureCannotPrepareOrRestartSuccessorRuntime() async {
+    let runtime = PermissionRequestRuntime()
+    runtime.suspendSnapshot = true
+    var access = DesktopPermissionSystemAccess()
+    access.accessibility = { true }
+    access.screenRecording = { true }
+    access.requestScreenRecording = { true }
+    let owner = DesktopPermissionChecklist(access: access, cuaRuntime: runtime, inputTarget: { PermissionRequestTarget() })
+    let stale = Task { await owner.adapter.setup(.screenRecording) }
+    while runtime.pendingSnapshot == nil { await Task.yield() }
+    stale.cancel()
+    runtime.pendingSnapshot?.resume()
+    runtime.pendingSnapshot = nil
+    let result = await stale.value
+    #expect(result.state == .checking && !result.verified)
+    #expect(runtime.calls.isEmpty)
 }
