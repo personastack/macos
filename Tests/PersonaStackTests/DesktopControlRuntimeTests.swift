@@ -1889,7 +1889,7 @@ func desktopControlAutomaticColdStartAndCapturePreserveEnrollmentAndRemoteLease(
     } catch { await runtime.shutdownForQuit(); throw error }
 }
 
-@Test(arguments: ["lifecycle", "lock", "executor", "cancel"], [false, true]) @MainActor
+@Test(arguments: ["lifecycle", "lock", "executor", "cancel", "accessibility", "screen-capture"], [false, true]) @MainActor
 func desktopControlAutomaticCaptureFencesOwnerChangeDuringExclusionAcquire(change: String, automatic: Bool) async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-auto-fence-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
@@ -1897,11 +1897,16 @@ func desktopControlAutomaticCaptureFencesOwnerChangeDuringExclusionAcquire(chang
     let executable = try makeRuntimeDriverFixture(root)
     let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
     let credentials = PermissionPreparationCredentialStore(installation: nil)
+    var accessibility = true
+    var screenCapture = true
     let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
-        credentials: credentials, executor: executor, sessionLockState: .unlocked, hostPermissions: { (true, true) })
+        credentials: credentials, executor: executor, sessionLockState: .unlocked,
+        hostPermissions: { (accessibility, screenCapture) })
     do {
         await runtime.waitForSessionLockChangeForTesting()
         try await runtime.prepareCuaPermissionsAutomatically()
+        try await runtime.verifyCuaCapabilitiesAutomatically()
+        #expect(runtime.isCuaReady())
         let calls = try runtimeFixtureCalls(root)
         var pending: CheckedContinuation<Void, Never>?
         executor.pauseNativeVerificationForTesting { await withCheckedContinuation { pending = $0 } }
@@ -1914,10 +1919,21 @@ func desktopControlAutomaticCaptureFencesOwnerChangeDuringExclusionAcquire(chang
         case "lifecycle": _ = try runtime.beginResume()
         case "lock": runtime.receiveSessionLockForTesting(.locked)
         case "cancel": check.cancel()
+        case "accessibility": accessibility = false
+        case "screen-capture": screenCapture = false
         default: runtime.replaceExecutorForTesting(DesktopControlCommandExecutor(powerAssertion: .testFixture()))
         }
         pending?.resume()
-        await #expect(throws: CancellationError.self) { try await check.value }
+        if change == "accessibility" || change == "screen-capture" {
+            await #expect(throws: CuaMCPProxyError.permissionsRequired) { try await check.value }
+            // AX revocation retires its earlier proof. Capture denial alone
+            // preserves the separately valid Accessibility readiness.
+            accessibility = true
+            screenCapture = true
+            #expect(runtime.isCuaReady() == (change == "screen-capture"))
+        } else {
+            await #expect(throws: CancellationError.self) { try await check.value }
+        }
         #expect(try runtimeFixtureCalls(root) == calls)
         #expect(!executor.nativeVerificationInProgress && credentials.readCount == 0)
         await runtime.shutdownForQuit()

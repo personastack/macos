@@ -812,11 +812,13 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         func requireCurrent() throws {
             try requireCurrentStartup(generation)
             try executor.requireNativeVerification(id)
-            let grants = hostPermissions()
             guard self.executor === executor, self.proxy === proxy, cuaService === service, service.isRunning,
-                  sessionLock.allowsControl, lockGeneration == lock, grants.accessibility, grants.screenRecording,
+                  sessionLock.allowsControl, lockGeneration == lock,
                   !disconnecting, !environmentSwitchPending, !repairInProgress,
                   !executorCleanupInProgress, !executorCleanupFailed else { throw CancellationError() }
+            let grants = hostPermissions()
+            if !grants.accessibility { verifiedCuaCapabilitiesGeneration = nil }
+            guard grants.accessibility, grants.screenRecording else { throw CuaMCPProxyError.permissionsRequired }
         }
         try requireCurrent()
         try await verifyCuaReadiness(proxy, generation: generation, timeout: 15, requireScreenCapture: true,
