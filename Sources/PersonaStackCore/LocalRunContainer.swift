@@ -57,6 +57,11 @@ public actor LocalRunContainer {
         guard try await command(["system", "status"]).status == 0 else { throw LocalRunError.runtimeUnavailable }
     }
 
+    public func startService() async throws {
+        guard try await command(["system", "start", "--enable-kernel-install"]).status == 0,
+              try await command(["system", "status"]).status == 0 else { throw LocalRunError.runtimeUnavailable }
+    }
+
     public static func supportsVersion(_ output: String) -> Bool {
         guard let match = output.range(of: "[0-9]+\\.[0-9]+\\.[0-9]+", options: .regularExpression) else { return false }
         let parts = output[match].split(separator: ".").compactMap { Int($0) }
@@ -252,7 +257,7 @@ public actor LocalRunContainer {
             process.standardOutput = pipe
             try process.run()
             let timeout = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-            let seconds = arguments.prefix(2) == ["image", "pull"] ? 300 : arguments.first == "run" ? 120 : 30
+            let seconds = arguments.prefix(2) == ["image", "pull"] || arguments.prefix(2) == ["system", "start"] ? 300 : arguments.first == "run" ? 120 : 30
             timeout.schedule(deadline: .now() + .seconds(seconds))
             timeout.setEventHandler {
                 guard process.isRunning else { return }

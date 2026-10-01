@@ -54,6 +54,7 @@ final class LocalRunManager: NSObject, WKScriptMessageHandlerWithReply {
         }
         Task {
             do { replyHandler(try await apply(action, body: body, scope: scope, page: page), nil) }
+            catch LocalRunError.setupCancelled { replyHandler(["ok": true, "cancelled": true], nil) }
             catch { replyHandler(nil, (error as? LocalRunError)?.rawValue ?? "Unable to start the local agent.") }
         }
     }
@@ -70,8 +71,9 @@ final class LocalRunManager: NSObject, WKScriptMessageHandlerWithReply {
         let generation = page.generation
         if action == "prepare" {
             guard let persona = body["persona_id"] as? String, ChatWindowCommand.validPersonaID(persona) else { throw LocalRunError.invalidBundle }
-            do { try await LocalRunContainer().preflight() }
-            catch { showSetup(error); throw error }
+            try await LocalRunSetupManager.shared.ensureReady {
+                page.generation == generation && page.scope == scope
+            }
             guard page.generation == generation else { throw LocalRunError.staleSession }
             let panel = NSOpenPanel()
             panel.title = "Run persona locally"
@@ -96,20 +98,6 @@ final class LocalRunManager: NSObject, WKScriptMessageHandlerWithReply {
         window.focus()
         window.start(appURL: page.appURL, personaID: pending.persona, ticket: ticket, verifier: pending.verifier)
         return ["ok": true, "session_id": id]
-    }
-
-    private func showSetup(_ error: Error) {
-        let alert = NSAlert()
-        alert.messageText = "Set up local runs"
-        alert.informativeText = (error as? LocalRunError)?.rawValue ?? "Apple's container runtime is unavailable."
-        if (error as? LocalRunError) != .unsupported {
-            alert.informativeText += "\n\nInstall Apple's signed container package. Then run container system start. For Mac localhost access, follow Apple's host integration setup."
-            alert.addButton(withTitle: "Setup Instructions")
-            alert.addButton(withTitle: "Cancel")
-            if alert.runModal() == .alertFirstButtonReturn {
-                NSWorkspace.shared.open(URL(string: "https://github.com/apple/container/blob/1.4.1/docs/host-integration.md")!)
-            }
-        } else { alert.addButton(withTitle: "OK"); alert.runModal() }
     }
 
     static func randomSecret() throws -> String {
