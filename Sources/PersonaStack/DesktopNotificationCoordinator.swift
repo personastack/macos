@@ -1,6 +1,38 @@
 import Foundation
 import UserNotifications
 
+/// Startup and the permission checklist share one pending OS approval request.
+@MainActor
+final class DesktopNotificationAuthorization {
+    private let settings: () async -> UNAuthorizationStatus
+    private let request: (UNAuthorizationOptions) async throws -> Bool
+    private var pending: Task<Bool, Error>?
+
+    init(settings: @escaping () async -> UNAuthorizationStatus = {
+        await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+    }, request: @escaping (UNAuthorizationOptions) async throws -> Bool = { options in
+        try await UNUserNotificationCenter.current().requestAuthorization(options: options)
+    }) {
+        self.settings = settings
+        self.request = request
+    }
+
+    func requestIfNeeded() async throws -> Bool {
+        if let pending { return try await pending.value }
+        let operation = Task { [settings, request] in
+            switch await settings() {
+            case .notDetermined: return try await request([.alert, .sound])
+            case .authorized, .provisional, .ephemeral: return true
+            case .denied: return false
+            @unknown default: return false
+            }
+        }
+        pending = operation
+        defer { pending = nil }
+        return try await operation.value
+    }
+}
+
 @MainActor
 final class DesktopNotificationCoordinator: NSObject, UNUserNotificationCenterDelegate {
     static let shared = DesktopNotificationCoordinator()
@@ -11,6 +43,7 @@ final class DesktopNotificationCoordinator: NSObject, UNUserNotificationCenterDe
     }
 
     private let center = UNUserNotificationCenter.current()
+    private let authorization = DesktopNotificationAuthorization()
     private let availableCategory = "PERSONASTACK_DESKTOP_UPDATE_AVAILABLE"
     private let readyCategory = "PERSONASTACK_DESKTOP_UPDATE_READY"
 
@@ -30,7 +63,11 @@ final class DesktopNotificationCoordinator: NSObject, UNUserNotificationCenterDe
     }
 
     func requestAuthorization() {
-        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        Task { _ = try? await requestAuthorizationIfNeeded() }
+    }
+
+    func requestAuthorizationIfNeeded() async throws -> Bool {
+        try await authorization.requestIfNeeded()
     }
 
     func verifyPermissionDelivery() async throws -> Bool {

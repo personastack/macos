@@ -4,6 +4,76 @@ import UserNotifications
 @testable import PersonaStack
 
 struct DesktopNotificationCoordinatorTests {
+    @Test @MainActor func launchChecklistAndReceiverReplacementShareOneNotificationPrompt() async throws {
+        var status = UNAuthorizationStatus.notDetermined
+        var reads = 0
+        var requests: [UNAuthorizationOptions] = []
+        var response: CheckedContinuation<Bool, Error>?
+        let authorization = DesktopNotificationAuthorization(settings: {
+            reads += 1
+            return status
+        }, request: { options in
+            requests.append(options)
+            return try await withCheckedThrowingContinuation { response = $0 }
+        })
+        let launch = Task { try await authorization.requestIfNeeded() }
+        while response == nil { await Task.yield() }
+        var checklistStarted = false
+        let checklist = Task {
+            checklistStarted = true
+            return try await authorization.requestIfNeeded()
+        }
+        while !checklistStarted { await Task.yield() }
+        #expect(reads == 1 && requests == [[.alert, .sound]])
+        // Closing setup must not cancel the app's pending startup approval.
+        checklist.cancel()
+        status = .authorized
+        response?.resume(returning: true)
+        response = nil
+        #expect(try await launch.value)
+        #expect(try await checklist.value)
+        #expect(try await authorization.requestIfNeeded())
+        #expect(reads == 2 && requests == [[.alert, .sound]])
+    }
+
+    @Test(arguments: [UNAuthorizationStatus.authorized, .provisional, .denied])
+    @MainActor func existingNotificationChoiceDoesNotPromptAgain(status: UNAuthorizationStatus) async throws {
+        let authorization = DesktopNotificationAuthorization(settings: { status }, request: { _ in
+            Issue.record("Existing notification decisions must not be requested again")
+            return false
+        })
+        #expect(try await authorization.requestIfNeeded() == (status != .denied))
+        #expect(try await authorization.requestIfNeeded() == (status != .denied))
+    }
+
+    @Test @MainActor func deniedNotificationRequestIsNotRepeatedByTheChecklist() async throws {
+        var status = UNAuthorizationStatus.notDetermined
+        var requests = 0
+        let authorization = DesktopNotificationAuthorization(settings: { status }, request: { _ in
+            requests += 1
+            status = .denied
+            return false
+        })
+        #expect(try await authorization.requestIfNeeded() == false)
+        #expect(try await authorization.requestIfNeeded() == false)
+        #expect(requests == 1)
+    }
+
+    @Test @MainActor func failedNotificationRequestCanBeRetriedWithoutCachingApproval() async throws {
+        var status = UNAuthorizationStatus.notDetermined
+        var requests = 0
+        let authorization = DesktopNotificationAuthorization(settings: { status }, request: { _ in
+            requests += 1
+            if requests == 1 { throw CancellationError() }
+            status = .authorized
+            return true
+        })
+        await #expect(throws: CancellationError.self) { try await authorization.requestIfNeeded() }
+        #expect(try await authorization.requestIfNeeded())
+        #expect(try await authorization.requestIfNeeded())
+        #expect(requests == 2)
+    }
+
     @Test @MainActor func notificationActionsRouteToTheMatchingUpdateFlow() {
         #expect(DesktopNotificationCoordinator.updateAction(
             requestIdentifier: "personastack-update-available-0.1.49",

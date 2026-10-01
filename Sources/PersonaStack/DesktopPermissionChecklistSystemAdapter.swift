@@ -41,7 +41,7 @@ struct DesktopPermissionSystemAccess {
         return (settings.authorizationStatus, settings.alertSetting, settings.soundSetting)
     }
     var requestNotifications: () async throws -> Void = {
-        _ = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+        _ = try await DesktopNotificationCoordinator.shared.requestAuthorizationIfNeeded()
     }
     var loginStatus: () -> SMAppService.Status = { SMAppService.mainApp.status }
     var registerLogin: () throws -> Void = { try SMAppService.mainApp.register() }
@@ -118,9 +118,10 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         case .screenRecording, .directCapture:
             // CGRequestScreenCaptureAccess can return false without registering
             // the app on newer macOS. A real host SCK request owns that prompt.
-            let capturable = await access.requestScreenRecording()
+            let alreadyAllowed = access.screenRecording()
+            let capturable = alreadyAllowed ? true : await access.requestScreenRecording()
             guard !Task.isCancelled else { return .init(.checking, detail: "Setup cancelled.") }
-            if capturable && !access.screenRecording() {
+            if !alreadyAllowed && capturable && !access.screenRecording() {
                 return .init(.restartRequired, detail: "macOS allowed the screen request, but PersonaStack's current process still reports the old grant. Quit and reopen PersonaStack, then retry Setup \(permission.title).")
             }
             guard access.screenRecording() else {
