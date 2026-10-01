@@ -86,6 +86,7 @@ enum DesktopControlEnrollmentError: Error, Equatable {
     case rejected
     case invalidResponse
     case credentialStoreUnavailable
+    case credentialAccessRequired
     case installationMissing
     case nativeCapabilitiesUnavailable
     case revocationFailed
@@ -101,7 +102,9 @@ extension DesktopControlEnrollmentError: LocalizedError {
         case .invalidResponse:
             "The server returned an invalid Desktop Control enrollment response."
         case .credentialStoreUnavailable:
-            "macOS Keychain could not access the Desktop Control installation. Allow PersonaStack to use its Keychain item and retry."
+            "macOS Keychain could not access the Desktop Control installation. Choose Retry Remote Control from the PersonaStack menu."
+        case .credentialAccessRequired:
+            "Desktop Control needs Keychain access. Choose Retry Remote Control from the PersonaStack menu. If macOS asks, choose Always Allow to remember this app."
         case .installationMissing:
             "This Mac has no Desktop Control enrollment. Open PersonaStack and set up Desktop Control again."
         case .nativeCapabilitiesUnavailable:
@@ -115,7 +118,12 @@ extension DesktopControlEnrollmentError: LocalizedError {
 protocol DesktopControlCredentialStoring: Sendable {
     func save(_ installation: DesktopControlInstallation) throws
     func load() throws -> DesktopControlInstallation?
+    func loadWithUserInteraction() throws -> DesktopControlInstallation?
     func delete() throws
+}
+
+extension DesktopControlCredentialStoring {
+    func loadWithUserInteraction() throws -> DesktopControlInstallation? { try load() }
 }
 
 enum DesktopControlEnvironment {
@@ -154,10 +162,24 @@ enum DesktopControlEnvironment {
     }
 }
 
+enum DesktopControlKeychainInteraction: Sendable {
+    case forbidden, allowed
+}
+
 protocol DesktopControlKeychainAccess: Sendable {
-    func read(service: String, account: String) throws -> Data?
-    func write(_ data: Data, service: String, account: String) throws
+    func read(service: String, account: String, interaction: DesktopControlKeychainInteraction) throws -> Data?
+    func write(_ data: Data, service: String, account: String, interaction: DesktopControlKeychainInteraction) throws
     func remove(service: String, account: String) throws
+}
+
+extension DesktopControlKeychainAccess {
+    func read(service: String, account: String) throws -> Data? {
+        try read(service: service, account: account, interaction: .forbidden)
+    }
+
+    func write(_ data: Data, service: String, account: String) throws {
+        try write(data, service: service, account: account, interaction: .forbidden)
+    }
 }
 
 final class DesktopControlRedirectBlocker: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
@@ -177,43 +199,112 @@ enum DesktopControlNetworkSession {
     }
 }
 
-struct SystemDesktopControlKeychainAccess: DesktopControlKeychainAccess {
-    func read(service: String, account: String) throws -> Data? {
-        var query = baseQuery(service: service, account: account)
-        query[kSecReturnData as String] = kCFBooleanTrue
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess, let data = result as? Data else {
-            throw DesktopControlEnrollmentError.credentialStoreUnavailable
-        }
-        return data
+/// The login Keychain uses SecAccess ACLs. Data-protection query flags do not
+/// disable its authorization UI, so all direct calls share the interaction gate.
+protocol DesktopControlKeychainSecurity: Sendable {
+    func interactionAllowed() -> (OSStatus, Bool)
+    func setInteractionAllowed(_ allowed: Bool) -> OSStatus
+    func copyMatching(_ query: [String: Any]) -> (OSStatus, Data?)
+    func update(_ query: [String: Any], attributes: [String: Any]) -> OSStatus
+    func add(_ attributes: [String: Any]) -> OSStatus
+    func delete(_ query: [String: Any]) -> OSStatus
+}
+
+struct SystemDesktopControlKeychainSecurity: DesktopControlKeychainSecurity {
+    func interactionAllowed() -> (OSStatus, Bool) {
+        var allowed: DarwinBoolean = false
+        let status = SecKeychainGetUserInteractionAllowed(&allowed)
+        return (status, allowed.boolValue)
     }
 
-    func write(_ data: Data, service: String, account: String) throws {
-        let query = baseQuery(service: service, account: account)
-        let attributes: [String: Any] = [
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-        ]
-        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if status == errSecItemNotFound {
-            var item = query
-            attributes.forEach { item[$0.key] = $0.value }
-            guard SecItemAdd(item as CFDictionary, nil) == errSecSuccess else {
-                throw DesktopControlEnrollmentError.credentialStoreUnavailable
-            }
-            return
+    func setInteractionAllowed(_ allowed: Bool) -> OSStatus {
+        SecKeychainSetUserInteractionAllowed(allowed)
+    }
+
+    func copyMatching(_ query: [String: Any]) -> (OSStatus, Data?) {
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        return (status, result as? Data)
+    }
+
+    func update(_ query: [String: Any], attributes: [String: Any]) -> OSStatus {
+        SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+    }
+
+    func add(_ attributes: [String: Any]) -> OSStatus { SecItemAdd(attributes as CFDictionary, nil) }
+    func delete(_ query: [String: Any]) -> OSStatus { SecItemDelete(query as CFDictionary) }
+}
+
+struct SystemDesktopControlKeychainAccess: DesktopControlKeychainAccess {
+    private static let interactionLock = NSLock()
+    private let security: any DesktopControlKeychainSecurity
+
+    init(security: any DesktopControlKeychainSecurity = SystemDesktopControlKeychainSecurity()) {
+        self.security = security
+    }
+
+    func read(service: String, account: String, interaction: DesktopControlKeychainInteraction) throws -> Data? {
+        try withInteraction(interaction) {
+            var query = baseQuery(service: service, account: account)
+            query[kSecReturnData as String] = kCFBooleanTrue
+            query[kSecMatchLimit as String] = kSecMatchLimitOne
+            let (status, data) = security.copyMatching(query)
+            if status == errSecItemNotFound { return nil }
+            try requireSuccess(status)
+            guard let data else { throw DesktopControlEnrollmentError.credentialStoreUnavailable }
+            return data
         }
-        guard status == errSecSuccess else { throw DesktopControlEnrollmentError.credentialStoreUnavailable }
+    }
+
+    func write(_ data: Data, service: String, account: String, interaction: DesktopControlKeychainInteraction) throws {
+        try withInteraction(interaction) {
+            let query = baseQuery(service: service, account: account)
+            let attributes: [String: Any] = [
+                kSecValueData as String: data,
+                kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            ]
+            let status = security.update(query, attributes: attributes)
+            if status == errSecItemNotFound {
+                var item = query
+                attributes.forEach { item[$0.key] = $0.value }
+                // Omit kSecAttrAccess to keep the default creator-only ACL. The
+                // persistent release signature identifies this app across updates.
+                try requireSuccess(security.add(item))
+                return
+            }
+            try requireSuccess(status)
+        }
     }
 
     func remove(service: String, account: String) throws {
-        let status = SecItemDelete(baseQuery(service: service, account: account) as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw DesktopControlEnrollmentError.credentialStoreUnavailable
+        try withInteraction(.forbidden) {
+            let status = security.delete(baseQuery(service: service, account: account))
+            if status != errSecItemNotFound { try requireSuccess(status) }
         }
+    }
+
+    private func withInteraction<T>(_ interaction: DesktopControlKeychainInteraction,
+                                    operation: () throws -> T) throws -> T {
+        // SecKeychain's interaction setting is process-global. Serialize our
+        // reads AND writes so a page load cannot borrow a menu action's grant.
+        Self.interactionLock.lock()
+        defer { Self.interactionLock.unlock() }
+        let (status, previous) = security.interactionAllowed()
+        try requireSuccess(status)
+        let result = Result {
+            try requireSuccess(security.setInteractionAllowed(interaction == .allowed))
+            return try operation()
+        }
+        try requireSuccess(security.setInteractionAllowed(previous))
+        return try result.get()
+    }
+
+    private func requireSuccess(_ status: OSStatus) throws {
+        if status == errSecSuccess { return }
+        if [errSecInteractionNotAllowed, errSecAuthFailed, errSecUserCanceled].contains(status) {
+            throw DesktopControlEnrollmentError.credentialAccessRequired
+        }
+        throw DesktopControlEnrollmentError.credentialStoreUnavailable
     }
 
     private func baseQuery(service: String, account: String) -> [String: Any] {
@@ -249,18 +340,26 @@ struct KeychainDesktopControlCredentialStore: DesktopControlCredentialStoring {
     }
 
     func load() throws -> DesktopControlInstallation? {
+        try load(interaction: .forbidden)
+    }
+
+    func loadWithUserInteraction() throws -> DesktopControlInstallation? {
+        try load(interaction: .allowed)
+    }
+
+    private func load(interaction: DesktopControlKeychainInteraction) throws -> DesktopControlInstallation? {
         let context = try credentialContext()
-        if let data = try keychain.read(service: service, account: context.account) {
+        if let data = try keychain.read(service: service, account: context.account, interaction: interaction) {
             guard let installation = try? JSONDecoder().decode(DesktopControlInstallation.self, from: data) else {
                 throw DesktopControlEnrollmentError.credentialStoreUnavailable
             }
             try installation.requireEnvironment(context.appURL, configuration: context.configuration)
             return installation
         }
-        guard var legacy = try matchingLegacyInstallation(configuration: context.configuration, appURL: context.appURL)
-            ?? matchingOriginScopedInstallation(configuration: context.configuration) else { return nil }
+        guard var legacy = try matchingOriginScopedInstallation(configuration: context.configuration, interaction: interaction)
+            ?? matchingLegacyInstallation(configuration: context.configuration, appURL: context.appURL, interaction: interaction) else { return nil }
         try legacy.bindEnvironment(context.appURL, configuration: context.configuration)
-        try keychain.write(JSONEncoder().encode(legacy), service: service, account: context.account)
+        try keychain.write(JSONEncoder().encode(legacy), service: service, account: context.account, interaction: interaction)
         return legacy
     }
 
@@ -306,12 +405,12 @@ struct KeychainDesktopControlCredentialStore: DesktopControlCredentialStoring {
     }
 
     private func matchingLegacyInstallation(configuration: DesktopEnvironmentConfiguration,
-                                            appURL: URL) throws -> DesktopControlInstallation? {
+                                            appURL: URL, interaction: DesktopControlKeychainInteraction = .forbidden) throws -> DesktopControlInstallation? {
         // The oldest build used one account for every environment. Only its
         // original production and LAN service pairs can identify ownership.
         guard configuration == .production || configuration == .lan,
               let origin = try? DesktopControlEnvironment.origin(appURL), origin == configuration.appOrigin,
-              let data = try keychain.read(service: service, account: "installation"),
+              let data = try keychain.read(service: service, account: "installation", interaction: interaction),
               let legacy = try? JSONDecoder().decode(DesktopControlInstallation.self, from: data),
               legacy.environmentOrigin == nil || legacy.environmentOrigin == origin,
               DesktopControlEnvironment.allowsGateway(legacy.gatewayWebsocketURL, for: origin, configuration: configuration) else {
@@ -320,10 +419,11 @@ struct KeychainDesktopControlCredentialStore: DesktopControlCredentialStoring {
         return legacy
     }
 
-    private func matchingOriginScopedInstallation(configuration: DesktopEnvironmentConfiguration) throws -> DesktopControlInstallation? {
+    private func matchingOriginScopedInstallation(configuration: DesktopEnvironmentConfiguration,
+                                                   interaction: DesktopControlKeychainInteraction = .forbidden) throws -> DesktopControlInstallation? {
         let origin = configuration.appOrigin
         guard configuration == .production || configuration == .lan,
-              let data = try keychain.read(service: service, account: "installation:" + origin),
+              let data = try keychain.read(service: service, account: "installation:" + origin, interaction: interaction),
               let installation = try? JSONDecoder().decode(DesktopControlInstallation.self, from: data),
               installation.environmentOrigin == nil || installation.environmentOrigin == origin,
               DesktopControlEnvironment.allowsGateway(installation.gatewayWebsocketURL, for: origin, configuration: configuration) else {

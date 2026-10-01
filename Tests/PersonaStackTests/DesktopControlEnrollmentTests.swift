@@ -54,14 +54,18 @@ private final class LegacyKeychainFixture: DesktopControlKeychainAccess, @unchec
     private let lock = NSLock()
     private var items: [String: Data] = [:]
     var failWrites = false
+    var deniedAccounts: Set<String> = []
+    var reads: [(account: String, interaction: DesktopControlKeychainInteraction)] = []
 
-    func read(service: String, account: String) throws -> Data? {
+    func read(service: String, account: String, interaction: DesktopControlKeychainInteraction) throws -> Data? {
         lock.lock()
         defer { lock.unlock() }
+        reads.append((account, interaction))
+        if deniedAccounts.contains(account) { throw DesktopControlEnrollmentError.credentialAccessRequired }
         return items["\(service):\(account)"]
     }
 
-    func write(_ data: Data, service: String, account: String) throws {
+    func write(_ data: Data, service: String, account: String, interaction: DesktopControlKeychainInteraction) throws {
         lock.lock()
         defer { lock.unlock() }
         if failWrites { throw DesktopControlEnrollmentError.credentialStoreUnavailable }
@@ -81,7 +85,7 @@ private final class BlockingLegacyKeychainFixture: DesktopControlKeychainAccess,
     private var legacyReadStarted = false
     private var allowLegacyRead = false
 
-    func read(service: String, account: String) throws -> Data? {
+    func read(service: String, account: String, interaction: DesktopControlKeychainInteraction) throws -> Data? {
         condition.lock()
         defer { condition.unlock() }
         if account == "installation" {
@@ -92,7 +96,7 @@ private final class BlockingLegacyKeychainFixture: DesktopControlKeychainAccess,
         return items["\(service):\(account)"]
     }
 
-    func write(_ data: Data, service: String, account: String) throws {
+    func write(_ data: Data, service: String, account: String, interaction: DesktopControlKeychainInteraction) throws {
         condition.lock()
         defer { condition.unlock() }
         items["\(service):\(account)"] = data
@@ -672,4 +676,48 @@ private func legacyInstallationData(gateway: String) throws -> Data {
         )
     }
     #expect(await transport.recordedRequests().isEmpty)
+}
+
+@Test func originScopedCredentialMigratesWithoutReadingDeniedOldestItem() throws {
+    let keychain = LegacyKeychainFixture()
+    let service = "fixture"
+    let configuration = DesktopEnvironmentConfiguration.production
+    let originAccount = "installation:" + configuration.appOrigin
+    let data = try legacyInstallationData(gateway: configuration.gatewayWebsocketURL.absoluteString)
+    try keychain.write(data, service: service, account: originAccount)
+    keychain.deniedAccounts = ["installation"]
+    let store = KeychainDesktopControlCredentialStore(service: service, configuration: configuration, keychain: keychain)
+
+    let migrated = try #require(try store.load())
+    #expect(migrated.installationID == "legacy-mac")
+    #expect(keychain.reads.map(\.account) == [store.account, originAccount])
+    #expect(keychain.reads.allSatisfy { $0.interaction == .forbidden })
+    #expect(try store.load() == migrated)
+}
+
+@Test func deniedCurrentOrOriginCredentialNeverFallsBackToOlderIdentity() throws {
+    for currentItem in [false, true] {
+        let keychain = LegacyKeychainFixture()
+        let configuration = DesktopEnvironmentConfiguration.production
+        let store = KeychainDesktopControlCredentialStore(service: "fixture", configuration: configuration, keychain: keychain)
+        keychain.deniedAccounts = [currentItem ? store.account : "installation:" + configuration.appOrigin]
+        try keychain.write(legacyInstallationData(gateway: configuration.gatewayWebsocketURL.absoluteString),
+                           service: "fixture", account: "installation")
+        #expect(throws: DesktopControlEnrollmentError.credentialAccessRequired) { try store.load() }
+        #expect(!keychain.reads.contains { $0.account == "installation" })
+    }
+}
+
+@Test func explicitKeychainRecoveryUsesSameScopedCredentialAndLeavesPassiveLoadsPassive() throws {
+    let keychain = LegacyKeychainFixture()
+    let configuration = DesktopEnvironmentConfiguration.production
+    let store = KeychainDesktopControlCredentialStore(service: "fixture", configuration: configuration, keychain: keychain)
+    var installation = try JSONDecoder().decode(DesktopControlInstallation.self, from:
+        legacyInstallationData(gateway: configuration.gatewayWebsocketURL.absoluteString))
+    try installation.bindEnvironment(configuration.appPageURL, configuration: configuration)
+    try store.save(installation)
+    #expect(try store.loadWithUserInteraction() == installation)
+    #expect(try store.load() == installation)
+    #expect(keychain.reads.map(\.account) == [store.account, store.account])
+    #expect(keychain.reads.map(\.interaction) == [.allowed, .forbidden])
 }

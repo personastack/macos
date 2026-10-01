@@ -174,6 +174,7 @@ struct DesktopControlMenu: View {
         do {
             let current = try runtime.beginResume()
             generation = current
+            try await runtime.authorizeSavedInstallation(generation: current)
             try await runtime.resume(generation: current)
             guard runtime.isCurrentLifecycle(current) else { return }
             guard runtime.hasActiveInstallation else {

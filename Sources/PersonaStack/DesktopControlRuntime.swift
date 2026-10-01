@@ -61,6 +61,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private var gatewayAttemptID = UUID()
     private var reconnectTask: Task<Void, Never>?
     private var activeInstallation: DesktopControlInstallation?
+    private var credentialAuthorizationInProgress = false
     private var executor = DesktopControlCommandExecutor()
     private weak var inputPermissionTarget: (any DesktopInputPermissionTarget)?
     private var lifecycleGeneration = UUID() {
@@ -187,13 +188,38 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 #endif
 
     func beginResume() throws -> UUID {
-        guard !disconnecting, !environmentSwitchPending else { throw CancellationError() }
+        guard !credentialAuthorizationInProgress, !disconnecting, !environmentSwitchPending else { throw CancellationError() }
         lifecycleGeneration = UUID()
         return lifecycleGeneration
     }
 
     func resume() async throws {
         try await resume(generation: beginResume())
+    }
+
+    /// Only the native menu action may request access to a saved Keychain item.
+    /// Startup, page state and reconnect continue to use noninteractive reads.
+    func authorizeSavedInstallation(generation: UUID) async throws {
+        try Task.checkCancellation()
+        try requireCurrentLifecycle(generation)
+        guard !credentialAuthorizationInProgress, !disconnecting, !environmentSwitchPending else { throw CancellationError() }
+        credentialAuthorizationInProgress = true
+        defer { credentialAuthorizationInProgress = false }
+        let configuration = try configurationProvider()
+        if let activeInstallation {
+            try activeInstallation.requireEnvironment(configuration.appPageURL, configuration: configuration)
+            return
+        }
+        let store = credentials
+        let saved = try await Task.detached(priority: .userInitiated) {
+            try store.loadWithUserInteraction()
+        }.value
+        try Task.checkCancellation()
+        try requireCurrentLifecycle(generation)
+        guard !disconnecting, !environmentSwitchPending,
+              try configurationProvider() == configuration else { throw CancellationError() }
+        try saved?.requireEnvironment(configuration.appPageURL, configuration: configuration)
+        activeInstallation = saved
     }
 
     func resume(generation: UUID) async throws {
@@ -1185,10 +1211,20 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         guard (try? DesktopControlEnvironment.origin(appURL)) == configuration.appOrigin else {
             throw DesktopControlEnrollmentError.invalidRequest
         }
-        let saved = try await readSavedInstallation()
-        guard generation == lifecycleGeneration, !disconnecting, !environmentSwitchPending else {
-            throw CancellationError()
+        let saved: DesktopControlInstallation?
+        do { saved = try await readSavedInstallation() }
+        catch {
+            guard generation == lifecycleGeneration, !disconnecting, !environmentSwitchPending,
+                  try configurationProvider() == configuration else { throw CancellationError() }
+            if let credentialError = error as? DesktopControlEnrollmentError,
+               credentialError == .credentialAccessRequired || credentialError == .credentialStoreUnavailable {
+                preferences.set(credentialError.localizedDescription,
+                                forKey: DesktopControlPreferenceKeys.relayError(configuration))
+            }
+            throw error
         }
+        guard generation == lifecycleGeneration, !disconnecting, !environmentSwitchPending,
+              try configurationProvider() == configuration else { throw CancellationError() }
         try saved?.requireEnvironment(appURL, configuration: configuration)
         activeInstallation = saved
         return saved
