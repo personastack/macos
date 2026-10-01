@@ -526,19 +526,34 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     }
 }
 
-@Test @MainActor func permissionChecklistAccessibilityEnablesFinishBeforeOptionalRefreshCompletes() async {
+@Test @MainActor func permissionChecklistAccessibilityEnablesFinishBeforeOptionalRefreshCompletes() async throws {
     let fake = PermissionChecklistFake()
     fake.values[.accessibility] = .init(.ready, detail: "Input verified", requiresVerification: true, verified: true)
     fake.suspendedObservation = .screenRecording
     let model = DesktopPermissionChecklistCoordinator(adapter: fake)
-    model.open()
+    let window = DesktopPermissionChecklistWindow(coordinator: model)
+    defer { model.cancel() }
+    // Own this refresh so the assertion waits for its entire resumed loop.
+    // The ordinary polling task cannot enter while this refresh is suspended.
+    let refresh = Task {
+        model.open()
+        await model.refresh()
+    }
     while fake.pendingObservation == nil { await Task.yield() }
+    let enrollment = Task { try await model.waitForFinish() }
+    while !model.isAwaitingFinish { await Task.yield() }
     #expect(model.canFinish)
-    model.finish()
-    #expect(model.isFinishing)
+    window.finish()
+    try await enrollment.value
+    #expect(model.isFinishing && model.isVisible)
     fake.pendingObservation?.resume(returning: .init(.failed, detail: "Optional capture failed"))
     fake.pendingObservation = nil
-    model.cancel()
+    await refresh.value
+    // Enrollment keeps this window open. Finish alone must fence subsequent
+    // authorized Local Network and Full Disk Access observations and probes.
+    #expect(model.isFinishing && model.isVisible)
+    #expect(fake.observed == [.accessibility, .screenRecording])
+    #expect(fake.requested.isEmpty)
 }
 
 @Test @MainActor func permissionChecklistFinishCancelsOptionalSetupAndFencesLateResult() async {

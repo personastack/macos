@@ -131,7 +131,7 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         let expected = generation
         defer { if generation == expected { refreshing = false } }
         for id in DesktopPermissionID.allCases {
-            guard generation == expected, isVisible, !Task.isCancelled else { return }
+            guard generation == expected, isVisible, !isFinishing, !Task.isCancelled else { return }
             // A check cannot race a deliberate functional verification.
             guard busyPermission != id, automaticBusyPermission != id else { continue }
             let revision = rowRevisions[id]
