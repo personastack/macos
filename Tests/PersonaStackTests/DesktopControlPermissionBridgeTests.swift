@@ -4,15 +4,35 @@ import ServiceManagement
 import Testing
 @testable import PersonaStack
 
-private enum PermissionBridgeFixtureError: Error { case unplannedCall, presenterDidNotOpen }
+private enum PermissionBridgeFixtureError: Error { case unplannedCall, presenterDidNotOpen, readbackDidNotStart }
 
 private final class PermissionBridgeCredentials: DesktopControlCredentialStoring, @unchecked Sendable {
     private let lock = NSLock()
     private var reads = 0
     private var saves = 0
     private var installation: DesktopControlInstallation?
+    private var suspendNextRead = false
+    private let readStarted = DispatchSemaphore(value: 0)
+    private let continueRead = DispatchSemaphore(value: 0)
     var counts: (reads: Int, saves: Int) { lock.withLock { (reads, saves) } }
-    func load() throws -> DesktopControlInstallation? { lock.withLock { reads += 1; return installation } }
+    func load() throws -> DesktopControlInstallation? {
+        let (value, suspended) = lock.withLock {
+            reads += 1
+            let suspended = suspendNextRead
+            suspendNextRead = false
+            return (installation, suspended)
+        }
+        if suspended {
+            readStarted.signal()
+            guard continueRead.wait(timeout: .now() + 2) == .success else {
+                throw PermissionBridgeFixtureError.readbackDidNotStart
+            }
+        }
+        return value
+    }
+    func suspendCredentialRead() { lock.withLock { suspendNextRead = true } }
+    func waitForCredentialRead() -> Bool { readStarted.wait(timeout: .now() + 2) == .success }
+    func releaseCredentialRead() { continueRead.signal() }
     func save(_ installation: DesktopControlInstallation) throws { lock.withLock { saves += 1; self.installation = installation } }
     func delete() throws { Issue.record("Unplanned credential deletion"); throw PermissionBridgeFixtureError.unplannedCall }
 }
@@ -23,6 +43,7 @@ private final class PermissionBridgeRuntime: DesktopControlSetupRuntime {
     var paused = false
     var nativeExecutorReady = true
     var cuaReady = true
+    var allowsReplacement = false
     var calls: [String] = []
     let generation = UUID()
     func isCuaReady() -> Bool { cuaReady }
@@ -31,7 +52,14 @@ private final class PermissionBridgeRuntime: DesktopControlSetupRuntime {
     func resume(generation: UUID) async throws { Issue.record("Unplanned ordinary resume"); throw PermissionBridgeFixtureError.unplannedCall }
     func resumeForSetup(generation: UUID) async throws { calls.append("resumeForSetup") }
     func finishSetupIfIdle() async { calls.append("finishSetupIfIdle") }
-    func disconnect() async throws { Issue.record("Unplanned saved-installation disconnect"); throw PermissionBridgeFixtureError.unplannedCall }
+    func disconnect() async throws {
+        guard allowsReplacement else {
+            Issue.record("Unplanned saved-installation disconnect")
+            throw PermissionBridgeFixtureError.unplannedCall
+        }
+        calls.append("disconnect")
+        gatewayConnected = false
+    }
     func repair(resumeRelay: Bool, expectedGeneration: UUID?) async throws -> UUID { Issue.record("Unplanned repair"); throw PermissionBridgeFixtureError.unplannedCall }
     func isCurrentLifecycle(_ generation: UUID) -> Bool { self.generation == generation }
     func connect(installation: DesktopControlInstallation, expectedGeneration: UUID?) async { calls.append("connect"); gatewayConnected = true }
@@ -47,6 +75,9 @@ private actor PermissionBridgeEnrollment: DesktopControlSetupEnrollment {
     private var pendingEnrollment: CheckedContinuation<Void, Never>?
     var isEnrollmentPending: Bool { pendingEnrollment != nil }
     private var configuration = DesktopControlConfigurationState(hasActiveConfig: true, hasConfig: true)
+    private var suspendConfiguration = false
+    private var pendingConfiguration: [CheckedContinuation<Void, Never>] = []
+    var pendingConfigurationCount: Int { pendingConfiguration.count }
     init(installation: DesktopControlInstallation, allowed: Set<String> = []) { self.installation = installation; self.allowed = allowed }
     private func require(_ name: String) throws {
         calls.append(name)
@@ -67,7 +98,19 @@ private actor PermissionBridgeEnrollment: DesktopControlSetupEnrollment {
     func attach(ticket: String, installation: DesktopControlInstallation, appURL: URL) async throws { try require("attach") }
     func configurationState(installation: DesktopControlInstallation, appURL: URL) async throws -> DesktopControlConfigurationState {
         try require("configurationState")
+        if suspendConfiguration { await withCheckedContinuation { pendingConfiguration.append($0) } }
         return configuration
+    }
+    func suspendConfigurationReadbacks() { suspendConfiguration = true }
+    func releaseNextConfigurationReadback() {
+        guard !pendingConfiguration.isEmpty else { return }
+        pendingConfiguration.removeFirst().resume()
+    }
+    func releaseConfigurationReadbacks() {
+        suspendConfiguration = false
+        let pending = pendingConfiguration
+        pendingConfiguration.removeAll()
+        for continuation in pending { continuation.resume() }
     }
     func setRejectEnrollment(_ value: Bool) { rejectEnrollment = value }
     func suspendRejectedEnrollment() { delayEnrollment = true; rejectEnrollment = true }
@@ -118,7 +161,7 @@ private struct PermissionBridgeFixture {
     let manager: DesktopControlSetupManager
     let page: DesktopControlSetupManager.Page
 
-    init(allowEnrollment: Bool = false) throws {
+    init(allowEnrollment: Bool = false, allowReplacement: Bool = false) throws {
         let configuration = DesktopEnvironmentConfiguration.production
         let payload = try JSONSerialization.data(withJSONObject: [
             "installation_id": "permission-fixture", "machine_credential": String(repeating: "A", count: 43),
@@ -127,7 +170,8 @@ private struct PermissionBridgeFixture {
         var installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
         try installation.bindEnvironment(configuration.appURL, configuration: configuration)
         enrollment = PermissionBridgeEnrollment(installation: installation,
-            allowed: allowEnrollment ? ["enroll", "reportReady", "configurationState"] : [])
+            allowed: allowEnrollment ? Set(["enroll", "reportReady", "configurationState"] + (allowReplacement ? ["attach"] : [])) : [])
+        runtime.allowsReplacement = allowReplacement
         suite = "permission-bridge-\(UUID().uuidString)"
         preferences = try #require(UserDefaults(suiteName: suite))
         manager = DesktopControlSetupManager(runtime: runtime, enrollment: enrollment, credentials: credentials,
@@ -168,6 +212,14 @@ private struct PermissionBridgeFixture {
             await Task.yield()
         }
         throw PermissionBridgeFixtureError.presenterDidNotOpen
+    }
+
+    func waitForConfigurationReadbacks(_ count: Int) async throws {
+        for _ in 0..<1000 {
+            if await enrollment.pendingConfigurationCount == count { return }
+            await Task.yield()
+        }
+        throw PermissionBridgeFixtureError.readbackDidNotStart
     }
 }
 
@@ -373,6 +425,112 @@ private struct PermissionBridgeFixture {
     let complete = await fixture.send(fixture.permissions("completed"))
     #expect(complete.ok && fixture.presenter.completions == 1)
     #expect(await fixture.enrollment.calls == ["enroll", "reportReady", "configurationState", "configurationState", "configurationState"])
+}
+
+@Test(arguments: ["gui", "native", "connection"]) @MainActor
+func permissionBridgeCompletionRechecksReadinessAfterConfigurationReadback(lost: String) async throws {
+    let fixture = try PermissionBridgeFixture(allowEnrollment: true)
+    defer {
+        fixture.cleanup()
+        Task { await fixture.enrollment.releaseConfigurationReadbacks() }
+    }
+    fixture.presenter.autoFinish = true
+    #expect(await fixture.send(fixture.permissions("open")).ok)
+    #expect(await fixture.send(fixture.prepare).ok)
+    await fixture.enrollment.suspendConfigurationReadbacks()
+    let completion = Task { await fixture.send(fixture.permissions("completed")) }
+    try await fixture.waitForConfigurationReadbacks(1)
+    switch lost {
+    case "gui": fixture.runtime.cuaReady = false
+    case "native": fixture.runtime.nativeExecutorReady = false
+    default: fixture.runtime.gatewayConnected = false
+    }
+    await fixture.enrollment.releaseConfigurationReadbacks()
+    let result = await completion.value
+    #expect(!result.ok && result.code == "permissions_incomplete")
+    #expect(fixture.presenter.completions == 0 && fixture.presenter.isFinishing)
+    #expect(fixture.credentials.counts.saves == 1)
+    #expect(await fixture.enrollment.calls == ["enroll", "reportReady", "configurationState"])
+
+    // The same current request can confirm once its runtime has recovered.
+    fixture.runtime.cuaReady = true
+    fixture.runtime.nativeExecutorReady = true
+    fixture.runtime.gatewayConnected = true
+    let retry = await fixture.send(fixture.permissions("completed"))
+    #expect(retry.ok && fixture.presenter.completions == 1)
+}
+
+@Test(arguments: [false, true]) @MainActor
+func permissionBridgeLateCompletionCannotCloseSameScopeSuccessor(finishSuccessor: Bool) async throws {
+    let fixture = try PermissionBridgeFixture(allowEnrollment: true, allowReplacement: true)
+    defer {
+        fixture.cleanup()
+        Task { await fixture.enrollment.releaseConfigurationReadbacks() }
+    }
+    fixture.presenter.autoFinish = true
+    #expect(await fixture.send(fixture.permissions("open")).ok)
+    #expect(await fixture.send(fixture.prepare).ok)
+    await fixture.enrollment.suspendConfigurationReadbacks()
+    let first = Task { await fixture.send(fixture.permissions("completed")) }
+    try await fixture.waitForConfigurationReadbacks(1)
+    let late = Task { await fixture.send(fixture.permissions("completed")) }
+    try await fixture.waitForConfigurationReadbacks(2)
+    await fixture.enrollment.releaseNextConfigurationReadback()
+    #expect(await first.value.ok)
+    #expect(fixture.presenter.completions == 1)
+
+    fixture.presenter.autoFinish = false
+    let successor = Task { await fixture.send(fixture.permissions("open")) }
+    try await fixture.waitForOpen()
+    if finishSuccessor {
+        fixture.presenter.finish()
+        #expect(await successor.value.ok)
+        #expect(await fixture.send(fixture.prepare).ok)
+    }
+    await fixture.enrollment.releaseConfigurationReadbacks()
+    let stale = await late.value
+    #expect(!stale.ok && stale.code == "permissions_incomplete")
+    #expect(fixture.presenter.completions == 1 && fixture.presenter.failures.isEmpty)
+    #expect(fixture.presenter.isFinishing == finishSuccessor)
+    #expect(fixture.presenter.isWaiting != finishSuccessor)
+
+    // A stale completion must not clear the successor's request or prepared state.
+    if !finishSuccessor {
+        fixture.presenter.finish()
+        #expect(await successor.value.ok)
+        #expect(await fixture.send(fixture.prepare).ok)
+    }
+    let completed = await fixture.send(fixture.permissions("completed"))
+    #expect(completed.ok && fixture.presenter.completions == 2)
+}
+
+@Test @MainActor func permissionBridgeStaleCredentialReadCannotInspectConfigurationOrCloseSuccessor() async throws {
+    let fixture = try PermissionBridgeFixture(allowEnrollment: true)
+    defer { fixture.credentials.releaseCredentialRead(); fixture.cleanup() }
+    fixture.presenter.autoFinish = true
+    #expect(await fixture.send(fixture.permissions("open")).ok)
+    #expect(await fixture.send(fixture.prepare).ok)
+    fixture.credentials.suspendCredentialRead()
+    let completion = Task { await fixture.send(fixture.permissions("completed")) }
+    let readStarted = await Task.detached { [credentials = fixture.credentials] in
+        credentials.waitForCredentialRead()
+    }.value
+    try #require(readStarted)
+    #expect(await fixture.send(fixture.permissions("failed", message: "Retry setup")).ok)
+    fixture.presenter.autoFinish = false
+    let successor = Task { await fixture.send(fixture.permissions("open")) }
+    try await fixture.waitForOpen()
+    fixture.credentials.releaseCredentialRead()
+    let stale = await completion.value
+    #expect(!stale.ok && stale.code == "permissions_incomplete")
+    #expect(fixture.presenter.isWaiting && fixture.presenter.completions == 0)
+    #expect(fixture.presenter.failures == ["Retry setup"])
+    #expect(fixture.credentials.counts.reads == 2 && fixture.credentials.counts.saves == 1)
+    #expect(await fixture.enrollment.calls == ["enroll", "reportReady"])
+    #expect(fixture.runtime.calls == ["begin", "resumeForSetup", "probe", "connect"])
+    fixture.presenter.finish()
+    let opened = await successor.value
+    #expect(opened.ok && opened.prerequisitesReady && fixture.presenter.isFinishing)
 }
 
 @Test @MainActor func permissionBridgeLegacyPrepareWaitsForFinishBeforeEnrollment() async throws {

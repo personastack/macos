@@ -211,6 +211,7 @@ for line in sys.stdin:
     elif method == 'tools/list': result = {'tools':[{'name':name} for name in names]}
     elif method == 'tools/call':
         name = request['params']['name']
+        with open(os.path.join(root, 'tool-calls.jsonl'), 'a') as out: out.write(json.dumps(name)+'\n')
         if name == 'health_report':
             assert request['params']['arguments'] == {'include':['bundle_identity']}
             result = {'structuredContent':{'schema_version':'1','driver_version':'0.29.1','platform':'darwin','checks':[{'name':'bundle_identity','status':'pass','data':{'bundle_identifier':'ai.personastack.desktop','configured_bundle_identifier':'ai.personastack.desktop','identity_source':'parent_application','parent_process_id':host,'executable_path':os.path.realpath(__file__)}}]}}
@@ -331,6 +332,150 @@ private final class RuntimeInputTarget: DesktopInputPermissionTarget {
         #expect(credentials.readCount == 0)
         #expect(!runtime.hasActiveInstallation && !runtime.gatewayConnected && !runtime.hasPendingRelayReconnectForTesting)
         #expect(runtime.paused && runtime.readiness == "paused")
+        await runtime.shutdownForQuit()
+    } catch { await runtime.shutdownForQuit(); throw error }
+}
+
+private func runtimeFixtureCalls(_ root: URL) throws -> [String] {
+    let data = try String(contentsOf: root.appendingPathComponent("tool-calls.jsonl"), encoding: .utf8)
+    return try data.split(separator: "\n").map { try JSONDecoder().decode(String.self, from: Data($0.utf8)) }
+}
+
+@Test(arguments: [false, true], [false, true]) @MainActor
+func permissionOnlyUnlockWaitsForExplicitSetupWithoutCredentialsOrCapture(granted: Bool, paused: Bool) async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-permission-unlock-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let executable = try makeRuntimeDriverFixture(root)
+    // A saved installation must not turn permission preparation into a relay.
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: Data(#"{"installation_id":"saved-preflight","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8))
+    let credentials = PermissionPreparationCredentialStore(installation: installation)
+    let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
+        credentials: credentials, paused: paused, sessionLockState: .unlocked, hostPermissions: { (granted, granted) })
+    do {
+        await runtime.waitForSessionLockChangeForTesting()
+        try await runtime.prepareCuaPermissions()
+        let preparedCalls = try runtimeFixtureCalls(root)
+        #expect(!preparedCalls.contains("get_desktop_state") && !preparedCalls.contains("get_accessibility_tree"))
+        runtime.receiveSessionLockForTesting(.locked)
+        await runtime.waitForSessionLockChangeForTesting()
+        #expect(runtime.readiness == "locked" && !runtime.isCuaReady())
+        runtime.receiveSessionLockForTesting(.unlocked)
+        await runtime.waitForSessionLockChangeForTesting()
+        #expect(try runtimeFixtureCalls(root) == preparedCalls)
+        #expect(credentials.readCount == 0)
+        #expect(!runtime.hasActiveInstallation && !runtime.gatewayConnected && !runtime.hasPendingRelayReconnectForTesting)
+        #expect(runtime.paused == paused && runtime.readiness == (paused ? "paused" : "permission_required"))
+        #expect(!runtime.isCuaReady())
+        // Only another explicit action can replace the interrupted proxy and verify.
+        try await runtime.prepareCuaPermissions()
+        if granted {
+            try await runtime.verifyCuaCapabilitiesForPermissions()
+            #expect(runtime.isCuaReady())
+        } else {
+            await #expect(throws: CuaMCPProxyError.permissionsRequired) { try await runtime.verifyCuaCapabilitiesForPermissions() }
+            #expect(!runtime.isCuaReady())
+        }
+        #expect(credentials.readCount == 0 && runtime.paused == paused)
+        #expect(!runtime.gatewayConnected && !runtime.hasPendingRelayReconnectForTesting)
+        await runtime.shutdownForQuit()
+    } catch { await runtime.shutdownForQuit(); throw error }
+}
+
+@Test(arguments: [false, true]) @MainActor
+func fullSetupAfterPermissionPreparationRestoresAutomaticUnlockRecovery(grantedAfterUnlock: Bool) async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-full-unlock-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let executable = try makeRuntimeDriverFixture(root)
+    let credentials = PermissionPreparationCredentialStore(installation: nil)
+    var granted = true
+    let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
+        credentials: credentials, sessionLockState: .unlocked, hostPermissions: { (granted, granted) })
+    do {
+        await runtime.waitForSessionLockChangeForTesting()
+        try await runtime.prepareCuaPermissions()
+        #expect(credentials.readCount == 0 && !runtime.isCuaReady())
+        // The existing post-Finish startup path explicitly authorizes full recovery.
+        try await runtime.resumeForSetup(generation: runtime.beginResume())
+        #expect(runtime.isCuaReady() && credentials.readCount == 1)
+        runtime.receiveSessionLockForTesting(.locked)
+        await runtime.waitForSessionLockChangeForTesting()
+        let beforeUnlock = try runtimeFixtureCalls(root)
+        granted = grantedAfterUnlock
+        runtime.receiveSessionLockForTesting(.unlocked)
+        await runtime.waitForSessionLockChangeForTesting()
+        let recoveryCalls = Array(try runtimeFixtureCalls(root).dropFirst(beforeUnlock.count))
+        #expect(recoveryCalls.contains("check_permissions"))
+        #expect(recoveryCalls.contains("get_desktop_state") == grantedAfterUnlock)
+        #expect(recoveryCalls.contains("get_accessibility_tree") == grantedAfterUnlock)
+        #expect(runtime.isCuaReady() == grantedAfterUnlock)
+        #expect(runtime.readiness == (grantedAfterUnlock ? "ready" : "permission_required"))
+        #expect(credentials.readCount == 2 && !runtime.paused)
+        await runtime.shutdownForQuit()
+    } catch { await runtime.shutdownForQuit(); throw error }
+}
+
+@Test(arguments: [false, true]) @MainActor
+func enrolledRuntimeKeepsUnlockRecoveryDuringPermissionRepair(grantedAfterUnlock: Bool) async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-enrolled-unlock-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let executable = try makeRuntimeDriverFixture(root)
+    // Omit environment binding deliberately. The gateway rejects this fixture
+    // before creating a URLSession task, while the real reconnect owner exists.
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: Data(#"{"installation_id":"saved-recovery","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8))
+    #expect(throws: DesktopControlEnrollmentError.invalidRequest) { try installation.requireBoundGateway() }
+    let credentials = PermissionPreparationCredentialStore(installation: installation)
+    var granted = true
+    let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
+        credentials: credentials, sessionLockState: .unlocked, hostPermissions: { (granted, granted) })
+    do {
+        await runtime.waitForSessionLockChangeForTesting()
+        try await runtime.resume()
+        #expect(runtime.isCuaReady() && runtime.hasActiveInstallation && runtime.hasPendingRelayReconnectForTesting)
+        try await runtime.prepareCuaPermissions()
+        try await runtime.restartCuaAfterPermissionChange()
+        let beforeUnlock = try runtimeFixtureCalls(root)
+        runtime.receiveSessionLockForTesting(.locked)
+        await runtime.waitForSessionLockChangeForTesting()
+        granted = grantedAfterUnlock
+        runtime.receiveSessionLockForTesting(.unlocked)
+        await runtime.waitForSessionLockChangeForTesting()
+        let recoveryCalls = Array(try runtimeFixtureCalls(root).dropFirst(beforeUnlock.count))
+        #expect(recoveryCalls.contains("check_permissions"))
+        #expect(recoveryCalls.contains("get_desktop_state") == grantedAfterUnlock)
+        #expect(runtime.isCuaReady() == grantedAfterUnlock)
+        #expect(runtime.readiness == (grantedAfterUnlock ? "ready" : "permission_required"))
+        #expect(runtime.hasActiveInstallation && runtime.hasPendingRelayReconnectForTesting && !runtime.gatewayConnected)
+        #expect(credentials.readCount == 1)
+        await runtime.shutdownForQuit()
+    } catch { await runtime.shutdownForQuit(); throw error }
+}
+
+@Test @MainActor func permissionRetryRetiresFailedFullStartupRecovery() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-failed-full-unlock-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let executable = try makeRuntimeDriverFixture(root)
+    let credentials = PermissionPreparationCredentialStore(installation: nil)
+    let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
+        credentials: credentials, sessionLockState: .unlocked, hostPermissions: { (false, false) })
+    do {
+        await runtime.waitForSessionLockChangeForTesting()
+        await #expect(throws: CuaMCPProxyError.permissionsRequired) {
+            try await runtime.resumeForSetup(generation: runtime.beginResume())
+        }
+        #expect(credentials.readCount == 1)
+        try await runtime.prepareCuaPermissions()
+        let beforeUnlock = try runtimeFixtureCalls(root)
+        runtime.receiveSessionLockForTesting(.locked)
+        await runtime.waitForSessionLockChangeForTesting()
+        runtime.receiveSessionLockForTesting(.unlocked)
+        await runtime.waitForSessionLockChangeForTesting()
+        #expect(try runtimeFixtureCalls(root) == beforeUnlock)
+        #expect(credentials.readCount == 1 && !runtime.hasPendingRelayReconnectForTesting)
+        #expect(runtime.readiness == "permission_required" && !runtime.isCuaReady())
         await runtime.shutdownForQuit()
     } catch { await runtime.shutdownForQuit(); throw error }
 }

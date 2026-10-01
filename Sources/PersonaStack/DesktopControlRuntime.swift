@@ -65,6 +65,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         didSet { inputPermissionTarget?.invalidate() }
     }
     private var setupMayRunUnconfigured = false
+    // Full startup authorizes recovery. Permission-only preparation cannot do so.
+    private var allowsAutomaticCuaRecovery = false
+    private var sessionLockChangeTask: Task<Void, Never>?
     private var disconnecting = false
     private var environmentSwitchPending = false
     private var repairInProgress = false
@@ -108,7 +111,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                 self.startingProxy?.interrupt()
                 self.lockCleanupTask = Task { await self.cleanupExecutor() }
             }
-            Task { await self.sessionLockChanged(lockGeneration) }
+            self.sessionLockChangeTask = Task { await self.sessionLockChanged(lockGeneration) }
         }
     }
 
@@ -166,6 +169,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     var executorCleanupFailedForTesting: Bool { executorCleanupFailed }
 
     func waitForLockCleanupForTesting() async { await lockCleanupTask?.value }
+    func waitForSessionLockChangeForTesting() async { await sessionLockChangeTask?.value }
     func receiveSessionLockForTesting(_ state: DesktopControlSessionLock.State) { sessionLock.receive(state) }
 
     func heartbeatReadinessForTesting() async -> String? { await heartbeatReadiness() }
@@ -273,6 +277,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     private func startCua(forceRepairInstall: Bool, startPaused: Bool, generation: UUID, verifyCapabilities: Bool = true) async throws {
         try requireCurrentLifecycle(generation)
+        if verifyCapabilities { allowsAutomaticCuaRecovery = true }
         let wasVerifiedReady = isCuaReady() && readiness == "ready"
         if proxy == nil {
             do {
@@ -412,6 +417,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     func shutdownForQuit() async {
+        allowsAutomaticCuaRecovery = false
         lifecycleGeneration = UUID()
         let generation = lifecycleGeneration
         disconnecting = true
@@ -438,6 +444,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     func prepareForEnvironmentSwitch() async throws {
         guard !disconnecting || environmentSwitchPending else { throw CancellationError() }
+        allowsAutomaticCuaRecovery = false
         lifecycleGeneration = UUID()
         let generation = lifecycleGeneration
         disconnecting = true
@@ -496,6 +503,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     func beginDisconnect() throws -> UUID {
         guard !disconnecting else { throw CancellationError() }
         disconnecting = true
+        allowsAutomaticCuaRecovery = false
         lifecycleGeneration = UUID()
         paused = true
         readiness = "paused"
@@ -620,6 +628,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     /// Explicit native setup only. It never attaches or replaces enrollment.
     func prepareCuaPermissions() async throws {
         guard !disconnecting, !environmentSwitchPending, !repairInProgress else { throw CancellationError() }
+        // A cached credential is not an active relay. Retain only existing relay recovery.
+        allowsAutomaticCuaRecovery = gateway != nil || pendingGateway != nil || reconnectTask != nil
         let preflightGeneration = lifecycleGeneration
         let ownedDaemonRunning = isOwnedCuaRunning()
         if let existing = proxy {
@@ -651,6 +661,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     func restartCuaAfterPermissionChange() async throws {
         guard !repairInProgress else { throw CancellationError() }
+        // A cached credential is not an active relay. Retain only existing relay recovery.
+        allowsAutomaticCuaRecovery = gateway != nil || pendingGateway != nil || reconnectTask != nil
         let remainPaused = paused
         let generation = try beginResume()
         try confirmForegroundSession()
@@ -902,7 +914,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         if let task = lockCleanupTask { await task.value }
         lockCleanupTask = nil
         if let task = executorCleanupTask { _ = await task.value }
-        guard self.lockGeneration == lockGeneration, !paused, !disconnecting else { return }
+        guard self.lockGeneration == lockGeneration, !disconnecting else { return }
+        guard allowsAutomaticCuaRecovery else {
+            if proxyInterruptedForLock { readiness = paused ? "paused" : "permission_required" }
+            return
+        }
+        guard !paused else { return }
         let generation = lifecycleGeneration
         if proxyInterruptedForLock {
             proxyInterruptedForLock = false
@@ -1065,6 +1082,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     private func stopIdleRelay(expectedLifecycle: UUID) async {
         guard lifecycleGeneration == expectedLifecycle, !disconnecting, !environmentSwitchPending else { return }
+        allowsAutomaticCuaRecovery = false
         lifecycleGeneration = UUID()
         let generation = lifecycleGeneration
         setupMayRunUnconfigured = false

@@ -456,7 +456,8 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         }
         try requireFinishedPermissions(page: page, generation: generation)
         if phase == .completed {
-            guard page.didPrepare, runtime.gatewayConnected, runtime.isCuaReady(), runtime.nativeExecutorReady else {
+            guard let request = permissionRequest, page.didPrepare,
+                  runtime.gatewayConnected, runtime.isCuaReady(), runtime.nativeExecutorReady else {
                 throw DesktopControlPermissionBridgeError.incomplete
             }
             let credentials = credentials ?? KeychainDesktopControlCredentialStore(appURL: page.appURL)
@@ -464,9 +465,12 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
                 throw DesktopControlPermissionBridgeError.incomplete
             }
             try requireCurrentScope(scope, generation: generation, page: page)
+            try requireFinishedPermissions(page: page, generation: generation, request: request)
             let state = try await enrollment.configurationState(installation: installation, appURL: page.appURL)
             try requireCurrentScope(scope, generation: generation, page: page)
-            guard state.hasConfig, state.hasActiveConfig, runtime.gatewayConnected else {
+            try requireFinishedPermissions(page: page, generation: generation, request: request)
+            guard state.hasConfig, state.hasActiveConfig, page.didPrepare,
+                  runtime.gatewayConnected, runtime.isCuaReady(), runtime.nativeExecutorReady else {
                 throw DesktopControlPermissionBridgeError.incomplete
             }
             permissionPresenter.completeSetup()
@@ -480,8 +484,9 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         return ["ok": true, "version": "1"]
     }
 
-    private func requireFinishedPermissions(page: Page, generation: UUID) throws {
-        guard permissionPage === page, page.permissionGeneration == generation, permissionPresenter.isFinishing else {
+    private func requireFinishedPermissions(page: Page, generation: UUID, request: UUID? = nil) throws {
+        guard permissionPage === page, page.permissionGeneration == generation, permissionPresenter.isFinishing,
+              request == nil || permissionRequest == request else {
             throw DesktopControlPermissionBridgeError.incomplete
         }
     }
