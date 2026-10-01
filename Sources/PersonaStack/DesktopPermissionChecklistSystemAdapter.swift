@@ -94,9 +94,7 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
                 return accessibilityObservation()
             case .screenRecording:
                 guard access.screenRecording() else { return Self.privacyDenialObservation(permission) }
-                guard access.accessibility() else {
-                    return .init(.verificationRequired, detail: "Set up Accessibility before PersonaStack can verify desktop capture.")
-                }
+                if let prerequisite = screenCaptureAccessibilityObservation() { return prerequisite }
             case .microphone:
                 guard access.microphone() == .authorized else { return microphoneObservation() }
             default: break
@@ -124,6 +122,14 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
             guard !Task.isCancelled else { return .init(.checking, detail: "Setup cancelled.") }
             if capturable && !access.screenRecording() {
                 return .init(.restartRequired, detail: "macOS allowed the screen request, but PersonaStack's current process still reports the old grant. Quit and reopen PersonaStack, then retry Setup \(permission.title).")
+            }
+            guard access.screenRecording() else {
+                openPrivacy("ScreenCapture")
+                return Self.privacyDenialObservation(permission)
+            }
+            if let prerequisite = screenCaptureAccessibilityObservation() {
+                openPrivacy("Accessibility")
+                return prerequisite
             }
             if !capturable { openPrivacy("ScreenCapture") }
         case .microphone:
@@ -165,6 +171,13 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         guard !Task.isCancelled else { return .init(.checking, detail: "Setup cancelled.") }
         if let value = await hooks.setup(permission) { return value }
         return await observe(permission)
+    }
+
+    func screenCaptureAccessibilityObservation() -> DesktopPermissionObservation? {
+        guard !access.accessibility() else { return nil }
+        return .init(.verificationRequired,
+                     detail: "Screen Capture is allowed. Set up Accessibility in Privacy & Security → Accessibility, then retry Setup Screen Capture to verify desktop capture.",
+                     verificationKey: "\(Bundle.main.bundleIdentifier ?? "unpackaged"):screen-capture:accessibility-missing")
     }
 
     /// The OS trust check is the complete Accessibility permission check.

@@ -273,6 +273,7 @@ final class DesktopPermissionChecklist {
         guard allowed else {
             return DesktopPermissionChecklistSystemAdapter.privacyDenialObservation(id)
         }
+        if let prerequisite = adapter.screenCaptureAccessibilityObservation() { return prerequisite }
         guard let snapshot = try? await cuaRuntime.cuaPermissionSnapshot(), snapshot.hostAttributionValid else {
             return .init(.verificationRequired, detail: "Use Setup \(id.title) to start PersonaStack's owned desktop runtime and verify access.",
                          verificationKey: "\(ownerKey):desktop-runtime-unavailable")
