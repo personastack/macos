@@ -1,6 +1,8 @@
 import Foundation
 import JavaScriptCore
+import PersonaStackCore
 import Testing
+import WebKit
 @testable import PersonaStack
 
 /// Runs the actual bundled diagnostic in-process with deterministic Web APIs.
@@ -13,7 +15,8 @@ private final class VoiceScriptFixture {
         context.evaluateScript(#"""
             var timers = [], events = {}, tracksStopped = 0, requests = 0, starts = 0, stops = 0;
             var permissionResolve, permissionReject, result = 'pending', failure;
-            var payloadBytes = 100, trackState = 'live';
+            var payloadBytes = 100, trackState = 'live', recorderInstance, timeslice;
+            var omitStopEvents = false;
             var window = globalThis;
             window.top = window;
             window.isSecureContext = true;
@@ -30,12 +33,13 @@ private final class VoiceScriptFixture {
                 return new Promise((resolve, reject) => { permissionResolve = resolve; permissionReject = reject; });
             } } };
             class MediaRecorder {
-                constructor() { this.events = {}; this.state = 'inactive'; }
+                constructor() { this.events = {}; this.state = 'inactive'; recorderInstance = this; }
                 addEventListener(name, handler) { this.events[name] = handler; }
-                start() { starts++; this.state = 'recording'; }
+                start(slice) { starts++; timeslice = slice; this.state = 'recording'; }
                 stop() {
                     stops++;
                     this.state = 'inactive';
+                    if (omitStopEvents) return;
                     this.events.dataavailable({ data: { size: payloadBytes } });
                     this.events.stop();
                 }
@@ -53,15 +57,26 @@ private final class VoiceScriptFixture {
 }
 
 struct DesktopVoicePermissionScriptTests {
-    @Test func olderHostedPageRecordsAndDiscardsWithoutAnyHostedHook() throws {
+    @Test func olderHostedPageWaitsForRecorderStartAndUsableDataBeforeStopping() throws {
         let fixture = try VoiceScriptFixture()
         fixture.run()
         #expect(fixture.value("requests") == "1")
         fixture.context.evaluateScript("permissionResolve(media)")
         #expect(fixture.value("starts") == "1")
+        #expect(fixture.value("timeslice") == "1000")
         fixture.context.evaluateScript("fire(200)")
+        fixture.context.evaluateScript("fire(5000)")
+        #expect(fixture.value("stops") == "0")
+        #expect(fixture.value("result") == "pending")
+        fixture.context.evaluateScript("recorderInstance.events.start()")
+        fixture.context.evaluateScript("recorderInstance.events.dataavailable({ data: { size: 0 } })")
+        #expect(fixture.value("stops") == "0")
+        #expect(fixture.value("result") == "pending")
+        fixture.context.evaluateScript("recorderInstance.events.dataavailable({ data: { size: 100 } })")
         #expect(fixture.value("result") == "ready")
+        #expect(fixture.value("stops") == "1")
         #expect(fixture.value("tracksStopped") == "1")
+        #expect(fixture.value("timers.filter(t => t.active).length") == "0")
         #expect(fixture.value("window.__personastackNativeVoiceTest") == "undefined")
         #expect(fixture.value("failure") == "undefined")
     }
@@ -71,10 +86,53 @@ struct DesktopVoicePermissionScriptTests {
         let fixture = try VoiceScriptFixture()
         fixture.run()
         fixture.context.evaluateScript("permissionResolve(media)")
+        fixture.context.evaluateScript("recorderInstance.events.start()")
         fixture.context.evaluateScript(change)
-        fixture.context.evaluateScript("fire(200)")
-        #expect(fixture.value("result") == "failed")
+        fixture.context.evaluateScript("fire(5000)")
+        #expect(fixture.value("result") == (change == "payloadBytes = 0" ? "empty" : "failed"))
         #expect(fixture.value("tracksStopped") == "1")
+        #expect(fixture.value("window.__personastackNativeVoiceTest") == "undefined")
+    }
+
+    @Test func finalChunkCanVerifyWhenWebKitDoesNotEmitPeriodicData() throws {
+        let fixture = try VoiceScriptFixture()
+        fixture.run()
+        fixture.context.evaluateScript("permissionResolve(media)")
+        fixture.context.evaluateScript("recorderInstance.events.start(); fire(5000)")
+        #expect(fixture.value("result") == "ready")
+        #expect(fixture.value("stops") == "1")
+        #expect(fixture.value("tracksStopped") == "1")
+        #expect(fixture.value("timers.filter(t => t.active).length") == "0")
+    }
+
+    @Test(arguments: ["missingStart", "missingStop"])
+    func recorderEventDeadlineStopsOnlyTheOwnedStream(reason: String) throws {
+        let fixture = try VoiceScriptFixture()
+        fixture.run()
+        fixture.context.evaluateScript("permissionResolve(media)")
+        if reason == "missingStop" {
+            fixture.context.evaluateScript("omitStopEvents = true; recorderInstance.events.start(); fire(5000)")
+        }
+        fixture.context.evaluateScript("fire(10000)")
+        #expect(fixture.value("result") == "timedOut")
+        #expect(fixture.value("tracksStopped") == "1")
+        #expect(fixture.value("stops") == "1")
+        #expect(fixture.value("window.__personastackNativeVoiceTest") == "undefined")
+        #expect(fixture.value("timers.filter(t => t.active).length") == "0")
+    }
+
+    @Test(arguments: [false, true])
+    func cancelledRecorderIgnoresLateStartDataAndStopEvents(started: Bool) throws {
+        let fixture = try VoiceScriptFixture()
+        fixture.run()
+        fixture.context.evaluateScript("permissionResolve(media)")
+        if started { fixture.context.evaluateScript("recorderInstance.events.start()") }
+        fixture.cancel()
+        fixture.context.evaluateScript("recorderInstance.events.start(); recorderInstance.events.dataavailable({data:{size:100}}); recorderInstance.events.stop()")
+        #expect(fixture.value("result") == "cancelled")
+        #expect(fixture.value("stops") == "1")
+        #expect(fixture.value("tracksStopped") == "1")
+        #expect(fixture.value("timers.filter(t => t.active).length") == "0")
         #expect(fixture.value("window.__personastackNativeVoiceTest") == "undefined")
     }
 
@@ -164,7 +222,7 @@ struct DesktopVoicePermissionScriptTests {
 }
 
 @Test @MainActor func nativeVoiceReplyAcceptsOnlyReadyAndPreservesFailureReasons() throws {
-    for status in ["ready", "busy", "denied", "noInput", "failed", "unsupported", "timedOut"] {
+    for status in ["ready", "busy", "denied", "noInput", "empty", "failed", "unsupported", "timedOut"] {
         let page = DesktopVoicePermissionWebPage(isCapturing: { false }, evaluate: { script, arguments, completion in
             #expect(script == DesktopVoicePermissionScript.test)
             #expect(arguments["testID"] as? String == "fixture")
@@ -180,4 +238,31 @@ struct DesktopVoicePermissionScriptTests {
             #expect(!error.observation.verified)
         }
     }
+}
+
+@Test(arguments: [WKError.Code.javaScriptExceptionOccurred, .javaScriptResultTypeIsUnsupported,
+                  .webContentProcessTerminated, .webViewInvalidated, .javaScriptInvalidFrameTarget]) @MainActor
+func nativeVoiceJavaScriptEvaluationFailureDoesNotClaimAnEmptyRecording(code: WKError.Code) {
+    let page = DesktopVoicePermissionWebPage(isCapturing: { false }, evaluate: { _, _, completion in
+        completion(.failure(NSError(domain: WKError.errorDomain, code: code.rawValue,
+            userInfo: [NSLocalizedDescriptionKey: "private page and script details"])))
+    })
+    var observation: PersonaStackCore.DesktopPermissionObservation?
+    page.test(id: "fixture") { result in
+        if case .failure(let error as DesktopVoicePermissionError) = result { observation = error.observation }
+    }
+    #expect(observation == DesktopVoicePermissionError.evaluationFailed.observation)
+    #expect(observation != DesktopVoicePermissionError.emptyRecording.observation)
+    #expect(observation?.detail.contains("private") == false)
+}
+
+@Test @MainActor func nativeVoiceEmptyRecordingHasItsOwnFailureReason() {
+    let page = DesktopVoicePermissionWebPage(isCapturing: { false }, evaluate: { _, _, completion in
+        completion(.success("empty"))
+    })
+    var empty = false
+    page.test(id: "fixture") { result in
+        if case .failure(DesktopVoicePermissionError.emptyRecording) = result { empty = true }
+    }
+    #expect(empty)
 }

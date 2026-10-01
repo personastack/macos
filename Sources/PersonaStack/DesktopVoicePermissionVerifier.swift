@@ -34,7 +34,8 @@ final class DesktopVoicePermissionWebPage: DesktopVoicePermissionPage {
             case .success(let value):
                 if value as? String == "ready" { completion(.success(true)) }
                 else { completion(.failure(DesktopVoicePermissionError(result: value as? String))) }
-            case .failure: completion(.failure(DesktopVoicePermissionError.recordingFailed))
+            case .failure(let error):
+                completion(.failure(error as? DesktopVoicePermissionError ?? .evaluationFailed))
             }
         }
     }
@@ -45,7 +46,7 @@ final class DesktopVoicePermissionWebPage: DesktopVoicePermissionPage {
 }
 
 enum DesktopVoicePermissionError: Error {
-    case busy, timedOut, pageChanged, unsupported, denied, noInput, recordingFailed
+    case busy, timedOut, pageChanged, unsupported, denied, noInput, emptyRecording, recordingFailed, evaluationFailed
 
     init(result: String?) {
         switch result {
@@ -55,6 +56,7 @@ enum DesktopVoicePermissionError: Error {
         case "unsupported": self = .unsupported
         case "denied": self = .denied
         case "noInput": self = .noInput
+        case "empty": self = .emptyRecording
         default: self = .recordingFailed
         }
     }
@@ -67,7 +69,9 @@ enum DesktopVoicePermissionError: Error {
         case .unsupported: .init(.unsupported, detail: "This page cannot record audio. Open the selected HTTPS PersonaStack app and retry.")
         case .denied: .init(.denied, detail: "WebKit could not access the microphone. Allow PersonaStack microphone access, reload the app page, and retry.")
         case .noInput: .init(.failed, detail: "No live microphone input is available. Choose an input in Sound settings and retry.")
-        case .recordingFailed: .init(.failed, detail: "The microphone recorder produced no usable audio. Finish any voice recording, check the audio input, and retry.")
+        case .emptyRecording: .init(.failed, detail: "The microphone recorder returned no audio data. Check the selected audio input and retry Setup Microphone.")
+        case .recordingFailed: .init(.failed, detail: "The microphone recorder could not finish. Finish any voice recording, check the audio input, and retry.")
+        case .evaluationFailed: .init(.failed, detail: "The microphone check could not run in this app page. Reload the page and retry Setup Microphone.")
         }
     }
 }

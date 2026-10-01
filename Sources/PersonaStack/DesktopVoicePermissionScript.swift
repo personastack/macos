@@ -23,7 +23,7 @@ enum DesktopVoicePermissionScript {
             return 'unsupported';
         }
         return await new Promise((resolve) => {
-            let ended = false, stream, recorder, stopTimer, deadline, bytes = 0;
+            let ended = false, started = false, stream, recorder, stopTimer, deadline, bytes = 0;
             const finish = (result) => {
                 if (ended) return;
                 ended = true;
@@ -42,6 +42,10 @@ enum DesktopVoicePermissionScript {
             deadline = setTimeout(() => finish('timedOut'), 10000);
             const failed = (error) => finish(error?.name === 'NotAllowedError' ? 'denied'
                 : error?.name === 'NotFoundError' ? 'noInput' : 'failed');
+            const stopRecording = () => {
+                if (ended || recorder?.state !== 'recording') return;
+                try { recorder.stop(); } catch { finish('failed'); }
+            };
             try {
                 Promise.resolve(navigator.mediaDevices.getUserMedia({ audio: true, video: false })).then((media) => {
                     if (ended || !current()) { media.getTracks().forEach((track) => track.stop()); cancel(); return; }
@@ -49,18 +53,25 @@ enum DesktopVoicePermissionScript {
                     if (!media.getAudioTracks().some((track) => track.readyState === 'live')) { finish('noInput'); return; }
                     try {
                         recorder = new MediaRecorder(media);
+                        recorder.addEventListener('start', () => {
+                            if (ended || started) return;
+                            started = true;
+                            stopTimer = setTimeout(stopRecording, 5000);
+                        });
                         recorder.addEventListener('dataavailable', (event) => {
                             if (ended) return;
                             bytes += event.data.size;
-                            if (bytes > 1048576) finish('failed');
+                            if (bytes > 1048576) { finish('failed'); return; }
+                            if (started && bytes > 0) stopRecording();
                         });
                         recorder.addEventListener('error', () => finish('failed'));
-                        recorder.addEventListener('stop', () => finish(current() && bytes > 0 &&
-                            stream?.getAudioTracks().some((track) => track.readyState === 'live') ? 'ready' : 'failed'));
-                        recorder.start(200);
-                        stopTimer = setTimeout(() => {
-                            try { recorder.stop(); } catch { finish('failed'); }
-                        }, 200);
+                        recorder.addEventListener('stop', () => {
+                            if (!current() || !started || !stream?.getAudioTracks().some((track) => track.readyState === 'live')) {
+                                finish('failed'); return;
+                            }
+                            finish(bytes > 0 ? 'ready' : 'empty');
+                        });
+                        recorder.start(1000);
                     } catch (error) { failed(error); }
                 }, failed);
             } catch (error) { failed(error); }
