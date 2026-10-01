@@ -221,12 +221,18 @@ public actor DesktopFileSystem {
         defer { _ = Darwin.close(library) }
         try Self.verifyOwnedDirectory(library)
         try Task.checkCancellation()
-        let mail = openat(library, "Mail", flags)
-        guard mail >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
-        defer { _ = Darwin.close(mail) }
-        try Self.verifyOwnedDirectory(mail)
+        // Both fixed locations are protected by macOS. Some users have never
+        // configured Mail. Only absence permits trying Messages; never bypass a
+        // denial, redirected path, unexpected owner, or failed directory read.
+        var resource = openat(library, "Mail", flags)
+        if resource < 0 && errno == ENOENT {
+            resource = openat(library, "Messages", flags)
+        }
+        guard resource >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        defer { _ = Darwin.close(resource) }
+        try Self.verifyOwnedDirectory(resource)
         try Task.checkCancellation()
-        let failure = Self.directoryListingFailure(descriptor: mail)
+        let failure = Self.directoryListingFailure(descriptor: resource)
         guard failure == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(failure)) }
         try Task.checkCancellation()
     }

@@ -260,7 +260,7 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         case .lockedScreenControl:
             return .init(.unsupported, detail: "Locked-screen control is unavailable in this release. Remote control stops when macOS locks.")
         case .fullDiskAccess:
-            return .init(.unsupported, detail: "In Full Disk Access settings, click + and select PersonaStack.app from Applications, then enable it. Setup Full Disk Access offers a content-free protected-directory check. This release cannot qualify the system-wide grant.")
+            return .init(.verificationRequired, detail: "Already enabled in System Settings? Choose Setup Full Disk Access, then Check Access to verify it. If needed, add PersonaStack.app from Applications with the + button in Full Disk Access settings and enable it.")
         case .inputMonitoring:
             return .init(.notNeeded, detail: "Ordinary mouse and keyboard control does not require Input Monitoring. No locked-control listener is installed.")
         case .camera: return .init(.notNeeded, detail: "PersonaStack does not use camera capture.")

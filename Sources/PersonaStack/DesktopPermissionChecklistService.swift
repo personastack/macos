@@ -420,18 +420,21 @@ final class DesktopPermissionChecklist {
         switch action {
         case .cancel: return .init(.checking, detail: "Protected-access check cancelled. Full Disk Access remains unverified.")
         case .settings:
-            return protectedAccessResult(.notGranted, detail: "In Full Disk Access settings, click + and select PersonaStack.app from Applications, then enable it. Relaunch if macOS asks, then retry Setup Full Disk Access. The grant remains unverified.", attempt: attempt, key: key)
+            return protectedAccessResult(.notGranted, detail: "Enable PersonaStack in Full Disk Access settings. If it is missing, click + and select PersonaStack.app from Applications. Return here and choose Setup Full Disk Access, then Check Access. Quit and reopen PersonaStack if macOS requests it.", attempt: attempt, key: key)
         case .check: break
         }
         do {
             try await verifyProtectedAccess()
-            return protectedAccessResult(.unsupported, detail: "PersonaStack could list the protected Mail directory. Entry names were discarded. No file content was read. This operation succeeded, but the Full Disk Access grant remains unqualified in this release.", attempt: attempt, key: key)
+            return protectedAccessResult(.ready, detail: "Protected-folder access verified for PersonaStack. The Mail or Messages folder listing succeeded. No file contents were read or changed. Other folders can still have separate access restrictions.", attempt: attempt, key: key)
         } catch {
             let failure = error as NSError
             if failure.domain == NSPOSIXErrorDomain && [Int(EPERM), Int(EACCES)].contains(failure.code) {
-                return protectedAccessResult(.denied, detail: "Protected-directory access was blocked. Review Full Disk Access and folder permissions. Mac policy may also deny access. Relaunch if macOS asks, then retry.", attempt: attempt, key: key)
+                return protectedAccessResult(.denied, detail: "Protected-folder access was blocked. Enable PersonaStack in Full Disk Access settings. If it is already enabled, quit and reopen PersonaStack, then choose Check Access again. Folder permissions or Mac policy can also block access.", attempt: attempt, key: key)
             }
-            return protectedAccessResult(.unsupported, detail: "The protected-directory check is unavailable or inconclusive. Full Disk Access remains unverified. No missing or redirected resource is treated as approval.", attempt: attempt, key: key)
+            if failure.domain == NSPOSIXErrorDomain && failure.code == Int(ENOENT) {
+                return protectedAccessResult(.verificationRequired, detail: "No protected Mail or Messages folder is available to check. Full Disk Access could not be verified on this Mac. Review PersonaStack in Full Disk Access settings. This optional check does not block setup.", attempt: attempt, key: key)
+            }
+            return protectedAccessResult(.failed, detail: "PersonaStack could not verify protected-folder access. Check that your Library folder and its Mail or Messages folder are available and are not redirected, then retry Check Access. Full Disk Access remains unverified.", attempt: attempt, key: key)
         }
     }
 
@@ -446,7 +449,8 @@ final class DesktopPermissionChecklist {
     private func protectedAccessResult(_ state: DesktopPermissionState, detail: String,
                                        attempt: UUID, key: String) -> DesktopPermissionObservation {
         guard protectedAccessIsCurrent(attempt, key: key) else { return protectedAccessChanged() }
-        let result = DesktopPermissionObservation(state, detail: detail, verificationKey: key)
+        let result = DesktopPermissionObservation(state, detail: detail, verificationKey: key,
+                                                 requiresVerification: state == .ready, verified: state == .ready)
         explicitObservations[.fullDiskAccess] = result
         return result
     }

@@ -82,7 +82,7 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     func protectedAccessSetupAction() async -> DesktopProtectedAccessSetupAction {
         let alert = NSAlert()
         alert.messageText = "Setup Full Disk Access"
-        alert.informativeText = "In System Settings → Privacy & Security → Full Disk Access, click + and select PersonaStack.app from Applications. PersonaStack may not appear until you add it. Turn its switch on and relaunch if macOS requests it. Check Access attempts one directory read in your Library/Mail folder. Entry names are discarded. No file contents are read or changed. A successful check proves this operation only. Full Disk Access remains unqualified in this release."
+        alert.informativeText = "If PersonaStack is already enabled in System Settings → Privacy & Security → Full Disk Access, choose Check Access. Otherwise, open Settings, add PersonaStack.app from Applications with + and enable it. Return here to check access. Quit and reopen PersonaStack if macOS requests it. Check Access attempts one directory read in Library/Mail, or Library/Messages if Mail is absent. Entry names are discarded. No file contents are read or changed. A successful check marks this row Ready. Other folders can still have separate access restrictions."
         alert.icon = NSImage(named: NSImage.applicationIconName)
         alert.addButton(withTitle: "Check Access")
         alert.addButton(withTitle: "Open Settings")
@@ -208,7 +208,7 @@ private struct DesktopPermissionChecklistView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(row.displayTitle).font(.headline)
                 if row.id == .fullDiskAccess {
-                    Text("Optional for setup. Broad file access remains unverified.").font(.caption).foregroundStyle(.secondary)
+                    Text("Optional for setup.").font(.caption).foregroundStyle(.secondary)
                 }
                 if !automatic || !row.isComplete {
                     Text(row.state.title).font(.caption.weight(.semibold))

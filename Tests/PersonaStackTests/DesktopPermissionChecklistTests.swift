@@ -316,7 +316,7 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     #expect(!allowed.requiresVerification)
     #expect(DesktopPermissionRow(id: .notifications, observation: allowed).isComplete)
     #expect(DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(.lockedScreenControl).state == .unsupported)
-    #expect(DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(.fullDiskAccess).state == .unsupported)
+    #expect(DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(.fullDiskAccess).state == .verificationRequired)
     #expect(DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(.speechRecognition).state == .notNeeded)
 }
 
@@ -330,7 +330,7 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     await model.refresh()
     #expect(model.canFinish)
     for row in model.rows where row.id == .lockedScreenControl || row.id == .fullDiskAccess {
-        #expect(row.state == .unsupported)
+        #expect(row.state == (row.id == .fullDiskAccess ? .verificationRequired : .unsupported))
         #expect(!row.isComplete)
     }
     let request = Task { try await model.waitForFinish() }
