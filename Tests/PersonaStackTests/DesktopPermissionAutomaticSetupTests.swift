@@ -85,7 +85,7 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
     model.cancel()
 }
 
-@Test @MainActor func notificationAutomaticSetupReadsBackApprovalAndNeverOpensSettings() async {
+@Test @MainActor func permissionNotificationAutomaticSetupReadsBackApprovalAndNeverOpensSettings() async {
     for approved in [true, false] {
         var authorization = UNAuthorizationStatus.notDetermined
         var requests = 0
@@ -105,7 +105,7 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
     }
 }
 
-@Test @MainActor func optionalNotificationPromptDoesNotBlockCoreSetupOrFinishAndLateResultsAreIgnored() async {
+@Test @MainActor func permissionOptionalNotificationPromptDoesNotBlockCoreSetupOrFinishAndLateResultsAreIgnored() async {
     let fake = AutomaticPermissionFake()
     fake.suspend = true
     fake.values[.notifications] = .init(.notGranted, detail: "Approval pending")
@@ -130,7 +130,7 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
     model.cancel()
 }
 
-@Test @MainActor func notificationAutomaticSetupPreservesDisabledAlertsAndManualRetryOpensSettings() async {
+@Test @MainActor func permissionNotificationAutomaticSetupPreservesDisabledAlertsAndManualRetryOpensSettings() async {
     var settingsOpened = 0
     var access = DesktopPermissionSystemAccess()
     access.notificationSettings = { (.authorized, .disabled, .disabled) }
@@ -142,7 +142,7 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
     #expect(settingsOpened == 1)
 }
 
-@Test @MainActor func loginAutomaticSetupRequiresConfirmedEnabledStatusAndDoesNotRepeatRegistration() async {
+@Test @MainActor func permissionLoginAutomaticSetupRequiresConfirmedEnabledStatusAndDoesNotRepeatRegistration() async {
     for registeredStatus in [SMAppService.Status.enabled, .requiresApproval] {
         var status = SMAppService.Status.notRegistered
         var registrations = 0
@@ -161,7 +161,7 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
     }
 }
 
-@Test @MainActor func cancelledNotificationRetryDoesNotOpenSettingsAfterDelayedReadback() async {
+@Test @MainActor func permissionCancelledNotificationRetryDoesNotOpenSettingsAfterDelayedReadback() async {
     var reads = 0
     var pending: CheckedContinuation<Void, Never>?
     var access = DesktopPermissionSystemAccess()
