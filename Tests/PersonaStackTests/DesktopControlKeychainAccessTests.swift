@@ -173,6 +173,10 @@ func deniedKeychainReadReturnsRecoveryErrorWithoutTreatingCredentialAsMissing(st
     #expect(security.events == ["get", "set:false", "update:false", "set:true"])
 }
 
+private func waitForKeychainSignal(_ semaphore: DispatchSemaphore, timeout: DispatchTimeInterval) -> Bool {
+    semaphore.wait(timeout: .now() + timeout) == .success
+}
+
 @Test func independentKeychainStoresCannotShareAnInteractiveAuthorizationWindow() async throws {
     let security = KeychainSecurityFixture()
     let entered = DispatchSemaphore(value: 0)
@@ -187,14 +191,23 @@ func deniedKeychainReadReturnsRecoveryErrorWithoutTreatingCredentialAsMissing(st
     let authorizing = Task.detached {
         try interactive.read(service: "fixture", account: "installation", interaction: .allowed)
     }
-    #expect(entered.wait(timeout: .now() + 2) == .success)
+    let authorizationEntered = await Task.detached {
+        waitForKeychainSignal(entered, timeout: .seconds(2))
+    }.value
+    #expect(authorizationEntered)
     let reading = Task.detached {
         passiveAttempted.signal()
         return try passive.read(service: "fixture", account: "installation")
     }
-    #expect(passiveAttempted.wait(timeout: .now() + 2) == .success)
+    let passiveStarted = await Task.detached {
+        waitForKeychainSignal(passiveAttempted, timeout: .seconds(2))
+    }.value
+    #expect(passiveStarted)
     // The second store cannot enter Security while the first is displaying UI.
-    #expect(laterEntered.wait(timeout: .now() + .milliseconds(100)) == .timedOut)
+    let passiveEnteredDuringAuthorization = await Task.detached {
+        waitForKeychainSignal(laterEntered, timeout: .milliseconds(100))
+    }.value
+    #expect(!passiveEnteredDuringAuthorization)
     release.signal()
     _ = try await authorizing.value
     _ = try await reading.value
