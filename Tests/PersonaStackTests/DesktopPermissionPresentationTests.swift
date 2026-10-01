@@ -116,7 +116,7 @@ private final class PresentationFixture {
     fixture.open()
     defer { fixture.close() }
     await fixture.settle()
-    #expect(fixture.service.window.coordinator.permissionRows.allSatisfy(\.isComplete))
+    #expect(fixture.service.window.coordinator.permissionRows.allSatisfy { $0.isComplete })
     #expect(fixture.runtime.calls == ["automatic-prepare", "input", "automatic-prepare", "automatic-capture"])
     #expect(fixture.diskChecks == 1 && fixture.voice.recordings == 1 && fixture.grantRequests.isEmpty)
     #expect(fixture.requests == [DesktopEnvironmentConfiguration.lan.appURL, DesktopEnvironmentConfiguration.lan.gatewayURL, DesktopEnvironmentConfiguration.lan.mcpURL])
@@ -128,7 +128,7 @@ private final class PresentationFixture {
     fixture.runtime.generation = "daemon-b"
     fixture.open()
     await fixture.settle()
-    #expect(fixture.service.window.coordinator.permissionRows.allSatisfy(\.isComplete))
+    #expect(fixture.service.window.coordinator.permissionRows.allSatisfy { $0.isComplete })
     #expect(fixture.voice.recordings == 2 && fixture.diskChecks == 2 && fixture.requests.count == 6)
 }
 
@@ -153,7 +153,7 @@ private final class PresentationFixture {
     fixture.denyNetwork = false
     fixture.open()
     await fixture.settle()
-    #expect(fixture.service.window.coordinator.permissionRows.allSatisfy(\.isComplete))
+    #expect(fixture.service.window.coordinator.permissionRows.allSatisfy { $0.isComplete })
 }
 
 @Test @MainActor func permissionPresentationActiveVoiceIsNotInterruptedAndFinishCancelsPendingChecks() async {
