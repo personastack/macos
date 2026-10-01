@@ -232,8 +232,8 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         manuallyCheckedRows.insert(id)
         pendingPresentationRows.remove(id)
         let pendingCuaCheck: Task<DesktopPermissionObservation, Never>?
-        if [.accessibility, .screenRecording, .directCapture].contains(id),
-           let current = verificationBusyPermission, [.accessibility, .screenRecording, .directCapture].contains(current) {
+        if [.screenRecording, .directCapture].contains(id),
+           let current = verificationBusyPermission, [.screenRecording, .directCapture].contains(current) {
             pendingCuaCheck = presentationOperationTask
             pendingCuaCheck?.cancel()
             invalidateVerification(current)

@@ -22,19 +22,6 @@ private final class PresentationRuntime: DesktopPermissionCuaRuntime {
         if holdCapture { await withCheckedContinuation { pendingCapture = $0 } }
         try Task.checkCancellation()
     }
-    func verifyCuaInputForPermissions(target: any DesktopInputPermissionTarget) async throws { calls.append("input") }
-}
-
-@MainActor
-private final class PresentationTarget: DesktopInputPermissionTarget {
-    let pid: Int32 = 10
-    let windowID = 20
-    let clickCount = 0
-    let text = ""
-    let expectedText = "fixture"
-    func present() throws { Issue.record("Fixture runtime owns input") }
-    func requireCurrent() throws {}
-    func invalidate() {}
 }
 
 @MainActor
@@ -75,7 +62,7 @@ private final class PresentationFixture {
         access.requestAccessibility = { self.grantRequests.append(.accessibility) }
         access.requestScreenRecording = { self.grantRequests.append(.screenRecording); return self.granted }
         access.requestMicrophone = { self.grantRequests.append(.microphone); return self.granted }
-        let service = DesktopPermissionChecklist(access: access, cuaRuntime: runtime, inputTarget: { PresentationTarget() },
+        let service = DesktopPermissionChecklist(access: access, cuaRuntime: runtime,
             selectedProfile: { .lan }, protectedAccessAction: { Issue.record("Automatic check opened consent"); return .cancel },
             verifyProtectedAccess: {
                 self.diskChecks += 1
@@ -117,7 +104,7 @@ private final class PresentationFixture {
     defer { fixture.close() }
     await fixture.settle()
     #expect(fixture.service.window.coordinator.permissionRows.allSatisfy { $0.isComplete })
-    #expect(fixture.runtime.calls == ["automatic-prepare", "input", "automatic-prepare", "automatic-capture"])
+    #expect(fixture.runtime.calls == ["automatic-prepare", "automatic-capture"])
     #expect(fixture.diskChecks == 1 && fixture.voice.recordings == 1 && fixture.grantRequests.isEmpty)
     #expect(fixture.requests == [DesktopEnvironmentConfiguration.lan.appURL, DesktopEnvironmentConfiguration.lan.gatewayURL, DesktopEnvironmentConfiguration.lan.mcpURL])
     for _ in 0..<3 { await fixture.service.window.coordinator.refresh() }
@@ -178,21 +165,23 @@ private final class PresentationFixture {
     #expect(fixture.service.window.coordinator.verificationBusyPermission == nil)
 }
 
-@Test @MainActor func permissionPresentationManualRequiredRetryCancelsOptionalCaptureAndKeepsOtherChecks() async {
+@Test @MainActor func permissionPresentationAccessibilityRetryDoesNotWaitForOrCancelOptionalCapture() async {
     let fixture = PresentationFixture()
     fixture.runtime.holdCapture = true
     fixture.open()
     defer { fixture.close() }
     while fixture.runtime.pendingCapture == nil { await Task.yield() }
     fixture.service.window.coordinator.setup(.accessibility)
-    // The same daemon operation must drain before manual input starts.
-    #expect(!fixture.runtime.calls.contains("manual-prepare"))
+    while fixture.service.window.coordinator.busyPermission != nil { await Task.yield() }
+    #expect(fixture.runtime.pendingCapture != nil)
+    #expect(fixture.service.window.coordinator.verificationBusyPermission == .screenRecording)
+    #expect(fixture.row(.accessibility)?.isComplete == true)
+    #expect(fixture.service.window.coordinator.canFinish)
+    #expect(fixture.runtime.calls == ["automatic-prepare", "automatic-capture"])
+    #expect(fixture.grantRequests.isEmpty)
     fixture.runtime.pendingCapture?.resume()
     fixture.runtime.pendingCapture = nil
-    while fixture.service.window.coordinator.busyPermission != nil { await Task.yield() }
     await fixture.settle()
-    #expect(fixture.runtime.calls.filter { $0 == "input" }.count == 2)
-    #expect(fixture.grantRequests == [.accessibility])
-    #expect(fixture.row(.accessibility)?.isComplete == true)
+    #expect(fixture.row(.screenRecording)?.isComplete == true)
     #expect(fixture.diskChecks == 1 && fixture.voice.recordings == 1 && fixture.requests.count == 3)
 }

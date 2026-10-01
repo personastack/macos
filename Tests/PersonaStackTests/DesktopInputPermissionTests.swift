@@ -113,17 +113,17 @@ private final class InputPermissionCalls {
 @Suite
 @MainActor
 struct DesktopInputPermissionTests {
-    @Test func completedInputProofCannotMoveToAnotherOwnerOrGrant() {
+    @Test func completedCaptureProofCannotMoveToAnotherOwnerOrGrant() {
         let initial = DesktopPermissionObservation(.ready, detail: "", verificationKey: "owner:daemon:grant", requiresVerification: true)
-        let stable = DesktopPermissionChecklist.finishCuaVerification(.accessibility, initial: initial, current: initial)
+        let stable = DesktopPermissionChecklist.finishCuaVerification(.screenRecording, initial: initial, current: initial)
         #expect(stable.state == .ready && stable.verified && stable.verificationKey == initial.verificationKey)
         let changed = DesktopPermissionObservation(.ready, detail: "", verificationKey: "new-owner:daemon:grant", requiresVerification: true)
-        let fenced = DesktopPermissionChecklist.finishCuaVerification(.accessibility, initial: initial, current: changed)
+        let fenced = DesktopPermissionChecklist.finishCuaVerification(.screenRecording, initial: initial, current: changed)
         #expect(fenced.state == .checking && !fenced.verified)
         let revoked = DesktopPermissionObservation(.notGranted, detail: "grant revoked")
-        #expect(DesktopPermissionChecklist.finishCuaVerification(.accessibility, initial: initial, current: revoked) == revoked)
+        #expect(DesktopPermissionChecklist.finishCuaVerification(.screenRecording, initial: initial, current: revoked) == revoked)
         let unknown = DesktopPermissionObservation(.ready, detail: "")
-        #expect(DesktopPermissionChecklist.finishCuaVerification(.accessibility, initial: unknown, current: unknown).state == .checking)
+        #expect(DesktopPermissionChecklist.finishCuaVerification(.screenRecording, initial: unknown, current: unknown).state == .checking)
     }
     @Test func ownedWindowInputRequiresFreshTokensAndNativeEffects() async throws {
         let target = InputPermissionTarget()

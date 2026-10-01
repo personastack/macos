@@ -166,7 +166,7 @@ private struct DesktopPermissionChecklistView: View {
             }
             Text("Accessibility (Required) must be Ready before you finish setup. Screen Capture adds screenshot-based control. Microphone and file access are optional. Desktop Control works while this Mac is unlocked.")
                 .foregroundStyle(.secondary)
-            Text("Opening this window checks current access. Granted microphone access uses a short recording that is discarded. Screen and input checks use the current desktop runtime. The disk check reads one protected folder listing without reading file contents. Network checks contact only your selected services.")
+            Text("Opening this window checks current access. Granted microphone access uses a short recording that is discarded. Accessibility reads macOS approval without clicking or typing. Screen Capture checks use the current desktop runtime. The disk check reads one protected folder listing without reading file contents. Network checks contact only your selected services.")
                 .font(.caption).foregroundStyle(.secondary)
             Text("After an update, macOS may need you to approve access again. If a permission is already enabled in System Settings, follow its recovery steps below, then retry Setup.")
                 .font(.caption).foregroundStyle(.secondary)

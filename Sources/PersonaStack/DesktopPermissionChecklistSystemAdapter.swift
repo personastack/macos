@@ -68,7 +68,7 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         if let value = await hooks.observe(permission) { return value }
         switch permission {
         case .accessibility:
-            return grant(access.accessibility(), permission: permission)
+            return accessibilityObservation()
         case .screenRecording, .directCapture:
             return grant(access.screenRecording(), permission: permission)
         case .microphone:
@@ -91,7 +91,7 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         if DesktopPermissionID.setupPermissions.contains(permission) {
             switch permission {
             case .accessibility:
-                guard access.accessibility() else { return Self.privacyDenialObservation(permission) }
+                return accessibilityObservation()
             case .screenRecording:
                 guard access.screenRecording() else { return Self.privacyDenialObservation(permission) }
                 guard access.accessibility() else {
@@ -112,12 +112,11 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         guard !Task.isCancelled else { return .init(.checking, detail: "Setup cancelled.") }
         switch permission {
         case .accessibility:
-            access.requestAccessibility()
+            if !access.accessibility() { access.requestAccessibility() }
             // AX's prompt return value is synchronous. Approval is asynchronous.
-            guard access.accessibility() else {
-                openPrivacy("Accessibility")
-                return Self.privacyDenialObservation(permission)
-            }
+            let current = accessibilityObservation()
+            if current.state != .ready { openPrivacy("Accessibility") }
+            return current
         case .screenRecording, .directCapture:
             // CGRequestScreenCaptureAccess can return false without registering
             // the app on newer macOS. A real host SCK request owns that prompt.
@@ -166,6 +165,15 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         guard !Task.isCancelled else { return .init(.checking, detail: "Setup cancelled.") }
         if let value = await hooks.setup(permission) { return value }
         return await observe(permission)
+    }
+
+    /// The OS trust check is the complete Accessibility permission check.
+    /// Runtime health and action delivery remain owned by DesktopControlRuntime.
+    func accessibilityObservation() -> DesktopPermissionObservation {
+        guard access.accessibility() else { return Self.privacyDenialObservation(.accessibility) }
+        return .init(.ready, detail: "macOS allows PersonaStack Accessibility access. No desktop action was performed.",
+                     verificationKey: "\(Bundle.main.bundleIdentifier ?? "unpackaged"):accessibility:allowed",
+                     verified: true)
     }
 
     private func grant(_ allowed: Bool, permission: DesktopPermissionID) -> DesktopPermissionObservation {
