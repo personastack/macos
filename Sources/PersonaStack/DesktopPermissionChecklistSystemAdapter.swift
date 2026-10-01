@@ -201,9 +201,12 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
 
     private func setupLogin(automatic: Bool) -> DesktopPermissionObservation {
         do {
-            if access.loginStatus() == .notRegistered { try access.registerLogin() }
-            if access.loginStatus() == .requiresApproval && !automatic { access.openLoginSettings() }
-            return Self.loginObservation(access.loginStatus())
+            let status = try DesktopLoginItemRegistration.registerIfNeeded(status: access.loginStatus, register: access.registerLogin)
+            if !automatic && status != .enabled { access.openLoginSettings() }
+            if status == .notFound || status == .notRegistered {
+                return .init(.failed, detail: DesktopLoginItemRegistration.unconfirmedMessage)
+            }
+            return Self.loginObservation(status)
         } catch {
             return .init(.failed, detail: "PersonaStack could not register Launch at Login. Check Login Items and retry.")
         }
@@ -229,9 +232,9 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
     static func loginObservation(_ status: SMAppService.Status) -> DesktopPermissionObservation {
         switch status {
         case .enabled: .init(.ready, detail: "PersonaStack starts after you log in to this Mac.")
-        case .requiresApproval: .init(.notGranted, detail: "Allow PersonaStack in General → Login Items & Extensions.")
+        case .requiresApproval: .init(.notGranted, detail: DesktopLoginItemRegistration.approvalMessage)
         case .notRegistered: .init(.notGranted, detail: "Register PersonaStack to launch after login.")
-        case .notFound: .init(.failed, detail: "The login service is missing. Install PersonaStack in Applications.")
+        case .notFound: .init(.notGranted, detail: "macOS has no registration for PersonaStack's login item. Retry Launch at Login setup.")
         @unknown default: .init(.checking, detail: "Login service status is unknown.")
         }
     }

@@ -223,7 +223,13 @@ struct DesktopControlMenu: View {
     private func registerLoginItem() {
         loginItemError = ""
         do {
-            try SMAppService.mainApp.register()
+            let status = try DesktopLoginItemRegistration.registerIfNeeded()
+            if status != .enabled {
+                loginItemError = status == .requiresApproval
+                    ? DesktopLoginItemRegistration.approvalMessage
+                    : DesktopLoginItemRegistration.unconfirmedMessage
+                SMAppService.openSystemSettingsLoginItems()
+            }
         } catch {
             loginItemError = error.localizedDescription
         }

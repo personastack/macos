@@ -310,7 +310,7 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
 
 @Test @MainActor func permissionChecklistNativeStatusMappingAndUnsupportedFeaturesStayTruthful() {
     #expect(DesktopPermissionChecklistSystemAdapter.loginObservation(.requiresApproval).state == .notGranted)
-    #expect(DesktopPermissionChecklistSystemAdapter.loginObservation(.notFound).state == .failed)
+    #expect(DesktopPermissionChecklistSystemAdapter.loginObservation(.notFound).state == .notGranted)
     #expect(DesktopPermissionChecklistSystemAdapter.loginObservation(.enabled).state == .ready)
     #expect(DesktopPermissionChecklistSystemAdapter.notificationObservation(authorization: .denied, alerts: .disabled, sounds: .disabled).state == .denied)
     #expect(DesktopPermissionChecklistSystemAdapter.notificationObservation(authorization: .authorized, alerts: .enabled, sounds: .disabled).state == .notGranted)

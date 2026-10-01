@@ -143,8 +143,11 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
 }
 
 @Test @MainActor func permissionLoginAutomaticSetupRequiresConfirmedEnabledStatusAndDoesNotRepeatRegistration() async {
-    for registeredStatus in [SMAppService.Status.enabled, .requiresApproval] {
-        var status = SMAppService.Status.notRegistered
+    for (initialStatus, registeredStatus) in [
+        (SMAppService.Status.notRegistered, SMAppService.Status.enabled),
+        (.notRegistered, .requiresApproval), (.notFound, .enabled), (.notFound, .requiresApproval)
+    ] {
+        var status = initialStatus
         var registrations = 0
         var settingsOpened = 0
         var access = DesktopPermissionSystemAccess()
@@ -153,11 +156,34 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
         access.openLoginSettings = { settingsOpened += 1 }
         let adapter = DesktopPermissionChecklistSystemAdapter(access: access)
         let expected: DesktopPermissionState = registeredStatus == .enabled ? .ready : .notGranted
+        #expect(await adapter.observe(.launchAtLogin).state == .notGranted)
+        #expect(registrations == 0)
         #expect(await adapter.setupAutomatically(.launchAtLogin).state == expected)
         #expect(await adapter.setupAutomatically(.launchAtLogin).state == expected)
         #expect(registrations == 1 && settingsOpened == 0)
         #expect(await adapter.setup(.launchAtLogin).state == expected)
         #expect(settingsOpened == (registeredStatus == .requiresApproval ? 1 : 0))
+    }
+}
+
+@Test @MainActor func permissionLoginUnconfirmedRegistrationStaysFailedAndManualRetryOpensSettings() async {
+    for initialStatus in [SMAppService.Status.notFound, .notRegistered] {
+        var registrations = 0
+        var settingsOpened = 0
+        var access = DesktopPermissionSystemAccess()
+        access.loginStatus = { initialStatus }
+        access.registerLogin = { registrations += 1 }
+        access.openLoginSettings = { settingsOpened += 1 }
+        let adapter = DesktopPermissionChecklistSystemAdapter(access: access)
+        let passive = await adapter.observe(.launchAtLogin)
+        #expect(passive.state == .notGranted)
+        #expect(!passive.detail.contains("Install"))
+        let automatic = await adapter.setupAutomatically(.launchAtLogin)
+        #expect(automatic.state == .failed)
+        #expect(automatic.detail == DesktopLoginItemRegistration.unconfirmedMessage)
+        #expect(registrations == 1 && settingsOpened == 0)
+        #expect(await adapter.setup(.launchAtLogin).state == .failed)
+        #expect(registrations == 2 && settingsOpened == 1)
     }
 }
 
