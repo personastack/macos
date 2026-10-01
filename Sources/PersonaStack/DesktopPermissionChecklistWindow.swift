@@ -84,7 +84,7 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     func protectedAccessSetupAction() async -> DesktopProtectedAccessSetupAction {
         let alert = NSAlert()
         alert.messageText = "Setup Full Disk Access"
-        alert.informativeText = "If PersonaStack is already enabled in System Settings → Privacy & Security → Full Disk Access, choose Check Access. Otherwise, open Settings, add PersonaStack.app from Applications with + and enable it. Return here to check access. Quit and reopen PersonaStack if macOS requests it. Check Access authorizes a directory read in Library/Mail, or Library/Messages if Mail is absent. This check repeats when you reopen this window or return to PersonaStack while setup is open. Entry names are discarded. No file contents are read or changed. A successful check marks this row Ready. Other folders can still have separate access restrictions."
+        alert.informativeText = "If PersonaStack is already enabled in System Settings → Privacy & Security → Full Disk Access, choose Check Access. Otherwise, open Settings, add PersonaStack.app from Applications with + and enable it. Return here to check access. Quit and reopen PersonaStack if macOS requests it. Check Access authorizes a directory read in Library/Mail, or Library/Messages if Mail is absent. The same check runs automatically whenever you open this window. Entry names are discarded. No file contents are read or changed. A successful check marks this row Ready. Other folders can still have separate access restrictions."
         alert.icon = NSImage(named: NSImage.applicationIconName)
         alert.addButton(withTitle: "Check Access")
         alert.addButton(withTitle: "Open Settings")
@@ -126,6 +126,7 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
         coordinator.open()
         NSApp.activate(ignoringOtherApps: true)
         value.makeKeyAndOrderFront(nil)
+        coordinator.startPresentationVerification()
         coordinator.startAutomaticSetup()
     }
 
@@ -163,9 +164,9 @@ private struct DesktopPermissionChecklistView: View {
                 Text("Allow PersonaStack to work on this Mac")
                     .font(.title2.weight(.semibold))
             }
-            Text("Verify Accessibility (Required), then finish setup. Screen Capture adds screenshot-based control. Microphone and file access are optional. Desktop Control works while this Mac is unlocked.")
+            Text("Accessibility (Required) must be Ready before you finish setup. Screen Capture adds screenshot-based control. Microphone and file access are optional. Desktop Control works while this Mac is unlocked.")
                 .foregroundStyle(.secondary)
-            Text("Successful disk and network checks repeat when you reopen setup or return to this window. Microphone recording runs only when you choose Setup Microphone.")
+            Text("Opening this window checks current access. Granted microphone access uses a short recording that is discarded. Screen and input checks use the current desktop runtime. The disk check reads one protected folder listing without reading file contents. Network checks contact only your selected services.")
                 .font(.caption).foregroundStyle(.secondary)
             Text("After an update, macOS may need you to approve access again. If a permission is already enabled in System Settings, follow its recovery steps below, then retry Setup.")
                 .font(.caption).foregroundStyle(.secondary)
@@ -222,10 +223,10 @@ private struct DesktopPermissionChecklistView: View {
             Spacer(minLength: 8)
             if !row.isComplete && (!automatic || (row.state != .checking && coordinator.automaticBusyPermission == nil)) {
                 Button(automatic ? "Retry" : row.setupTitle) { coordinator.setup(row.id) }
-                    .disabled(coordinator.isFinishing || coordinator.busyPermission != nil)
+                    .disabled(coordinator.isFinishing || coordinator.busyPermission != nil || coordinator.verificationBusyPermission == row.id)
                     .accessibilityLabel(row.setupTitle)
             }
-            if coordinator.busyPermission == row.id || coordinator.automaticBusyPermission == row.id { ProgressView().controlSize(.small) }
+            if coordinator.busyPermission == row.id || coordinator.automaticBusyPermission == row.id || coordinator.verificationBusyPermission == row.id { ProgressView().controlSize(.small) }
         }
         .padding(.vertical, 12)
     }

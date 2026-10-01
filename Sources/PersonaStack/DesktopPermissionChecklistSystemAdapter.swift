@@ -13,6 +13,7 @@ import PersonaStackCore
 struct DesktopPermissionChecklistHooks {
     var observe: (DesktopPermissionID) async -> DesktopPermissionObservation? = { _ in nil }
     var setup: (DesktopPermissionID) async -> DesktopPermissionObservation? = { _ in nil }
+    var verifyAutomatically: (DesktopPermissionID) async -> DesktopPermissionObservation? = { _ in nil }
 }
 
 /// Injectable OS boundary. Passive reads never request access. ScreenCaptureKit
@@ -86,9 +87,24 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
     }
 
     func setupAutomatically(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation {
-        guard DesktopPermissionID.automaticSetup.contains(permission) else {
+        guard !Task.isCancelled else { return .init(.checking, detail: "Check cancelled.") }
+        if DesktopPermissionID.setupPermissions.contains(permission) {
+            switch permission {
+            case .accessibility:
+                guard access.accessibility() else { return Self.privacyDenialObservation(permission) }
+            case .screenRecording:
+                guard access.screenRecording() else { return Self.privacyDenialObservation(permission) }
+                guard access.accessibility() else {
+                    return .init(.verificationRequired, detail: "Set up Accessibility before PersonaStack can verify desktop capture.")
+                }
+            case .microphone:
+                guard access.microphone() == .authorized else { return microphoneObservation() }
+            default: break
+            }
+            if let value = await hooks.verifyAutomatically(permission) { return value }
             return await observe(permission)
         }
+        guard DesktopPermissionID.automaticSetup.contains(permission) else { return await observe(permission) }
         return await setup(permission, automatic: true)
     }
 

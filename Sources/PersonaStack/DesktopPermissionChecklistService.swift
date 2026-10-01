@@ -11,9 +11,29 @@ import WebKit
 protocol DesktopPermissionCuaRuntime: AnyObject {
     func cuaPermissionSnapshot() async throws -> CuaDriverPermissionSnapshot
     func prepareCuaPermissions() async throws
+    func prepareCuaPermissionsAutomatically() async throws
     func restartCuaAfterPermissionChange() async throws
     func verifyCuaCapabilitiesForPermissions() async throws
+    func verifyCuaCapabilitiesAutomatically() async throws
     func verifyCuaInputForPermissions(target: any DesktopInputPermissionTarget) async throws
+}
+
+extension DesktopPermissionCuaRuntime {
+    func prepareCuaPermissionsAutomatically() async throws { throw DesktopPermissionAutomaticCheckError.runtimeStartRequired }
+    func verifyCuaCapabilitiesAutomatically() async throws { throw DesktopPermissionAutomaticCheckError.runtimeStartRequired }
+}
+
+enum DesktopPermissionAutomaticCheckError: Error {
+    case sessionConfirmationRequired, runtimeStartRequired
+
+    var observation: DesktopPermissionObservation {
+        switch self {
+        case .sessionConfirmationRequired:
+            .init(.verificationRequired, detail: "Unlock this Mac, then choose Setup Accessibility to confirm the current session before desktop checks can run.")
+        case .runtimeStartRequired:
+            .init(.verificationRequired, detail: "Choose Setup Accessibility to start PersonaStack's desktop runtime. Permission approval is already present; functional access still needs the running runtime.")
+        }
+    }
 }
 
 extension DesktopControlRuntime: DesktopPermissionCuaRuntime {}
@@ -148,7 +168,8 @@ final class DesktopPermissionChecklist {
         window.onStopVerification = { [weak self] in self?.cancelVerification() }
         adapter.hooks = .init(
             observe: { [weak self] in await self?.observe($0) },
-            setup: { [weak self] in await self?.setup($0) }
+            setup: { [weak self] in await self?.setup($0) },
+            verifyAutomatically: { [weak self] in await self?.verifyAutomatically($0) }
         )
         activationObserver = activationNotificationCenter.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
@@ -167,7 +188,7 @@ final class DesktopPermissionChecklist {
     }
 
     func invalidateAfterActivation() {
-        let busy = window.coordinator.busyPermission
+        let busy = window.coordinator.busyPermission ?? window.coordinator.verificationBusyPermission
         for id in [DesktopPermissionID.fullDiskAccess, .localNetwork, .messagingConnection] where id != busy {
             let running = id == .fullDiskAccess ? protectedAccessAttempt != nil : connectionAttempts[id] != nil
             if !running, authorizedRefreshKeys[id] != nil { refreshNeeded.insert(id) }
@@ -344,14 +365,30 @@ final class DesktopPermissionChecklist {
         }
     }
 
-    private func setupCua(_ id: DesktopPermissionID) async -> DesktopPermissionObservation {
+    private func verifyAutomatically(_ id: DesktopPermissionID) async -> DesktopPermissionObservation? {
+        synchronizeOwner()
+        guard !Task.isCancelled else { return .init(.checking, detail: "Check cancelled.") }
+        switch id {
+        case .accessibility, .screenRecording: return await setupCua(id, automatic: true)
+        case .microphone: return await setupMicrophone()
+        case .fullDiskAccess: return await setupProtectedAccess(automatic: true)
+        case .localNetwork: return await setupConnection(id)
+        default: return await observe(id)
+        }
+    }
+
+    private func setupCua(_ id: DesktopPermissionID, automatic: Bool = false) async -> DesktopPermissionObservation {
         do {
             let runtime = cuaRuntime
             let old = try? await runtime.cuaPermissionSnapshot()
             try Task.checkCancellation()
             if let old, old.accessibility != adapter.access.accessibility() || old.screenRecording != adapter.access.screenRecording() {
+                if automatic {
+                    return .init(.restartRequired, detail: "The desktop runtime needs a permission refresh. Choose Setup to restart its permission check.")
+                }
                 try await runtime.restartCuaAfterPermissionChange()
-            } else { try await runtime.prepareCuaPermissions() }
+            } else if automatic { try await runtime.prepareCuaPermissionsAutomatically() }
+            else { try await runtime.prepareCuaPermissions() }
             try Task.checkCancellation()
             let snapshot = try await runtime.cuaPermissionSnapshot()
             guard snapshot.hostAttributionValid else { throw CuaMCPProxyError.serviceMismatch }
@@ -370,12 +407,14 @@ final class DesktopPermissionChecklist {
                 guard adapter.access.accessibility() else {
                     return .init(.verificationRequired, detail: "Screen access was requested. Set up Accessibility, then retry Setup \(id.title) to verify PersonaStack's desktop capture.")
                 }
-                try await runtime.verifyCuaCapabilitiesForPermissions()
+                if automatic { try await runtime.verifyCuaCapabilitiesAutomatically() }
+                else { try await runtime.verifyCuaCapabilitiesForPermissions() }
                 try Task.checkCancellation()
             }
             let verified = await observeCua(id)
             return Self.finishCuaVerification(id, initial: result, current: verified)
         } catch is CancellationError { return .init(.checking, detail: "Setup cancelled.") }
+        catch let error as DesktopPermissionAutomaticCheckError { return error.observation }
         catch let error as DesktopInputPermissionVerificationError { return .init(.failed, detail: error.localizedDescription) }
         catch let error as CuaMCPProxyError { return .init(.failed, detail: error.localizedDescription) }
         catch { return .init(.failed, detail: "PersonaStack's desktop runtime could not complete the \(id.title) check. Quit and reopen PersonaStack, then retry Setup \(id.title).") }
@@ -443,7 +482,7 @@ final class DesktopPermissionChecklist {
         }
     }
 
-    private func setupProtectedAccess() async -> DesktopPermissionObservation {
+    private func setupProtectedAccess(automatic: Bool = false) async -> DesktopPermissionObservation {
         guard !Task.isCancelled, protectedAccessAttempt == nil else {
             return .init(.checking, detail: "The protected-access check is busy or was cancelled.")
         }
@@ -452,7 +491,8 @@ final class DesktopPermissionChecklist {
         protectedAccessAttempt = attempt
         defer { if protectedAccessAttempt == attempt { protectedAccessAttempt = nil } }
         let action: DesktopProtectedAccessSetupAction
-        if let protectedAccessAction { action = await protectedAccessAction() }
+        if automatic { action = .check }
+        else if let protectedAccessAction { action = await protectedAccessAction() }
         else { action = await window.protectedAccessSetupAction() }
         guard protectedAccessIsCurrent(attempt, key: key) else { return protectedAccessChanged() }
         switch action {

@@ -64,6 +64,7 @@ final class DesktopControlCommandExecutor {
     private var activeOperationWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var cleanupResourceBarrierForTesting: (@Sendable () async -> Void)?
     private var cleanupFailuresForTesting = 0
+    private var nativeVerificationBarrierForTesting: (@MainActor () async -> Void)?
     private var leaseGrantBarrierForTesting: (@Sendable () async -> Void)?
 #endif
 
@@ -98,6 +99,12 @@ final class DesktopControlCommandExecutor {
         invalidateNativeTarget = onInvalidation
         activeOperations += 1
         do {
+#if DEBUG
+            if let barrier = nativeVerificationBarrierForTesting {
+                nativeVerificationBarrierForTesting = nil
+                await barrier()
+            }
+#endif
             let state = await diagnostics()
             try requireNativeVerification(id)
             try Task.checkCancellation()
@@ -219,6 +226,10 @@ final class DesktopControlCommandExecutor {
 
     func failNextCleanupForTesting() {
         cleanupFailuresForTesting += 1
+    }
+
+    func pauseNativeVerificationForTesting(_ barrier: @escaping @MainActor () async -> Void) {
+        nativeVerificationBarrierForTesting = barrier
     }
 
     func pauseLeaseGrantAfterCleanupForTesting(_ barrier: @escaping @Sendable () async -> Void) {

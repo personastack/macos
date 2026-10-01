@@ -1704,3 +1704,128 @@ func cuaFinishWaitsForCancelledStartupCleanupBeforeSuccessorUsesDaemon(_ stage: 
         await runtime.shutdownForQuit()
     } catch { model.cancel(); await runtime.shutdownForQuit(); throw error }
 }
+
+
+@Test @MainActor func desktopControlAutomaticPermissionPreparationRequiresKnownUnlockedSession() async {
+    for state in [DesktopControlSessionLock.State.unknown, .locked] {
+        let installer = DesktopControlInstallerFixture(errors: [])
+        let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: DeniedDesktopControlCredentialStore(),
+            sessionLockState: state, confirmForegroundSetup: { Issue.record("Automatic checks must not confirm a session"); return false })
+        await #expect(throws: DesktopPermissionAutomaticCheckError.self) { try await runtime.prepareCuaPermissionsAutomatically() }
+        #expect(await installer.repairArguments.isEmpty)
+        #expect(!runtime.hasActiveInstallation && !runtime.gatewayConnected)
+    }
+}
+
+@Test @MainActor func desktopControlAutomaticPermissionColdStartUsesOnlyIdlePermissionOwner() async {
+    let installer = DesktopControlInstallerFixture(errors: [CuaDriverInstallError.invalidLayout])
+    let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: DeniedDesktopControlCredentialStore(),
+        readiness: "paused", paused: true, sessionLockState: .unlocked,
+        confirmForegroundSetup: { Issue.record("Known unlocked checks need no confirmation"); return false })
+    await #expect(throws: CuaDriverInstallError.invalidLayout) { try await runtime.prepareCuaPermissionsAutomatically() }
+    #expect(await installer.repairArguments == [false])
+    #expect(runtime.paused && runtime.readiness == "paused")
+    #expect(!runtime.hasActiveInstallation && !runtime.gatewayConnected)
+}
+
+@Test @MainActor func desktopControlAutomaticPreparationCannotTakeBusyOwnerOrExistingConnection() async throws {
+    let installer = DesktopControlInstallerFixture(errors: [])
+    let executor = DesktopControlCommandExecutor()
+    let id = try await executor.beginNativeVerification()
+    let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: DeniedDesktopControlCredentialStore(),
+        executor: executor, sessionLockState: .unlocked)
+    await #expect(throws: DesktopInputPermissionVerificationError.busy) { try await runtime.prepareCuaPermissionsAutomatically() }
+    try executor.requireNativeVerification(id)
+    executor.endNativeVerification(id)
+    let connected = DesktopControlRuntime.makeForTesting(installer: installer, credentials: DeniedDesktopControlCredentialStore(),
+        connectionID: UUID(), connected: true, sessionLockState: .unlocked)
+    await #expect(throws: DesktopPermissionAutomaticCheckError.self) { try await connected.prepareCuaPermissionsAutomatically() }
+    #expect(connected.gatewayConnected)
+    #expect(await installer.repairArguments.isEmpty)
+}
+
+@Test @MainActor func desktopControlAutomaticPreparationFencesLifecycleChangeDuringExclusionAcquire() async throws {
+    let installer = DesktopControlInstallerFixture(errors: [])
+    let executor = DesktopControlCommandExecutor()
+    var pending: CheckedContinuation<Void, Never>?
+    executor.pauseNativeVerificationForTesting { await withCheckedContinuation { pending = $0 } }
+    let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: DeniedDesktopControlCredentialStore(),
+        executor: executor, sessionLockState: .unlocked)
+    let preparation = Task { try await runtime.prepareCuaPermissionsAutomatically() }
+    while pending == nil { await Task.yield() }
+    _ = try runtime.beginResume()
+    pending?.resume()
+    await #expect(throws: CancellationError.self) { try await preparation.value }
+    #expect(await installer.repairArguments.isEmpty)
+    #expect(!executor.nativeVerificationInProgress)
+    let successor = try await executor.beginNativeVerification()
+    try executor.requireNativeVerification(successor)
+    executor.endNativeVerification(successor)
+}
+
+
+@Test @MainActor func desktopControlAutomaticColdStartAndCapturePreserveEnrollmentAndRemoteLease() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-auto-check-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let executable = try makeRuntimeDriverFixture(root)
+    let credentials = PermissionPreparationCredentialStore(installation: nil)
+    let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
+    let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
+        credentials: credentials, executor: executor, sessionLockState: .unlocked,
+        confirmForegroundSetup: { Issue.record("Automatic checks cannot confirm a session"); return false },
+        hostPermissions: { (true, true) })
+    do {
+        await runtime.waitForSessionLockChangeForTesting()
+        try await runtime.prepareCuaPermissionsAutomatically()
+        let starts = try String(contentsOf: root.appendingPathComponent("daemon-starts"), encoding: .utf8)
+        try await runtime.prepareCuaPermissionsAutomatically()
+        #expect(try String(contentsOf: root.appendingPathComponent("daemon-starts"), encoding: .utf8) == starts)
+        try await runtime.verifyCuaCapabilitiesAutomatically()
+        #expect(runtime.isCuaReady() && !executor.nativeVerificationInProgress)
+        let owner = DesktopControlTarget(installationID: "install", workspaceID: "workspace", configID: "config",
+            personaID: "persona", runID: "run", generation: 1, configVersion: 1)
+        let acquire = DesktopControlFrame(type: "command", requestID: "acquire", target: owner,
+            operation: "desktop_control_acquire", arguments: .object([:]))
+        let lease = await executor.handle(acquire, proxy: nil)
+        #expect(lease.type == "result")
+        let calls = try runtimeFixtureCalls(root)
+        await #expect(throws: DesktopInputPermissionVerificationError.busy) { try await runtime.verifyCuaCapabilitiesAutomatically() }
+        #expect(try runtimeFixtureCalls(root) == calls)
+        let renewed = await executor.handle(acquire, proxy: nil)
+        #expect(renewed.type == "result" && renewed.result == lease.result)
+        #expect(credentials.readCount == 0 && !runtime.hasActiveInstallation && !runtime.gatewayConnected)
+        await runtime.shutdownForQuit()
+    } catch { await runtime.shutdownForQuit(); throw error }
+}
+
+@Test(arguments: ["lifecycle", "lock", "executor"]) @MainActor
+func desktopControlAutomaticCaptureFencesOwnerChangeDuringExclusionAcquire(change: String) async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-auto-fence-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let executable = try makeRuntimeDriverFixture(root)
+    let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
+    let credentials = PermissionPreparationCredentialStore(installation: nil)
+    let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
+        credentials: credentials, executor: executor, sessionLockState: .unlocked, hostPermissions: { (true, true) })
+    do {
+        await runtime.waitForSessionLockChangeForTesting()
+        try await runtime.prepareCuaPermissionsAutomatically()
+        let calls = try runtimeFixtureCalls(root)
+        var pending: CheckedContinuation<Void, Never>?
+        executor.pauseNativeVerificationForTesting { await withCheckedContinuation { pending = $0 } }
+        let check = Task { try await runtime.verifyCuaCapabilitiesAutomatically() }
+        while pending == nil { await Task.yield() }
+        switch change {
+        case "lifecycle": _ = try runtime.beginResume()
+        case "lock": runtime.receiveSessionLockForTesting(.locked)
+        default: runtime.replaceExecutorForTesting(DesktopControlCommandExecutor(powerAssertion: .testFixture()))
+        }
+        pending?.resume()
+        await #expect(throws: CancellationError.self) { try await check.value }
+        #expect(try runtimeFixtureCalls(root) == calls)
+        #expect(!executor.nativeVerificationInProgress && credentials.readCount == 0)
+        await runtime.shutdownForQuit()
+    } catch { await runtime.shutdownForQuit(); throw error }
+}

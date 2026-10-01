@@ -167,6 +167,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         await handle(frame, connectionID: connectionID, onChunk: { _ in })
     }
 
+    func replaceExecutorForTesting(_ replacement: DesktopControlCommandExecutor) { executor = replacement }
+
     var lockCleanupStartedForTesting: Bool { executorCleanupInProgress && readiness == "locked" }
     var executorCleanupFailedForTesting: Bool { executorCleanupFailed }
 
@@ -673,6 +675,45 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             == selectedCuaExecutableURL.resolvingSymlinksInPath().standardizedFileURL
     }
 
+    /// Opening the checklist cannot replace a runtime or interrupt remote work.
+    /// An unlocked idle process may start its existing permission-only owner.
+    func prepareCuaPermissionsAutomatically() async throws {
+        try Task.checkCancellation()
+        guard sessionLock.allowsControl else { throw DesktopPermissionAutomaticCheckError.sessionConfirmationRequired }
+        if isOwnedCuaRunning(), let proxy, let service = cuaService {
+            let generation = lifecycleGeneration
+            let lock = lockGeneration
+            let running = await proxy.isProcessRunning()
+            try requireCurrentStartup(generation)
+            guard self.proxy === proxy, cuaService === service, lockGeneration == lock,
+                  sessionLock.allowsControl else { throw CancellationError() }
+            if running { return }
+        }
+        guard canStartAutomaticPermissionRuntime else { throw DesktopPermissionAutomaticCheckError.runtimeStartRequired }
+        let generation = lifecycleGeneration
+        let lock = lockGeneration
+        let executor = self.executor
+        let id: UUID
+        do { id = try await executor.beginNativeVerification() }
+        catch is CancellationError { throw CancellationError() }
+        catch { throw DesktopInputPermissionVerificationError.busy }
+        defer { executor.endNativeVerification(id) }
+        try requireCurrentStartup(generation)
+        try executor.requireNativeVerification(id)
+        guard self.executor === executor, lockGeneration == lock, sessionLock.allowsControl,
+              canStartAutomaticPermissionRuntime else { throw CancellationError() }
+        try await startPermissionCua(generation: generation, remainPaused: paused)
+        try requireCurrentStartup(generation)
+        try executor.requireNativeVerification(id)
+        guard self.executor === executor, lockGeneration == lock, sessionLock.allowsControl else { throw CancellationError() }
+    }
+
+    private var canStartAutomaticPermissionRuntime: Bool {
+        proxy == nil && cuaService == nil && cuaStartup == nil && cuaShutdown == nil && startingProxy == nil &&
+        gateway == nil && pendingGateway == nil && reconnectTask == nil && gatewayConnectionID == nil &&
+        !disconnecting && !environmentSwitchPending && !repairInProgress && !executorCleanupInProgress && !executorCleanupFailed
+    }
+
     /// Explicit native setup only. It never attaches or replaces enrollment.
     func prepareCuaPermissions() async throws {
         try Task.checkCancellation()
@@ -741,13 +782,40 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         }
     }
 
-    /// Called only by an explicit native setup action that explained capture.
+    /// Used by disclosed native checklist checks and explicit capture setup.
     func verifyCuaCapabilitiesForPermissions() async throws {
         guard sessionLock.allowsControl, let proxy else { throw CuaMCPProxyError.permissionsRequired }
         let generation = lifecycleGeneration
         try await verifyCuaReadiness(proxy, generation: generation, timeout: 15, requireScreenCapture: true)
         try requireCurrentLifecycle(generation)
         guard sessionLock.allowsControl else { throw CuaMCPProxyError.permissionsRequired }
+    }
+
+    func verifyCuaCapabilitiesAutomatically() async throws {
+        guard sessionLock.allowsControl, isOwnedCuaRunning(), let proxy, let service = cuaService else {
+            throw CuaMCPProxyError.permissionsRequired
+        }
+        let generation = lifecycleGeneration
+        let lock = lockGeneration
+        let executor = self.executor
+        let id: UUID
+        do { id = try await executor.beginNativeVerification() }
+        catch is CancellationError { throw CancellationError() }
+        catch { throw DesktopInputPermissionVerificationError.busy }
+        defer { executor.endNativeVerification(id) }
+        func requireCurrent() throws {
+            try requireCurrentStartup(generation)
+            try executor.requireNativeVerification(id)
+            let grants = hostPermissions()
+            guard self.executor === executor, self.proxy === proxy, cuaService === service, service.isRunning,
+                  sessionLock.allowsControl, lockGeneration == lock, grants.accessibility, grants.screenRecording,
+                  !disconnecting, !environmentSwitchPending, !repairInProgress,
+                  !executorCleanupInProgress, !executorCleanupFailed else { throw CancellationError() }
+        }
+        try requireCurrent()
+        try await verifyCuaReadiness(proxy, generation: generation, timeout: 15, requireScreenCapture: true,
+                                    verifyOwner: requireCurrent)
+        try requireCurrent()
     }
 
     /// Input proof is local-only and cannot share the daemon with a remote task.
@@ -1468,16 +1536,19 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func verifyCuaReadiness(_ candidate: CuaMCPProxy, generation: UUID,
-                                    timeout: Int32 = 60, requireScreenCapture: Bool = false) async throws {
+                                    timeout: Int32 = 60, requireScreenCapture: Bool = false,
+                                    verifyOwner: @MainActor () throws -> Void = {}) async throws {
         try Task.checkCancellation()
+        try verifyOwner()
         guard let service = cuaService else { throw CuaMCPProxyError.notStarted }
         if !requireScreenCapture { verifiedCuaCapabilitiesGeneration = nil }
         try await verifyCuaPermissions(candidate, generation: generation, timeout: timeout, requireScreenCapture: requireScreenCapture)
 
         try Task.checkCancellation()
+        try verifyOwner()
 
-        // Accessibility is sufficient for element actions. Only explicit
-        // screen setup requests capture. All proof stays in the unlocked session.
+        // Accessibility is sufficient for element actions. Checklist capture
+        // checks opt in separately. All proof stays in the unlocked session.
         guard sessionLock.allowsControl else { return }
         let probeLockGeneration = lockGeneration
         if requireScreenCapture {
@@ -1486,17 +1557,20 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             )
             try Task.checkCancellation()
             try requireCurrentLifecycle(generation)
+            try verifyOwner()
             guard let screenshotResult = Self.toolResult(screenshot),
                   let content = screenshotResult["content"] as? [[String: Any]],
                   content.contains(where: Self.hasCapturePixels) else {
                 throw CuaMCPProxyError.functionalProbeFailed
             }
         }
+        try verifyOwner()
         let accessibility = try await candidate.callTool(
             name: "get_accessibility_tree", argumentsJSON: Data("{}".utf8), timeout: timeout
         )
         try Task.checkCancellation()
         try requireCurrentLifecycle(generation)
+        try verifyOwner()
         guard let result = Self.toolResult(accessibility),
               let content = result["content"] as? [[String: Any]],
               content.contains(where: { $0["type"] as? String == "text" && !($0["text"] as? String ?? "").isEmpty }) else {
