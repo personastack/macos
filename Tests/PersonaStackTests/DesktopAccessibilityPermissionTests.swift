@@ -53,9 +53,7 @@ import Testing
     let retried = await adapter.setup(.accessibility)
     #expect(observed.state == .ready && observed.verified)
     #expect(presented.state == .ready && retried.state == .ready)
-    #expect(adapter.screenCaptureAccessibilityObservation() == nil)
     roleReadable = false
     let revoked = await adapter.observe(.accessibility)
     #expect(revoked.state == .notGranted && !revoked.verified)
-    #expect(adapter.screenCaptureAccessibilityObservation()?.state == .verificationRequired)
 }

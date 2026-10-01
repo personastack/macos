@@ -5,26 +5,6 @@ import Testing
 @testable import PersonaStack
 
 @MainActor
-private final class PresentationRuntime: DesktopPermissionCuaRuntime {
-    var calls: [String] = []
-    var generation = "daemon-a"
-    var pendingCapture: CheckedContinuation<Void, Never>?
-    var holdCapture = false
-    func cuaPermissionSnapshot() async throws -> CuaDriverPermissionSnapshot {
-        .init(accessibility: true, screenRecording: true, hostAttributionValid: true, verificationKey: generation)
-    }
-    func prepareCuaPermissions() async throws { calls.append("manual-prepare") }
-    func prepareCuaPermissionsAutomatically() async throws { calls.append("automatic-prepare") }
-    func restartCuaAfterPermissionChange() async throws { Issue.record("Presentation must not restart the runtime") }
-    func verifyCuaCapabilitiesForPermissions() async throws { calls.append("manual-capture") }
-    func verifyCuaCapabilitiesAutomatically() async throws {
-        calls.append("automatic-capture")
-        if holdCapture { await withCheckedContinuation { pendingCapture = $0 } }
-        try Task.checkCancellation()
-    }
-}
-
-@MainActor
 private final class PresentationVoice: DesktopVoicePermissionPage {
     var recordings = 0
     var busy = false
@@ -41,9 +21,9 @@ private final class PresentationVoice: DesktopVoicePermissionPage {
 
 @MainActor
 private final class PresentationFixture {
-    let runtime = PresentationRuntime()
     let voice = PresentationVoice()
     var granted = true
+    var accessibilityGranted: Bool?
     var grantRequests: [DesktopPermissionID] = []
     var document = "document-a"
     var diskChecks = 0
@@ -54,7 +34,7 @@ private final class PresentationFixture {
 
     private func makeService() -> DesktopPermissionChecklist {
         var access = DesktopPermissionSystemAccess()
-        access.accessibility = { self.granted }
+        access.accessibility = { self.accessibilityGranted ?? self.granted }
         access.screenRecording = { self.granted }
         access.microphone = { self.granted ? .authorized : .notDetermined }
         access.microphoneIdentity = { "input" }
@@ -62,7 +42,7 @@ private final class PresentationFixture {
         access.requestAccessibility = { self.grantRequests.append(.accessibility) }
         access.requestScreenRecording = { self.grantRequests.append(.screenRecording); return self.granted }
         access.requestMicrophone = { self.grantRequests.append(.microphone); return self.granted }
-        let service = DesktopPermissionChecklist(access: access, cuaRuntime: runtime,
+        let service = DesktopPermissionChecklist(access: access,
             selectedProfile: { .lan }, protectedAccessAction: { Issue.record("Automatic check opened consent"); return .cancel },
             verifyProtectedAccess: {
                 self.diskChecks += 1
@@ -104,7 +84,6 @@ private final class PresentationFixture {
     defer { fixture.close() }
     await fixture.settle()
     #expect(fixture.service.window.coordinator.permissionRows.allSatisfy { $0.isComplete })
-    #expect(fixture.runtime.calls == ["automatic-prepare", "automatic-capture"])
     #expect(fixture.diskChecks == 1 && fixture.voice.recordings == 1 && fixture.grantRequests.isEmpty)
     #expect(fixture.requests == [DesktopEnvironmentConfiguration.lan.appURL, DesktopEnvironmentConfiguration.lan.gatewayURL, DesktopEnvironmentConfiguration.lan.mcpURL])
     for _ in 0..<3 { await fixture.service.window.coordinator.refresh() }
@@ -112,7 +91,6 @@ private final class PresentationFixture {
     #expect(fixture.diskChecks == 1 && fixture.voice.recordings == 1 && fixture.requests.count == 3)
     fixture.close()
     fixture.document = "document-b"
-    fixture.runtime.generation = "daemon-b"
     fixture.open()
     await fixture.settle()
     #expect(fixture.service.window.coordinator.permissionRows.allSatisfy { $0.isComplete })
@@ -132,7 +110,7 @@ private final class PresentationFixture {
     #expect(fixture.row(.microphone)?.state == .notGranted)
     #expect(fixture.row(.fullDiskAccess)?.state == .denied)
     #expect(fixture.row(.localNetwork)?.state == .failed)
-    #expect(fixture.voice.recordings == 0 && fixture.runtime.calls.isEmpty && fixture.grantRequests.isEmpty)
+    #expect(fixture.voice.recordings == 0 && fixture.grantRequests.isEmpty)
     #expect(fixture.diskChecks == 1 && fixture.requests.count == 1)
     fixture.close()
     fixture.granted = true
@@ -165,23 +143,24 @@ private final class PresentationFixture {
     #expect(fixture.service.window.coordinator.verificationBusyPermission == nil)
 }
 
-@Test @MainActor func permissionPresentationAccessibilityRetryDoesNotWaitForOrCancelOptionalCapture() async {
+@Test @MainActor func permissionPresentationScreenGrantIsReadyWithoutAccessibilityOrRuntime() async {
     let fixture = PresentationFixture()
-    fixture.runtime.holdCapture = true
+    fixture.accessibilityGranted = false
+    fixture.voice.hold = true
     fixture.open()
     defer { fixture.close() }
-    while fixture.runtime.pendingCapture == nil { await Task.yield() }
+    while fixture.voice.pending == nil { await Task.yield() }
+    #expect(fixture.row(.accessibility)?.state == .notGranted)
+    #expect(fixture.row(.screenRecording)?.isComplete == true)
+    #expect(!fixture.service.window.coordinator.canFinish)
+    fixture.accessibilityGranted = true
     fixture.service.window.coordinator.setup(.accessibility)
     while fixture.service.window.coordinator.busyPermission != nil { await Task.yield() }
-    #expect(fixture.runtime.pendingCapture != nil)
-    #expect(fixture.service.window.coordinator.verificationBusyPermission == .screenRecording)
     #expect(fixture.row(.accessibility)?.isComplete == true)
-    #expect(fixture.service.window.coordinator.canFinish)
-    #expect(fixture.runtime.calls == ["automatic-prepare", "automatic-capture"])
-    #expect(fixture.grantRequests.isEmpty)
-    fixture.runtime.pendingCapture?.resume()
-    fixture.runtime.pendingCapture = nil
-    await fixture.settle()
     #expect(fixture.row(.screenRecording)?.isComplete == true)
+    #expect(fixture.service.window.coordinator.canFinish)
+    #expect(fixture.grantRequests.isEmpty)
+    fixture.voice.pending?(.success(true))
+    await fixture.settle()
     #expect(fixture.diskChecks == 1 && fixture.voice.recordings == 1 && fixture.requests.count == 3)
 }

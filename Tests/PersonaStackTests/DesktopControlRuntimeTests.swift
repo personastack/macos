@@ -1722,7 +1722,7 @@ func cuaFinishWaitsForCancelledStartupCleanupBeforeSuccessorUsesDaemon(_ stage: 
 }
 
 @Test(arguments: [false, true], [DesktopPermissionID.accessibility, .screenRecording]) @MainActor
-func permissionSetupConfirmsSessionAfterAutomaticCheck(warm: Bool, first: DesktopPermissionID) async throws {
+func permissionApprovalDoesNotConfirmOrUseTheRuntimeSession(warm: Bool, first: DesktopPermissionID) async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-session-retry-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
     defer { try? FileManager.default.removeItem(at: root) }
@@ -1738,7 +1738,7 @@ func permissionSetupConfirmsSessionAfterAutomaticCheck(warm: Bool, first: Deskto
     access.requestAccessibility = {}
     access.requestScreenRecording = { true }
     access.microphone = { .denied }
-    let service = DesktopPermissionChecklist(access: access, cuaRuntime: runtime,
+    let service = DesktopPermissionChecklist(access: access,
         selectedProfile: { .production },
         verifyProtectedAccess: {}, activationNotificationCenter: NotificationCenter())
     let hooks = service.adapter.hooks
@@ -1756,7 +1756,7 @@ func permissionSetupConfirmsSessionAfterAutomaticCheck(warm: Bool, first: Deskto
         while model.verificationBusyPermission != nil { await Task.yield() }
         #expect(confirmations == 0 && runtime.requiresForegroundSessionConfirmation)
         #expect(model.rows.first { $0.id == .accessibility }?.state == .ready)
-        #expect(model.rows.first { $0.id == .screenRecording }?.state == .verificationRequired)
+        #expect(model.rows.first { $0.id == .screenRecording }?.state == .ready)
         #expect(model.canFinish)
         for id in [first, first == .accessibility ? .screenRecording : .accessibility] {
             let previousConfirmations = confirmations
@@ -1765,15 +1765,19 @@ func permissionSetupConfirmsSessionAfterAutomaticCheck(warm: Bool, first: Deskto
             #expect(model.rows.first { $0.id == id }?.isComplete == true)
             if id == .accessibility { #expect(confirmations == previousConfirmations) }
         }
-        let calls = try runtimeFixtureCalls(root)
+        let calls = warm ? try runtimeFixtureCalls(root) : []
         #expect(!calls.contains("click") && !calls.contains("type_text"))
-        #expect(confirmations == 1 && !runtime.requiresForegroundSessionConfirmation)
+        #expect(confirmations == 0 && runtime.requiresForegroundSessionConfirmation)
         #expect(model.canFinish && runtime.paused && !runtime.gatewayConnected && !runtime.hasActiveInstallation)
         #expect(credentials.readCount == 0 && !runtime.hasPendingRelayReconnectForTesting)
-        let current = try await runtime.cuaPermissionSnapshot().verificationKey
-        if warm { #expect(current == original) }
-        let starts = try String(contentsOf: root.appendingPathComponent("daemon-starts"), encoding: .utf8)
-        #expect(starts.split(separator: "\n").count == 1)
+        if warm {
+            let current = try await runtime.cuaPermissionSnapshot().verificationKey
+            #expect(current == original)
+            let starts = try String(contentsOf: root.appendingPathComponent("daemon-starts"), encoding: .utf8)
+            #expect(starts.split(separator: "\n").count == 1)
+        } else {
+            #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("daemon-starts").path))
+        }
         service.window.cancel()
         await runtime.shutdownForQuit()
     } catch { service.window.cancel(); await runtime.shutdownForQuit(); throw error }

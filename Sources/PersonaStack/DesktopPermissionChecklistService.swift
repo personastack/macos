@@ -7,21 +7,6 @@ import Foundation
 import PersonaStackCore
 import WebKit
 
-@MainActor
-protocol DesktopPermissionCuaRuntime: AnyObject {
-    func cuaPermissionSnapshot() async throws -> CuaDriverPermissionSnapshot
-    func prepareCuaPermissions() async throws
-    func prepareCuaPermissionsAutomatically() async throws
-    func restartCuaAfterPermissionChange() async throws
-    func verifyCuaCapabilitiesForPermissions() async throws
-    func verifyCuaCapabilitiesAutomatically() async throws
-}
-
-extension DesktopPermissionCuaRuntime {
-    func prepareCuaPermissionsAutomatically() async throws { throw DesktopPermissionAutomaticCheckError.runtimeStartRequired }
-    func verifyCuaCapabilitiesAutomatically() async throws { throw DesktopPermissionAutomaticCheckError.runtimeStartRequired }
-}
-
 enum DesktopPermissionAutomaticCheckError: Error {
     case sessionConfirmationRequired, runtimeStartRequired
 
@@ -34,8 +19,6 @@ enum DesktopPermissionAutomaticCheckError: Error {
         }
     }
 }
-
-extension DesktopControlRuntime: DesktopPermissionCuaRuntime {}
 
 /// Composes the checklist with existing app owners. Stored observations are
 /// content-free evidence from explicit checks, never persisted OS grants.
@@ -61,7 +44,6 @@ final class DesktopPermissionChecklist {
     private var connectionAttempts: [DesktopPermissionID: UUID] = [:]
     private var resourceVerificationGeneration = UUID()
     private var resourceVerificationGenerations: [DesktopPermissionID: UUID] = [:]
-    private let cuaRuntime: any DesktopPermissionCuaRuntime
     private var protectedAccessGeneration = UUID()
     private var protectedAccessAttempt: UUID?
     private lazy var volumeCheck = makeVolumeCheck()
@@ -113,7 +95,6 @@ final class DesktopPermissionChecklist {
     }
 
     init(access: DesktopPermissionSystemAccess = .init(),
-         cuaRuntime: (any DesktopPermissionCuaRuntime)? = nil,
          directoryURL: @escaping (FileManager.SearchPathDirectory) -> URL? = {
              FileManager.default.urls(for: $0, in: .userDomainMask).first
          }, verifyDirectory: (@MainActor (URL) async throws -> Void)? = nil,
@@ -137,7 +118,6 @@ final class DesktopPermissionChecklist {
             guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
             return response
         }
-        self.cuaRuntime = cuaRuntime ?? DesktopControlRuntime.shared
         self.directoryURL = directoryURL
         self.verifyDirectory = verifyDirectory ?? { url in
             let files = DesktopFileSystem()
@@ -228,7 +208,6 @@ final class DesktopPermissionChecklist {
         synchronizeOwner()
         switch id {
         case .accessibility: return adapter.accessibilityObservation()
-        case .screenRecording, .directCapture: return await observeCua(id)
         case .microphone: return observeMicrophone()
         case .automaticUpdates: return observeUpdates()
         case .backgroundOperation:
@@ -266,24 +245,6 @@ final class DesktopPermissionChecklist {
             return "\(ownerKey):\(resourceVerificationGenerations[id] ?? resourceVerificationGeneration)"
         default: return ownerKey
         }
-    }
-
-    private func observeCua(_ id: DesktopPermissionID) async -> DesktopPermissionObservation {
-        let allowed = adapter.access.screenRecording()
-        guard allowed else {
-            return DesktopPermissionChecklistSystemAdapter.privacyDenialObservation(id)
-        }
-        if let prerequisite = adapter.screenCaptureAccessibilityObservation() { return prerequisite }
-        guard let snapshot = try? await cuaRuntime.cuaPermissionSnapshot(), snapshot.hostAttributionValid else {
-            return .init(.verificationRequired, detail: "Use Setup \(id.title) to start PersonaStack's owned desktop runtime and verify access.",
-                         verificationKey: "\(ownerKey):desktop-runtime-unavailable")
-        }
-        let granted = snapshot.screenRecording
-        return .init(granted ? .ready : .restartRequired,
-                     detail: granted ? "PersonaStack has the OS grant. Use Setup \(id.title) to verify real desktop access."
-                                     : "The desktop runtime needs a restart after the permission change.",
-                     verificationKey: "\(ownerKey):\(snapshot.verificationKey):\(granted)",
-                     requiresVerification: true)
     }
 
     private func observeMicrophone() -> DesktopPermissionObservation? {
@@ -328,7 +289,6 @@ final class DesktopPermissionChecklist {
         synchronizeOwner()
         switch id {
         case .accessibility: return adapter.accessibilityObservation()
-        case .screenRecording, .directCapture: return await setupCua(id)
         case .microphone: return await setupMicrophone()
         case .automaticUpdates:
             DesktopUpdater.shared.start()
@@ -365,54 +325,11 @@ final class DesktopPermissionChecklist {
         guard !Task.isCancelled else { return .init(.checking, detail: "Check cancelled.") }
         switch id {
         case .accessibility: return adapter.accessibilityObservation()
-        case .screenRecording: return await setupCua(id, automatic: true)
         case .microphone: return await setupMicrophone()
         case .fullDiskAccess: return await setupProtectedAccess(automatic: true)
         case .localNetwork: return await setupConnection(id)
         default: return await observe(id)
         }
-    }
-
-    private func setupCua(_ id: DesktopPermissionID, automatic: Bool = false) async -> DesktopPermissionObservation {
-        do {
-            let runtime = cuaRuntime
-            let old = try? await runtime.cuaPermissionSnapshot()
-            try Task.checkCancellation()
-            if let old, old.accessibility != adapter.access.accessibility() || old.screenRecording != adapter.access.screenRecording() {
-                if automatic {
-                    return .init(.restartRequired, detail: "The desktop runtime needs a permission refresh. Choose Setup to restart its permission check.")
-                }
-                try await runtime.restartCuaAfterPermissionChange()
-            } else if automatic { try await runtime.prepareCuaPermissionsAutomatically() }
-            else { try await runtime.prepareCuaPermissions() }
-            try Task.checkCancellation()
-            let snapshot = try await runtime.cuaPermissionSnapshot()
-            guard snapshot.hostAttributionValid else { throw CuaMCPProxyError.serviceMismatch }
-            let result = await observeCua(id)
-            guard result.state == .ready else { return result }
-            guard adapter.access.accessibility() else {
-                return .init(.verificationRequired, detail: "Screen access was requested. Set up Accessibility, then retry Setup \(id.title) to verify PersonaStack's desktop capture.")
-            }
-            if automatic { try await runtime.verifyCuaCapabilitiesAutomatically() }
-            else { try await runtime.verifyCuaCapabilitiesForPermissions() }
-            try Task.checkCancellation()
-            let verified = await observeCua(id)
-            return Self.finishCuaVerification(id, initial: result, current: verified)
-        } catch is CancellationError { return .init(.checking, detail: "Setup cancelled.") }
-        catch let error as DesktopPermissionAutomaticCheckError { return error.observation }
-        catch let error as DesktopInputPermissionVerificationError { return .init(.failed, detail: error.localizedDescription) }
-        catch let error as CuaMCPProxyError { return .init(.failed, detail: error.localizedDescription) }
-        catch { return .init(.failed, detail: "PersonaStack's desktop runtime could not complete the \(id.title) check. Quit and reopen PersonaStack, then retry Setup \(id.title).") }
-    }
-
-    static func finishCuaVerification(_ id: DesktopPermissionID, initial: DesktopPermissionObservation,
-                                      current: DesktopPermissionObservation) -> DesktopPermissionObservation {
-        guard current.state == .ready else { return current }
-        guard initial.state == .ready, let key = initial.verificationKey, !key.isEmpty, current.verificationKey == key else {
-            return .init(.checking, detail: "Desktop access changed during verification. Retry Setup \(id.title).")
-        }
-        return .init(.ready, detail: "PersonaStack's desktop runtime verified screen capture and accessibility reads.",
-                     verificationKey: key, requiresVerification: true, verified: true)
     }
 
     private func setupMicrophone() async -> DesktopPermissionObservation {

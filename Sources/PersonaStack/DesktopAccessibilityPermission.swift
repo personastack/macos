@@ -43,6 +43,7 @@ enum DesktopAccessibilityPermission {
         print("accessibility_trust_without_prompt=\(trusted)")
         print("accessibility_application_role_read=\(readable)")
         print("event_posting_allowed=\(postEvents)")
+        print("screen_capture_allowed=\(CGPreflightScreenCaptureAccess())")
         print("accessibility_granted=\(isGranted(trusted: { trusted }, readRole: { readable }, canPostEvents: { postEvents }))")
     }
 }

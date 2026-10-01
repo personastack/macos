@@ -4,55 +4,25 @@ import Testing
 import PersonaStackCore
 @testable import PersonaStack
 
-@MainActor
-private final class PermissionRequestRuntime: DesktopPermissionCuaRuntime {
-    var accessibility = true
-    var screenRecording = false
-    var hostAttributionValid = true
-    var calls: [String] = []
-    var snapshotReads = 0
-    var snapshotFailure = false
-    var captureFailure = false
-    var suspendSnapshot = false
-    var pendingSnapshot: CheckedContinuation<Void, Never>?
-    func cuaPermissionSnapshot() async throws -> CuaDriverPermissionSnapshot {
-        snapshotReads += 1
-        if snapshotFailure { throw CuaMCPProxyError.notStarted }
-        if suspendSnapshot {
-            suspendSnapshot = false
-            await withCheckedContinuation { pendingSnapshot = $0 }
-        }
-        return .init(accessibility: accessibility, screenRecording: screenRecording,
-              hostAttributionValid: hostAttributionValid, verificationKey: "owned-generation")
-    }
-    func prepareCuaPermissions() async throws { calls.append("prepare") }
-    func restartCuaAfterPermissionChange() async throws { calls.append("restart") }
-    func verifyCuaCapabilitiesForPermissions() async throws {
-        calls.append("capture")
-        if captureFailure { throw CuaMCPProxyError.functionalProbeFailed }
-    }
-}
-
 @Suite @MainActor
 struct DesktopPermissionRequestFlowTests {
     @Test(arguments: [DesktopPermissionID.screenRecording, .directCapture])
-    func hostScreenRequestRunsDespiteDeniedPreflightBeforeRuntimeVerification(id: DesktopPermissionID) async {
+    func hostScreenRequestRunsDespiteDeniedPreflightAndReadsApproval(id: DesktopPermissionID) async {
         var granted = false
         var calls: [String] = []
         var access = DesktopPermissionSystemAccess()
-        access.accessibility = { true }
+        access.accessibility = { Issue.record("Screen approval must not read Accessibility"); return false }
         access.screenRecording = { granted }
         access.requestScreenRecording = { calls.append("host-screen-request"); granted = true; return true }
-        let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(setup: { requested in
-            #expect(requested == id && granted)
-            calls.append("functional-check")
-            return .init(.ready, detail: "Pixels verified", verificationKey: "generation", requiresVerification: true, verified: true)
+        let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(setup: { _ in
+            Issue.record("Screen approval must not run a Cua operation")
+            return nil
         }), access: access, openSettings: { _ in Issue.record("Granted request must not open Settings") })
         let before = await adapter.observe(id)
         #expect(before.state == .notGranted && calls.isEmpty)
         let result = await adapter.setup(id)
-        #expect(result.verified)
-        #expect(calls == ["host-screen-request", "functional-check"])
+        #expect(result.state == .ready && result.verified && !result.requiresVerification)
+        #expect(calls == ["host-screen-request"])
     }
 
     @Test(arguments: [DesktopPermissionID.screenRecording, .directCapture])
@@ -71,20 +41,18 @@ struct DesktopPermissionRequestFlowTests {
     }
 
     @Test(arguments: [DesktopPermissionID.screenRecording, .directCapture])
-    func existingScreenGrantSkipsTheHostRequestAndStillVerifiesCapture(id: DesktopPermissionID) async {
-        let runtime = PermissionRequestRuntime()
-        runtime.screenRecording = true
+    func existingScreenGrantSkipsRequestsAndOperationHooks(id: DesktopPermissionID) async {
         var access = DesktopPermissionSystemAccess()
-        access.accessibility = { true }
+        access.accessibility = { Issue.record("Screen access must not depend on Accessibility"); return false }
         access.screenRecording = { true }
-        access.requestScreenRecording = { Issue.record("Existing screen approval must not be requested again"); return false }
-        let owner = DesktopPermissionChecklist(access: access, cuaRuntime: runtime)
+        access.requestScreenRecording = { Issue.record("Existing approval must not prompt again"); return false }
+        let owner = DesktopPermissionChecklist(access: access, activationNotificationCenter: NotificationCenter())
         let value = await owner.adapter.setup(id)
-        #expect(value.state == .ready && value.verified)
-        #expect(runtime.calls == ["prepare", "capture"])
+        #expect(value.state == .ready && value.verified && !value.requiresVerification)
+        #expect(value.detail.contains("No screenshot was taken"))
     }
 
-    @Test @MainActor func screenGrantRevokedDuringSetupDoesNotClaimAnApprovedRequestNeedsRestart() async {
+    @Test func screenGrantRevokedDuringSetupDoesNotClaimAnApprovedRequestNeedsRestart() async {
         var reads = 0
         var settings: [String] = []
         var access = DesktopPermissionSystemAccess()
@@ -101,24 +69,18 @@ struct DesktopPermissionRequestFlowTests {
 
     @Test(arguments: [false, true])
     func accessibilityApprovalNeedsNoRuntimeOrScreenOperation(screenGranted: Bool) async {
-        let runtime = PermissionRequestRuntime()
-        runtime.accessibility = false
-        runtime.hostAttributionValid = false
-        // No runtime exists. OS approval must still be sufficient for this row.
-        runtime.snapshotFailure = true
         var access = DesktopPermissionSystemAccess()
         access.accessibility = { true }
         access.requestAccessibility = { Issue.record("Existing approval must not prompt again") }
         access.screenRecording = { screenGranted }
         access.requestScreenRecording = { Issue.record("AX must not request screen access"); return false }
-        let owner = DesktopPermissionChecklist(access: access, cuaRuntime: runtime)
+        let owner = DesktopPermissionChecklist(access: access, activationNotificationCenter: NotificationCenter())
         for value in [await owner.adapter.observe(.accessibility),
                       await owner.adapter.setupAutomatically(.accessibility),
                       await owner.adapter.setup(.accessibility)] {
             #expect(value.state == .ready && value.verified && !value.requiresVerification)
             #expect(value.detail.contains("No desktop action was performed"))
         }
-        #expect(runtime.calls.isEmpty && runtime.snapshotReads == 0)
     }
 
     @Test func accessibilitySetupReadsApprovalAfterPromptWithoutCallingOperationHooks() async {
@@ -135,48 +97,18 @@ struct DesktopPermissionRequestFlowTests {
         #expect(requests == 1)
     }
 
-    @Test(arguments: [DesktopPermissionID.screenRecording, .directCapture])
-    func grantedScreenWithoutAccessibilityOpensTheMissingPermissionWithoutStartingRuntime(id: DesktopPermissionID) async {
-        let runtime = PermissionRequestRuntime()
-        runtime.accessibility = false
-        runtime.screenRecording = true
+    @Test(arguments: [DesktopPermissionID.screenRecording, .directCapture], [false, true])
+    func screenGrantIsReadyIndependentlyOfAccessibility(id: DesktopPermissionID, accessibility: Bool) async {
         var access = DesktopPermissionSystemAccess()
-        access.accessibility = { false }
+        access.accessibility = { accessibility }
         access.screenRecording = { true }
         access.requestScreenRecording = { Issue.record("Existing screen approval must not prompt"); return false }
-        let owner = DesktopPermissionChecklist(access: access, cuaRuntime: runtime)
-        var settings: [String] = []
+        let owner = DesktopPermissionChecklist(access: access, activationNotificationCenter: NotificationCenter())
         let adapter = DesktopPermissionChecklistSystemAdapter(hooks: owner.adapter.hooks, access: access,
-                                                              openSettings: { settings.append($0) })
-        let value = await adapter.setup(id)
-        #expect(value.state == .verificationRequired && !value.verified)
-        #expect(value.detail.contains("Set up Accessibility"))
-        #expect(value.detail.contains("Screen Capture is allowed"))
-        #expect(settings == ["com.apple.preference.security?Privacy_Accessibility"])
-        #expect(runtime.calls.isEmpty && runtime.snapshotReads == 0)
-        settings.removeAll()
-        let automatic = await adapter.setupAutomatically(.screenRecording)
-        #expect(automatic == value)
-        #expect(await adapter.observe(id) == value)
-        #expect(settings.isEmpty && runtime.calls.isEmpty && runtime.snapshotReads == 0)
-    }
-
-    @Test func failedPixelsNeverBecomeReadyAfterTheHostGrant() async {
-        let runtime = PermissionRequestRuntime()
-        runtime.screenRecording = true
-        runtime.captureFailure = true
-        var access = DesktopPermissionSystemAccess()
-        access.accessibility = { true }
-        access.screenRecording = { true }
-        access.requestScreenRecording = { Issue.record("Existing screen approval must not prompt"); return false }
-        let owner = DesktopPermissionChecklist(access: access, cuaRuntime: runtime)
-        var settings: [String] = []
-        let adapter = DesktopPermissionChecklistSystemAdapter(hooks: owner.adapter.hooks, access: access,
-                                                              openSettings: { settings.append($0) })
-        let value = await adapter.setup(.screenRecording)
-        #expect(value.state == .failed && !value.verified)
-        #expect(runtime.calls == ["prepare", "capture"])
-        #expect(settings.isEmpty)
+            openSettings: { _ in Issue.record("Screen approval must not open another permission's settings") })
+        for value in [await adapter.observe(id), await adapter.setup(id), await adapter.setupAutomatically(.screenRecording)] {
+            #expect(value.state == .ready && value.verified && !value.requiresVerification)
+        }
     }
 
     @Test func microphoneAuthorizationIsReadBackBeforeFunctionalCheckAndNotReprompted() async {
@@ -226,47 +158,37 @@ private struct PermissionOnlyAdapter: DesktopPermissionChecklistAdapting {
     func setup(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation { await base.setup(permission) }
 }
 
-@Test @MainActor func screenCaptureSetupRecoversAfterAccessibilityApprovalAndInvalidatesAfterRevocation() async {
+@Test @MainActor func screenCaptureReadbackTracksItsOwnGrantAcrossAccessibilityChangesAndReopening() async {
     var accessibility = false
-    var settings: [String] = []
-    var screenRequests = 0
-    let runtime = PermissionRequestRuntime()
-    runtime.screenRecording = true
+    var screenGranted = true
     var access = DesktopPermissionSystemAccess()
     access.accessibility = { accessibility }
-    access.screenRecording = { true }
-    access.requestScreenRecording = { screenRequests += 1; return true }
-    access.requestAccessibility = { Issue.record("Screen setup must not request a second permission") }
-    let owner = DesktopPermissionChecklist(access: access, cuaRuntime: runtime)
-    let adapter = DesktopPermissionChecklistSystemAdapter(hooks: owner.adapter.hooks, access: access,
-                                                          openSettings: { settings.append($0) })
-    let model = DesktopPermissionChecklistCoordinator(adapter: PermissionOnlyAdapter(base: adapter))
-    model.open()
+    access.screenRecording = { screenGranted }
+    access.requestScreenRecording = { Issue.record("Passive checks must not request access"); return false }
+    let owner = DesktopPermissionChecklist(access: access, activationNotificationCenter: NotificationCenter())
+    let model = DesktopPermissionChecklistCoordinator(adapter: PermissionOnlyAdapter(base: owner.adapter))
     defer { model.cancel() }
+    model.open()
     await model.refresh()
-    model.setup(.screenRecording)
-    while model.busyPermission != nil { await Task.yield() }
-    await model.refresh()
-    #expect(model.rows.first { $0.id == .screenRecording }?.observation.detail.contains("Set up Accessibility") == true)
-    #expect(settings == ["com.apple.preference.security?Privacy_Accessibility"])
-    #expect(runtime.calls.isEmpty && runtime.snapshotReads == 0)
-
-    accessibility = true
-    await model.refresh()
-    #expect(model.rows.first { $0.id == .screenRecording }?.observation.detail.contains("Set up Accessibility") == false)
-    #expect(model.rows.first { $0.id == .screenRecording }?.isComplete == false)
+    #expect(model.rows.first { $0.id == .screenRecording }?.isComplete == true)
     model.setup(.screenRecording)
     while model.busyPermission != nil { await Task.yield() }
     await model.refresh()
     #expect(model.rows.first { $0.id == .screenRecording }?.isComplete == true)
-    #expect(runtime.calls == ["prepare", "capture"] && screenRequests == 0)
-    #expect(settings.count == 1)
-
+    accessibility = true
+    await model.refresh()
+    #expect(model.rows.first { $0.id == .screenRecording }?.isComplete == true)
     accessibility = false
     await model.refresh()
-    #expect(model.rows.first { $0.id == .screenRecording }?.isComplete == false)
-    #expect(model.rows.first { $0.id == .screenRecording }?.observation.detail.contains("Set up Accessibility") == true)
-    #expect(settings.count == 1 && screenRequests == 0)
+    #expect(model.rows.first { $0.id == .screenRecording }?.isComplete == true)
+    screenGranted = false
+    await model.refresh()
+    #expect(model.rows.first { $0.id == .screenRecording }?.state == .notGranted)
+    screenGranted = true
+    model.cancel()
+    model.open()
+    await model.refresh()
+    #expect(model.rows.first { $0.id == .screenRecording }?.isComplete == true)
 }
 
 @Test @MainActor func permissionPromptActivationPreservesBusyDirectoryProofButInvalidatesIdleProof() async {
@@ -319,22 +241,26 @@ private struct PermissionOnlyAdapter: DesktopPermissionChecklistAdapting {
     #expect(requested == 1 && settings == 1)
 }
 
-@Test @MainActor func permissionCancelledOptionalCaptureCannotPrepareOrRestartSuccessorRuntime() async {
-    let runtime = PermissionRequestRuntime()
-    runtime.suspendSnapshot = true
+@Test @MainActor func permissionCancelledScreenRequestCannotPublishReady() async {
+    var pending: CheckedContinuation<Void, Never>?
+    var granted = false
     var access = DesktopPermissionSystemAccess()
-    access.accessibility = { true }
-    access.screenRecording = { true }
-    access.requestScreenRecording = { true }
-    let owner = DesktopPermissionChecklist(access: access, cuaRuntime: runtime)
-    let stale = Task { await owner.adapter.setup(.screenRecording) }
-    while runtime.pendingSnapshot == nil { await Task.yield() }
+    access.screenRecording = { granted }
+    access.requestScreenRecording = {
+        await withCheckedContinuation { pending = $0 }
+        granted = true
+        return true
+    }
+    let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(setup: { _ in
+        Issue.record("Cancelled permission request must not invoke an operation")
+        return nil
+    }), access: access, openSettings: { _ in Issue.record("Cancelled request must not open Settings") })
+    let stale = Task { await adapter.setup(.screenRecording) }
+    while pending == nil { await Task.yield() }
     stale.cancel()
-    runtime.pendingSnapshot?.resume()
-    runtime.pendingSnapshot = nil
+    pending?.resume()
     let result = await stale.value
     #expect(result.state == .checking && !result.verified)
-    #expect(runtime.calls.isEmpty)
 }
 
 @MainActor

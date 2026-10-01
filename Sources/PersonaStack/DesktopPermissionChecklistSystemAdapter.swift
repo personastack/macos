@@ -70,7 +70,7 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         case .accessibility:
             return accessibilityObservation()
         case .screenRecording, .directCapture:
-            return grant(access.screenRecording(), permission: permission)
+            return screenCaptureObservation(permission)
         case .microphone:
             return microphoneObservation()
         case .notifications:
@@ -93,8 +93,7 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
             case .accessibility:
                 return accessibilityObservation()
             case .screenRecording:
-                guard access.screenRecording() else { return Self.privacyDenialObservation(permission) }
-                if let prerequisite = screenCaptureAccessibilityObservation() { return prerequisite }
+                return screenCaptureObservation(permission)
             case .microphone:
                 guard access.microphone() == .authorized else { return microphoneObservation() }
             default: break
@@ -128,11 +127,7 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
                 openPrivacy("ScreenCapture")
                 return Self.privacyDenialObservation(permission)
             }
-            if let prerequisite = screenCaptureAccessibilityObservation() {
-                openPrivacy("Accessibility")
-                return prerequisite
-            }
-            if !capturable { openPrivacy("ScreenCapture") }
+            return screenCaptureObservation(permission)
         case .microphone:
             if access.microphone() == .notDetermined {
                 _ = await access.requestMicrophone()
@@ -174,11 +169,13 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         return await observe(permission)
     }
 
-    func screenCaptureAccessibilityObservation() -> DesktopPermissionObservation? {
-        guard !access.accessibility() else { return nil }
-        return .init(.verificationRequired,
-                     detail: "Screen Capture is allowed. Set up Accessibility in Privacy & Security → Accessibility, then retry Setup Screen Capture to verify desktop capture.",
-                     verificationKey: "\(Bundle.main.bundleIdentifier ?? "unpackaged"):screen-capture:accessibility-missing")
+    /// Permission approval is independent of input trust and Cua readiness.
+    /// Runtime command admission still verifies the owned capture service.
+    func screenCaptureObservation(_ permission: DesktopPermissionID) -> DesktopPermissionObservation {
+        guard access.screenRecording() else { return Self.privacyDenialObservation(permission) }
+        return .init(.ready, detail: "macOS allows PersonaStack Screen Capture access. No screenshot was taken.",
+                     verificationKey: "\(Bundle.main.bundleIdentifier ?? "unpackaged"):\(permission.rawValue):allowed",
+                     verified: true)
     }
 
     /// Read OS trust and content-free AX access without exercising input.
@@ -188,14 +185,6 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         return .init(.ready, detail: "macOS allows PersonaStack Accessibility access. No desktop action was performed.",
                      verificationKey: "\(Bundle.main.bundleIdentifier ?? "unpackaged"):accessibility:allowed",
                      verified: true)
-    }
-
-    private func grant(_ allowed: Bool, permission: DesktopPermissionID) -> DesktopPermissionObservation {
-        .init(allowed ? .ready : .notGranted,
-              detail: allowed ? "macOS permits PersonaStack. Use Setup \(permission.title) to verify the operation."
-                              : Self.privacyDenialObservation(permission).detail,
-              verificationKey: "\(Bundle.main.bundleIdentifier ?? "unpackaged"):\(permission.rawValue):\(allowed)",
-              requiresVerification: true)
     }
 
     private func microphoneObservation() -> DesktopPermissionObservation {
