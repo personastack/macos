@@ -4,7 +4,8 @@ import PersonaStackCore
 
 @MainActor
 protocol DesktopPermissionChecklistAdapting {
-    /// Never prompts, captures, exercises input, or touches protected files.
+    /// Reads current grants and refreshes explicitly authorized disk/network checks.
+    /// Never records audio, captures, exercises input, or starts an initial privacy check.
     func observe(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation
     /// Called only by an explicit native Setup or Retry button.
     func setup(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation
@@ -31,6 +32,7 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     private let adapter: any DesktopPermissionChecklistAdapting
     private var generation = UUID()
     private var refreshTask: Task<Void, Never>?
+    private var observationTask: Task<DesktopPermissionObservation, Never>?
     private var setupTask: Task<Void, Never>?
     private var automaticSetupTask: Task<Void, Never>?
     private var automaticSetupStarted = false
@@ -133,8 +135,14 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
             // A check cannot race a deliberate functional verification.
             guard busyPermission != id, automaticBusyPermission != id else { continue }
             let revision = rowRevisions[id]
-            let observation = await adapter.observe(id)
-            guard generation == expected, isVisible, busyPermission != id, automaticBusyPermission != id,
+            let task = Task { await adapter.observe(id) }
+            observationTask = task
+            let observation = await withTaskCancellationHandler {
+                await task.value
+            } onCancel: { task.cancel() }
+            if generation == expected { observationTask = nil }
+            guard generation == expected, isVisible, !isFinishing, !task.isCancelled,
+                  busyPermission != id, automaticBusyPermission != id,
                   rowRevisions[id] == revision else { continue }
             apply(observation, id: id, explicit: false)
         }
@@ -164,6 +172,8 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     func finish() {
         guard canFinish else { return }
         isFinishing = true
+        observationTask?.cancel()
+        observationTask = nil
         setupTask?.cancel()
         setupTask = nil
         busyPermission = nil
@@ -187,6 +197,8 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     func cancel() {
         generation = UUID()
         refreshTask?.cancel()
+        observationTask?.cancel()
+        observationTask = nil
         setupTask?.cancel()
         automaticSetupTask?.cancel()
         refreshTask = nil

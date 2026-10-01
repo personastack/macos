@@ -34,6 +34,12 @@ final class DesktopPermissionChecklist {
     private let protectedAccessAction: (@MainActor () async -> DesktopProtectedAccessSetupAction)?
     private let verifyProtectedAccess: @MainActor () async throws -> Void
     private let verifyPowerAvailability: () -> Bool
+    private let voiceContext: @MainActor () -> DesktopVoicePermissionContext?
+    private let requestEndpoint: @MainActor (URLRequest) async throws -> HTTPURLResponse
+    private var authorizedRefreshKeys: [DesktopPermissionID: String] = [:]
+    private var refreshNeeded: Set<DesktopPermissionID> = []
+    private var observedOwnerKey: String?
+    private var connectionAttempts: [DesktopPermissionID: UUID] = [:]
     private var resourceVerificationGeneration = UUID()
     private var resourceVerificationGenerations: [DesktopPermissionID: UUID] = [:]
     private let cuaRuntime: any DesktopPermissionCuaRuntime
@@ -69,17 +75,26 @@ final class DesktopPermissionChecklist {
     private var verificationGeneration = UUID()
     private var inputTest: (any DesktopInputPermissionTarget)?
 
+    /// Closing a presentation cancels operations, not completed capability proof.
     func cancelVerification() {
         verificationGeneration = UUID()
-        resourceVerificationGeneration = UUID()
-        resourceVerificationGenerations.removeAll()
-        explicitObservations.removeAll()
-        invalidateProtectedAccessVerification()
-        window.coordinator.invalidateVerification(.microphone)
-        invalidateVolumeVerification()
+        for id in [DesktopPermissionID.desktopFiles, .documentsFiles, .downloadsFiles] {
+            resourceVerificationGenerations[id] = UUID()
+            explicitObservations.removeValue(forKey: id)
+            window.coordinator.invalidateVerification(id)
+        }
+        connectionAttempts.removeAll()
+        protectedAccessAttempt = nil
+        window.cancelPermissionSelection()
         inputTest?.invalidate()
         inputTest = nil
         voiceVerifier.invalidate()
+        invalidateVolumeVerification()
+    }
+
+    private func preparePresentation() {
+        cancelVerification()
+        refreshNeeded.formUnion(authorizedRefreshKeys.keys)
     }
 
     init(access: DesktopPermissionSystemAccess = .init(),
@@ -97,7 +112,17 @@ final class DesktopPermissionChecklist {
          protectedAccessAction: (@MainActor () async -> DesktopProtectedAccessSetupAction)? = nil,
          verifyProtectedAccess: (@MainActor () async throws -> Void)? = nil,
          verifyPowerAvailability: @escaping () -> Bool = { DesktopControlPowerAssertion.verifyAvailability() },
-         activationNotificationCenter: NotificationCenter = .default) {
+         activationNotificationCenter: NotificationCenter = .default,
+         voiceContext: @escaping @MainActor () -> DesktopVoicePermissionContext? = DesktopVoicePermissionContext.current,
+         requestEndpoint: (@MainActor (URLRequest) async throws -> HTTPURLResponse)? = nil) {
+        self.voiceContext = voiceContext
+        self.requestEndpoint = requestEndpoint ?? { request in
+            let session = DesktopControlNetworkSession.makeWithoutRedirects()
+            defer { session.invalidateAndCancel() }
+            let (_, response) = try await session.data(for: request)
+            guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+            return response
+        }
         self.cuaRuntime = cuaRuntime ?? DesktopControlRuntime.shared
         self.inputTarget = inputTarget
         self.directoryURL = directoryURL
@@ -118,8 +143,9 @@ final class DesktopPermissionChecklist {
         let adapter = DesktopPermissionChecklistSystemAdapter(access: access)
         self.adapter = adapter
         window = DesktopPermissionChecklistWindow(coordinator: DesktopPermissionChecklistCoordinator(adapter: adapter))
-        window.onPresent = { [weak self] in self?.cancelVerification() }
+        window.onPresent = { [weak self] in self?.preparePresentation() }
         window.onCancel = { [weak self] in self?.cancelVerification() }
+        window.onStopVerification = { [weak self] in self?.cancelVerification() }
         adapter.hooks = .init(
             observe: { [weak self] in await self?.observe($0) },
             setup: { [weak self] in await self?.setup($0) }
@@ -142,12 +168,14 @@ final class DesktopPermissionChecklist {
 
     func invalidateAfterActivation() {
         let busy = window.coordinator.busyPermission
-        if busy != .fullDiskAccess { invalidateProtectedAccessVerification() }
+        for id in [DesktopPermissionID.fullDiskAccess, .localNetwork, .messagingConnection] where id != busy {
+            let running = id == .fullDiskAccess ? protectedAccessAttempt != nil : connectionAttempts[id] != nil
+            if !running, authorizedRefreshKeys[id] != nil { refreshNeeded.insert(id) }
+        }
         if busy != .removableVolumes && busy != .networkVolumes { invalidateVolumeVerification() }
         // A TCC prompt returns focus before its own functional operation finishes.
         // Let that operation prove its result. Invalidate other cached resources.
-        for id in [DesktopPermissionID.desktopFiles, .documentsFiles, .downloadsFiles,
-                   .localNetwork, .messagingConnection] where id != busy {
+        for id in [DesktopPermissionID.desktopFiles, .documentsFiles, .downloadsFiles] where id != busy {
             resourceVerificationGenerations[id] = UUID()
             explicitObservations.removeValue(forKey: id)
             window.coordinator.invalidateVerification(id)
@@ -162,20 +190,28 @@ final class DesktopPermissionChecklist {
         }
     }
 
-    private func invalidateProtectedAccessVerification() {
-        protectedAccessGeneration = UUID()
-        protectedAccessAttempt = nil
-        explicitObservations.removeValue(forKey: .fullDiskAccess)
-        window.cancelPermissionSelection(permission: .fullDiskAccess)
-        window.coordinator.invalidateVerification(.fullDiskAccess)
-    }
-
     private var profile: DesktopEnvironmentConfiguration? { selectedProfile() }
     private var ownerKey: String {
         "\(Bundle.main.bundleIdentifier ?? "unpackaged"):\(profile?.preferenceIdentity ?? "unconfigured"):\(ProcessInfo.processInfo.operatingSystemVersionString)"
     }
 
+    private func synchronizeOwner() {
+        let current = ownerKey
+        guard observedOwnerKey != current else { return }
+        if observedOwnerKey != nil {
+            cancelVerification()
+            explicitObservations.removeAll()
+            authorizedRefreshKeys.removeAll()
+            refreshNeeded.removeAll()
+            protectedAccessGeneration = UUID()
+            resourceVerificationGeneration = UUID()
+            resourceVerificationGenerations.removeAll()
+        }
+        observedOwnerKey = current
+    }
+
     private func observe(_ id: DesktopPermissionID) async -> DesktopPermissionObservation? {
+        synchronizeOwner()
         switch id {
         case .accessibility, .screenRecording, .directCapture:
             return await observeCua(id)
@@ -185,22 +221,19 @@ final class DesktopPermissionChecklist {
             return .init(.ready, detail: "PersonaStack keeps its menu bar and existing relay alive when ordinary windows close.")
         case .messagingConnection:
             guard profile != nil else { return .init(.notGranted, detail: "Choose trusted App, Gateway, and MCP URLs in Server Settings.") }
-            return evidence(id, detail: "Use Setup Messaging Connection to check the selected app endpoint. Enrollment is verified after Finish.")
+            return await observeConnection(id, detail: "Use Setup Messaging Connection to check the selected app endpoint. Enrollment is verified after Finish.")
         case .localNetwork:
             guard let profile else { return .init(.notGranted, detail: "Configure the selected server environment first.") }
             if #available(macOS 15, *) {
                 if profile == .production { return .init(.notNeeded, detail: "The selected PersonaStack cloud services do not require LAN access.") }
-                return evidence(id, detail: "Use Setup Local Network to connect to the configured services. macOS requests LAN approval when needed.")
+                return await observeConnection(id, detail: "Use Setup Local Network to connect to the configured services. macOS requests LAN approval when needed.")
             }
             return .init(.notNeeded, detail: "This macOS version has no Local Network privacy approval.")
         case .desktopFiles, .documentsFiles, .downloadsFiles:
             return evidence(id, detail: "Use Setup \(id.title) to verify listing and read/write access with a disposable file. No existing file content is read.")
         case .removableVolumes, .networkVolumes: return volumeCheck.observe(id)
         case .fullDiskAccess:
-            let key = "\(ownerKey):\(protectedAccessGeneration)"
-            if let result = explicitObservations[id], result.verificationKey == key { return result }
-            explicitObservations.removeValue(forKey: id)
-            return DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(id)
+            return await observeProtectedAccess()
         case .awakeDuringRemoteWork:
             return evidence(id, detail: "Use Setup Awake During Remote Work to verify idle sleep prevention. PersonaStack holds it only during a remote task.")
         default: return nil
@@ -239,17 +272,29 @@ final class DesktopPermissionChecklist {
     }
 
     private func observeMicrophone() -> DesktopPermissionObservation? {
-        guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else { return nil }
-        guard let input = AVCaptureDevice.default(for: .audio) else {
+        guard adapter.access.microphone() == .authorized else {
+            explicitObservations.removeValue(forKey: .microphone)
+            return nil
+        }
+        guard adapter.access.hasMicrophone(), let inputID = adapter.access.microphoneIdentity() else {
+            explicitObservations.removeValue(forKey: .microphone)
             return .init(.failed, detail: "No microphone is available. Connect an audio input and retry.")
         }
         guard let appURL = profile?.appURL,
               DesktopMediaPermissionPolicy.isSecureContext(scheme: appURL.scheme ?? "", host: appURL.host ?? "") else {
+            explicitObservations.removeValue(forKey: .microphone)
             return .init(.unsupported, detail: "Voice recording needs an HTTPS app URL or a loopback development URL. Review Server Settings.")
         }
+        guard let context = voiceContext(),
+              (try? DesktopControlEnvironment.origin(context.url)) == (try? DesktopControlEnvironment.origin(appURL)) else {
+            explicitObservations.removeValue(forKey: .microphone)
+            return .init(.verificationRequired, detail: "Open the selected PersonaStack app before testing voice input.")
+        }
+        let key = "\(ownerKey):microphone:\(inputID):\(context.identity)"
+        if let value = explicitObservations[.microphone], value.verificationKey == key { return value }
+        explicitObservations.removeValue(forKey: .microphone)
         return .init(.ready, detail: "Microphone access is allowed. Use Setup Microphone to test WebKit recording.",
-                     verificationKey: "\(ownerKey):microphone:\(input.uniqueID):\(MainWebViewHost.shared.coordinator.documentGeneration.uuidString)",
-                     requiresVerification: true)
+                     verificationKey: key, requiresVerification: true)
     }
 
     private func observeUpdates() -> DesktopPermissionObservation {
@@ -265,6 +310,7 @@ final class DesktopPermissionChecklist {
     }
 
     private func setup(_ id: DesktopPermissionID) async -> DesktopPermissionObservation? {
+        synchronizeOwner()
         switch id {
         case .accessibility, .screenRecording, .directCapture: return await setupCua(id)
         case .microphone: return await setupMicrophone()
@@ -348,34 +394,27 @@ final class DesktopPermissionChecklist {
     }
 
     private func setupMicrophone() async -> DesktopPermissionObservation {
-        guard let observed = observeMicrophone(), observed.state == .ready else {
-            if let observation = observeMicrophone() { return observation }
-            return await adapter.observe(.microphone)
-        }
-        let host = MainWebViewHost.shared
-        let view = host.webView
-        guard let url = view.url, let expected = profile?.appURL,
-              (try? DesktopControlEnvironment.origin(url)) == (try? DesktopControlEnvironment.origin(expected)) else {
-            return .init(.failed, detail: "Open the selected PersonaStack app before testing voice input.")
-        }
+        // A failed retry must never fall back to an earlier successful recording.
+        explicitObservations.removeValue(forKey: .microphone)
+        guard let observed = observeMicrophone(), observed.state == .ready,
+              let context = voiceContext() else { return await adapter.observe(.microphone) }
         let generation = verificationGeneration
-        let document = host.coordinator.documentGeneration
         do {
-            let result = try await voiceVerifier.verify(page: DesktopVoicePermissionWebPage(view: view)) { [weak self, weak host, weak view] in
-                guard let self, let host, let view else { return false }
-                return MainWebViewHost.shared === host && host.webView === view && view.url == url &&
-                    !host.coordinator.isRetired && host.coordinator.documentGeneration == document &&
-                    self.verificationGeneration == generation && self.observeMicrophone()?.verificationKey == observed.verificationKey
+            let result = try await voiceVerifier.verify(page: context.page) { [weak self] in
+                guard let self else { return false }
+                return self.verificationGeneration == generation &&
+                    self.observeMicrophone()?.verificationKey == observed.verificationKey
             }
             try Task.checkCancellation()
-            guard result else {
-                return .init(.failed, detail: "Voice recording could not be verified. Reload the selected PersonaStack page, check the microphone, and retry.")
-            }
-            return .init(.ready, detail: "PersonaStack verified WebKit microphone recording. The test audio was discarded.",
-                         verificationKey: observed.verificationKey, requiresVerification: true, verified: true)
+            guard result else { throw DesktopVoicePermissionError.recordingFailed }
+            let value = DesktopPermissionObservation(.ready,
+                detail: "PersonaStack verified WebKit microphone recording. The test audio was discarded.",
+                verificationKey: observed.verificationKey, requiresVerification: true, verified: true)
+            explicitObservations[.microphone] = value
+            return value
         } catch is CancellationError { return .init(.checking, detail: "Setup cancelled.") }
         catch let error as DesktopVoicePermissionError { return error.observation }
-        catch { return .init(.failed, detail: "Voice recording could not be verified. Reload the selected PersonaStack page, check the microphone, and retry.") }
+        catch { return DesktopVoicePermissionError.recordingFailed.observation }
     }
 
     private func setupDirectory(_ id: DesktopPermissionID) async -> DesktopPermissionObservation {
@@ -411,18 +450,44 @@ final class DesktopPermissionChecklist {
         let attempt = UUID()
         let key = "\(ownerKey):\(protectedAccessGeneration)"
         protectedAccessAttempt = attempt
-        explicitObservations.removeValue(forKey: .fullDiskAccess)
         defer { if protectedAccessAttempt == attempt { protectedAccessAttempt = nil } }
         let action: DesktopProtectedAccessSetupAction
         if let protectedAccessAction { action = await protectedAccessAction() }
         else { action = await window.protectedAccessSetupAction() }
         guard protectedAccessIsCurrent(attempt, key: key) else { return protectedAccessChanged() }
         switch action {
-        case .cancel: return .init(.checking, detail: "Protected-access check cancelled. Full Disk Access remains unverified.")
+        case .cancel:
+            return explicitObservations[.fullDiskAccess] ?? .init(.checking, detail: "Protected-access check cancelled.")
         case .settings:
+            authorizedRefreshKeys.removeValue(forKey: .fullDiskAccess)
             return protectedAccessResult(.notGranted, detail: "Enable PersonaStack in Full Disk Access settings. If it is missing, click + and select PersonaStack.app from Applications. Return here and choose Setup Full Disk Access, then Check Access. Quit and reopen PersonaStack if macOS requests it.", attempt: attempt, key: key)
         case .check: break
         }
+        refreshNeeded.remove(.fullDiskAccess)
+        return await checkProtectedAccess(attempt: attempt, key: key)
+    }
+
+    private func observeProtectedAccess() async -> DesktopPermissionObservation {
+        let key = "\(ownerKey):\(protectedAccessGeneration)"
+        if authorizedRefreshKeys[.fullDiskAccess] != key {
+            authorizedRefreshKeys.removeValue(forKey: .fullDiskAccess)
+        }
+        if explicitObservations[.fullDiskAccess]?.verificationKey != key {
+            explicitObservations.removeValue(forKey: .fullDiskAccess)
+        }
+        if refreshNeeded.contains(.fullDiskAccess), authorizedRefreshKeys[.fullDiskAccess] == key,
+           protectedAccessAttempt == nil {
+            refreshNeeded.remove(.fullDiskAccess)
+            let attempt = UUID()
+            protectedAccessAttempt = attempt
+            defer { if protectedAccessAttempt == attempt { protectedAccessAttempt = nil } }
+            return await checkProtectedAccess(attempt: attempt, key: key)
+        }
+        return explicitObservations[.fullDiskAccess] ?? DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(.fullDiskAccess)
+    }
+
+    private func checkProtectedAccess(attempt: UUID, key: String) async -> DesktopPermissionObservation {
+        explicitObservations.removeValue(forKey: .fullDiskAccess)
         do {
             try await verifyProtectedAccess()
             return protectedAccessResult(.ready, detail: "Protected-folder access verified for PersonaStack. The Mail or Messages folder listing succeeded. No file contents were read or changed. Other folders can still have separate access restrictions.", attempt: attempt, key: key)
@@ -451,6 +516,7 @@ final class DesktopPermissionChecklist {
         guard protectedAccessIsCurrent(attempt, key: key) else { return protectedAccessChanged() }
         let result = DesktopPermissionObservation(state, detail: detail, verificationKey: key,
                                                  requiresVerification: state == .ready, verified: state == .ready)
+        authorizedRefreshKeys[.fullDiskAccess] = state == .ready ? key : nil
         explicitObservations[.fullDiskAccess] = result
         return result
     }
@@ -466,25 +532,60 @@ final class DesktopPermissionChecklist {
         return result
     }
 
-    private func setupConnection(_ id: DesktopPermissionID) async -> DesktopPermissionObservation {
-        guard let profile else { return .init(.notGranted, detail: "Configure the selected server environment first.") }
+    private func observeConnection(_ id: DesktopPermissionID, detail: String) async -> DesktopPermissionObservation {
         let key = evidenceKey(id)
+        if authorizedRefreshKeys[id] != key { authorizedRefreshKeys.removeValue(forKey: id) }
+        if explicitObservations[id]?.verificationKey != key { explicitObservations.removeValue(forKey: id) }
+        if refreshNeeded.contains(id), authorizedRefreshKeys[id] == key, connectionAttempts[id] == nil {
+            return await setupConnection(id)
+        }
+        return evidence(id, detail: detail)
+    }
+
+    private static func responseMatchesEndpoint(_ responseURL: URL?, _ endpoint: URL) -> Bool {
+        guard let responseURL, responseURL.user == nil, responseURL.password == nil,
+              responseURL.query == nil, responseURL.fragment == nil,
+              (try? DesktopControlEnvironment.origin(responseURL)) == (try? DesktopControlEnvironment.origin(endpoint)) else { return false }
+        // URLSession may canonicalize an empty root path to a slash.
+        return (responseURL.path.isEmpty ? "/" : responseURL.path) == (endpoint.path.isEmpty ? "/" : endpoint.path)
+    }
+
+    private func setupConnection(_ id: DesktopPermissionID) async -> DesktopPermissionObservation {
+        guard !Task.isCancelled, let profile else { return .init(.notGranted, detail: "Configure the selected server environment first.") }
+        if id == .localNetwork {
+            if profile == .production { return .init(.notNeeded, detail: "The selected PersonaStack cloud services do not require LAN access.") }
+            if #unavailable(macOS 15) { return .init(.notNeeded, detail: "This macOS version has no Local Network privacy approval.") }
+        }
+        let key = evidenceKey(id)
+        let attempt = UUID()
+        let generation = verificationGeneration
+        connectionAttempts[id] = attempt
+        refreshNeeded.remove(id)
+        explicitObservations.removeValue(forKey: id)
+        defer { if connectionAttempts[id] == attempt { connectionAttempts.removeValue(forKey: id) } }
         let endpoints = id == .localNetwork ? [profile.appURL, profile.gatewayURL, profile.mcpURL] : [profile.appURL]
+        let value: DesktopPermissionObservation
         do {
             for endpoint in endpoints {
                 try Task.checkCancellation()
+                guard generation == verificationGeneration, key == evidenceKey(id), connectionAttempts[id] == attempt else { throw CancellationError() }
                 var request = URLRequest(url: endpoint)
                 request.httpMethod = "HEAD"
                 request.timeoutInterval = 4
-                let (_, response) = try await URLSession.shared.data(for: request)
-                guard response is HTTPURLResponse else { throw URLError(.badServerResponse) }
+                request.cachePolicy = .reloadIgnoringLocalCacheData
+                let response = try await requestEndpoint(request)
+                guard Self.responseMatchesEndpoint(response.url, endpoint) else { throw URLError(.badServerResponse) }
             }
-            try Task.checkCancellation()
-            guard key == evidenceKey(id) else { return .init(.checking, detail: "The selected server environment changed. Retry setup.") }
-            let value = DesktopPermissionObservation(.ready, detail: "The configured service endpoints responded. Account and relay authorization are verified by the existing setup flow.",
-                                                     verificationKey: key, requiresVerification: true, verified: true)
-            explicitObservations[id] = value
-            return value
-        } catch { return .init(.failed, detail: "The selected service could not be reached. Check network approval, DNS, service availability, and certificate settings. Retry after recovery.") }
+            value = .init(.ready, detail: "The configured service endpoints responded. Account and relay authorization are verified by the existing setup flow.",
+                          verificationKey: key, requiresVerification: true, verified: true)
+        } catch {
+            value = .init(.failed, detail: "The selected service could not be reached directly. Check network approval, DNS, service availability, and certificate settings. Retry after recovery.", verificationKey: key)
+        }
+        guard !Task.isCancelled, generation == verificationGeneration, key == evidenceKey(id), connectionAttempts[id] == attempt else {
+            return .init(.checking, detail: "Setup changed or was cancelled. Retry the connection check.")
+        }
+        authorizedRefreshKeys[id] = value.state == .ready ? key : nil
+        explicitObservations[id] = value
+        return value
     }
 }

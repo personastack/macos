@@ -33,6 +33,7 @@ struct DesktopPermissionSystemAccess {
     }
     var microphone: () -> AVAuthorizationStatus = { AVCaptureDevice.authorizationStatus(for: .audio) }
     var requestMicrophone: () async -> Bool = { await AVCaptureDevice.requestAccess(for: .audio) }
+    var microphoneIdentity: () -> String? = { AVCaptureDevice.default(for: .audio)?.uniqueID }
     var hasMicrophone: () -> Bool = { AVCaptureDevice.default(for: .audio) != nil }
     var notificationSettings: () async -> (authorization: UNAuthorizationStatus, alerts: UNNotificationSetting, sounds: UNNotificationSetting) = {
         let settings = await UNUserNotificationCenter.current().notificationSettings()

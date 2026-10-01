@@ -8,6 +8,21 @@ protocol DesktopVoicePermissionPage: AnyObject {
     func cancel(id: String)
 }
 
+/// The current main document is part of functional microphone proof.
+@MainActor
+struct DesktopVoicePermissionContext {
+    let identity: String
+    let url: URL
+    let page: any DesktopVoicePermissionPage
+
+    static func current() -> DesktopVoicePermissionContext? {
+        let host = MainWebViewHost.shared
+        guard !host.coordinator.isRetired, let url = host.webView.url else { return nil }
+        return .init(identity: "\(ObjectIdentifier(host)):\(ObjectIdentifier(host.webView)):\(host.coordinator.documentGeneration):\(url.absoluteString)",
+                     url: url, page: DesktopVoicePermissionWebPage(view: host.webView))
+    }
+}
+
 @MainActor
 final class DesktopVoicePermissionWebPage: DesktopVoicePermissionPage {
     typealias Evaluate = (String, [String: Any], @escaping (Result<Any, Error>) -> Void) -> Void

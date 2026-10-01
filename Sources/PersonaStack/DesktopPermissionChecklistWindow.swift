@@ -11,6 +11,7 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     private var activationObserver: NSObjectProtocol?
     private var permissionSelection: (id: UUID, permission: DesktopPermissionID, window: NSWindow)?
     var onCancel: (() -> Void)?
+    var onStopVerification: (() -> Void)?
     var onPresent: (() -> Void)?
 
     init(coordinator: DesktopPermissionChecklistCoordinator) {
@@ -35,6 +36,7 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
 
     func completeSetup() {
         coordinator.cancel()
+        onStopVerification?()
         window?.orderOut(nil)
     }
 
@@ -42,7 +44,7 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
 
     func finish() {
         guard coordinator.canFinish else { return }
-        if coordinator.isAwaitingFinish { coordinator.finish() }
+        if coordinator.isAwaitingFinish { coordinator.finish(); onStopVerification?() }
         else { completeSetup() }
     }
 
@@ -82,7 +84,7 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     func protectedAccessSetupAction() async -> DesktopProtectedAccessSetupAction {
         let alert = NSAlert()
         alert.messageText = "Setup Full Disk Access"
-        alert.informativeText = "If PersonaStack is already enabled in System Settings → Privacy & Security → Full Disk Access, choose Check Access. Otherwise, open Settings, add PersonaStack.app from Applications with + and enable it. Return here to check access. Quit and reopen PersonaStack if macOS requests it. Check Access attempts one directory read in Library/Mail, or Library/Messages if Mail is absent. Entry names are discarded. No file contents are read or changed. A successful check marks this row Ready. Other folders can still have separate access restrictions."
+        alert.informativeText = "If PersonaStack is already enabled in System Settings → Privacy & Security → Full Disk Access, choose Check Access. Otherwise, open Settings, add PersonaStack.app from Applications with + and enable it. Return here to check access. Quit and reopen PersonaStack if macOS requests it. Check Access authorizes a directory read in Library/Mail, or Library/Messages if Mail is absent. This check repeats when you reopen this window or return to PersonaStack while setup is open. Entry names are discarded. No file contents are read or changed. A successful check marks this row Ready. Other folders can still have separate access restrictions."
         alert.icon = NSImage(named: NSImage.applicationIconName)
         alert.addButton(withTitle: "Check Access")
         alert.addButton(withTitle: "Open Settings")
@@ -163,6 +165,8 @@ private struct DesktopPermissionChecklistView: View {
             }
             Text("Verify Accessibility (Required), then finish setup. Screen Capture adds screenshot-based control. Microphone and file access are optional. Desktop Control works while this Mac is unlocked.")
                 .foregroundStyle(.secondary)
+            Text("Successful disk and network checks repeat when you reopen setup or return to this window. Microphone recording runs only when you choose Setup Microphone.")
+                .font(.caption).foregroundStyle(.secondary)
             Text("After an update, macOS may need you to approve access again. If a permission is already enabled in System Settings, follow its recovery steps below, then retry Setup.")
                 .font(.caption).foregroundStyle(.secondary)
             ScrollView {

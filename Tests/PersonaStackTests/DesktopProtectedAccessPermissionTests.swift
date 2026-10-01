@@ -239,7 +239,7 @@ struct DesktopProtectedAccessPermissionTests {
         #expect(await adapter.observe(.fullDiskAccess).state == .verificationRequired)
     }
 
-    @Test @MainActor func protectedAccessEnvironmentChangeAndActivationFenceLateProbe() async {
+    @Test @MainActor func protectedAccessEnvironmentChangeFencesLateProbeButOwnActivationDoesNot() async {
         for activate in [false, true] {
             var profile = DesktopEnvironmentConfiguration.production
             let notifications = NotificationCenter()
@@ -254,8 +254,8 @@ struct DesktopProtectedAccessPermissionTests {
             if activate { notifications.post(name: NSApplication.didBecomeActiveNotification, object: nil) }
             else { profile = .lan }
             pending?.resume()
-            #expect(await check.value.state == .checking)
-            #expect(await adapter.observe(.fullDiskAccess).state == .verificationRequired)
+            #expect(await check.value.state == (activate ? .ready : .checking))
+            #expect(await adapter.observe(.fullDiskAccess).state == (activate ? .ready : .verificationRequired))
             #expect(settings.isEmpty)
         }
     }
@@ -295,7 +295,7 @@ struct DesktopProtectedAccessPermissionTests {
         #expect(await service.adapter.observe(.fullDiskAccess).state == .verificationRequired)
     }
 
-    @Test @MainActor func protectedAccessCachedOperationEvidenceExpiresOnActivationOrEnvironmentChange() async {
+    @Test @MainActor func protectedAccessCachedOperationEvidenceRefreshesOnActivationAndExpiresOnEnvironmentChange() async {
         let notifications = NotificationCenter()
         var profile = DesktopEnvironmentConfiguration.production
         let service = DesktopPermissionChecklist(selectedProfile: { profile }, protectedAccessAction: { .check },
@@ -303,7 +303,7 @@ struct DesktopProtectedAccessPermissionTests {
         let first = await service.adapter.setup(.fullDiskAccess)
         #expect(await service.adapter.observe(.fullDiskAccess) == first)
         notifications.post(name: NSApplication.didBecomeActiveNotification, object: nil)
-        #expect(await service.adapter.observe(.fullDiskAccess).verificationKey == nil)
+        #expect(await service.adapter.observe(.fullDiskAccess).state == .ready)
         _ = await service.adapter.setup(.fullDiskAccess)
         profile = .lan
         #expect(await service.adapter.observe(.fullDiskAccess).verificationKey == nil)
@@ -333,7 +333,7 @@ struct DesktopProtectedAccessPermissionTests {
         #expect(probes == 0 && protectedAccessRow(model)?.isComplete == false)
         service.invalidateAfterActivation()
         await model.refresh()
-        #expect(protectedAccessRow(model)?.state == .verificationRequired)
+        #expect(protectedAccessRow(model)?.state == .notGranted)
         #expect(protectedAccessRow(model)?.observation.detail.contains("Check Access") == true)
         #expect(probes == 0)
         action = .check
@@ -365,19 +365,20 @@ struct DesktopProtectedAccessPermissionTests {
         denied = true
         service.invalidateAfterActivation()
         await model.refresh()
-        #expect(protectedAccessRow(model)?.isComplete == false && probes == 1)
+        #expect(protectedAccessRow(model)?.state == .denied && probes == 2)
+        #expect(settings.isEmpty)
         model.setup(.fullDiskAccess)
         while model.busyPermission != nil { await Task.yield() }
         #expect(protectedAccessRow(model)?.state == .denied)
         #expect(protectedAccessRow(model)?.observation.verified == false)
-        #expect(protectedAccessRow(model)?.observation.verificationKey != verified)
+        #expect(protectedAccessRow(model)?.observation.verificationKey == verified)
         #expect(protectedAccessRow(model)?.observation.detail.contains("quit and reopen") == true)
-        #expect(probes == 2 && settings.count == 1)
+        #expect(probes == 3 && settings.count == 1)
         await model.refresh()
         #expect(protectedAccessRow(model)?.state == .denied)
     }
 
-    @Test @MainActor func protectedAccessReopenExpiresReadyAndCancelNeverRestoresIt() async {
+    @Test @MainActor func protectedAccessReopenRefreshesReadyAndConsentCancelPreservesIt() async {
         var action = DesktopProtectedAccessSetupAction.check
         var probes = 0
         let service = DesktopPermissionChecklist(selectedProfile: { .production }, protectedAccessAction: { action },
@@ -390,13 +391,14 @@ struct DesktopProtectedAccessPermissionTests {
         #expect(protectedAccessRow(model)?.isComplete == true)
         model.cancel()
         service.cancelVerification()
+        service.window.onPresent?()
         model.open()
         await model.refresh()
-        #expect(protectedAccessRow(model)?.state == .verificationRequired)
+        #expect(protectedAccessRow(model)?.state == .ready && probes == 2)
         action = .cancel
         model.setup(.fullDiskAccess)
         while model.busyPermission != nil { await Task.yield() }
-        #expect(protectedAccessRow(model)?.isComplete == false && probes == 1)
+        #expect(protectedAccessRow(model)?.isComplete == true && probes == 2)
     }
 }
 
