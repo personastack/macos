@@ -63,13 +63,34 @@ private final class KeychainSecurityFixture: DesktopControlKeychainSecurity, @un
     }
 }
 
-private func waitForKeychainSignal(_ semaphore: DispatchSemaphore, timeout: DispatchTimeInterval) -> Bool {
-    semaphore.wait(timeout: .now() + timeout) == .success
+@MainActor
+func awaitKeychainRaceSignal(_ semaphore: DispatchSemaphore,
+                             timeout: DispatchTimeInterval = .seconds(10)) async -> Bool {
+    // Observe blocking fixture barriers on Dispatch workers. Keep this helper
+    // on MainActor so starting the wait never requires a cooperative executor
+    // worker that a competing synchronous operation could already be holding.
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global(qos: .userInitiated).async {
+            continuation.resume(returning: semaphore.wait(timeout: .now() + timeout) == .success)
+        }
+    }
+}
+
+@MainActor
+private func readKeychainFixture(_ keychain: SystemDesktopControlKeychainAccess,
+                                 interaction: DesktopControlKeychainInteraction) async throws -> Data? {
+    try await withCheckedThrowingContinuation { continuation in
+        DispatchQueue.global(qos: .userInitiated).async {
+            continuation.resume(with: Result {
+                try keychain.read(service: "fixture", account: "installation", interaction: interaction)
+            })
+        }
+    }
 }
 
 // Shares the serialized synchronous-Keychain fixture suite with runtime races.
 extension DesktopControlKeychainRaceTests {
-    @Test func independentKeychainStoresCannotShareAnInteractiveAuthorizationWindow() async throws {
+    @Test @MainActor func independentKeychainStoresCannotShareAnInteractiveAuthorizationWindow() async throws {
         let security = KeychainSecurityFixture()
         let entered = DispatchSemaphore(value: 0)
         let release = DispatchSemaphore(value: 0)
@@ -80,25 +101,19 @@ extension DesktopControlKeychainRaceTests {
         security.laterReadEntered = laterEntered
         let interactive = SystemDesktopControlKeychainAccess(security: security)
         let passive = SystemDesktopControlKeychainAccess(security: security)
-        let authorizing = Task.detached {
-            try interactive.read(service: "fixture", account: "installation", interaction: .allowed)
+        let authorizing = Task { @MainActor in
+            try await readKeychainFixture(interactive, interaction: .allowed)
         }
-        let authorizationEntered = await Task.detached {
-            waitForKeychainSignal(entered, timeout: .seconds(10))
-        }.value
+        let authorizationEntered = await awaitKeychainRaceSignal(entered)
         #expect(authorizationEntered)
-        let reading = Task.detached {
+        let reading = Task { @MainActor in
             passiveAttempted.signal()
-            return try passive.read(service: "fixture", account: "installation")
+            return try await readKeychainFixture(passive, interaction: .forbidden)
         }
-        let passiveStarted = await Task.detached {
-            waitForKeychainSignal(passiveAttempted, timeout: .seconds(10))
-        }.value
+        let passiveStarted = await awaitKeychainRaceSignal(passiveAttempted)
         #expect(passiveStarted)
         // The second store cannot enter Security while the first is displaying UI.
-        let passiveEnteredDuringAuthorization = await Task.detached {
-            waitForKeychainSignal(laterEntered, timeout: .milliseconds(100))
-        }.value
+        let passiveEnteredDuringAuthorization = await awaitKeychainRaceSignal(laterEntered, timeout: .milliseconds(100))
         #expect(!passiveEnteredDuringAuthorization)
         release.signal()
         _ = try await authorizing.value

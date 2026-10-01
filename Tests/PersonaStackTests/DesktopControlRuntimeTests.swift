@@ -2141,9 +2141,9 @@ func currentLaunchKeychainFailureStillPublishesMenuRetry(paused: Bool) async thr
     #expect(preferences.string(forKey: "desktopControlRepairError") == "Preserved repair error")
 }
 
-// These fixtures deliberately block synchronous credential calls on Swift's
-// shared cooperative executor. Serialize the race cases with each other while
-// keeping each case's competing operations concurrent and other tests parallel.
+// These fixtures deliberately hold synchronous credential calls. Serialize
+// their shared Security gate while keeping each case's competing operations
+// concurrent and other tests parallel.
 @Suite(.serialized)
 struct DesktopControlKeychainRaceTests {
     @Test(arguments: [false, true]) @MainActor
@@ -2154,7 +2154,7 @@ struct DesktopControlKeychainRaceTests {
             installer: DesktopControlInstallerFixture(errors: []), credentials: credentials, configurationProvider: { selected })
         let generation = try runtime.beginResume()
         let authorization = Task { @MainActor in try await runtime.authorizeSavedInstallation(generation: generation) }
-        let started = await Task.detached { waitForKeychainRaceSignal(credentials.readStarted) }.value
+        let started = await awaitKeychainRaceSignal(credentials.readStarted)
         #expect(started)
         #expect(throws: CancellationError.self) { try runtime.beginResume() }
         await #expect(throws: CancellationError.self) { try await runtime.authorizeSavedInstallation(generation: generation) }
@@ -2181,7 +2181,7 @@ struct DesktopControlKeychainRaceTests {
         let read = Task { @MainActor in
             try await runtime.savedInstallation(for: DesktopEnvironmentConfiguration.production.appPageURL)
         }
-        let started = await Task.detached { waitForKeychainRaceSignal(credentials.readStarted) }.value
+        let started = await awaitKeychainRaceSignal(credentials.readStarted)
         #expect(started)
         selected = try DesktopEnvironmentConfiguration(appURL: "https://my.personastack.ai",
                                                        gatewayURL: "https://gateway-alt.example",
@@ -2197,7 +2197,7 @@ struct DesktopControlKeychainRaceTests {
             installer: DesktopControlInstallerFixture(errors: []), credentials: credentials)
         let generation = try runtime.beginResume()
         let authorization = Task { @MainActor in try await runtime.authorizeSavedInstallation(generation: generation) }
-        let started = await Task.detached { waitForKeychainRaceSignal(credentials.readStarted) }.value
+        let started = await awaitKeychainRaceSignal(credentials.readStarted)
         #expect(started)
         authorization.cancel()
         credentials.continueRead.signal()
@@ -2226,10 +2226,10 @@ struct DesktopControlKeychainRaceTests {
             readiness: "paused", paused: true, preferences: preferences)
         let generation = try runtime.beginResume()
         let authorization = Task { @MainActor in try await runtime.authorizeSavedInstallation(generation: generation) }
-        let authorizationStarted = await Task.detached { waitForKeychainRaceSignal(credentials.authorizationStarted) }.value
+        let authorizationStarted = await awaitKeychainRaceSignal(credentials.authorizationStarted)
         #expect(authorizationStarted)
         let passive = Task { @MainActor in try await runtime.savedInstallation(for: configuration.appPageURL) }
-        let passiveStarted = await Task.detached { waitForKeychainRaceSignal(credentials.passiveStarted) }.value
+        let passiveStarted = await awaitKeychainRaceSignal(credentials.passiveStarted)
         #expect(passiveStarted)
 
         if authorizationFirst {
@@ -2270,7 +2270,7 @@ struct DesktopControlKeychainRaceTests {
             installer: installer, credentials: credentials, readiness: paused ? "paused" : "unknown",
             paused: paused, preferences: preferences)
         let startup = Task { @MainActor in await runtime.startAtLaunch(configuration: configuration, paused: paused) }
-        let started = await Task.detached { waitForKeychainRaceSignal(credentials.readStarted) }.value
+        let started = await awaitKeychainRaceSignal(credentials.readStarted)
         #expect(started)
         let recoveryGeneration = try runtime.beginResume()
         try await runtime.authorizeSavedInstallation(generation: recoveryGeneration)
@@ -2305,7 +2305,7 @@ struct DesktopControlKeychainRaceTests {
             installer: DesktopControlInstallerFixture(errors: []), credentials: credentials,
             preferences: preferences, configurationProvider: { configuration })
         let startup = Task { @MainActor in await runtime.startAtLaunch(configuration: .production, paused: paused) }
-        let started = await Task.detached { waitForKeychainRaceSignal(credentials.readStarted) }.value
+        let started = await awaitKeychainRaceSignal(credentials.readStarted)
         #expect(started)
         if changeProfile { configuration = changedProfile }
         else { startup.cancel() }

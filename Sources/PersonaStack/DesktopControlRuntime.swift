@@ -230,10 +230,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             clearCredentialAccessError(configuration: configuration)
             return
         }
-        let store = credentials
-        let saved = try await Task.detached(priority: .userInitiated) {
-            try store.loadWithUserInteraction()
-        }.value
+        let saved = try await readStoredInstallation(allowUserInteraction: true)
         try Task.checkCancellation()
         try requireCurrentLifecycle(generation)
         guard !disconnecting, !environmentSwitchPending,
@@ -1225,8 +1222,22 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     private func readSavedInstallation() async throws -> DesktopControlInstallation? {
         if let activeInstallation { return activeInstallation }
+        return try await readStoredInstallation()
+    }
+
+    private func readStoredInstallation(allowUserInteraction: Bool = false) async throws -> DesktopControlInstallation? {
         let store = credentials
-        return try await Task.detached(priority: .userInitiated) { try store.load() }.value
+        // Legacy Keychain authorization and its serialized interaction gate can
+        // block. Keep that work off Swift's cooperative task executor so page
+        // reads cannot prevent the native authorization owner from progressing.
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(with: Result {
+                    if allowUserInteraction { return try store.loadWithUserInteraction() }
+                    return try store.load()
+                })
+            }
+        }
     }
 
     private func savedInstallationForStartup(generation: UUID) async throws -> DesktopControlInstallation? {
