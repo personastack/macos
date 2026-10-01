@@ -93,8 +93,9 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
 @Test @MainActor func permissionChecklistPrivacyRecoveryMatchesTheSettingsPane() {
     let accessibility = DesktopPermissionChecklistSystemAdapter.privacyDenialObservation(.accessibility)
     #expect(accessibility.state == .notGranted)
-    #expect(accessibility.detail.contains("remove the old PersonaStack entry"))
-    #expect(accessibility.detail.contains("PersonaStack.app from Applications"))
+    #expect(accessibility.detail.contains("Remove its old entry with −"))
+    #expect(accessibility.detail.contains("Show PersonaStack in Finder"))
+    #expect(accessibility.detail.contains("approval updates automatically"))
     for id in [DesktopPermissionID.microphone, .screenRecording, .directCapture] {
         let observation = DesktopPermissionChecklistSystemAdapter.privacyDenialObservation(id)
         #expect(observation.state == (id == .microphone ? .denied : .notGranted))
