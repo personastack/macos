@@ -243,7 +243,7 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
     static func privacyDenialObservation(_ permission: DesktopPermissionID) -> DesktopPermissionObservation {
         switch permission {
         case .accessibility:
-            return .init(.notGranted, detail: "Allow PersonaStack in Privacy & Security → Accessibility. If it is already enabled, remove the old PersonaStack entry with −. Click + and choose PersonaStack.app from Applications. Enable it, then retry Setup Accessibility.")
+            return .init(.notGranted, detail: "Enable PersonaStack in Privacy & Security → Accessibility (Device Control and Data Access on newer macOS). Already enabled? Remove its old entry with −, click +, then add the app shown by Show PersonaStack in Finder. Enable it again. Keep this window open; approval updates automatically.")
         case .microphone:
             return .init(.denied, detail: "Enable PersonaStack in Privacy & Security → Microphone. If it is already enabled, turn it off and on. Relaunch PersonaStack if macOS requests it, then retry Setup Microphone.")
         case .screenRecording, .directCapture:

@@ -10,12 +10,20 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     private var activationObserver: NSObjectProtocol?
     private var permissionSelection: (id: UUID, permission: DesktopPermissionID, window: NSWindow)?
+    private let applicationURL: URL
+    private let showApplicationInFinder: (URL) -> Void
     var onCancel: (() -> Void)?
     var onStopVerification: (() -> Void)?
     var onPresent: (() -> Void)?
 
-    init(coordinator: DesktopPermissionChecklistCoordinator) {
+    init(coordinator: DesktopPermissionChecklistCoordinator,
+         applicationURL: URL = Bundle.main.bundleURL,
+         showApplicationInFinder: @escaping (URL) -> Void = {
+             NSWorkspace.shared.activateFileViewerSelecting([$0])
+         }) {
         self.coordinator = coordinator
+        self.applicationURL = applicationURL
+        self.showApplicationInFinder = showApplicationInFinder
         super.init()
         activationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
@@ -41,6 +49,12 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     }
 
     func failSetup(message: String) { coordinator.failSetup(message) }
+
+    func revealCurrentApplication() {
+        guard coordinator.isVisible, !coordinator.isFinishing,
+              coordinator.rows.first(where: { $0.id == .accessibility })?.state == .notGranted else { return }
+        showApplicationInFinder(applicationURL)
+    }
 
     func finish() {
         guard coordinator.canFinish else { return }
@@ -133,7 +147,8 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     func makeWindowIfNeeded() -> NSWindow {
         if let window { return window }
         let content = DesktopPermissionChecklistView(coordinator: coordinator,
-            cancel: { [weak self] in self?.cancel() }, finish: { [weak self] in self?.finish() })
+            cancel: { [weak self] in self?.cancel() }, finish: { [weak self] in self?.finish() },
+            revealApplication: { [weak self] in self?.revealCurrentApplication() })
         let value = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 670, height: 740),
                              styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         value.title = "Set Up Desktop Control"
@@ -155,6 +170,7 @@ private struct DesktopPermissionChecklistView: View {
     @ObservedObject var coordinator: DesktopPermissionChecklistCoordinator
     let cancel: () -> Void
     let finish: () -> Void
+    let revealApplication: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -168,7 +184,7 @@ private struct DesktopPermissionChecklistView: View {
                 .foregroundStyle(.secondary)
             Text("Opening this window checks current access. Granted microphone access uses a short recording that is discarded. Accessibility checks macOS approval and, when needed, reads an application role without clicking, typing or reading window contents. Screen Capture reads macOS approval without taking a screenshot. The disk check reads one protected folder listing without reading file contents. Network checks contact only your selected services.")
                 .font(.caption).foregroundStyle(.secondary)
-            Text("After an update, macOS may need you to approve access again. If a permission is already enabled in System Settings, follow its recovery steps below, then retry Setup.")
+            Text("Updates from an older unsigned build can leave an enabled permission tied to the old app. Follow the recovery steps below if macOS still denies access. This window checks approval automatically.")
                 .font(.caption).foregroundStyle(.secondary)
             ScrollView {
                 LazyVStack(spacing: 0) {
@@ -218,6 +234,12 @@ private struct DesktopPermissionChecklistView: View {
                 if !automatic || !row.isComplete {
                     Text(row.state.title).font(.caption.weight(.semibold))
                     Text(row.observation.detail).font(.caption).foregroundStyle(.secondary)
+                    if row.id == .accessibility && row.state == .notGranted {
+                        Button("Show PersonaStack in Finder", action: revealApplication)
+                            .buttonStyle(.link)
+                            .font(.caption)
+                            .disabled(coordinator.isFinishing)
+                    }
                 }
             }
             Spacer(minLength: 8)

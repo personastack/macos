@@ -639,3 +639,25 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     #expect(model.rows.first { $0.id == .microphone }?.observation.detail == "New OS grant needs recording proof")
     #expect(fake.requested == [.microphone])
 }
+
+@Test @MainActor func permissionRecoveryRevealsTheRunningCopyWithoutRequestingOrResettingAccess() async {
+    let fake = PermissionChecklistFake()
+    fake.values[.accessibility] = .init(.notGranted, detail: "Fixture")
+    let model = DesktopPermissionChecklistCoordinator(adapter: fake)
+    let runningCopy = URL(fileURLWithPath: "/Applications/PersonaStack.app")
+    var revealed: [URL] = []
+    let owner = DesktopPermissionChecklistWindow(coordinator: model,
+        applicationURL: runningCopy, showApplicationInFinder: { revealed.append($0) })
+    model.open()
+    await model.refresh()
+    owner.revealCurrentApplication()
+    #expect(revealed == [runningCopy])
+    #expect(fake.requested.isEmpty)
+    fake.values[.accessibility] = .init(.ready, detail: "Approved")
+    await model.refresh()
+    owner.revealCurrentApplication()
+    #expect(revealed == [runningCopy])
+    model.cancel()
+    owner.revealCurrentApplication()
+    #expect(revealed == [runningCopy] && fake.requested.isEmpty)
+}
