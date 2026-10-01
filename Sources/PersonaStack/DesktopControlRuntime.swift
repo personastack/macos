@@ -85,7 +85,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private(set) var readiness = "unknown"
 
     private init(installer: any DesktopControlDriverInstalling = CuaDriverInstaller(),
-                 credentials: any DesktopControlCredentialStoring = KeychainDesktopControlCredentialStore(),
+                 credentials: any DesktopControlCredentialStoring = FileDesktopControlCredentialStore(),
                  relayStateReader: (any DesktopControlRelayStateReading)? = nil,
                  preferences: UserDefaults = .standard,
                  configurationProvider: @escaping () throws -> DesktopEnvironmentConfiguration = { try LaunchConfiguration.selectedEnvironment() },
@@ -216,8 +216,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         try await resume(generation: beginResume())
     }
 
-    /// Only the native menu action may request access to a saved Keychain item.
-    /// Startup, page state and reconnect continue to use noninteractive reads.
+    /// Retry the native credential load. The production store never requests
+    /// Keychain authorization, including from the menu.
     func authorizeSavedInstallation(generation: UUID) async throws {
         try Task.checkCancellation()
         try requireCurrentLifecycle(generation)
@@ -243,7 +243,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private func clearCredentialAccessError(configuration: DesktopEnvironmentConfiguration) {
         let key = DesktopControlPreferenceKeys.relayError(configuration)
         let credentialErrors = [DesktopControlEnrollmentError.credentialAccessRequired.localizedDescription,
-                                DesktopControlEnrollmentError.credentialStoreUnavailable.localizedDescription]
+                                DesktopControlEnrollmentError.credentialStoreUnavailable.localizedDescription,
+                                "macOS Keychain could not access the Desktop Control installation. Choose Retry Remote Control from the PersonaStack menu.",
+                                "Desktop Control needs Keychain access. Choose Retry Remote Control from the PersonaStack menu. If macOS asks, choose Always Allow to remember this app."]
         if let message = preferences.string(forKey: key), credentialErrors.contains(message) {
             preferences.set("", forKey: key)
         }

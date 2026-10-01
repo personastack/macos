@@ -275,7 +275,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
 
     func apply(_ command: DesktopControlSetupCommand, page: Page) async throws -> [String: Any] {
         guard !page.isRetired else { throw DesktopControlEnrollmentError.invalidRequest }
-        let credentials = credentials ?? KeychainDesktopControlCredentialStore(appURL: page.appURL)
+        let credentials = credentials ?? FileDesktopControlCredentialStore(appURL: page.appURL)
         switch command {
         case .sync(let scope):
             if scope.isEmpty || page.setupScope.value != scope { cancelPermissions(for: page) }
@@ -451,7 +451,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
                 throw DesktopControlPermissionBridgeError.incomplete
             }
             try requireCompletionReadiness(page: page)
-            let credentials = credentials ?? KeychainDesktopControlCredentialStore(appURL: page.appURL)
+            let credentials = credentials ?? FileDesktopControlCredentialStore(appURL: page.appURL)
             guard let installation = try await savedInstallation(credentials: credentials, appURL: page.appURL) else {
                 throw DesktopControlPermissionBridgeError.incomplete
             }

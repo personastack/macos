@@ -102,9 +102,9 @@ extension DesktopControlEnrollmentError: LocalizedError {
         case .invalidResponse:
             "The server returned an invalid Desktop Control enrollment response."
         case .credentialStoreUnavailable:
-            "macOS Keychain could not access the Desktop Control installation. Choose Retry Remote Control from the PersonaStack menu."
+            "PersonaStack could not read or save this Mac's Desktop Control credential. Check local storage access and retry."
         case .credentialAccessRequired:
-            "Desktop Control needs Keychain access. Choose Retry Remote Control from the PersonaStack menu. If macOS asks, choose Always Allow to remember this app."
+            "The previous Desktop Control credential cannot be read. Set up this Mac again while signed in to PersonaStack."
         case .installationMissing:
             "This Mac has no Desktop Control enrollment. Open PersonaStack and set up Desktop Control again."
         case .nativeCapabilitiesUnavailable:
@@ -347,7 +347,14 @@ struct KeychainDesktopControlCredentialStore: DesktopControlCredentialStoring {
         try load(interaction: .allowed)
     }
 
-    private func load(interaction: DesktopControlKeychainInteraction) throws -> DesktopControlInstallation? {
+    /// Disk migration reads the old identity without writing another Keychain
+    /// item or asking macOS to authorize access.
+    func loadForMigration() throws -> DesktopControlInstallation? {
+        try load(interaction: .forbidden, migrateInKeychain: false)
+    }
+
+    private func load(interaction: DesktopControlKeychainInteraction,
+                      migrateInKeychain: Bool = true) throws -> DesktopControlInstallation? {
         let context = try credentialContext()
         if let data = try keychain.read(service: service, account: context.account, interaction: interaction) {
             guard let installation = try? JSONDecoder().decode(DesktopControlInstallation.self, from: data) else {
@@ -359,7 +366,9 @@ struct KeychainDesktopControlCredentialStore: DesktopControlCredentialStoring {
         guard var legacy = try matchingOriginScopedInstallation(configuration: context.configuration, interaction: interaction)
             ?? matchingLegacyInstallation(configuration: context.configuration, appURL: context.appURL, interaction: interaction) else { return nil }
         try legacy.bindEnvironment(context.appURL, configuration: context.configuration)
-        try keychain.write(JSONEncoder().encode(legacy), service: service, account: context.account, interaction: interaction)
+        if migrateInKeychain {
+            try keychain.write(JSONEncoder().encode(legacy), service: service, account: context.account, interaction: interaction)
+        }
         return legacy
     }
 
@@ -489,7 +498,7 @@ actor DesktopControlEnrollmentClient: DesktopControlRelayStateReading {
         guard DesktopControlEnvironment.supportsAppOrigin(appURL) else {
             throw DesktopControlEnrollmentError.invalidRequest
         }
-        let credentials = credentials ?? KeychainDesktopControlCredentialStore(appURL: appURL)
+        let credentials = credentials ?? FileDesktopControlCredentialStore(appURL: appURL)
         if let existing = try credentials.load() {
             try existing.requireEnvironment(appURL)
             return existing

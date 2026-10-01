@@ -119,7 +119,7 @@ private final class SuspendedDesktopControlCredentialStore: DesktopControlCreden
     await #expect(throws: DesktopControlEnrollmentError.credentialStoreUnavailable) { try await denied.resume() }
     #expect(!denied.hasActiveInstallation)
     #expect(await installer.repairArguments.isEmpty)
-    #expect(DesktopControlEnrollmentError.credentialStoreUnavailable.localizedDescription.contains("Keychain"))
+    #expect(DesktopControlEnrollmentError.credentialStoreUnavailable.localizedDescription.contains("local storage"))
 }
 
 @Test @MainActor func passivePermissionSnapshotCannotInstallOrUnpauseTheRelay() async {
@@ -2071,6 +2071,8 @@ private struct InterleavedKeychainCredentialStore: DesktopControlCredentialStori
 
 @Test(arguments: [false, true], [DesktopControlEnrollmentError.credentialAccessRequired.localizedDescription,
                                 DesktopControlEnrollmentError.credentialStoreUnavailable.localizedDescription,
+                                "macOS Keychain could not access the Desktop Control installation. Choose Retry Remote Control from the PersonaStack menu.",
+                                "Desktop Control needs Keychain access. Choose Retry Remote Control from the PersonaStack menu. If macOS asks, choose Always Allow to remember this app.",
                                 "Cua permissions need attention", "Waiting for PersonaStack connection"]) @MainActor
 func nativeKeychainAuthorizationClearsOnlyItsProfilesCredentialError(alreadyCached: Bool, message: String) async throws {
     let suite = "keychain-error-clear-\(UUID().uuidString)"
@@ -2088,6 +2090,7 @@ func nativeKeychainAuthorizationClearsOnlyItsProfilesCredentialError(alreadyCach
     try await runtime.authorizeSavedInstallation(generation: runtime.beginResume())
     let isCredentialError = message == DesktopControlEnrollmentError.credentialAccessRequired.localizedDescription
         || message == DesktopControlEnrollmentError.credentialStoreUnavailable.localizedDescription
+        || message.hasPrefix("macOS Keychain could not access") || message.hasPrefix("Desktop Control needs Keychain access.")
     #expect(preferences.string(forKey: errorKey) == (isCredentialError ? "" : message))
     #expect(preferences.string(forKey: otherProfileKey) == DesktopControlEnrollmentError.credentialAccessRequired.localizedDescription)
     #expect(credentials.counts.authorizations == (alreadyCached ? 0 : 1))

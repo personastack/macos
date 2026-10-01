@@ -721,3 +721,16 @@ private func legacyInstallationData(gateway: String) throws -> Data {
     #expect(keychain.reads.map(\.account) == [store.account, store.account])
     #expect(keychain.reads.map(\.interaction) == [.allowed, .forbidden])
 }
+
+@Test func diskMigrationReadsLegacyKeychainWithoutWritingOrPrompting() throws {
+    let keychain = LegacyKeychainFixture()
+    let configuration = DesktopEnvironmentConfiguration.production
+    try keychain.write(legacyInstallationData(gateway: configuration.gatewayWebsocketURL.absoluteString),
+                       service: "fixture", account: "installation:" + configuration.appOrigin)
+    keychain.failWrites = true
+    let store = KeychainDesktopControlCredentialStore(service: "fixture", configuration: configuration, keychain: keychain)
+    let installation = try #require(try store.loadForMigration())
+    #expect(installation.installationID == "legacy-mac")
+    #expect(keychain.reads.allSatisfy { $0.interaction == .forbidden })
+    #expect(keychain.reads.map(\.account) == [store.account, "installation:" + configuration.appOrigin])
+}

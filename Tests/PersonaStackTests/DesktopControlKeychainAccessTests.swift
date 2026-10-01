@@ -155,7 +155,7 @@ extension DesktopControlKeychainRaceTests {
             try keychain.read(service: "fixture", account: "installation")
         }
         #expect(security.events == ["get", "set:false", "read:false", "set:true"])
-        #expect(DesktopControlEnrollmentError.credentialAccessRequired.localizedDescription.contains("Retry Remote Control"))
+        #expect(DesktopControlEnrollmentError.credentialAccessRequired.localizedDescription.contains("Set up this Mac again"))
     }
 
     @Test func missingAndMalformedKeychainResultsRemainDistinct() throws {
