@@ -223,3 +223,33 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     for _ in 0..<3 { await service.window.coordinator.refresh() }
     #expect(probes == 3)
 }
+
+@Test @MainActor func microphonePermissionGrantedDuringSetupRetainsRecordingFailure() async {
+    let page = ReadyVoicePage()
+    page.result = .failure(DesktopVoicePermissionError.emptyRecording)
+    var status = AVAuthorizationStatus.notDetermined
+    var prompts = 0
+    var access = DesktopPermissionSystemAccess()
+    access.microphone = { status }
+    access.requestMicrophone = { prompts += 1; status = .authorized; return true }
+    access.hasMicrophone = { true }
+    access.microphoneIdentity = { "input" }
+    let service = DesktopPermissionChecklist(access: access, selectedProfile: { .production },
+        activationNotificationCenter: NotificationCenter(), voiceContext: {
+            .init(identity: "document", url: DesktopEnvironmentConfiguration.production.appURL, page: page)
+        })
+    isolateReadyRows(service, [.microphone])
+    await openReadyChecklist(service)
+    defer { service.window.cancel() }
+    #expect(readyRow(service, .microphone)?.state == .notGranted)
+    service.window.coordinator.setup(.microphone)
+    while service.window.coordinator.busyPermission != nil { await Task.yield() }
+    for _ in 0..<3 { await service.window.coordinator.refresh() }
+    #expect(readyRow(service, .microphone)?.state == .failed)
+    #expect(readyRow(service, .microphone)?.observation.detail.contains("returned no audio data") == true)
+    #expect(status == .authorized && prompts == 1 && page.tests == 1)
+    status = .denied
+    await service.window.coordinator.refresh()
+    #expect(readyRow(service, .microphone)?.state == .denied)
+    #expect(page.tests == 1)
+}

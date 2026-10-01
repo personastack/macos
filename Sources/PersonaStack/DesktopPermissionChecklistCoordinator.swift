@@ -41,9 +41,8 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     private var rowRevisions: [DesktopPermissionID: UUID] = [:]
     private struct SetupFailure {
         let observation: DesktopPermissionObservation
-        var passiveKey: String?
-        var passiveState: DesktopPermissionState?
-        var anchored = false
+        let passiveKey: String?
+        let passiveState: DesktopPermissionState
     }
     private var setupFailures: [DesktopPermissionID: SetupFailure] = [:]
     private var refreshOperationTask: Task<Void, Never>?
@@ -82,7 +81,11 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
                 let value = DesktopPermissionRow(id: id, observation: current).isComplete
                     ? current : await self.adapter.setupAutomatically(id)
                 guard self.generation == expected, self.isVisible, !Task.isCancelled else { return }
-                if self.rowRevisions[id] == revision { self.apply(value, id: id, explicit: true) }
+                if self.rowRevisions[id] == revision {
+                    let baseline = await self.failureBaseline(value, id: id)
+                    guard self.generation == expected, self.isVisible, !Task.isCancelled else { return }
+                    if self.rowRevisions[id] == revision { self.apply(value, id: id, explicit: true, failureBaseline: baseline) }
+                }
             }
             self.automaticBusyPermission = nil
             self.automaticSetupTask = nil
@@ -185,7 +188,9 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
             let observation = await self.adapter.setup(id)
             guard self.generation == expected, self.isVisible, !Task.isCancelled else { return }
             if self.rowRevisions[id] == revision {
-                self.apply(observation, id: id, explicit: true)
+                let baseline = await self.failureBaseline(observation, id: id)
+                guard self.generation == expected, self.isVisible, !Task.isCancelled else { return }
+                if self.rowRevisions[id] == revision { self.apply(observation, id: id, explicit: true, failureBaseline: baseline) }
             }
             self.busyPermission = nil
             self.setupTask = nil
@@ -262,19 +267,25 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         rows[index].observation = .init(.verificationRequired, detail: "Use Setup \(id.title) to verify access again.")
     }
 
+    private static func isSetupFailure(_ value: DesktopPermissionObservation) -> Bool {
+        [.failed, .restartRequired, .verificationRequired, .denied, .restricted, .unsupported].contains(value.state)
+    }
+
+    private func failureBaseline(_ value: DesktopPermissionObservation, id: DesktopPermissionID) async -> DesktopPermissionObservation? {
+        guard Self.isSetupFailure(value) else { return nil }
+        // Capture the grant after Setup's prompt or operation, before the busy
+        // row completes. A later changed grant cannot anchor an earlier failure.
+        return await adapter.observe(id)
+    }
+
     private func retainedSetupFailure(_ value: DesktopPermissionObservation, id: DesktopPermissionID,
-                                      explicit: Bool) -> DesktopPermissionObservation? {
-        if explicit, [.failed, .restartRequired, .verificationRequired, .denied, .restricted, .unsupported].contains(value.state) {
-            setupFailures[id] = SetupFailure(observation: value)
-        } else if !explicit, var failure = setupFailures[id] {
-            if !failure.anchored {
-                failure.passiveKey = value.verificationKey
-                failure.passiveState = value.state
-                failure.anchored = true
-            }
+                                      explicit: Bool, baseline: DesktopPermissionObservation?) -> DesktopPermissionObservation? {
+        if explicit, Self.isSetupFailure(value), let baseline {
+            setupFailures[id] = SetupFailure(observation: value, passiveKey: baseline.verificationKey,
+                                            passiveState: baseline.state)
+        } else if !explicit, let failure = setupFailures[id] {
             let incomplete = !value.state.satisfiesSetup || (value.requiresVerification && !value.verified)
             if incomplete, value.state == failure.passiveState, value.verificationKey == failure.passiveKey {
-                setupFailures[id] = failure
                 return failure.observation
             }
             setupFailures.removeValue(forKey: id)
@@ -282,9 +293,10 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         return nil
     }
 
-    private func apply(_ value: DesktopPermissionObservation, id: DesktopPermissionID, explicit: Bool) {
+    private func apply(_ value: DesktopPermissionObservation, id: DesktopPermissionID, explicit: Bool,
+                       failureBaseline: DesktopPermissionObservation? = nil) {
         guard let index = rows.firstIndex(where: { $0.id == id }) else { return }
-        if let failure = retainedSetupFailure(value, id: id, explicit: explicit) {
+        if let failure = retainedSetupFailure(value, id: id, explicit: explicit, baseline: failureBaseline) {
             rows[index].observation = failure
             return
         }

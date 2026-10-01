@@ -613,3 +613,29 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     #expect(model.rows.first { $0.id == .microphone }?.state == .denied)
     model.cancel()
 }
+
+@Test @MainActor func permissionChecklistGrantChangedBeforeFirstFailurePollCannotAnchorOldDenial() async {
+    let fake = PermissionChecklistFake()
+    fake.values[.microphone] = .init(.denied, detail: "OS grant denied")
+    fake.setupValues[.microphone] = .init(.denied, detail: "Earlier setup denial")
+    let model = DesktopPermissionChecklistCoordinator(adapter: fake)
+    model.open()
+    defer { model.cancel() }
+    await model.refresh()
+    // Hold the follow-up pass before it reaches Microphone. Setup must capture
+    // its own failure baseline before publishing completion to the user.
+    fake.suspendedObservation = .screenRecording
+    model.setup(.microphone)
+    while fake.pendingObservation == nil { await Task.yield() }
+    #expect(model.busyPermission == nil)
+    #expect(model.rows.first { $0.id == .microphone }?.observation.detail == "Earlier setup denial")
+    fake.values[.microphone] = .init(.ready, detail: "New OS grant needs recording proof",
+        verificationKey: "new-device-document", requiresVerification: true)
+    let refresh = Task { await model.refresh() }
+    fake.pendingObservation?.resume(returning: .init(.ready, detail: "Optional screen observation"))
+    fake.pendingObservation = nil
+    await refresh.value
+    #expect(model.rows.first { $0.id == .microphone }?.state == .verificationRequired)
+    #expect(model.rows.first { $0.id == .microphone }?.observation.detail == "New OS grant needs recording proof")
+    #expect(fake.requested == [.microphone])
+}
