@@ -24,17 +24,7 @@ struct PersonaStackApp: App {
         let paused = UserDefaults.standard.bool(forKey: DesktopControlPreferenceKeys.relayPaused(configuration))
         Task { @MainActor in
             _ = MainWebViewHost.shared
-            UserDefaults.standard.set("", forKey: DesktopControlPreferenceKeys.relayError(configuration))
-            UserDefaults.standard.set("", forKey: "desktopControlRepairError")
-            do {
-                if paused {
-                    try await DesktopControlRuntime.shared.startPaused()
-                } else {
-                    try await DesktopControlRuntime.shared.resume()
-                }
-            } catch {
-                UserDefaults.standard.set(error.localizedDescription, forKey: DesktopControlPreferenceKeys.relayError(configuration))
-            }
+            await DesktopControlRuntime.shared.startAtLaunch(configuration: configuration, paused: paused)
         }
     }
 

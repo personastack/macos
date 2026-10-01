@@ -193,6 +193,25 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         return lifecycleGeneration
     }
 
+    /// App launch owns only this captured profile and lifecycle. A native Retry
+    /// may replace it while the passive credential read is still pending.
+    func startAtLaunch(configuration: DesktopEnvironmentConfiguration, paused: Bool) async {
+        guard !Task.isCancelled, (try? configurationProvider()) == configuration,
+              let generation = try? beginResume() else { return }
+        preferences.set("", forKey: DesktopControlPreferenceKeys.relayError(configuration))
+        preferences.set("", forKey: "desktopControlRepairError")
+        do {
+            if paused { try await startPaused(generation: generation) }
+            else { try await resume(generation: generation) }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled, isCurrentLifecycle(generation), !environmentSwitchPending,
+                  (try? configurationProvider()) == configuration else { return }
+            preferences.set(error.localizedDescription, forKey: DesktopControlPreferenceKeys.relayError(configuration))
+        }
+    }
+
     func resume() async throws {
         try await resume(generation: beginResume())
     }
@@ -443,9 +462,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     func startPaused() async throws {
-        guard !disconnecting else { throw CancellationError() }
-        lifecycleGeneration = UUID()
-        let generation = lifecycleGeneration
+        try await startPaused(generation: beginResume())
+    }
+
+    private func startPaused(generation: UUID) async throws {
+        try requireCurrentLifecycle(generation)
+        guard !disconnecting, !environmentSwitchPending else { throw CancellationError() }
         setupMayRunUnconfigured = false
         guard let installation = try await savedInstallationForStartup(generation: generation) else {
             throw DesktopControlEnrollmentError.installationMissing
@@ -1208,9 +1230,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func savedInstallationForStartup(generation: UUID) async throws -> DesktopControlInstallation? {
+        let configuration = try configurationProvider()
         let saved = try await readSavedInstallation()
+        try Task.checkCancellation()
         try requireCurrentLifecycle(generation)
-        guard !disconnecting else { throw CancellationError() }
+        guard !disconnecting, !environmentSwitchPending,
+              try configurationProvider() == configuration else { throw CancellationError() }
         activeInstallation = saved
         return saved
     }

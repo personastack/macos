@@ -2181,3 +2181,120 @@ func nativeKeychainAuthorizationClearsOnlyItsProfilesCredentialError(alreadyCach
     #expect(credentials.counts.authorizations == (alreadyCached ? 0 : 1))
     #expect(credentials.counts.reads == 0)
 }
+
+private struct DeferredLaunchCredentialStore: DesktopControlCredentialStoring {
+    let installation: DesktopControlInstallation
+    let denyPassiveRead: Bool
+    let readStarted = DispatchSemaphore(value: 0)
+    let continueRead = DispatchSemaphore(value: 0)
+
+    func save(_ installation: DesktopControlInstallation) throws { Issue.record("Launch must not replace credentials") }
+    func delete() throws { Issue.record("Launch must not delete credentials") }
+    func loadWithUserInteraction() throws -> DesktopControlInstallation? { installation }
+
+    func load() throws -> DesktopControlInstallation? {
+        readStarted.signal()
+        guard waitForCredentialRead(continueRead) else { throw CancellationError() }
+        if denyPassiveRead { throw DesktopControlEnrollmentError.credentialAccessRequired }
+        return installation
+    }
+}
+
+@Test(arguments: [false, true], [false, true]) @MainActor
+func launchKeychainReadCannotPublishAfterNativeRecovery(paused: Bool, denied: Bool) async throws {
+    let suite = "keychain-launch-recovery-\(UUID().uuidString)"
+    let preferences = try #require(UserDefaults(suiteName: suite))
+    defer { preferences.removePersistentDomain(forName: suite) }
+    let credentials = DeferredLaunchCredentialStore(installation: try boundKeychainRecoveryInstallation(), denyPassiveRead: denied)
+    defer { credentials.continueRead.signal() }
+    let installer = DesktopControlInstallerFixture(errors: [])
+    let configuration = DesktopEnvironmentConfiguration.production
+    let errorKey = DesktopControlPreferenceKeys.relayError(configuration)
+    let otherProfileKey = DesktopControlPreferenceKeys.relayError(.lan)
+    preferences.set("Other profile error", forKey: otherProfileKey)
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: installer, credentials: credentials, readiness: paused ? "paused" : "unknown",
+        paused: paused, preferences: preferences)
+    let startup = Task { @MainActor in await runtime.startAtLaunch(configuration: configuration, paused: paused) }
+    let started = await Task.detached { waitForCredentialRead(credentials.readStarted) }.value
+    #expect(started)
+    let recoveryGeneration = try runtime.beginResume()
+    try await runtime.authorizeSavedInstallation(generation: recoveryGeneration)
+    #expect(runtime.hasActiveInstallation)
+    credentials.continueRead.signal()
+    await startup.value
+
+    #expect(preferences.string(forKey: errorKey) == "")
+    #expect(preferences.string(forKey: otherProfileKey) == "Other profile error")
+    #expect(try await runtime.savedInstallation(for: configuration.appPageURL) == credentials.installation)
+    #expect(runtime.isCurrentLifecycle(recoveryGeneration))
+    #expect(runtime.paused == paused && !runtime.gatewayConnected && !runtime.hasPendingRelayReconnectForTesting)
+    #expect(await installer.repairArguments.isEmpty)
+}
+
+@Test(arguments: [false, true]) @MainActor
+func currentLaunchKeychainFailureStillPublishesMenuRetry(paused: Bool) async throws {
+    let suite = "keychain-launch-denied-\(UUID().uuidString)"
+    let preferences = try #require(UserDefaults(suiteName: suite))
+    defer { preferences.removePersistentDomain(forName: suite) }
+    let credentials = AuthorizingDesktopControlCredentialStore(installation: try boundKeychainRecoveryInstallation())
+    let otherProfileKey = DesktopControlPreferenceKeys.relayError(.lan)
+    preferences.set("Other profile error", forKey: otherProfileKey)
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []), credentials: credentials, paused: paused, preferences: preferences)
+    await runtime.startAtLaunch(configuration: .production, paused: paused)
+    #expect(preferences.string(forKey: DesktopControlPreferenceKeys.relayError(.production))
+            == DesktopControlEnrollmentError.credentialAccessRequired.localizedDescription)
+    #expect(preferences.string(forKey: otherProfileKey) == "Other profile error")
+    #expect(credentials.counts.reads == 1 && credentials.counts.authorizations == 0)
+    #expect(!runtime.hasActiveInstallation && !runtime.gatewayConnected)
+}
+
+@Test(arguments: [false, true], ["profile-denied", "profile-success", "cancel-denied", "cancel-success"]) @MainActor
+func launchKeychainReadCannotOverwriteChangedProfileOrCancelledTask(paused: Bool, completion: String) async throws {
+    let changeProfile = completion.hasPrefix("profile")
+    let suite = "keychain-launch-fenced-\(UUID().uuidString)"
+    let preferences = try #require(UserDefaults(suiteName: suite))
+    defer { preferences.removePersistentDomain(forName: suite) }
+    let credentials = DeferredLaunchCredentialStore(installation: try boundKeychainRecoveryInstallation(),
+                                                    denyPassiveRead: completion.hasSuffix("denied"))
+    defer { credentials.continueRead.signal() }
+    var configuration = DesktopEnvironmentConfiguration.production
+    let changedProfile = try DesktopEnvironmentConfiguration(appURL: "https://my.personastack.ai",
+                                                             gatewayURL: "https://gateway-alt.example",
+                                                             mcpURL: "https://mcp-alt.example")
+    let oldErrorKey = DesktopControlPreferenceKeys.relayError(configuration)
+    let changedErrorKey = DesktopControlPreferenceKeys.relayError(changedProfile)
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []), credentials: credentials,
+        preferences: preferences, configurationProvider: { configuration })
+    let startup = Task { @MainActor in await runtime.startAtLaunch(configuration: .production, paused: paused) }
+    let started = await Task.detached { waitForCredentialRead(credentials.readStarted) }.value
+    #expect(started)
+    if changeProfile { configuration = changedProfile }
+    else { startup.cancel() }
+    preferences.set("Current old-profile state", forKey: oldErrorKey)
+    preferences.set("Current changed-profile state", forKey: changedErrorKey)
+    credentials.continueRead.signal()
+    await startup.value
+    #expect(preferences.string(forKey: oldErrorKey) == "Current old-profile state")
+    #expect(preferences.string(forKey: changedErrorKey) == "Current changed-profile state")
+    #expect(!runtime.hasActiveInstallation && !runtime.gatewayConnected)
+}
+
+@Test @MainActor func launchWithAlreadyChangedProfileDoesNotReadOrClearErrors() async throws {
+    let suite = "keychain-launch-profile-before-\(UUID().uuidString)"
+    let preferences = try #require(UserDefaults(suiteName: suite))
+    defer { preferences.removePersistentDomain(forName: suite) }
+    let credentials = AuthorizingDesktopControlCredentialStore(installation: try boundKeychainRecoveryInstallation())
+    let errorKey = DesktopControlPreferenceKeys.relayError(.production)
+    preferences.set("Preserved startup error", forKey: errorKey)
+    preferences.set("Preserved repair error", forKey: "desktopControlRepairError")
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []), credentials: credentials,
+        preferences: preferences, configurationProvider: { .lan })
+    await runtime.startAtLaunch(configuration: .production, paused: false)
+    #expect(credentials.counts.reads == 0 && credentials.counts.authorizations == 0)
+    #expect(preferences.string(forKey: errorKey) == "Preserved startup error")
+    #expect(preferences.string(forKey: "desktopControlRepairError") == "Preserved repair error")
+}
