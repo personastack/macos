@@ -643,32 +643,40 @@ struct DesktopUpdatesMenuSection: View {
     @ObservedObject private var updater = DesktopUpdater.shared
 
     var body: some View {
-        Section("Updates") {
-            Text("Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "Unknown")")
-            if let instruction = updater.applicationsInstallInstruction {
-                Text(instruction).font(.caption)
-            }
-            if !updater.statusMessage.isEmpty { Text(updater.statusMessage).font(.caption) }
-            if updater.isReady {
-                Button("Restart Now") { updater.restartToInstall() }
-                Button("Later") { updater.dismissReadyToast() }
-            }
-            Button("Check for Updates…") { updater.checkForUpdates() }
-                .disabled(!updater.isAvailable || !updater.canCheckForUpdates || updater.isChecking)
+        Text("Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "Unknown")")
+        if let instruction = updater.applicationsInstallInstruction {
+            Text(instruction).font(.caption)
+        }
+        if !updater.statusMessage.isEmpty { Text(updater.statusMessage).font(.caption) }
+        Divider()
+        if updater.isReady {
+            Button("Restart Now") { updater.restartToInstall() }
+            Button("Later") { updater.dismissReadyToast() }
+        }
+        Button("Check for Updates…") { updater.checkForUpdates() }
+            .disabled(!updater.isAvailable || !updater.canCheckForUpdates || updater.isChecking)
+        if updater.updateAvailable && !updater.isReady {
             Button(updateActionTitle) { updater.downloadLatestUpdate() }
                 .disabled(!updater.isAvailable || !updater.updateAvailable || updater.isReady)
-            Toggle("Automatically Install Updates", isOn: Binding(
-                get: { updater.automaticallyDownloadsUpdates },
-                set: { updater.automaticallyDownloadsUpdates = $0 }
-            ))
-            .disabled(!updater.isAvailable)
-            .help(automaticDownloadsHelp)
         }
     }
 
     private var updateActionTitle: String {
         if updater.isInformationalUpdate { return "View Update Information…" }
         return updater.isWaitingForApproval ? "Continue Update…" : "Download Latest Update…"
+    }
+}
+
+struct DesktopAutomaticUpdatesMenuItem: View {
+    @ObservedObject private var updater = DesktopUpdater.shared
+
+    var body: some View {
+        Toggle("Automatically Install Updates", isOn: Binding(
+            get: { updater.automaticallyDownloadsUpdates },
+            set: { updater.automaticallyDownloadsUpdates = $0 }
+        ))
+        .disabled(!updater.isAvailable)
+        .help(automaticDownloadsHelp)
     }
 
     private var automaticDownloadsHelp: String {

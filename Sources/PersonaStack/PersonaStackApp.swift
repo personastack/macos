@@ -55,7 +55,6 @@ struct PersonaStackApp: App {
 
         MenuBarExtra {
             DesktopControlMenu()
-            DesktopUpdatesMenuSection()
         } label: {
             Image(nsImage: menuBarIcon)
                 .renderingMode(.original)

@@ -52,8 +52,47 @@ struct DesktopControlMenu: View {
     }
 
     var body: some View {
-        Text("PersonaStack")
-            .font(.headline)
+        Button("Open PersonaStack") {
+            MainWebViewHost.showMainWindow {
+                openWindow(id: "personastack-main")
+            }
+        }
+        Divider()
+        connectionStatus
+        if let action = relayAction {
+            Button(action.title) {
+                Task { await toggleRelay() }
+            }
+            .disabled(!action.isEnabled)
+        }
+        Menu("Desktop Control") {
+            desktopControlActions
+        }
+        Divider()
+        Menu("Settings") {
+            DesktopServerSettingsMenuItem()
+            Button("Launch at Login") {
+                registerLoginItem()
+            }
+            .disabled(SMAppService.mainApp.status == .enabled)
+            if !loginItemError.isEmpty {
+                Text(loginItemError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            Divider()
+            DesktopAutomaticUpdatesMenuItem()
+        }
+        Menu("Updates") {
+            DesktopUpdatesMenuSection()
+        }
+        Divider()
+        Button("Quit PersonaStack") {
+            NSApp.terminate(nil)
+        }
+    }
+
+    private var connectionStatus: some View {
         Label(relayStatus, systemImage: relayEnabled ? "dot.radiowaves.left.and.right" : "pause.circle")
             .foregroundStyle(relayEnabled ? .green : .secondary)
             .onReceive(status.objectWillChange) { _ in
@@ -63,15 +102,29 @@ struct DesktopControlMenu: View {
                 let savedLoginItemError = UserDefaults.standard.string(forKey: "desktopControlLoginItemError") ?? ""
                 if loginItemError != savedLoginItemError { loginItemError = savedLoginItemError }
             }
-        Divider()
+    }
+
+    private var relayAction: DesktopMenuRelayAction? {
+        DesktopMenuRelayAction(relayEnabled: relayEnabled, relayPaused: relayPaused,
+                               hasError: !relayError.isEmpty,
+                               hasTrustedConfiguration: serverSettings.hasTrustedConfiguration,
+                               environmentSwitchPending: DesktopControlRuntime.shared.hasPendingEnvironmentSwitch)
+    }
+
+    @ViewBuilder
+    private var desktopControlActions: some View {
+        if !relayError.isEmpty {
+            Text(relayError)
+                .font(.caption)
+                .foregroundStyle(.red)
+        }
+        if !repairError.isEmpty && !DesktopControlRuntime.shared.isCuaReady() {
+            Text(repairError)
+                .font(.caption)
+                .foregroundStyle(.red)
+        }
         Button("Permissions and Setup…") {
             DesktopPermissionChecklist.shared.window.presentForRepair()
-        }
-        if relayEnabled || DesktopControlRuntime.shared.hasPendingEnvironmentSwitch {
-            Button(status.isRepairing ? "Repairing Cua Service…" : "Repair Cua Service") {
-                Task { await repairCua() }
-            }
-            .disabled(status.isRepairing || DesktopControlRuntime.shared.isDisconnecting)
         }
         if relayEnabled && DesktopControlRuntime.shared.requiresForegroundSessionConfirmation {
             Button("Confirm This Mac Is Unlocked") {
@@ -84,49 +137,15 @@ struct DesktopControlMenu: View {
                 }
             }
         }
-        if relayEnabled {
-            Button(!relayError.isEmpty ? "Retry Remote Control" : (relayPaused ? "Resume Remote Control" : "Pause Remote Control")) {
-                Task { await toggleRelay() }
-            }
-            .disabled(DesktopControlRuntime.shared.hasPendingEnvironmentSwitch)
-        }
         if relayEnabled || DesktopControlRuntime.shared.hasPendingEnvironmentSwitch {
-            Button("Disconnect this Mac…", role: .destructive) {
+            Button(status.isRepairing ? "Repairing Desktop Control…" : "Repair Desktop Control") {
+                Task { await repairCua() }
+            }
+            .disabled(status.isRepairing || DesktopControlRuntime.shared.isDisconnecting)
+            Divider()
+            Button("Disconnect This Mac…", role: .destructive) {
                 confirmDisconnect()
             }
-        } else {
-            Button(relayError.isEmpty ? "Start Local Service" : "Retry Remote Control") {
-                Task { await toggleRelay() }
-            }.disabled(!serverSettings.hasTrustedConfiguration || DesktopControlRuntime.shared.hasPendingEnvironmentSwitch)
-        }
-        Button("Launch at Login") {
-            registerLoginItem()
-        }
-        .disabled(SMAppService.mainApp.status == .enabled)
-        Divider()
-        Button("Open PersonaStack") {
-            MainWebViewHost.showMainWindow {
-                openWindow(id: "personastack-main")
-            }
-        }
-        DesktopServerSettingsMenuItem()
-        Button("Quit PersonaStack Desktop") {
-            NSApp.terminate(nil)
-        }
-        if !loginItemError.isEmpty {
-            Text(loginItemError)
-                .font(.caption)
-                .foregroundStyle(.red)
-        }
-        if !repairError.isEmpty && !DesktopControlRuntime.shared.isCuaReady() {
-            Text(repairError)
-                .font(.caption)
-                .foregroundStyle(.red)
-        }
-        if !relayError.isEmpty {
-            Text(relayError)
-                .font(.caption)
-                .foregroundStyle(.red)
         }
     }
 
@@ -275,4 +294,19 @@ struct DesktopControlMenu: View {
         }
     }
 
+}
+
+/// Presentation of the existing relay action, shared by its single menu button.
+struct DesktopMenuRelayAction: Equatable {
+    let title: String
+    let isEnabled: Bool
+
+    init?(relayEnabled: Bool, relayPaused: Bool, hasError: Bool,
+          hasTrustedConfiguration: Bool, environmentSwitchPending: Bool) {
+        guard relayEnabled || !environmentSwitchPending else { return nil }
+        if hasError { title = "Retry Remote Control" }
+        else if !relayEnabled { title = "Start Desktop Control" }
+        else { title = relayPaused ? "Resume Remote Control" : "Pause Remote Control" }
+        isEnabled = !environmentSwitchPending && (relayEnabled || hasTrustedConfiguration)
+    }
 }

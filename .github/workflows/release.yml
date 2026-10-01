@@ -61,7 +61,7 @@ jobs:
           fi
           swift test --disable-xctest --skip-update -j 2 \
             "${test_scheduling[@]}" \
-            --filter '(LocalRun|[Pp]ermission|[Pp]rotected|[Vv]olume|[Vv]oice|[Mm]icrophone|[Dd]irectory|[Cc]ua|[Dd]esktopControl|[Kk]eychain|[Cc]redential|[Ll]ogin)'
+            --filter '(LocalRun|[Pp]ermission|[Pp]rotected|[Vv]olume|[Vv]oice|[Mm]icrophone|[Dd]irectory|[Cc]ua|[Dd]esktopControl|DesktopMenu|DesktopUpdater|[Kk]eychain|[Cc]redential|[Ll]ogin)'
       - name: Build certificate-signed installer
         env:
           PERSONASTACK_DEFAULT_URL: https://my.personastack.ai/user/personas
