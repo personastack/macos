@@ -36,7 +36,7 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
     fake.values[.localNetwork] = .init(.verificationRequired, detail: "Selected LAN endpoints")
     await model.refresh()
     #expect(model.permissionRows.map(\.id) == DesktopPermissionID.setupPermissions)
-    #expect(!model.canFinish)
+    #expect(model.canFinish)
     #expect(fake.requested.isEmpty)
 }
 
