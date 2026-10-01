@@ -9,9 +9,10 @@ import CoreGraphics
 enum DesktopAccessibilityPermission {
     static func isGranted(
         trusted: @MainActor () -> Bool = currentProcessTrusted,
-        readRole: @MainActor () -> Bool = canReadApplicationRole
+        readRole: @MainActor () -> Bool = canReadApplicationRole,
+        canPostEvents: @MainActor () -> Bool = { CGPreflightPostEventAccess() }
     ) -> Bool {
-        trusted() || readRole()
+        trusted() || (readRole() && canPostEvents())
     }
 
     static func currentProcessTrusted() -> Bool {
@@ -37,10 +38,11 @@ enum DesktopAccessibilityPermission {
     static func printDiagnostics() {
         let trusted = currentProcessTrusted()
         let readable = canReadApplicationRole()
+        let postEvents = CGPreflightPostEventAccess()
         print("accessibility_trust_flag=\(AXIsProcessTrusted())")
         print("accessibility_trust_without_prompt=\(trusted)")
         print("accessibility_application_role_read=\(readable)")
-        print("event_posting_allowed=\(CGPreflightPostEventAccess())")
-        print("accessibility_granted=\(isGranted(trusted: { trusted }, readRole: { readable }))")
+        print("event_posting_allowed=\(postEvents)")
+        print("accessibility_granted=\(isGranted(trusted: { trusted }, readRole: { readable }, canPostEvents: { postEvents }))")
     }
 }

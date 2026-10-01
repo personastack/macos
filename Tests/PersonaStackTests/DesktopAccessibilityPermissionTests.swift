@@ -13,10 +13,15 @@ import Testing
 
 @Test @MainActor func accessibilityReadbackDetectsStaleTrustAndLaterRevocation() {
     var roleReadable = true
-    let check = { DesktopAccessibilityPermission.isGranted(trusted: { false }, readRole: { roleReadable }) }
+    let check = { DesktopAccessibilityPermission.isGranted(trusted: { false }, readRole: { roleReadable }, canPostEvents: { true }) }
     #expect(check())
     roleReadable = false
     #expect(!check())
+}
+
+@Test @MainActor func accessibilityReadGrantAloneDoesNotEstablishControlPermission() {
+    let granted = DesktopAccessibilityPermission.isGranted(trusted: { false }, readRole: { true }, canPostEvents: { false })
+    #expect(!granted)
 }
 
 @Test(arguments: [AXError.apiDisabled, .cannotComplete, .invalidUIElement, .attributeUnsupported, .noValue, .failure])
@@ -36,7 +41,7 @@ import Testing
     var roleReadable = true
     var access = DesktopPermissionSystemAccess()
     access.accessibility = {
-        DesktopAccessibilityPermission.isGranted(trusted: { false }, readRole: { roleReadable })
+        DesktopAccessibilityPermission.isGranted(trusted: { false }, readRole: { roleReadable }, canPostEvents: { true })
     }
     access.requestAccessibility = { Issue.record("Confirmed access must not request permission") }
     let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(
