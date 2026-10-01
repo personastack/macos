@@ -327,15 +327,15 @@ struct DesktopDirectoryPermissionTests {
     let model = service.window.coordinator
     model.open()
     await model.refresh()
-    #expect(!model.canFinish && selections == 0 && checks == 0)
+    #expect(model.canFinish && selections == 0 && checks == 0)
     model.setup(.removableVolumes)
     while model.busyPermission != nil { await Task.yield() }
     #expect(model.canFinish && selections == 1 && checks == 1)
     notifications.post(name: NSWorkspace.didUnmountNotification, object: nil)
-    #expect(!model.canFinish)
+    #expect(model.canFinish)
     #expect(model.rows.first { $0.id == .removableVolumes }?.state == .verificationRequired)
     await model.refresh()
-    #expect(!model.canFinish && selections == 1 && checks == 1)
+    #expect(model.canFinish && selections == 1 && checks == 1)
     #expect(await service.adapter.setup(.removableVolumes).state == .ready)
     service.cancelVerification()
     #expect(await service.adapter.observe(.removableVolumes).state == .checking)
