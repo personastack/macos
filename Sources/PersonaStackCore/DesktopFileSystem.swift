@@ -133,6 +133,7 @@ public actor DesktopFileSystem {
         var entries: [DesktopFileEntry] = []
         var hasMore = false
         while let item = readdir(directory) {
+            try DesktopControlExecution.check()
             let name = withUnsafePointer(to: item.pointee.d_name) { pointer in
                 pointer.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX) + 1) { String(cString: $0) }
             }
@@ -314,6 +315,7 @@ public actor DesktopFileSystem {
         }
         var matches: [DesktopFileSearchMatch] = []
         while matches.count < limit, ProcessInfo.processInfo.systemUptime < deadline {
+            try DesktopControlExecution.check()
             if let directory = state.currentDirectory {
                 errno = 0
                 if let item = readdir(directory) {
@@ -474,10 +476,17 @@ public actor DesktopFileSystem {
     private func lineStartOffset(id: UUID, line: Int) throws -> UInt64 {
         guard let file = openFiles[id] else { throw DesktopFileSystemError.missingHandle }
         try file.handle.seek(toOffset: 0)
+        return try Self.lineStartOffset(line: line) {
+            try file.handle.read(upToCount: 64 * 1024) ?? Data()
+        }
+    }
+
+    static func lineStartOffset(line: Int, readChunk: () throws -> Data) throws -> UInt64 {
         var currentLine = 1
         var offset: UInt64 = 0
         while currentLine < line {
-            let chunk = try file.handle.read(upToCount: 64 * 1024) ?? Data()
+            try DesktopControlExecution.check()
+            let chunk = try readChunk()
             if chunk.isEmpty { return offset }
             let newlines = chunk.indices.filter { chunk[$0] == 10 }
             if !newlines.isEmpty {
@@ -545,8 +554,12 @@ public actor DesktopFileSystem {
         let descriptor = try Self.openRegularFile(url.path, flags: O_RDONLY)
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         var openedInfo = stat()
-        guard fstat(descriptor, &openedInfo) == 0, openedInfo.st_size <= 4 * 1024 * 1024,
-              let data = try? Self.readBounded(handle, limit: 4 * 1024 * 1024 + 1), data.count <= 4 * 1024 * 1024,
+        guard fstat(descriptor, &openedInfo) == 0, openedInfo.st_size <= 4 * 1024 * 1024 else {
+            throw DesktopFileSystemError.patchMismatch
+        }
+        let data = try? Self.readBounded(handle, limit: 4 * 1024 * 1024 + 1)
+        try DesktopControlExecution.check()
+        guard let data, data.count <= 4 * 1024 * 1024,
               let current = String(data: data, encoding: .utf8), current.components(separatedBy: expected).count == 2 else {
             throw DesktopFileSystemError.patchMismatch
         }
@@ -726,10 +739,13 @@ public actor DesktopFileSystem {
         guard let text = String(data: data.prefix(maxBytes), encoding: .utf8), !needle.isEmpty else {
             return ([], truncated)
         }
-        let lines = text.components(separatedBy: .newlines).enumerated().compactMap { index, line in
-            line.localizedCaseInsensitiveContains(needle) ? index + 1 : nil
+        var lines: [Int] = []
+        for (index, line) in text.components(separatedBy: .newlines).enumerated() {
+            try DesktopControlExecution.check()
+            if line.localizedCaseInsensitiveContains(needle) { lines.append(index + 1) }
+            if lines.count == 100 { break }
         }
-        return (Array(lines.prefix(100)), truncated)
+        return (lines, truncated)
     }
 
     private static func directoryEntries(_ url: URL, limit: Int) throws -> (entries: [URL], truncated: Bool) {
@@ -738,6 +754,7 @@ public actor DesktopFileSystem {
         var result: [URL] = []
         errno = 0
         while let item = readdir(directory) {
+            try DesktopControlExecution.check()
             let name = withUnsafePointer(to: item.pointee.d_name) { pointer in
                 pointer.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX) + 1) { String(cString: $0) }
             }
@@ -752,6 +769,7 @@ public actor DesktopFileSystem {
     private static func readBounded(_ handle: FileHandle, limit: Int) throws -> Data {
         var result = Data()
         while result.count < limit {
+            try DesktopControlExecution.check()
             let chunk = try handle.read(upToCount: min(64 * 1024, limit - result.count)) ?? Data()
             if chunk.isEmpty { break }
             result.append(chunk)

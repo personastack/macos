@@ -3,6 +3,30 @@ import Testing
 @testable import PersonaStackCore
 
 struct DesktopFileSystemTests {
+    @Test func cancellationStopsALineScanBeforeAnotherChunkIsRead() async {
+        let result = await Task {
+            var reads = 0
+            do {
+                _ = try DesktopFileSystem.lineStartOffset(line: 100) {
+                    reads += 1
+                    if reads == 1 {
+                        withUnsafeCurrentTask { $0?.cancel() }
+                        return Data("first line\n".utf8)
+                    }
+                    return Data()
+                }
+                return (reads, false)
+            } catch is CancellationError {
+                return (reads, true)
+            } catch {
+                Issue.record("Unexpected line-scan error: \(error)")
+                return (reads, false)
+            }
+        }.value
+        #expect(result.0 == 1)
+        #expect(result.1)
+    }
+
     @Test func sharedDesktopParityFileFixtures() async throws {
         let fixture = try DesktopParityFixture.load().files
         let root = try temporaryRoot()
