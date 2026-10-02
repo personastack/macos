@@ -55,6 +55,7 @@ final class PopoutWindowPresentation: NSObject, NSToolbarDelegate {
     private static let pinIdentifier = NSToolbarItem.Identifier("popout.pin")
     let toolbar = NSToolbar(identifier: "PersonaStack.Popout")
     let pinButton = NSButton()
+    private let pinAccessory = NSTitlebarAccessoryViewController()
     private let window: NSWindow
     private let kind: PopoutWindowKind
     private let geometry: PopoutGeometryStore
@@ -81,8 +82,7 @@ final class PopoutWindowPresentation: NSObject, NSToolbarDelegate {
         // Hosted pop-outs use a dark canvas independently of the system theme.
         // Keep native active/inactive toolbar materials in that same appearance.
         window.appearance = NSAppearance(named: .darkAqua)
-        // Unified keeps the title and controls together in the native ~52pt row.
-        window.toolbarStyle = .unified
+        window.toolbarStyle = kind == .chat ? .automatic : .unified
         window.collectionBehavior.insert(.fullScreenPrimary)
         window.isOpaque = true
         window.backgroundColor = Self.backgroundColor
@@ -92,7 +92,8 @@ final class PopoutWindowPresentation: NSObject, NSToolbarDelegate {
         toolbar.allowsUserCustomization = false
         toolbar.autosavesConfiguration = false
         pinButton.setButtonType(.toggle)
-        pinButton.bezelStyle = .texturedRounded
+        pinButton.bezelStyle = kind == .chat ? .accessoryBarAction : .texturedRounded
+        if kind == .chat { pinButton.controlSize = .small }
         pinButton.imagePosition = .imageOnly
         pinButton.setAccessibilityLabel("Always on top")
         pinButton.toolTip = "Always on top"
@@ -100,7 +101,22 @@ final class PopoutWindowPresentation: NSObject, NSToolbarDelegate {
         pinButton.action = #selector(togglePin)
         setPinned(false)
         pinButton.sizeToFit()
-        window.toolbar = toolbar
+        if kind == .chat {
+            let accessoryView = NSView(frame: NSRect(x: 0, y: 0, width: 36, height: 24))
+            pinButton.translatesAutoresizingMaskIntoConstraints = false
+            accessoryView.addSubview(pinButton)
+            NSLayoutConstraint.activate([
+                pinButton.centerXAnchor.constraint(equalTo: accessoryView.centerXAnchor),
+                pinButton.centerYAnchor.constraint(equalTo: accessoryView.centerYAnchor),
+                pinButton.widthAnchor.constraint(equalToConstant: 24),
+                pinButton.heightAnchor.constraint(equalToConstant: 24),
+            ])
+            pinAccessory.view = accessoryView
+            pinAccessory.layoutAttribute = .right
+            window.addTitlebarAccessoryViewController(pinAccessory)
+        } else {
+            window.toolbar = toolbar
+        }
         window.center()
         let initialFrame = geometry.read(kind) ?? window.frame
         window.setFrame(PopoutGeometryStore.clamp(initialFrame, screens: NSScreen.screens.map(\.visibleFrame), minimum: window.minSize), display: false)
@@ -134,7 +150,17 @@ final class PopoutWindowPresentation: NSObject, NSToolbarDelegate {
         behavior.remove([.fullScreenPrimary, .fullScreenNone])
         behavior.insert(value ? .fullScreenNone : .fullScreenPrimary)
         window.collectionBehavior = behavior
-        window.toolbar = value ? nil : toolbar
+        if kind == .chat {
+            if value {
+                if let index = window.titlebarAccessoryViewControllers.firstIndex(of: pinAccessory) {
+                    window.removeTitlebarAccessoryViewController(at: index)
+                }
+            } else if !window.titlebarAccessoryViewControllers.contains(pinAccessory) {
+                window.addTitlebarAccessoryViewController(pinAccessory)
+            }
+        } else {
+            window.toolbar = value ? nil : toolbar
+        }
     }
 
     func finishResize() {
@@ -171,7 +197,10 @@ final class PopoutWindowPresentation: NSObject, NSToolbarDelegate {
     private func setPinned(_ pinned: Bool) {
         window.level = pinned ? .floating : .normal
         pinButton.state = pinned ? .on : .off
-        pinButton.image = NSImage(systemSymbolName: pinned ? "pin.fill" : "pin", accessibilityDescription: nil)
+        let image = NSImage(systemSymbolName: pinned ? "pin.fill" : "pin", accessibilityDescription: nil)
+        pinButton.image = kind == .chat
+            ? image?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .regular, scale: .small))
+            : image
         pinButton.setAccessibilityValue(pinned ? 1 : 0)
     }
 

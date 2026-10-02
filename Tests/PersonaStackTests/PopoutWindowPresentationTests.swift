@@ -48,6 +48,10 @@ struct PopoutWindowPresentationTests {
     @MainActor @Test func sharedChromeAndCapabilityForEveryKind() throws {
         _ = NSApplication.shared
         let preferences = PopoutTestPreferences()
+        let standardWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 650), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        standardWindow.isReleasedWhenClosed = false
+        defer { standardWindow.close() }
+        let standardTitlebarHeight = standardWindow.frame.height - standardWindow.contentLayoutRect.maxY
         for kind in PopoutWindowKind.allCases {
             let config = WKWebViewConfiguration()
             PopoutWindowPresentation.advertise(in: config)
@@ -65,7 +69,7 @@ struct PopoutWindowPresentationTests {
             #expect(window.title == kind.fallbackTitle)
             #expect(window.titleVisibility == .visible)
             #expect(window.appearance?.name == .darkAqua)
-            #expect(window.toolbarStyle == .unified)
+            #expect(window.toolbarStyle == (kind == .chat ? .automatic : .unified))
             #expect(!window.styleMask.contains(.fullSizeContentView))
             #expect(window.collectionBehavior.contains(.fullScreenPrimary))
             #expect(window.hasShadow)
@@ -74,8 +78,19 @@ struct PopoutWindowPresentationTests {
                 #expect(window.standardWindowButton(type)?.isEnabled == true)
             }
             window.contentView?.layoutSubtreeIfNeeded()
+            window.layoutIfNeeded()
+            chrome.pinButton.superview?.layoutSubtreeIfNeeded()
             let chromeHeight = window.frame.height - window.contentLayoutRect.maxY
-            #expect(chromeHeight >= 48 && chromeHeight <= 52)
+            if kind == .chat {
+                #expect(chromeHeight == standardTitlebarHeight)
+                #expect(window.toolbar == nil)
+                #expect(window.titlebarAccessoryViewControllers.count == 1)
+                #expect(window.titlebarAccessoryViewControllers.first?.layoutAttribute == .right)
+                #expect(chrome.pinButton.controlSize == .small)
+                #expect(chrome.pinButton.frame.size == NSSize(width: 24, height: 24))
+            } else {
+                #expect(chromeHeight >= 48 && chromeHeight <= 52)
+            }
             #expect(window.contentLayoutRect.maxY == webView.frame.maxY)
             #expect(!window.isVisible)
             chrome.pinButton.performClick(nil)
