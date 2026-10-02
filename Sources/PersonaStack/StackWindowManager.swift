@@ -182,7 +182,7 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction) async -> WKNavigationActionPolicy {
         guard let destination = action.request.url else { return .cancel }
         if destination == url && action.targetFrame?.isMainFrame == true { return .allow }
-        if action.navigationType == .linkActivated, ["https", "http", "mailto"].contains(destination.scheme ?? "") {
+        if action.navigationType == .linkActivated, NavigationPolicy.canOpenExternally(destination) {
             NSWorkspace.shared.open(destination)
         } else if action.targetFrame?.isMainFrame == true {
             dispose()

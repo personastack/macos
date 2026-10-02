@@ -210,9 +210,9 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
 
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction) async -> WKNavigationActionPolicy {
         guard let destination = action.request.url else { return .cancel }
-        if action.shouldPerformDownload, destination.scheme == "blob" { return .download }
+        if NavigationPolicy.shouldDownload(destination, requested: action.shouldPerformDownload, appURL: url) { return .download }
         if destination == url && action.targetFrame?.isMainFrame == true { return .allow }
-        if action.navigationType == .linkActivated, ["https", "http", "mailto"].contains(destination.scheme ?? "") {
+        if action.navigationType == .linkActivated, NavigationPolicy.canOpenExternally(destination) {
             NSWorkspace.shared.open(destination)
         } else if action.targetFrame?.isMainFrame == true {
             // Includes a session-expiry redirect. Never display a login page over a stale transcript.
@@ -241,7 +241,8 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
     func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) { download.delegate = self }
     func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) { download.delegate = self }
     func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String) async -> URL? {
-        FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first?.appendingPathComponent((suggestedFilename as NSString).lastPathComponent)
+        guard let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else { return nil }
+        return DesktopDownloadDestination.choose(suggestedFilename: suggestedFilename, directory: downloads)
     }
 }
 

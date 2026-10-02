@@ -503,6 +503,10 @@ struct PersonaStackWebView: NSViewRepresentable {
                 return .cancel
             }
 
+            if NavigationPolicy.shouldDownload(url, requested: navigationAction.shouldPerformDownload, appURL: appURL) {
+                return .download
+            }
+
             if webView === self.webView, navigationAction.targetFrame?.isMainFrame == true,
                ChatWindowCommand.sameOrigin(url, appURL) {
                 DesktopControlSetupManager.shared.invalidate(webView)
@@ -520,7 +524,7 @@ struct PersonaStackWebView: NSViewRepresentable {
                 if NavigationPolicy.isGoogleOAuthURL(url) {
                     return .allow
                 }
-                NSWorkspace.shared.open(url)
+                if NavigationPolicy.canOpenExternally(url) { NSWorkspace.shared.open(url) }
                 return .cancel
             }
 
@@ -533,7 +537,7 @@ struct PersonaStackWebView: NSViewRepresentable {
                 return .cancel
             }
 
-            return .allow
+            return NavigationPolicy.canLoadInWebView(url) ? .allow : .cancel
         }
 
         func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse) async -> WKNavigationResponsePolicy {
@@ -548,7 +552,7 @@ struct PersonaStackWebView: NSViewRepresentable {
         ) -> WKWebView? {
             guard let url = navigationAction.request.url,
                   NavigationPolicy.isGoogleOAuthURL(url) else {
-                if let url = navigationAction.request.url {
+                if let url = navigationAction.request.url, NavigationPolicy.canOpenExternally(url) {
                     NSWorkspace.shared.open(url)
                 }
                 return nil

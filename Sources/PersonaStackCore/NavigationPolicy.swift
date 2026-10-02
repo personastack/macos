@@ -22,7 +22,35 @@ public enum NavigationPolicy {
     }
 
     public static func isGoogleOAuthURL(_ url: URL) -> Bool {
-        url.scheme?.lowercased() == "https" && url.host?.lowercased() == "accounts.google.com"
+        canOpenExternally(url) && url.scheme?.lowercased() == "https" && url.host?.lowercased() == "accounts.google.com"
+    }
+
+    public static func canOpenExternally(_ url: URL) -> Bool {
+        switch url.scheme?.lowercased() {
+        case "http", "https":
+            return url.host != nil && url.user == nil && url.password == nil
+        case "mailto":
+            return !url.path.isEmpty
+        default:
+            return false
+        }
+    }
+
+    public static func canLoadInWebView(_ url: URL) -> Bool {
+        switch url.scheme?.lowercased() {
+        case "http", "https": return canOpenExternally(url)
+        case "about", "blob", "data": return true
+        default: return false
+        }
+    }
+
+    public static func shouldDownload(_ url: URL, requested: Bool, appURL: URL) -> Bool {
+        guard requested else { return false }
+        if url.scheme?.lowercased() == "blob" {
+            guard let originURL = URL(string: String(url.absoluteString.dropFirst(5))) else { return false }
+            return keepsInApp(originURL, appURL: appURL)
+        }
+        return keepsInApp(url, appURL: appURL)
     }
 
     private static func normalizedOrigin(_ url: URL) -> String? {
@@ -39,7 +67,7 @@ public enum NavigationPolicy {
     }
 
     public static func shouldOpenInDefaultBrowser(_ url: URL, linkWasUserActivated: Bool, appURL: URL? = nil) -> Bool {
-        linkWasUserActivated && !keepsInApp(url, appURL: appURL)
+        linkWasUserActivated && canOpenExternally(url) && !keepsInApp(url, appURL: appURL)
     }
 }
 
