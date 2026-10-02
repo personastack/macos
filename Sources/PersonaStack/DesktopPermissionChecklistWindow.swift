@@ -15,6 +15,7 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     private let showApplicationInFinder: (URL) -> Void
     private let lockedControlVerifier: DesktopLockedControlSetupVerifier
     private let authorizeFullControl: @MainActor (DesktopLockedControlSetupVerifier) -> Bool
+    private let restartApplication: @MainActor () throws -> Void
     var onCancel: (() -> Void)?
     var onStopVerification: (() -> Void)?
     var onPresent: (() -> Void)?
@@ -25,12 +26,14 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
              NSWorkspace.shared.activateFileViewerSelecting([$0])
          },
          lockedControlVerifier: DesktopLockedControlSetupVerifier = .shared,
-         authorizeFullControl: @escaping @MainActor (DesktopLockedControlSetupVerifier) -> Bool = DesktopPermissionChecklistWindow.confirmFullControl) {
+         authorizeFullControl: @escaping @MainActor (DesktopLockedControlSetupVerifier) -> Bool = DesktopPermissionChecklistWindow.confirmFullControl,
+         restartApplication: @escaping @MainActor () throws -> Void = { try DesktopApplicationRestart.request() }) {
         self.coordinator = coordinator
         self.applicationURL = applicationURL
         self.showApplicationInFinder = showApplicationInFinder
         self.lockedControlVerifier = lockedControlVerifier
         self.authorizeFullControl = authorizeFullControl
+        self.restartApplication = restartApplication
         super.init()
         activationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
@@ -60,6 +63,16 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     func revealCurrentApplication() {
         guard coordinator.isVisible, !coordinator.isFinishing else { return }
         showApplicationInFinder(applicationURL)
+    }
+
+    func restart() {
+        guard coordinator.canRestart else { return }
+        do {
+            try restartApplication()
+            cancel()
+        } catch {
+            coordinator.reportSetupPrerequisite("PersonaStack could not restart. Quit and reopen the app, then return to Desktop Control setup.")
+        }
     }
 
     func finish() async {
@@ -195,6 +208,7 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
             cancel: { [weak self] in self?.cancel() }, finish: { [weak self] in
                 Task { @MainActor in await self?.finish() }
             },
+            restart: { [weak self] in self?.restart() },
             revealApplication: { [weak self] in self?.revealCurrentApplication() })
         let value = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 670, height: 740),
                              styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
@@ -218,6 +232,7 @@ private struct DesktopPermissionChecklistView: View {
     @ObservedObject var lockedControlVerifier: DesktopLockedControlSetupVerifier
     let cancel: () -> Void
     let finish: () -> Void
+    let restart: () -> Void
     let revealApplication: () -> Void
 
     var body: some View {
@@ -268,10 +283,10 @@ private struct DesktopPermissionChecklistView: View {
                 Button("Cancel", action: cancel).keyboardShortcut(.cancelAction)
                 Spacer()
                 if coordinator.isFinishing { ProgressView().controlSize(.small) }
-                Button(coordinator.isFinishing ? "Finishing Setup…" : "Finish Setup", action: finish)
+                Button(coordinator.primaryActionTitle, action: coordinator.requiresAppRestart ? restart : finish)
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(!coordinator.canFinish)
+                    .disabled(coordinator.requiresAppRestart ? !coordinator.canRestart : !coordinator.canFinish)
             }
         }
         .padding(24)

@@ -515,3 +515,18 @@ private final class RestartConfirmationState {
 private func isolatedUpdatePreferences() -> UserDefaults {
     UserDefaults(suiteName: "DesktopUpdaterTests-\(UUID().uuidString)")!
 }
+
+@Test @MainActor func permissionRestartUsesReadyUpdateHandlerAndFailsClosedWithoutOne() throws {
+    let preferences = isolatedUpdatePreferences()
+    let updater = DesktopUpdater(updaterFactory: { _, _ in FakeDesktopUpdateClient(preferences: preferences) },
+                                 preferences: preferences, presentReadyReminder: { _ in }, clearAvailableNotification: { _ in })
+    #expect(try !updater.restartForPermissionRepairIfNeeded())
+    updater.projectReady(version: "0.5.0", notifyWhenInactive: true)
+    #expect(throws: CocoaError.self) { try updater.restartForPermissionRepairIfNeeded() }
+    var installs = 0
+    #expect(updater.retainAutomaticInstallHandler(version: "0.5.0", handler: { installs += 1 }))
+    #expect(try updater.restartForPermissionRepairIfNeeded())
+    #expect(try updater.restartForPermissionRepairIfNeeded())
+    #expect(installs == 1)
+    #expect(preferences.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey))
+}

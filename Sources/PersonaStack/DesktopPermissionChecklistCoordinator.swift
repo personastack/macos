@@ -71,6 +71,16 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     var canFinish: Bool {
         isVisible && !isFinishing && !needsNewSetupRequest && busyPermission != .accessibility && verificationBusyPermission != .accessibility && rows.filter(\.isRequiredForUnlockedSetup).allSatisfy(\.isComplete)
     }
+    var requiresAppRestart: Bool {
+        rows.contains { $0.isRequiredForUnlockedSetup && $0.state == .restartRequired }
+    }
+    var canRestart: Bool {
+        isVisible && !isFinishing && busyPermission == nil && requiresAppRestart
+    }
+    var primaryActionTitle: String {
+        if isFinishing { return "Finishing Setup…" }
+        return requiresAppRestart ? "Restart PersonaStack" : "Finish Setup"
+    }
     var operationGeneration: UUID { generation }
     var isAwaitingFinish: Bool { continuation != nil }
     var permissionRows: [DesktopPermissionRow] {

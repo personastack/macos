@@ -41,7 +41,7 @@ public enum DesktopPermissionState: String, Sendable, CaseIterable {
         case .notGranted: "Not granted"
         case .denied: "Denied"
         case .restricted: "Restricted"
-        case .restartRequired: "Restart required"
+        case .restartRequired: "PersonaStack app restart required"
         case .failed: "Failed"
         case .unsupported: "Unsupported"
         case .notNeeded: "Not needed"

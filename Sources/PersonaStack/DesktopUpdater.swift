@@ -222,6 +222,21 @@ final class DesktopUpdater: NSObject, ObservableObject {
             isReadyToastVisible = false
             return
         }
+        beginImmediateInstallation(immediateInstallHandler)
+    }
+
+    /// Permission repair must not race Sparkle's install-on-quit replacement.
+    /// The explicit Restart PersonaStack action already authorizes restarting.
+    func restartForPermissionRepairIfNeeded() throws -> Bool {
+        guard isReady else { return false }
+        guard applicationsInstallInstruction == nil, let immediateInstallHandler else {
+            throw CocoaError(.executableNotLoadable)
+        }
+        beginImmediateInstallation(immediateInstallHandler)
+        return true
+    }
+
+    private func beginImmediateInstallation(_ immediateInstallHandler: () -> Void) {
         requestForegroundRestart()
         isReadyToastVisible = false
         guard !isImmediateInstallRequested else { return }

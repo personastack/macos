@@ -39,6 +39,7 @@ struct PersonaStackApp: App {
     }()
     init() {
         let foregroundUpdateRelaunch = UserDefaults.standard.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
+            || CommandLine.arguments.contains(DesktopApplicationRestart.foregroundArgument)
         guard let configuration = try? LaunchConfiguration.selectedEnvironment(),
               UserDefaults.standard.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(configuration)) else { return }
         if DesktopUpdatePolicy.shouldUseAccessoryActivation(relayEnabled: true,
@@ -150,7 +151,8 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         // enrollment or the visible main window.
         _ = MainWebViewHost.shared
         DesktopUpdater.shared.start()
-        guard UserDefaults.standard.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey) else { return }
+        guard UserDefaults.standard.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
+                || CommandLine.arguments.contains(DesktopApplicationRestart.foregroundArgument) else { return }
         UserDefaults.standard.removeObject(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
         _ = UserDefaults.standard.synchronize()
         shouldRestoreMainWindowAfterUpdate = true

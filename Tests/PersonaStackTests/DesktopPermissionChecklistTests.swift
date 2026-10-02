@@ -831,3 +831,70 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     model.cancel()
     await #expect(throws: CancellationError.self) { try await currentRequest.value }
 }
+
+@Test @MainActor func permissionRestartActionOnlyReplacesFinishForRequiredRestart() async {
+    let fake = PermissionChecklistFake()
+    let model = DesktopPermissionChecklistCoordinator(adapter: fake)
+    model.open()
+    defer { model.cancel() }
+    fake.values[.screenRecording] = .init(.restartRequired, detail: "Optional")
+    await model.refresh()
+    #expect(model.primaryActionTitle == "Finish Setup" && model.canFinish && !model.canRestart)
+    fake.values[.accessibility] = .init(.restartRequired, detail: "Required")
+    await model.refresh()
+    #expect(model.primaryActionTitle == "Restart PersonaStack" && model.canRestart && !model.canFinish)
+    #expect(DesktopPermissionState.restartRequired.title == "PersonaStack app restart required")
+    var restarts = 0
+    let window = DesktopPermissionChecklistWindow(coordinator: model, restartApplication: { restarts += 1 })
+    window.restart()
+    window.restart()
+    #expect(restarts == 1 && !model.isVisible && !model.isFinishing)
+}
+
+@Test @MainActor func permissionRestartFailureKeepsSetupOpenAndRetryable() async {
+    let fake = PermissionChecklistFake()
+    fake.values[.accessibility] = .init(.restartRequired, detail: "Required")
+    let model = DesktopPermissionChecklistCoordinator(adapter: fake)
+    model.open()
+    defer { model.cancel() }
+    await model.refresh()
+    let window = DesktopPermissionChecklistWindow(coordinator: model, restartApplication: { throw CocoaError(.executableNotLoadable) })
+    window.restart()
+    #expect(model.isVisible && model.canRestart && !model.canFinish)
+    #expect(model.completionError.contains("could not restart"))
+    fake.values[.accessibility] = .init(.ready, detail: "Ready")
+    await model.refresh()
+    #expect(!model.canRestart && model.primaryActionTitle == "Finish Setup")
+}
+
+@Test @MainActor func permissionRestartSchedulesBundleRelaunchBeforeNormalQuit() throws {
+    var events: [String] = []
+    let appURL = URL(fileURLWithPath: "/Applications/PersonaStack Test ' $().app")
+    try DesktopApplicationRestart.request(applicationURL: appURL, processID: 123, installUpdate: { false }, start: { process in
+        events.append("schedule")
+        #expect(process.executableURL?.path == "/bin/sh")
+        let args = try #require(process.arguments)
+        #expect(Array(args.suffix(3)) == ["123", appURL.path, DesktopApplicationRestart.foregroundArgument])
+        #expect(!args[1].contains(appURL.path))
+        #expect(args[1].contains("/bin/kill -0") && args[1].contains("exec /usr/bin/open"))
+    }, terminate: { events.append("quit") })
+    #expect(events == ["schedule", "quit"])
+    events.removeAll()
+    #expect(throws: CocoaError.self) {
+        try DesktopApplicationRestart.request(applicationURL: appURL, installUpdate: { false }, start: { _ in throw CocoaError(.executableNotLoadable) },
+                                               terminate: { events.append("quit") })
+    }
+    #expect(events.isEmpty)
+}
+
+@Test @MainActor func permissionRestartLetsPendingUpdaterOwnRelaunchExclusively() throws {
+    var installs = 0
+    let appURL = URL(fileURLWithPath: "/Applications/PersonaStack.app")
+    try DesktopApplicationRestart.request(applicationURL: appURL, installUpdate: { installs += 1; return true },
+        start: { _ in Issue.record("Scheduled competing relaunch") }, terminate: { Issue.record("Quit outside Sparkle") })
+    #expect(installs == 1)
+    #expect(throws: CocoaError.self) {
+        try DesktopApplicationRestart.request(applicationURL: appURL, installUpdate: { throw CocoaError(.executableNotLoadable) },
+            start: { _ in Issue.record("Scheduled competing relaunch after update error") }, terminate: { Issue.record("Quit after update error") })
+    }
+}
