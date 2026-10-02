@@ -14,7 +14,7 @@ protocol DesktopControlSetupRuntime: AnyObject {
     func beginResume() throws -> UUID
     func resume(generation: UUID) async throws
     func resumeForSetup(generation: UUID) async throws
-    func finishSetupIfIdle() async
+    func finishSetupIfIdle() async throws
     func disconnect() async throws
     func repair(resumeRelay: Bool, expectedGeneration: UUID?) async throws -> UUID
     func isCurrentLifecycle(_ generation: UUID) -> Bool
@@ -281,7 +281,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             if scope.isEmpty || page.setupScope.value != scope { cancelPermissions(for: page) }
             page.setupScope.synchronize(scope)
             if scope.isEmpty {
-                await runtime.finishSetupIfIdle()
+                try await runtime.finishSetupIfIdle()
                 try requireCurrentScope(scope, page: page)
             }
             return Self.scopeReply

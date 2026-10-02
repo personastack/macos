@@ -21,6 +21,12 @@ private struct DesktopControlOwnedCuaStopError: LocalizedError {
     }
 }
 
+private struct DesktopControlLocalCleanupError: LocalizedError {
+    var errorDescription: String? {
+        "Desktop Control could not finish local cleanup. Remote control remains paused. Retry disconnect before adding this desktop again."
+    }
+}
+
 enum DesktopControlEnvironmentSwitchError: LocalizedError {
     case cleanupFailed
 
@@ -666,6 +672,11 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         activeInstallation = installation
         await stopLocalControl(generation: generation)
         guard disconnecting, generation == lifecycleGeneration else { return }
+        guard !executorCleanupFailed else {
+            readiness = "cua_unavailable"
+            await gateway?.setReadiness(readiness)
+            throw DesktopControlLocalCleanupError()
+        }
         let enrollment = DesktopControlEnrollmentClient(credentials: credentials)
         if let installation {
             do {
@@ -992,7 +1003,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                             let hasActiveConfig = try await self.hasActiveConfig(for: installation)
                             guard generation == self.lifecycleGeneration else { return }
                             if !hasActiveConfig {
-                                await self.stopIdleRelay(expectedLifecycle: generation)
+                                try? await self.stopIdleRelay(expectedLifecycle: generation)
                                 return
                             }
                         } catch {
@@ -1194,31 +1205,27 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         beginReconnectLoop(for: installation)
     }
 
-    func finishSetupIfIdle() async {
-        guard !disconnecting, !environmentSwitchPending else { return }
+    func finishSetupIfIdle() async throws {
+        try Task.checkCancellation()
+        guard !disconnecting, !environmentSwitchPending else { throw CancellationError() }
         let generation = lifecycleGeneration
-        let configuration: DesktopEnvironmentConfiguration
-        do { configuration = try configurationProvider() }
-        catch { return }
+        let configuration = try configurationProvider()
         setupMayRunUnconfigured = false
-        let saved: DesktopControlInstallation?
-        do { saved = try await readSavedInstallation() }
-        catch { return }
-        guard generation == lifecycleGeneration, !disconnecting, !environmentSwitchPending else { return }
-        do { try saved?.requireEnvironment(configuration.appPageURL, configuration: configuration) }
-        catch { return }
+        let saved = try await readSavedInstallation()
+        try Task.checkCancellation()
+        guard generation == lifecycleGeneration, !disconnecting, !environmentSwitchPending,
+              try configurationProvider() == configuration else { throw CancellationError() }
+        try saved?.requireEnvironment(configuration.appPageURL, configuration: configuration)
         activeInstallation = saved
         guard let installation = saved else {
-            await stopIdleRelay(expectedLifecycle: generation)
+            try await stopIdleRelay(expectedLifecycle: generation)
             return
         }
-        do {
-            let hasActiveConfig = try await hasActiveConfig(for: installation)
-            guard generation == lifecycleGeneration else { return }
-            if !hasActiveConfig { await stopIdleRelay(expectedLifecycle: generation) }
-        } catch {
-            // Preserve the relay when the API cannot prove that no workspace still uses it.
-        }
+        let hasActiveConfig = try await hasActiveConfig(for: installation)
+        try Task.checkCancellation()
+        guard generation == lifecycleGeneration, !disconnecting, !environmentSwitchPending,
+              try configurationProvider() == configuration else { throw CancellationError() }
+        if !hasActiveConfig { try await stopIdleRelay(expectedLifecycle: generation) }
     }
 
     private func stopIfNoActiveConfiguration(installation: DesktopControlInstallation, generation: UUID) async -> Bool {
@@ -1227,7 +1234,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             let hasActiveConfig = try await relayStateReader.hasActiveConfig(installation: installation, appURL: LaunchConfiguration.selectedURL())
             guard generation == lifecycleGeneration else { return false }
             if !hasActiveConfig {
-                await stopIdleRelay(expectedLifecycle: generation)
+                try? await stopIdleRelay(expectedLifecycle: generation)
                 return true
             }
         } catch {
@@ -1312,14 +1319,14 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         do {
             let hasActiveConfig = try await hasActiveConfig(for: installation)
             guard gatewayConnectionID == connectionID, generation == lifecycleGeneration else { return }
-            if !hasActiveConfig { await stopIdleRelay(expectedLifecycle: generation) }
+            if !hasActiveConfig { try? await stopIdleRelay(expectedLifecycle: generation) }
         } catch {
             // A failed read must not stop a relay another workspace may still use.
         }
     }
 
-    private func stopIdleRelay(expectedLifecycle: UUID) async {
-        guard lifecycleGeneration == expectedLifecycle, !disconnecting, !environmentSwitchPending else { return }
+    private func stopIdleRelay(expectedLifecycle: UUID) async throws {
+        guard lifecycleGeneration == expectedLifecycle, !disconnecting, !environmentSwitchPending else { throw CancellationError() }
         allowsAutomaticCuaRecovery = false
         lifecycleGeneration = UUID()
         let generation = lifecycleGeneration
@@ -1332,18 +1339,19 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let pending = pendingGateway
         pendingGateway = nil
         await pending?.stop()
-        guard generation == lifecycleGeneration else { return }
+        guard generation == lifecycleGeneration else { throw CancellationError() }
         await stopLocalControl(generation: generation)
-        guard generation == lifecycleGeneration else { return }
+        guard generation == lifecycleGeneration else { throw CancellationError() }
         let cuaStopped = await stopOwnedCuaService()
-        guard generation == lifecycleGeneration else { return }
+        guard generation == lifecycleGeneration else { throw CancellationError() }
         if executorCleanupFailed || !cuaStopped {
             readiness = "cua_unavailable"
             await gateway?.setReadiness(readiness)
             if let installation = activeInstallation, gateway != nil { beginReconnectLoop(for: installation) }
-            return
+            throw DesktopControlLocalCleanupError()
         }
         await gateway?.stop()
+        guard generation == lifecycleGeneration else { throw CancellationError() }
         gateway = nil
         gatewayConnectionID = nil
         gatewayConnected = false
@@ -1354,6 +1362,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         }
         paused = false
         readiness = "unknown"
+        try Task.checkCancellation()
     }
 
     private func stopOwnedCuaService() async -> Bool {

@@ -924,7 +924,7 @@ private struct SavedDesktopControlCredentialStore: DesktopControlCredentialStori
         credentials: credentials,
         configurationProvider: { selectedConfiguration }
     )
-    let finishingSetup = Task { @MainActor in await runtime.finishSetupIfIdle() }
+    let finishingSetup = Task { @MainActor in try await runtime.finishSetupIfIdle() }
     let readStarted = await Task.detached { waitForCredentialRead(credentials.readStarted) }.value
     #expect(readStarted)
 
@@ -932,7 +932,7 @@ private struct SavedDesktopControlCredentialStore: DesktopControlCredentialStori
     selectedConfiguration = changed
     runtime.completeEnvironmentSwitch()
     credentials.continueRead.signal()
-    await finishingSetup.value
+    await #expect(throws: CancellationError.self) { try await finishingSetup.value }
 
     #expect(!runtime.hasActiveInstallation)
 }
@@ -1042,11 +1042,15 @@ private struct SavedDesktopControlCredentialStore: DesktopControlCredentialStori
 
 private actor DesktopControlRelayStateFixture: DesktopControlRelayStateReading {
     let active: Bool
+    private var readFails = false
 
     init(active: Bool) { self.active = active }
 
+    func setReadFailure(_ value: Bool) { readFails = value }
+
     func hasActiveConfig(installation: DesktopControlInstallation, appURL: URL) async throws -> Bool {
-        active
+        if readFails { throw DesktopControlEnrollmentError.rejected }
+        return active
     }
 }
 
@@ -1091,7 +1095,7 @@ private final class DesktopControlSetupRuntimeFixture: DesktopControlSetupRuntim
         try await resume(generation: generation)
     }
 
-    func finishSetupIfIdle() async { finishSetupCalls += 1 }
+    func finishSetupIfIdle() async throws { finishSetupCalls += 1 }
     func disconnect() async throws {
         disconnectCalls += 1
         if let disconnectError { throw disconnectError }
@@ -1147,6 +1151,58 @@ private final class DesktopControlSetupRuntimeFixture: DesktopControlSetupRuntim
     #expect(runtime.disconnectCalls == 1)
     #expect(await enrollment.attachedTicketInstallationIDs.isEmpty)
     #expect(runtime.attempts == 0)
+}
+
+@Test @MainActor func setupDoesNotAttachWhenOwnedExecutorCleanupFailsAndDisconnectCanRetry() async throws {
+    let appURL = DesktopEnvironmentConfiguration.production.appURL
+    let payload = Data(#"{"installation_id":"installation-cleanup-failure","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8)
+    var installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
+    try installation.bindEnvironment(appURL)
+    let credentials = PermissionPreparationCredentialStore(installation: installation)
+    let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
+    let owner = DesktopControlTarget(installationID: installation.installationID, workspaceID: "workspace-a",
+                                     configID: "removed-config", personaID: "persona-a", runID: "run-a",
+                                     generation: 1, configVersion: 1)
+    let acquire = DesktopControlFrame(type: "command", requestID: "acquire-before-removal", target: owner,
+                                      operation: "desktop_control_acquire", arguments: .object([:]))
+    #expect((await executor.handle(acquire, proxy: nil)).type == "result")
+    executor.failNextCleanupForTesting()
+    let installer = DesktopControlInstallerFixture(errors: [])
+    // Keep the real runtime's network boundary unconfigured. Inject the saved
+    // machine proof into setup independently so an erroneous attach is visible
+    // in the strict enrollment fixture without an external revocation request.
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: installer, credentials: EmptyDesktopControlCredentialStore(), executor: executor,
+        connected: true, readiness: "ready", sessionLockState: .unlocked
+    )
+    let enrollment = DesktopControlSetupEnrollmentFixture()
+    let manager = DesktopControlSetupManager(runtime: runtime, enrollment: enrollment, credentials: credentials,
+        configurationProvider: { .production }, permissionPresenter: FinishedDesktopControlPermissionFixture())
+    let page = DesktopControlSetupManager.Page(appURL: appURL)
+    let scope = "workspace-setup-session"
+    page.setupScope.synchronize(scope)
+    _ = try await manager.apply(.permissions(scope: scope, phase: .open, message: nil), page: page)
+
+    do {
+        _ = try await manager.apply(.prepare(scope: scope, enrollmentTicket: String(repeating: "a", count: 43)), page: page)
+        Issue.record("cleanup failure must prevent reattachment")
+    } catch {
+        #expect(error.localizedDescription.contains("could not finish local cleanup"))
+    }
+    #expect(await enrollment.attachedTicketInstallationIDs.isEmpty)
+    #expect(await enrollment.readyInstallationIDs.isEmpty)
+    #expect(await installer.repairArguments.isEmpty)
+    #expect(runtime.paused && runtime.executorCleanupFailedForTesting)
+    #expect(runtime.readiness == "cua_unavailable")
+    #expect(!runtime.isDisconnecting)
+    #expect(try credentials.load() == installation)
+
+    // A later explicit attempt retries only owned cleanup. A transient failure
+    // must not strand the disconnect lifecycle or erase the saved identity.
+    try await runtime.disconnect()
+    #expect(!runtime.executorCleanupFailedForTesting && !runtime.isDisconnecting)
+    #expect(!runtime.gatewayConnected)
+    #expect(try credentials.load() == installation)
 }
 
 private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollment {
@@ -1308,7 +1364,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
             preferences: preferences
         )
 
-        await runtime.finishSetupIfIdle()
+        try await runtime.finishSetupIfIdle()
 
         #expect(runtime.gatewayConnected == hasActiveConfig)
         #expect(runtime.hasActiveInstallation == hasActiveConfig)
@@ -1327,9 +1383,10 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
         defer { preferences.removePersistentDomain(forName: suite) }
         preferences.set(true, forKey: DesktopControlPreferenceKeys.relayEnabled(.production))
         var cuaStops = 0
+        let credentials = PermissionPreparationCredentialStore(installation: installation)
+        let installer = DesktopControlInstallerFixture(errors: [])
         let runtime = DesktopControlRuntime.makeForTesting(
-            installer: DesktopControlInstallerFixture(errors: []),
-            credentials: SavedDesktopControlCredentialStore(installation: installation),
+            installer: installer, credentials: credentials,
             connectionID: UUID(), installation: installation, connected: true,
             readiness: "ready", relayStateReader: DesktopControlRelayStateFixture(active: hasActiveConfig),
             preferences: preferences,
@@ -1337,11 +1394,13 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
             stopCuaService: { _ in cuaStops += 1; return true }
         )
 
-        await runtime.finishSetupIfIdle()
+        try await runtime.finishSetupIfIdle()
 
         #expect(cuaStops == expectedStops)
         #expect(runtime.gatewayConnected == hasActiveConfig)
         #expect(preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(.production)) == hasActiveConfig)
+        #expect(try credentials.load() == installation)
+        #expect(await installer.repairArguments.isEmpty)
     }
 }
 
@@ -1363,7 +1422,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
         stopCuaService: { _ in cuaStops += 1; return false }
     )
 
-    await runtime.finishSetupIfIdle()
+    await #expect(throws: (any Error).self) { try await runtime.finishSetupIfIdle() }
 
     #expect(cuaStops == 1)
     #expect(runtime.gatewayConnected)
@@ -1396,12 +1455,137 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
         preferences: preferences
     )
 
-    await runtime.finishSetupIfIdle()
+    await #expect(throws: (any Error).self) { try await runtime.finishSetupIfIdle() }
 
     #expect(runtime.gatewayConnected)
     #expect(runtime.hasActiveInstallation)
     #expect(preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(.production)))
     #expect(runtime.readiness == "cua_unavailable")
+}
+
+@MainActor
+private func sendIdleSetupSync(_ manager: DesktopControlSetupManager,
+                               page: DesktopControlSetupManager.Page) async -> (ok: Bool, error: String?) {
+    await withCheckedContinuation { continuation in
+        manager.dispatch(["version": "1", "action": "sync", "scope": ""], page: page) { value, error in
+            let response = value as? [String: Any]
+            continuation.resume(returning: (response?["ok"] as? Bool == true, error))
+        }
+    }
+}
+
+@Test(arguments: ["executor", "cua", "aggregate"]) @MainActor
+func setupIdleSyncReportsRealReconciliationFailureAndRecoversOnRetry(failure: String) async throws {
+    let configuration = DesktopEnvironmentConfiguration.production
+    let payload = Data(#"{"installation_id":"install-sync-removal","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8)
+    var installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
+    try installation.bindEnvironment(configuration.appURL, configuration: configuration)
+    let credentials = PermissionPreparationCredentialStore(installation: installation)
+    let suite = "desktop-sync-removal-\(UUID().uuidString)"
+    let preferences = try #require(UserDefaults(suiteName: suite))
+    defer { preferences.removePersistentDomain(forName: suite) }
+    preferences.set(true, forKey: DesktopControlPreferenceKeys.relayEnabled(configuration))
+    let reader = DesktopControlRelayStateFixture(active: false)
+    await reader.setReadFailure(failure == "aggregate")
+    let installer = DesktopControlInstallerFixture(errors: [])
+    let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
+    let owner = DesktopControlTarget(installationID: installation.installationID, workspaceID: "workspace-a",
+                                     configID: "removed-config", personaID: "persona-a", runID: "run-a",
+                                     generation: 1, configVersion: 1)
+    let acquire = DesktopControlFrame(type: "command", requestID: "sync-before-removal", target: owner,
+                                      operation: "desktop_control_acquire", arguments: .object([:]))
+    #expect((await executor.handle(acquire, proxy: nil)).type == "result")
+    if failure == "executor" { executor.failNextCleanupForTesting() }
+    var cuaShouldFail = failure == "cua"
+    var cuaStops = 0
+    let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: credentials,
+        executor: executor, connectionID: UUID(), installation: installation, connected: true,
+        readiness: "ready", relayStateReader: reader, preferences: preferences,
+        ownedCuaService: CuaEmbeddedService(executableURL: URL(fileURLWithPath: "/fake/cua")),
+        stopCuaService: { _ in cuaStops += 1; return !cuaShouldFail })
+    let manager = DesktopControlSetupManager(runtime: runtime, credentials: credentials,
+        preferences: preferences, configurationProvider: { configuration },
+        permissionPresenter: FinishedDesktopControlPermissionFixture())
+    let page = DesktopControlSetupManager.Page(appURL: configuration.appURL)
+
+    let failed = await sendIdleSetupSync(manager, page: page)
+    #expect(!failed.ok && failed.error != nil)
+    #expect(runtime.gatewayConnected && runtime.hasActiveInstallation)
+    #expect(preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(configuration)))
+    #expect(try credentials.load() == installation)
+    if failure == "aggregate" {
+        #expect(cuaStops == 0 && !runtime.paused)
+        #expect(runtime.readiness == "ready")
+    } else {
+        #expect(failed.error?.contains("could not finish local cleanup") == true)
+        #expect(runtime.paused && runtime.readiness == "cua_unavailable")
+    }
+
+    await reader.setReadFailure(false)
+    cuaShouldFail = false
+    let retried = await sendIdleSetupSync(manager, page: page)
+    #expect(retried.ok && retried.error == nil)
+    #expect(!runtime.gatewayConnected && !runtime.hasActiveInstallation && !runtime.paused)
+    #expect(!preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(configuration)))
+    #expect(try credentials.load() == installation)
+    #expect(await installer.repairArguments.isEmpty)
+}
+
+@Test(arguments: [false, true]) @MainActor
+func setupIdleSyncPreservesAnActiveConfigurationOrAllowsFirstSetup(hasSavedIdentity: Bool) async throws {
+    let configuration = DesktopEnvironmentConfiguration.production
+    let payload = Data(#"{"installation_id":"install-sync-active","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8)
+    var installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
+    try installation.bindEnvironment(configuration.appURL, configuration: configuration)
+    let credentials = PermissionPreparationCredentialStore(installation: hasSavedIdentity ? installation : nil)
+    let suite = "desktop-sync-active-\(UUID().uuidString)"
+    let preferences = try #require(UserDefaults(suiteName: suite))
+    defer { preferences.removePersistentDomain(forName: suite) }
+    preferences.set(hasSavedIdentity, forKey: DesktopControlPreferenceKeys.relayEnabled(configuration))
+    let installer = DesktopControlInstallerFixture(errors: [])
+    var cuaStops = 0
+    let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: credentials,
+        installation: hasSavedIdentity ? installation : nil, connected: hasSavedIdentity,
+        readiness: "ready", relayStateReader: DesktopControlRelayStateFixture(active: true),
+        preferences: preferences, ownedCuaService: hasSavedIdentity ? CuaEmbeddedService(executableURL: URL(fileURLWithPath: "/fake/cua")) : nil,
+        stopCuaService: { _ in cuaStops += 1; return true })
+    let manager = DesktopControlSetupManager(runtime: runtime, credentials: credentials, preferences: preferences,
+        configurationProvider: { configuration }, permissionPresenter: FinishedDesktopControlPermissionFixture())
+    let page = DesktopControlSetupManager.Page(appURL: configuration.appURL)
+
+    let synced = await sendIdleSetupSync(manager, page: page)
+    #expect(synced.ok && synced.error == nil)
+    #expect(runtime.gatewayConnected == hasSavedIdentity)
+    #expect(runtime.hasActiveInstallation == hasSavedIdentity)
+    #expect(preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(configuration)) == hasSavedIdentity)
+    #expect(cuaStops == 0)
+    #expect(await installer.repairArguments.isEmpty)
+    #expect(try credentials.load() == (hasSavedIdentity ? installation : nil))
+}
+
+@Test(arguments: ["credential", "profile", "cancelled"]) @MainActor
+func setupIdleSyncRejectsUnavailableCredentialsProfileOrCancellation(failure: String) async throws {
+    let credentials: any DesktopControlCredentialStoring = failure == "credential"
+        ? DeniedDesktopControlCredentialStore() : EmptyDesktopControlCredentialStore()
+    let installer = DesktopControlInstallerFixture(errors: [])
+    let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: credentials,
+        connected: true, readiness: "ready", configurationProvider: {
+            if failure == "profile" { throw DesktopControlEnrollmentError.invalidRequest }
+            return .production
+        })
+    let manager = DesktopControlSetupManager(runtime: runtime, credentials: credentials,
+        configurationProvider: { .production }, permissionPresenter: FinishedDesktopControlPermissionFixture())
+    let page = DesktopControlSetupManager.Page(appURL: DesktopEnvironmentConfiguration.production.appURL)
+    if failure == "cancelled" {
+        let task = Task { @MainActor in _ = try await manager.apply(.sync(scope: ""), page: page) }
+        task.cancel()
+        await #expect(throws: CancellationError.self) { try await task.value }
+    } else {
+        let synced = await sendIdleSetupSync(manager, page: page)
+        #expect(!synced.ok && synced.error != nil)
+    }
+    #expect(runtime.gatewayConnected && runtime.readiness == "ready")
+    #expect(await installer.repairArguments.isEmpty)
 }
 
 @Test @MainActor func setupReplyBoundaryRetriesAfterPermissionGrantAndConnectsInstallation() async throws {

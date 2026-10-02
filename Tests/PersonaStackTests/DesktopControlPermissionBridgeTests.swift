@@ -44,6 +44,7 @@ private final class PermissionBridgeRuntime: DesktopControlSetupRuntime {
     var nativeExecutorReady = true
     var cuaReady = true
     var allowsReplacement = false
+    var onDisconnect: (() throws -> Void)?
     var calls: [String] = []
     let generation = UUID()
     func isCuaReady() -> Bool { cuaReady }
@@ -51,13 +52,14 @@ private final class PermissionBridgeRuntime: DesktopControlSetupRuntime {
     func beginResume() throws -> UUID { calls.append("begin"); return generation }
     func resume(generation: UUID) async throws { Issue.record("Unplanned ordinary resume"); throw PermissionBridgeFixtureError.unplannedCall }
     func resumeForSetup(generation: UUID) async throws { calls.append("resumeForSetup") }
-    func finishSetupIfIdle() async { calls.append("finishSetupIfIdle") }
+    func finishSetupIfIdle() async throws { calls.append("finishSetupIfIdle") }
     func disconnect() async throws {
         guard allowsReplacement else {
             Issue.record("Unplanned saved-installation disconnect")
             throw PermissionBridgeFixtureError.unplannedCall
         }
         calls.append("disconnect")
+        try onDisconnect?()
         gatewayConnected = false
     }
     func repair(resumeRelay: Bool, expectedGeneration: UUID?) async throws -> UUID { Issue.record("Unplanned repair"); throw PermissionBridgeFixtureError.unplannedCall }
@@ -95,7 +97,12 @@ private actor PermissionBridgeEnrollment: DesktopControlSetupEnrollment {
         return installation
     }
     func reportReady(installation: DesktopControlInstallation, appURL: URL) async throws { try require("reportReady") }
-    func attach(ticket: String, installation: DesktopControlInstallation, appURL: URL) async throws { try require("attach") }
+    func attach(ticket: String, installation: DesktopControlInstallation, appURL: URL) async throws {
+        try require("attach")
+        #expect(ticket == String(repeating: "a", count: 43))
+        #expect(installation == self.installation)
+        #expect(appURL == DesktopEnvironmentConfiguration.production.appURL)
+    }
     func configurationState(installation: DesktopControlInstallation, appURL: URL) async throws -> DesktopControlConfigurationState {
         try require("configurationState")
         if suspendConfiguration { await withCheckedContinuation { pendingConfiguration.append($0) } }
@@ -452,6 +459,71 @@ func permissionBridgeRepairRejectsInvalidPageAndPayload(_ reason: String) async 
     let completed = await fixture.send(fixture.permissions("completed"))
     #expect(completed.ok && fixture.presenter.completions == 1)
     #expect(await fixture.enrollment.calls == ["enroll", "reportReady", "configurationState"])
+}
+
+@Test(arguments: [false, true]) @MainActor
+func permissionBridgeRemovedConfigurationReattachesSavedMachineWithoutGatewayNotice(noticeReceived: Bool) async throws {
+    let fixture = try PermissionBridgeFixture(allowEnrollment: true, allowReplacement: true)
+    defer { fixture.cleanup() }
+    let saved = fixture.enrollment.installation
+    try fixture.credentials.save(saved)
+    fixture.runtime.gatewayConnected = !noticeReceived
+    await fixture.enrollment.setConfiguration(hasConfig: false, active: false)
+
+    #expect(await fixture.send(["version": "1", "action": "sync", "scope": ""]).ok)
+    let unlinked = try await fixture.manager.apply(.state(scope: ""), page: fixture.page)
+    #expect(unlinked["installation_id"] as? String == saved.installationID)
+    #expect(unlinked["configuration_in_use"] as? Bool == false)
+    #expect(unlinked["machine_credential"] == nil)
+    #expect(fixture.presenter.opens == 0)
+    #expect(fixture.runtime.calls == ["finishSetupIfIdle"])
+    #expect(await fixture.enrollment.calls == ["configurationState"])
+
+    // Add is explicit. Native permission Finish still gates attachment.
+    #expect(await fixture.send(["version": "1", "action": "sync", "scope": "workspace-session"]).ok)
+    fixture.presenter.autoFinish = true
+    #expect(await fixture.send(fixture.permissions("open")).ok)
+    fixture.runtime.onDisconnect = {
+        // A delayed removal notification must not be required to stop the old relay.
+        #expect(fixture.runtime.gatewayConnected == !noticeReceived)
+    }
+    let prepared = await fixture.send(fixture.prepare)
+    #expect(prepared.ok && prepared.installationID == saved.installationID)
+    #expect(fixture.runtime.calls == ["finishSetupIfIdle", "disconnect", "begin", "resumeForSetup", "probe", "connect"])
+    #expect(await fixture.enrollment.calls == ["configurationState", "attach", "reportReady"])
+    #expect(try fixture.credentials.load() == saved)
+    #expect(fixture.credentials.counts.saves == 1)
+
+    // Preparation cannot manufacture the API-owned configuration. Complete only
+    // after the canonical web save creates a fresh active mapping.
+    let missing = await fixture.send(fixture.permissions("completed"))
+    #expect(!missing.ok && missing.code == "permissions_incomplete")
+    #expect(fixture.presenter.completions == 0)
+    await fixture.enrollment.setConfiguration(hasConfig: true, active: true)
+    #expect(await fixture.send(fixture.permissions("completed")).ok)
+    #expect(fixture.presenter.completions == 1 && fixture.presenter.repairs == 0)
+    #expect(fixture.credentials.counts.saves == 1)
+    #expect(await fixture.enrollment.calls == ["configurationState", "attach", "reportReady", "configurationState", "configurationState"])
+}
+
+@Test(arguments: ["", "other-workspace-session"]) @MainActor
+func permissionBridgeRemovedConfigurationCannotAttachAfterScopeChangesDuringDisconnect(newScope: String) async throws {
+    let fixture = try PermissionBridgeFixture(allowEnrollment: true, allowReplacement: true)
+    defer { fixture.cleanup() }
+    let saved = fixture.enrollment.installation
+    try fixture.credentials.save(saved)
+    await fixture.enrollment.setConfiguration(hasConfig: false, active: false)
+    fixture.presenter.autoFinish = true
+    #expect(await fixture.send(fixture.permissions("open")).ok)
+    fixture.runtime.onDisconnect = { fixture.page.setupScope.synchronize(newScope) }
+
+    let stale = await fixture.send(fixture.prepare)
+    #expect(!stale.ok && stale.error != nil)
+    #expect(fixture.runtime.calls == ["disconnect"])
+    #expect(await fixture.enrollment.calls.isEmpty)
+    #expect(try fixture.credentials.load() == saved)
+    #expect(fixture.credentials.counts.saves == 1)
+    #expect(fixture.presenter.completions == 0)
 }
 
 @Test @MainActor func permissionBridgeCompletionRequiresAuthoritativeActiveConfigurationReadback() async throws {
