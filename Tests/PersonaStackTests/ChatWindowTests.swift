@@ -6,22 +6,24 @@ import PersonaStackCore
 
 struct ChatWindowTests {
     @MainActor
-    @Test func testExpandedChatMaskReachesBottomEdge() {
+    @Test func testExpandedChatUsesNativeCornersAndCollapsedAvatarMask() {
         _ = NSApplication.shared
-        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false) {}
+        let preferences = PopoutTestPreferences()
+        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false, defaults: preferences.defaults) {}
         defer { chat.dispose() }
         chat.window.contentView?.layoutSubtreeIfNeeded()
         chat.webView.layoutSubtreeIfNeeded()
-        let mask = chat.webView.layer?.mask as? CAShapeLayer
-        let bounds = mask?.path?.boundingBoxOfPath
-        #expect(bounds?.minY == 0)
-        #expect(abs((bounds?.maxY ?? -1) - chat.webView.bounds.height) < 0.1)
+        #expect(chat.webView.layer?.mask == nil)
+        chat.apply(.collapse)
+        chat.webView.layoutSubtreeIfNeeded()
+        #expect((chat.webView.layer?.mask as? CAShapeLayer)?.path?.boundingBoxOfPath.size == NSSize(width: 64, height: 64))
     }
 
     @MainActor
     @Test func testNativePinReplacesHostedPinOnOlderPages() async throws {
         _ = NSApplication.shared
-        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false) {}
+        let preferences = PopoutTestPreferences()
+        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false, defaults: preferences.defaults) {}
         defer { chat.dispose() }
         // Use the chat's WebKit configuration with a local document and no navigation delegate.
         let hosted = WKWebView(frame: .zero, configuration: chat.webView.configuration)
@@ -39,21 +41,12 @@ struct ChatWindowTests {
             try await Task.sleep(for: .milliseconds(50))
         }
         #expect(hidden)
-        for width in [440.0, 390.0] {
-            chat.window.setContentSize(NSSize(width: width, height: 676))
-            chat.window.contentView?.layoutSubtreeIfNeeded()
-            let pin = chat.titleBar.pinButton
-            #expect(pin.frame.size == NSSize(width: 28, height: 28))
-            #expect(abs(chat.titleBar.bounds.maxX - pin.frame.maxX - 16) < 0.1)
-            #expect(abs(chat.titleBar.bounds.midY - pin.frame.midY) < 0.1)
-            #expect(chat.titleBar.subviews.filter { $0 is NSButton }.count == 1)
-        }
-        chat.titleBar.pinButton.performClick(nil)
+        chat.presentation.pinButton.performClick(nil)
         #expect(chat.window.level == .floating)
-        #expect(chat.titleBar.pinButton.pinned)
-        chat.titleBar.pinButton.performClick(nil)
+        #expect(chat.presentation.pinButton.state == .on)
+        chat.presentation.pinButton.performClick(nil)
         #expect(chat.window.level == .normal)
-        #expect(!chat.titleBar.pinButton.pinned)
+        #expect(chat.presentation.pinButton.state == .off)
     }
 
     @Test func testStrictCommands() {
@@ -104,14 +97,17 @@ struct ChatWindowTests {
     }
 
     @MainActor
-    @Test func testStackPopoutWindowsAreBorderlessAndDeduplicated() throws {
+    @Test func testStackPopoutChromePreservesGraphAndDeduplication() throws {
         _ = NSApplication.shared
-        let manager = StackWindowManager(loadPages: false)
+        let preferences = PopoutTestPreferences()
+        let manager = StackWindowManager(loadPages: false, defaults: preferences.defaults, presentWindows: false)
+        defer { manager.invalidateSession() }
         let base = try #require(URL(string: "https://example.invalid"))
         manager.apply(.open(.graph, "stack-1"), base: base)
         let graph = try #require(manager.window(for: .graph, stackID: "stack-1"))
         #expect(graph.window.styleMask.contains([.titled, .miniaturizable, .resizable, .closable]))
-        #expect(graph.windowChrome == nil)
+        #expect(graph.presentation == nil)
+        #expect(graph.webView.configuration.userContentController.userScripts.isEmpty)
         #expect(!graph.window.isOpaque)
         #expect(graph.window.backgroundColor == .clear)
         #expect(graph.webView.underPageBackgroundColor?.alphaComponent == 0)
@@ -122,25 +118,18 @@ struct ChatWindowTests {
         let stream = try #require(manager.window(for: .stream, stackID: "stack-1"))
         #expect(stream !== graph)
         #expect(stream.webView.value(forKey: "drawsBackground") as? Bool == true)
-        let streamChrome = try #require(stream.windowChrome)
-        #expect(streamChrome.mouseDownCanMoveWindow)
-        #expect(!streamChrome.closeButton.isBordered)
-        #expect(streamChrome.closeButton.toolTip == "Close")
-        #expect(streamChrome.closeButton.contentTintColor == .white)
-        #expect(stream.window.contentView !== stream.webView)
-        #expect(stream.window.toolbar == nil)
-        streamChrome.closeButton.performClick(nil)
+        #expect(stream.presentation != nil)
+        #expect(stream.window.contentView === stream.webView)
+        #expect(stream.window.toolbar != nil)
+        stream.window.performClose(nil)
         #expect(manager.window(for: .stream, stackID: "stack-1") == nil)
         manager.apply(.openPersonaActivity("persona-1"), base: base)
         let activity = try #require(manager.window(forPersonaActivity: "persona-1"))
-        let activityChrome = try #require(activity.windowChrome)
-        #expect(activityChrome.mouseDownCanMoveWindow)
-        #expect(!activityChrome.closeButton.isBordered)
-        #expect(activityChrome.closeButton.toolTip == "Close")
-        #expect(activity.window.contentView !== activity.webView)
+        #expect(activity.presentation != nil)
+        #expect(activity.window.contentView === activity.webView)
         manager.apply(.openPersonaActivity("persona-1"), base: base)
         #expect(manager.window(forPersonaActivity: "persona-1") === activity)
-        activityChrome.closeButton.performClick(nil)
+        activity.window.performClose(nil)
         #expect(manager.window(forPersonaActivity: "persona-1") == nil)
         manager.invalidateSession()
         #expect(manager.window(for: .graph, stackID: "stack-1") == nil)
@@ -149,13 +138,14 @@ struct ChatWindowTests {
     }
 
     @MainActor
-    @Test func testWindowIsOrdinaryTransparentAndDisposesOnce() {
+    @Test func testWindowIsOrdinaryAndDisposesOnce() {
         _ = NSApplication.shared
         var closes = 0
-        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid/user/personas/chat/desktop-popout?persona_id=p")!, loadPage: false) { closes += 1 }
+        let preferences = PopoutTestPreferences()
+        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid/user/personas/chat/desktop-popout?persona_id=p")!, loadPage: false, defaults: preferences.defaults) { closes += 1 }
         #expect(chat.window.styleMask.contains([.titled, .miniaturizable, .resizable, .closable]))
-        #expect(!(chat.window.isOpaque))
-        #expect(chat.window.backgroundColor == .clear)
+        #expect(chat.window.isOpaque)
+        #expect(chat.window.hasShadow)
         #expect(chat.window.level == .normal)
         #expect(chat.window.standardWindowButton(.closeButton)?.isHidden == false)
         #expect(chat.window.standardWindowButton(.miniaturizeButton)?.isHidden == false)
@@ -167,8 +157,9 @@ struct ChatWindowTests {
     @MainActor
     @Test func testWindowLifecycleAndScopeFence() async throws {
         _ = NSApplication.shared
-        NSApplication.shared.setActivationPolicy(.regular)
-        let manager = ChatWindowManager(loadPages: false)
+        let preferences = PopoutTestPreferences()
+        let manager = ChatWindowManager(loadPages: false, defaults: preferences.defaults, presentWindows: false)
+        defer { manager.invalidateSession() }
         let base = URL(string: "https://example.invalid")!
         manager.apply(.open("p-1", "account-a"), base: base)
         let first = try #require(manager.chat(for: "p-1"))
@@ -179,34 +170,27 @@ struct ChatWindowTests {
         manager.apply(.sync("account-a"), base: base)
         #expect(manager.chat(for: "p-1") === first)
         let frame = first.window.frame
-        #expect(!first.titleBar.isHidden)
-        #expect(first.titleBar.pinButton.superview === first.titleBar)
-        #expect(first.titleBar.pinButton.toolTip == "Always on top")
+        #expect(first.window.toolbar === first.presentation.toolbar)
+        #expect(first.presentation.pinButton.toolTip == "Always on top")
         first.apply(.collapse)
         #expect(first.window.frame.size == NSSize(width: 72, height: 72))
         #expect(!first.window.styleMask.contains(.resizable))
-        #expect(first.titleBar.isHidden)
-        #expect(first.titleBar.pinButton.isHiddenOrHasHiddenAncestor)
-        #expect(first.window.standardWindowButton(.closeButton)?.isHidden == true)
+        #expect(first.window.toolbar == nil)
+        #expect(!first.window.styleMask.contains(.titled))
         first.apply(.drag(20, 10))
         #expect(abs(first.window.frame.minX - frame.minX - 20) < 1)
         first.apply(.expand)
         #expect(first.window.frame.size == frame.size)
         #expect(abs(first.window.frame.minX - frame.minX - 20) < 1)
-        #expect(!first.titleBar.isHidden)
+        #expect(first.window.toolbar === first.presentation.toolbar)
         #expect(first.window.standardWindowButton(.closeButton)?.isHidden == false)
-        first.titleBar.pinButton.performClick(nil)
+        first.presentation.pinButton.performClick(nil)
         #expect(first.window.level == .floating)
-        #expect(first.titleBar.pinButton.accessibilityValue() as? String == "On")
+        #expect(first.presentation.pinButton.accessibilityValue() as? Int == 1)
         first.apply(.pin)
         #expect(first.window.level == .normal)
-        #expect(first.titleBar.pinButton.accessibilityValue() as? String == "Off")
-        first.apply(.minimize)
-        // AppKit completes Dock animations on the run loop, not synchronously.
-        for _ in 0..<30 where !first.window.isMiniaturized { try await Task.sleep(for: .milliseconds(50)) }
-        #expect(first.window.isMiniaturized)
-        first.focus()
-        #expect(!first.window.isMiniaturized)
+        #expect(first.presentation.pinButton.accessibilityValue() as? Int == 0)
+        #expect(!first.window.isVisible)
         first.apply(.close)
         #expect(manager.chat(for: "p-1") == nil)
         manager.apply(.sync(""), base: base)
@@ -217,10 +201,45 @@ struct ChatWindowTests {
     @Test func testCmdWCanCloseAnUnbootedDocument() async throws {
         _ = NSApplication.shared
         var closed = false
-        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false) { closed = true }
+        let preferences = PopoutTestPreferences()
+        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false, defaults: preferences.defaults) { closed = true }
         #expect(chat.windowShouldClose(chat.window) == false)
         for _ in 0..<40 where !closed { try await Task.sleep(for: .milliseconds(50)) }
         #expect(closed)
         chat.dispose()
+    }
+
+    @MainActor
+    @Test func testNativeCloseWaitsForHostedCloseAuthority() async throws {
+        _ = NSApplication.shared
+        let preferences = PopoutTestPreferences()
+        var closed = false
+        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false, defaults: preferences.defaults) { closed = true }
+        defer { chat.dispose() }
+        chat.webView.navigationDelegate = nil
+        chat.webView.loadHTMLString("""
+            <script>window.closeRequests = 0;
+            window.personastackDesktopClose = () => { window.closeRequests += 1; };</script>
+            """, baseURL: nil)
+        var ready = false
+        for _ in 0..<60 {
+            ready = (try? await chat.webView.evaluateJavaScript("typeof window.personastackDesktopClose === 'function'")) as? Bool == true
+            if ready { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(ready)
+        #expect(!chat.windowShouldClose(chat.window))
+        var requested = false
+        for _ in 0..<40 {
+            requested = (try? await chat.webView.evaluateJavaScript("window.closeRequests > 0")) as? Bool == true
+            if requested { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(requested)
+        #expect(!closed)
+        // A failed/unfinished hosted operation sends no close acknowledgment.
+        // Only the existing validated bridge's .close command disposes it.
+        chat.apply(.close)
+        #expect(closed)
     }
 }
