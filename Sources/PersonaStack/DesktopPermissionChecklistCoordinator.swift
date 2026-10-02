@@ -7,14 +7,24 @@ protocol DesktopPermissionChecklistAdapting {
     /// Reads current grants and refreshes explicitly authorized disk/network checks.
     /// Never records audio, captures, exercises input, or starts an initial privacy check.
     func observe(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation
+    func check(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation
     /// Called only by an explicit native Setup or Retry button.
     func setup(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation
     /// Runs only on native presentation: verifies existing core grants without
     /// requesting them, or performs the established automatic-settings policy.
     func setupAutomatically(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation
+    func openLocalNetworkSettings()
+    func openSettings(_ permission: DesktopPermissionID)
 }
 
 extension DesktopPermissionChecklistAdapting {
+    func openLocalNetworkSettings() {}
+    func openSettings(_ permission: DesktopPermissionID) {
+        if permission == .localNetwork { openLocalNetworkSettings() }
+    }
+    func check(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation {
+        await observe(permission)
+    }
     func setupAutomatically(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation {
         await setup(permission)
     }
@@ -68,6 +78,17 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
             rows.first { $0.id == id && !(id == .localNetwork && $0.state == .notNeeded) }
         }
     }
+
+    func openLocalNetworkSettings() {
+        guard isVisible, !isFinishing, busyPermission != .localNetwork else { return }
+        adapter.openLocalNetworkSettings()
+    }
+
+    func openSettings(_ id: DesktopPermissionID) {
+        guard isVisible, !isFinishing, busyPermission != id else { return }
+        adapter.openSettings(id)
+    }
+
     var automaticRows: [DesktopPermissionRow] {
         DesktopPermissionID.automaticSetup.compactMap { id in rows.first { $0.id == id } }
     }
@@ -228,6 +249,14 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     }
 
     func setup(_ id: DesktopPermissionID) {
+        perform(id, resetting: true)
+    }
+
+    func check(_ id: DesktopPermissionID) {
+        perform(id, resetting: false)
+    }
+
+    private func perform(_ id: DesktopPermissionID, resetting: Bool) {
         guard isVisible, !isFinishing, busyPermission == nil, verificationBusyPermission != id,
               !(DesktopPermissionID.automaticSetup.contains(id) && automaticBusyPermission != nil) else { return }
         manuallyCheckedRows.insert(id)
@@ -248,7 +277,7 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
             guard let self, self.generation == expected, self.isVisible, !Task.isCancelled else { return }
             if let pendingCuaCheck { _ = await pendingCuaCheck.value }
             guard self.generation == expected, self.isVisible, !Task.isCancelled else { return }
-            let observation = await self.adapter.setup(id)
+            let observation = resetting ? await self.adapter.setup(id) : await self.adapter.check(id)
             guard self.generation == expected, self.isVisible, !Task.isCancelled else { return }
             if self.rowRevisions[id] == revision {
                 let baseline = await self.failureBaseline(observation, id: id)
@@ -279,6 +308,11 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         let pending = continuation
         continuation = nil
         pending?.resume()
+    }
+
+    func reportSetupPrerequisite(_ message: String) {
+        guard isVisible, !isFinishing else { return }
+        completionError = message
     }
 
     func failSetup(_ message: String) {

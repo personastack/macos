@@ -36,6 +36,8 @@ def main() -> int:
         raise SystemExit("release archive URL is not the immutable tap artifact")
     if not enclosure.get(f"{{{namespace}}}edSignature"):
         raise SystemExit("release archive has no EdDSA signature")
+    if enclosure.get(f"{{{namespace}}}installationType") != "package":
+        raise SystemExit("release must install the app and Desktop Control through the main package")
     if int(enclosure.get("length", "0")) <= 0:
         raise SystemExit("release archive length is missing")
     if int(enclosure.get("length", "0")) != Path(dmg_path).stat().st_size:
@@ -55,6 +57,8 @@ def main() -> int:
         raise SystemExit("cask URL does not select the same immutable installer as the appcast")
     if "auto_updates true" not in cask:
         raise SystemExit("cask does not enable application updates")
+    if '  pkg "Install PersonaStack.pkg"' not in cask:
+        raise SystemExit("cask must run the same main PersonaStack package")
     if "<!-- sparkle-signatures:\n" not in contents or "edSignature:" not in contents:
         raise SystemExit("appcast has no signed-feed signature")
     description = item.find("description")

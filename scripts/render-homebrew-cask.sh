@@ -25,8 +25,22 @@ cask "personastack" do
 
   depends_on macos: :sonoma
 
-  app "PersonaStack.app"
+  pkg "Install PersonaStack.pkg"
   auto_updates true
+
+  uninstall quit: "ai.personastack.desktop",
+            script: [{
+              executable: "/Applications/PersonaStack.app/Contents/MacOS/PersonaStack",
+              args: ["--personastack-unregister-login"],
+              sudo: false,
+              must_succeed: true,
+            }, {
+              executable: "/Library/Application Support/PersonaStack/LockedControlInstaller",
+              args: ["--remove"],
+              sudo: true,
+              must_succeed: true,
+            }],
+            pkgutil: ["ai.personastack.desktop", "ai.personastack.locked-control"]
 
 end
 EOF

@@ -2447,7 +2447,7 @@ func permissionApprovalDoesNotConfirmOrUseTheRuntimeSession(warm: Bool, first: D
     let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
         credentials: credentials, readiness: "paused", paused: true,
         confirmForegroundSetup: { confirmations += 1; return true }, hostPermissions: { (true, true) })
-    var access = DesktopPermissionSystemAccess()
+    var access = DesktopPermissionSystemAccess.permissionFixture()
     access.accessibility = { true }
     access.screenRecording = { true }
     access.requestAccessibility = {}

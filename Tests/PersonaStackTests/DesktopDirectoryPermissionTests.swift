@@ -181,7 +181,7 @@ struct DesktopDirectoryPermissionTests {
     let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(
         observe: { _ in .init(.checking, detail: "Use Setup") },
         setup: { _ in setups += 1; Issue.record("Passive refresh requested a probe"); return nil }
-    ), openSettings: { settings.append($0) })
+    ), access: .permissionFixture(), openSettings: { settings.append($0) })
     for id in [DesktopPermissionID.desktopFiles, .documentsFiles, .downloadsFiles] {
         #expect(await adapter.observe(id).state == .checking)
     }
@@ -194,7 +194,7 @@ struct DesktopDirectoryPermissionTests {
         let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(setup: { actual in
             #expect(actual == id)
             return .init(.denied, detail: "Denied")
-        }), openSettings: { settings.append($0) })
+        }), access: .permissionFixture(), openSettings: { settings.append($0) })
         #expect(await adapter.setup(id).state == .denied)
         #expect(settings == ["com.apple.preference.security?Privacy_FilesAndFolders"])
     }
@@ -204,7 +204,7 @@ struct DesktopDirectoryPermissionTests {
     var settings: [String] = []
     let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(setup: { _ in
         .init(.failed, detail: "Unavailable")
-    }), openSettings: { settings.append($0) })
+    }), access: .permissionFixture(), openSettings: { settings.append($0) })
     #expect(await adapter.setup(.desktopFiles).state == .failed)
     #expect(settings.isEmpty)
 }
@@ -214,7 +214,7 @@ struct DesktopDirectoryPermissionTests {
     var pending: CheckedContinuation<DesktopPermissionObservation, Never>?
     let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(setup: { _ in
         await withCheckedContinuation { pending = $0 }
-    }), openSettings: { settings.append($0) })
+    }), access: .permissionFixture(), openSettings: { settings.append($0) })
     let task = Task { await adapter.setup(.documentsFiles) }
     while pending == nil { await Task.yield() }
     task.cancel()
@@ -228,7 +228,7 @@ struct DesktopDirectoryPermissionTests {
     defer { try? FileManager.default.removeItem(at: root) }
     var requested: [FileManager.SearchPathDirectory] = []
     var verified: [URL] = []
-    let service = DesktopPermissionChecklist(directoryURL: { directory in
+    let service = DesktopPermissionChecklist(access: .permissionFixture(), directoryURL: { directory in
         requested.append(directory)
         return root.appendingPathComponent(String(directory.rawValue), isDirectory: true)
     }, verifyDirectory: { verified.append($0) }, selectedProfile: { .production })
@@ -249,7 +249,7 @@ struct DesktopDirectoryPermissionTests {
 @Test @MainActor func directoryPermissionServiceFailureReplacesOldProofAndSurvivesPassivePolling() async {
     var shouldFail = false
     var checks = 0
-    let service = DesktopPermissionChecklist(directoryURL: { _ in URL(fileURLWithPath: "/fake-directory") },
+    let service = DesktopPermissionChecklist(access: .permissionFixture(), directoryURL: { _ in URL(fileURLWithPath: "/fake-directory") },
         verifyDirectory: { _ in
             checks += 1
             if shouldFail { throw DesktopFileSystemError.patchMismatch }
@@ -268,7 +268,7 @@ struct DesktopDirectoryPermissionTests {
 
 @Test @MainActor func directoryPermissionServiceUnavailableDirectoryDoesNotRunAProbe() async {
     var checks = 0
-    let service = DesktopPermissionChecklist(directoryURL: { _ in nil }, verifyDirectory: { _ in
+    let service = DesktopPermissionChecklist(access: .permissionFixture(), directoryURL: { _ in nil }, verifyDirectory: { _ in
         checks += 1
         Issue.record("Missing directory must not be probed")
     }, selectedProfile: { .production })
@@ -281,7 +281,7 @@ struct DesktopDirectoryPermissionTests {
 @Test @MainActor func directoryPermissionServiceEnvironmentChangeFencesLateProof() async {
     var profile = DesktopEnvironmentConfiguration.production
     var pending: CheckedContinuation<Void, Never>?
-    let service = DesktopPermissionChecklist(directoryURL: { _ in URL(fileURLWithPath: "/fake-directory") },
+    let service = DesktopPermissionChecklist(access: .permissionFixture(), directoryURL: { _ in URL(fileURLWithPath: "/fake-directory") },
         verifyDirectory: { _ in await withCheckedContinuation { pending = $0 } }, selectedProfile: { profile })
     let check = Task { await service.adapter.setup(.downloadsFiles) }
     while pending == nil { await Task.yield() }
@@ -294,7 +294,7 @@ struct DesktopDirectoryPermissionTests {
 
 @Test @MainActor func directoryPermissionServiceCancellationCannotStoreProof() async {
     var pending: CheckedContinuation<Void, Never>?
-    let service = DesktopPermissionChecklist(directoryURL: { _ in URL(fileURLWithPath: "/fake-directory") },
+    let service = DesktopPermissionChecklist(access: .permissionFixture(), directoryURL: { _ in URL(fileURLWithPath: "/fake-directory") },
         verifyDirectory: { _ in await withCheckedContinuation { pending = $0 } }, selectedProfile: { .production })
     let check = Task { await service.adapter.setup(.desktopFiles) }
     while pending == nil { await Task.yield() }
@@ -310,7 +310,7 @@ struct DesktopDirectoryPermissionTests {
         fileSystemIDFirst: 1, fileSystemIDSecond: 2, fileSystemType: "apfs", flags: UInt32(MNT_LOCAL | MNT_REMOVABLE))
     var selections = 0
     var checks = 0
-    let service = DesktopPermissionChecklist(selectedProfile: { .production }, volumeSnapshot: { [mount] },
+    let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .production }, volumeSnapshot: { [mount] },
         chooseVolume: { id, mounts in
             #expect(id == .removableVolumes && mounts == [mount])
             selections += 1

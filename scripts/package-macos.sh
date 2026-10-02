@@ -63,10 +63,8 @@ lipo -create \
   "$(dirname "$x86_64_binary")/PersonaStackLockedControlInstaller" \
   -output "$installer_binary"
 if [ "$configuration" = release ]; then
-  : "${PERSONASTACK_INSTALLER_SIGNING_IDENTITY:?Developer ID Installer identity is required for the embedded setup package}"
+  : "${PERSONASTACK_INSTALLER_SIGNING_IDENTITY:?Developer ID Installer identity is required for the main installer}"
 fi
-"$root_dir/scripts/package-locked-control.sh" "$installer_binary" \
-  "$bundle_dir/Contents/Resources/LockedControlInstaller.pkg"
 cp "$root_dir/Resources/Info.plist" "$bundle_dir/Contents/Info.plist"
 cp "$root_dir/Resources/AppIcon.icns" "$bundle_dir/Contents/Resources/AppIcon.icns"
 cp "$root_dir/Resources/MenuBarIcon.png" "$bundle_dir/Contents/Resources/MenuBarIcon.png"
@@ -84,7 +82,6 @@ chmod 755 "$bundle_dir/Contents/MacOS/PersonaStack"
 plutil -replace CFBundleShortVersionString -string "$version" "$bundle_dir/Contents/Info.plist"
 plutil -replace CFBundleVersion -string "$version" "$bundle_dir/Contents/Info.plist"
 plutil -replace PersonaStackDefaultURL -string "$default_url" "$bundle_dir/Contents/Info.plist"
-install_name_tool -add_rpath @executable_path/../Frameworks "$bundle_dir/Contents/MacOS/PersonaStack"
 if [ -n "$sparkle_public_key" ]; then
   /usr/libexec/PlistBuddy -c "Set :SUPublicEDKey $sparkle_public_key" "$bundle_dir/Contents/Info.plist" 2>/dev/null \
     || /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $sparkle_public_key" "$bundle_dir/Contents/Info.plist"
@@ -96,10 +93,12 @@ artifact_suffix=developerid
 "$root_dir/scripts/notarize.sh" "$bundle_dir"
 spctl --assess --type execute --verbose=2 "$bundle_dir"
 
-cp -R "$bundle_dir" "$staging_dir/"
+PERSONASTACK_INCLUDE_LOCKED_CONTROL=1 "$root_dir/scripts/package-desktop-installer.sh" "$bundle_dir" "$installer_binary" \
+  "$staging_dir/Install PersonaStack.pkg"
+"$root_dir/scripts/notarize.sh" "$staging_dir/Install PersonaStack.pkg"
+spctl --assess --type install --verbose=2 "$staging_dir/Install PersonaStack.pkg"
 mkdir -p "$staging_dir/.background"
 "$root_dir/scripts/render-dmg-background.swift" "$staging_dir/.background/background@2x.png"
-ln -s /Applications "$staging_dir/Applications"
 mkdir -p "$artifact_dir"
 hdiutil create -volname "PersonaStack" -srcfolder "$staging_dir" -ov -format UDRW "$rw_dmg" >/dev/null
 mount_root=$(mktemp -d "${TMPDIR:-/tmp}/personastack-dmg.XXXXXX")
@@ -126,8 +125,7 @@ tell application "Finder"
     set shows item info of icon view options of container window to false
     set arrangement of icon view options of container window to not arranged
     set background picture of icon view options of container window to file ".background:background@2x.png"
-    set position of item "PersonaStack.app" of container window to {180, 260}
-    set position of item "Applications" of container window to {560, 260}
+    set position of item "Install PersonaStack.pkg" of container window to {370, 260}
     update without registering applications
     delay 2
     close

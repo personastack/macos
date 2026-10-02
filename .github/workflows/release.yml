@@ -32,6 +32,8 @@ jobs:
         env:
           PERSONASTACK_CODESIGN_CERTIFICATE_P12_BASE64: ${{ secrets.PERSONASTACK_DEVELOPER_ID_P12_BASE64 }}
           PERSONASTACK_CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.PERSONASTACK_DEVELOPER_ID_PASSWORD }}
+          PERSONASTACK_INSTALLER_CERTIFICATE_P12_BASE64: ${{ secrets.PERSONASTACK_DEVELOPER_ID_INSTALLER_P12_BASE64 }}
+          PERSONASTACK_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.PERSONASTACK_DEVELOPER_ID_INSTALLER_PASSWORD }}
         run: ./scripts/import-release-signing.sh
       - name: Test signing identity across updates
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -163,35 +165,15 @@ jobs:
           chmod 755 "$sparkle_dir/bin/sign_update"
           archive_dir="$sparkle_dir/archives"
           mkdir -p "$archive_dir"
-          cp "Downloads/PersonaStack-$version-developerid.dmg" "$archive_dir/"
-          cp "Downloads/PersonaStack-$version-developerid.md" "$archive_dir/"
           if [ -f appcast.xml ]; then cp appcast.xml "$archive_dir/appcast.xml"; fi
-          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$sparkle_dir/bin/generate_appcast" \
-            --ed-key-file - --maximum-versions 0 --embed-release-notes \
-            --link https://personastack.ai \
-            --download-url-prefix "https://raw.githubusercontent.com/personastack/homebrew-tap/$tap_tag/Downloads/" \
-            -o "$archive_dir/appcast.xml" "$archive_dir"
+          archive_signature=$(printf '%s' "$SPARKLE_PRIVATE_KEY" | "$sparkle_dir/bin/sign_update" \
+            --ed-key-file - -p "$GITHUB_WORKSPACE/artifacts/PersonaStack-$version-developerid.dmg")
+          python3 "$GITHUB_WORKSPACE/scripts/render-package-appcast.py" \
+            "$version" "$GITHUB_WORKSPACE/artifacts/PersonaStack-$version-developerid.dmg" \
+            "$GITHUB_WORKSPACE/release-notes/$version.md" "$archive_signature" "$archive_dir/appcast.xml"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$sparkle_dir/bin/sign_update" \
+            --ed-key-file - "$archive_dir/appcast.xml"
           cp "$archive_dir/appcast.xml" "$tap_dir/appcast.xml"
-          archive_signature=$(python3 - "$tap_dir/appcast.xml" "$version" <<'PY'
-          import sys
-          import xml.etree.ElementTree as ET
-
-          root = ET.parse(sys.argv[1]).getroot()
-          namespace = "http://www.andymatuschak.org/xml-namespaces/sparkle"
-          item = None
-          for node in root.findall(".//item"):
-              if node.findtext(f"{{{namespace}}}version") == sys.argv[2]:
-                  item = node
-                  break
-          if item is None:
-              raise SystemExit("appcast release item is missing")
-          enclosure = item.find("enclosure")
-          signature = enclosure.get(f"{{{namespace}}}edSignature") if enclosure is not None else None
-          if not signature:
-              raise SystemExit("appcast archive signature is missing")
-          print(signature)
-          PY
-          )
           printf '%s' "$SPARKLE_PRIVATE_KEY" | "$sparkle_dir/bin/sign_update" \
             --ed-key-file - --verify "$GITHUB_WORKSPACE/artifacts/PersonaStack-$version-developerid.dmg" "$archive_signature"
           printf '%s' "$SPARKLE_PRIVATE_KEY" | "$sparkle_dir/bin/sign_update" \

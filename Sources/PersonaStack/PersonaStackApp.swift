@@ -8,6 +8,14 @@ import WebKit
 @MainActor
 enum DesktopEntryPoint {
     static func main() {
+        if CommandLine.arguments == [CommandLine.arguments[0], "--personastack-unregister-login"] {
+            do { try DesktopLoginItemRegistration.unregisterForUninstall() }
+            catch {
+                fputs("PersonaStack could not unregister Login Items. Quit PersonaStack and retry uninstall.\n", stderr)
+                exit(1)
+            }
+            return
+        }
         if DesktopCrashRecoverySupervisor.dispatchSupervisorIfRequested() { return }
         if CommandLine.arguments.contains("--personastack-permission-diagnostics") {
             DesktopAccessibilityPermission.printDiagnostics()

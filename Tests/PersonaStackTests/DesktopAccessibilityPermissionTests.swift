@@ -39,7 +39,7 @@ import Testing
 
 @Test @MainActor func accessibilityRoleReadMakesChecklistReadyWithoutSetupActions() async {
     var roleReadable = true
-    var access = DesktopPermissionSystemAccess()
+    var access = DesktopPermissionSystemAccess.permissionFixture()
     access.accessibility = {
         DesktopAccessibilityPermission.isGranted(trusted: { false }, readRole: { roleReadable }, canPostEvents: { true })
     }

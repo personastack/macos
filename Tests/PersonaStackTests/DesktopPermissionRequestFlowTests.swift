@@ -10,7 +10,7 @@ struct DesktopPermissionRequestFlowTests {
     func hostScreenRequestRunsDespiteDeniedPreflightAndReadsApproval(id: DesktopPermissionID) async {
         var granted = false
         var calls: [String] = []
-        var access = DesktopPermissionSystemAccess()
+        var access = DesktopPermissionSystemAccess.permissionFixture()
         access.accessibility = { Issue.record("Screen approval must not read Accessibility"); return false }
         access.screenRecording = { granted }
         access.requestScreenRecording = { calls.append("host-screen-request"); granted = true; return true }
@@ -28,7 +28,7 @@ struct DesktopPermissionRequestFlowTests {
     @Test(arguments: [DesktopPermissionID.screenRecording, .directCapture])
     func refusedScreenRequestOpensSettingsWithoutGrantingReady(id: DesktopPermissionID) async {
         var calls: [String] = []
-        var access = DesktopPermissionSystemAccess()
+        var access = DesktopPermissionSystemAccess.permissionFixture()
         access.screenRecording = { false }
         access.requestScreenRecording = { calls.append("request"); return false }
         let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(setup: { _ in
@@ -42,7 +42,7 @@ struct DesktopPermissionRequestFlowTests {
 
     @Test(arguments: [DesktopPermissionID.screenRecording, .directCapture])
     func existingScreenGrantSkipsRequestsAndOperationHooks(id: DesktopPermissionID) async {
-        var access = DesktopPermissionSystemAccess()
+        var access = DesktopPermissionSystemAccess.permissionFixture()
         access.accessibility = { Issue.record("Screen access must not depend on Accessibility"); return false }
         access.screenRecording = { true }
         access.requestScreenRecording = { Issue.record("Existing approval must not prompt again"); return false }
@@ -55,7 +55,7 @@ struct DesktopPermissionRequestFlowTests {
     @Test func screenGrantRevokedDuringSetupDoesNotClaimAnApprovedRequestNeedsRestart() async {
         var reads = 0
         var settings: [String] = []
-        var access = DesktopPermissionSystemAccess()
+        var access = DesktopPermissionSystemAccess.permissionFixture()
         access.screenRecording = { reads += 1; return reads == 1 }
         access.requestScreenRecording = { Issue.record("Initial approval must not be requested again"); return false }
         let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(setup: { _ in
@@ -69,7 +69,7 @@ struct DesktopPermissionRequestFlowTests {
 
     @Test(arguments: [false, true])
     func accessibilityApprovalNeedsNoRuntimeOrScreenOperation(screenGranted: Bool) async {
-        var access = DesktopPermissionSystemAccess()
+        var access = DesktopPermissionSystemAccess.permissionFixture()
         access.accessibility = { true }
         access.requestAccessibility = { Issue.record("Existing approval must not prompt again") }
         access.screenRecording = { screenGranted }
@@ -86,7 +86,7 @@ struct DesktopPermissionRequestFlowTests {
     @Test func accessibilitySetupReadsApprovalAfterPromptWithoutCallingOperationHooks() async {
         var granted = false
         var requests = 0
-        var access = DesktopPermissionSystemAccess()
+        var access = DesktopPermissionSystemAccess.permissionFixture()
         access.accessibility = { granted }
         access.requestAccessibility = { requests += 1; granted = true }
         let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(
@@ -99,7 +99,7 @@ struct DesktopPermissionRequestFlowTests {
 
     @Test(arguments: [DesktopPermissionID.screenRecording, .directCapture], [false, true])
     func screenGrantIsReadyIndependentlyOfAccessibility(id: DesktopPermissionID, accessibility: Bool) async {
-        var access = DesktopPermissionSystemAccess()
+        var access = DesktopPermissionSystemAccess.permissionFixture()
         access.accessibility = { accessibility }
         access.screenRecording = { true }
         access.requestScreenRecording = { Issue.record("Existing screen approval must not prompt"); return false }
@@ -114,7 +114,7 @@ struct DesktopPermissionRequestFlowTests {
     @Test func microphoneAuthorizationIsReadBackBeforeFunctionalCheckAndNotReprompted() async {
         var status = AVAuthorizationStatus.notDetermined
         var calls: [String] = []
-        var access = DesktopPermissionSystemAccess()
+        var access = DesktopPermissionSystemAccess.permissionFixture()
         access.microphone = { status }
         access.hasMicrophone = { true }
         access.requestMicrophone = { calls.append("request"); status = .authorized; return true }
@@ -130,7 +130,7 @@ struct DesktopPermissionRequestFlowTests {
 }
 
 @Test @MainActor func successfulScreenRequestWithStalePreflightRequiresRestartAndNeverCallsRuntime() async {
-    var access = DesktopPermissionSystemAccess()
+    var access = DesktopPermissionSystemAccess.permissionFixture()
     access.screenRecording = { false }
     access.requestScreenRecording = { true }
     let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(setup: { _ in
@@ -161,7 +161,7 @@ private struct PermissionOnlyAdapter: DesktopPermissionChecklistAdapting {
 @Test @MainActor func screenCaptureReadbackTracksItsOwnGrantAcrossAccessibilityChangesAndReopening() async {
     var accessibility = false
     var screenGranted = true
-    var access = DesktopPermissionSystemAccess()
+    var access = DesktopPermissionSystemAccess.permissionFixture()
     access.accessibility = { accessibility }
     access.screenRecording = { screenGranted }
     access.requestScreenRecording = { Issue.record("Passive checks must not request access"); return false }
@@ -193,7 +193,7 @@ private struct PermissionOnlyAdapter: DesktopPermissionChecklistAdapting {
 
 @Test @MainActor func permissionPromptActivationPreservesBusyDirectoryProofButInvalidatesIdleProof() async {
     var release: CheckedContinuation<Void, Never>?
-    let owner = DesktopPermissionChecklist(directoryURL: { _ in URL(fileURLWithPath: "/fixture") }, verifyDirectory: { _ in
+    let owner = DesktopPermissionChecklist(access: .permissionFixture(), directoryURL: { _ in URL(fileURLWithPath: "/fixture") }, verifyDirectory: { _ in
         await withCheckedContinuation { release = $0 }
     }, selectedProfile: { .production }, volumeSnapshot: { [] })
     let observe = owner.adapter.hooks.observe
@@ -222,7 +222,7 @@ private struct PermissionOnlyAdapter: DesktopPermissionChecklistAdapting {
     var granted = false
     var requested = 0
     var settings = 0
-    var access = DesktopPermissionSystemAccess()
+    var access = DesktopPermissionSystemAccess.permissionFixture()
     access.accessibility = { granted }
     access.requestAccessibility = { requested += 1 }
     let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(setup: { _ in
@@ -244,7 +244,7 @@ private struct PermissionOnlyAdapter: DesktopPermissionChecklistAdapting {
 @Test @MainActor func permissionCancelledScreenRequestCannotPublishReady() async {
     var pending: CheckedContinuation<Void, Never>?
     var granted = false
-    var access = DesktopPermissionSystemAccess()
+    var access = DesktopPermissionSystemAccess.permissionFixture()
     access.screenRecording = { granted }
     access.requestScreenRecording = {
         await withCheckedContinuation { pending = $0 }
@@ -282,7 +282,7 @@ private struct AccessibilityOnlyAdapter: DesktopPermissionChecklistAdapting {
     var granted = false
     var requests = 0
     var settings = 0
-    var access = DesktopPermissionSystemAccess()
+    var access = DesktopPermissionSystemAccess.permissionFixture()
     access.accessibility = { granted }
     access.requestAccessibility = { requests += 1 }
     let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(

@@ -16,7 +16,8 @@ let package = Package(
     targets: [
         .target(name: "LockedControlAudit", publicHeadersPath: "include", linkerSettings: [.linkedFramework("Security"), .linkedFramework("SystemConfiguration"), .linkedLibrary("bsm")]),
         .target(name: "PersonaStackCore", dependencies: ["Yams", "LockedControlAudit"]),
-        .executableTarget(name: "PersonaStack", dependencies: ["PersonaStackCore", .product(name: "Sparkle", package: "Sparkle")]),
+        .executableTarget(name: "PersonaStack", dependencies: ["PersonaStackCore", .product(name: "Sparkle", package: "Sparkle")],
+                          linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])]),
         .executableTarget(name: "PersonaStackPolicyCheck", dependencies: ["PersonaStackCore"]),
         .executableTarget(name: "PersonaStackLockedControlInstaller", dependencies: ["PersonaStackCore"]),
         .testTarget(name: "PersonaStackTests", dependencies: ["PersonaStackCore", "PersonaStack"], resources: [.copy("Fixtures/local-session.json"), .copy("Fixtures/desktop-parity.json")]),

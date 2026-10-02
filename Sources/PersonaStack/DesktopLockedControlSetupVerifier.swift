@@ -1,5 +1,6 @@
 import CryptoKit
 import CoreFoundation
+import Combine
 import Darwin
 import Foundation
 import PersonaStackCore
@@ -7,12 +8,13 @@ import PersonaStackCore
 /// Cached, read-only evidence that the locked-session authorization candidate
 /// is installed for this signed app. Construction performs no system reads.
 @MainActor
-final class DesktopLockedControlSetupVerifier {
+final class DesktopLockedControlSetupVerifier: ObservableObject {
     static let shared = DesktopLockedControlSetupVerifier()
 
     enum Readiness: Equatable, Sendable {
         case absent
         case mismatch
+        case unsupported
         case ready
     }
 
@@ -26,6 +28,8 @@ final class DesktopLockedControlSetupVerifier {
             detail: "The installed locked-screen control policy could not be verified.")
         nonisolated static let ready = Snapshot(readiness: .ready,
             detail: "The installed locked-screen control policy matches this PersonaStack build.")
+        nonisolated static let unsupported = Snapshot(readiness: .unsupported,
+            detail: "Locked-screen control requires the signed PersonaStack installer. This unsigned build cannot enable it.")
     }
 
     struct Operations: Sendable {
@@ -38,7 +42,8 @@ final class DesktopLockedControlSetupVerifier {
         })
     }
 
-    private(set) var snapshot = Snapshot.absent
+    @Published private(set) var snapshot = Snapshot.absent
+    @Published private(set) var isChecking = false
     var onChange: (@MainActor () -> Void)?
 
     private let defaults: UserDefaults
@@ -59,11 +64,13 @@ final class DesktopLockedControlSetupVerifier {
     @discardableResult
     func refresh() async -> Snapshot {
         if let refreshTask { return await refreshTask.value }
+        isChecking = true
         let operations = self.operations
         let task = Task { @MainActor [weak self] in
             let value = await operations.inspect()
             guard let self else { return value }
             self.snapshot = value
+            self.isChecking = false
             self.onChange?()
             self.refreshTask = nil
             return value
@@ -106,6 +113,10 @@ final class DesktopLockedControlSetupVerifier {
     }
 
     nonisolated private static func inspectInstalledCandidate() -> Snapshot {
+        guard let pinURL = Bundle.main.url(forResource: "ReleaseSigningCertificate", withExtension: "der"),
+              let pin = try? Data(contentsOf: pinURL),
+              hasPinnedCodeSignature(Bundle.main.bundleURL, pin: pin, identifier: "ai.personastack.desktop")
+        else { return .unsupported }
         let bundleURL = URL(fileURLWithPath: candidateBundlePath, isDirectory: true)
         var metadata = stat()
         guard lstat(bundleURL.path, &metadata) == 0 else {
@@ -160,15 +171,17 @@ final class DesktopLockedControlSetupVerifier {
                                      baselineReceipt: receipt)
     }
 
-    nonisolated private static func hasPinnedCodeSignature(_ bundleURL: URL, pin: Data) -> Bool {
+    nonisolated private static func hasPinnedCodeSignature(_ bundleURL: URL, pin: Data,
+                                                          identifier: String = candidateBundleIdentifier) -> Bool {
         return runReadOnlyProcess(URL(fileURLWithPath: "/usr/bin/codesign"),
-            pinnedCodeSignatureArguments(bundleURL, pin: pin), timeoutNanoseconds: 2_000_000_000) != nil
+            pinnedCodeSignatureArguments(bundleURL, pin: pin, identifier: identifier), timeoutNanoseconds: 2_000_000_000) != nil
     }
 
-    nonisolated static func pinnedCodeSignatureArguments(_ bundleURL: URL, pin: Data) -> [String] {
+    nonisolated static func pinnedCodeSignatureArguments(_ bundleURL: URL, pin: Data,
+                                                        identifier: String = candidateBundleIdentifier) -> [String] {
         let digest = Insecure.SHA1.hash(data: pin).map { String(format: "%02x", $0) }.joined()
         // codesign treats requirements without the leading '=' as filenames.
-        let requirement = "=identifier \"\(candidateBundleIdentifier)\" and certificate leaf = H\"\(digest)\""
+        let requirement = "=identifier \"\(identifier)\" and anchor apple generic and certificate leaf = H\"\(digest)\""
         return ["--verify", "--strict", "--deep", "-R", requirement, bundleURL.path]
     }
 

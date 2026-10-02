@@ -48,7 +48,7 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     var status = AVAuthorizationStatus.authorized
     var input: String? = "input-a"
     var document = "document-a"
-    var access = DesktopPermissionSystemAccess()
+    var access = DesktopPermissionSystemAccess.permissionFixture()
     access.microphone = { status }
     access.hasMicrophone = { input != nil }
     access.microphoneIdentity = { input }
@@ -92,7 +92,7 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
 
 @Test @MainActor func microphoneFailedRetryAndCanceledLateReplyCannotRestoreReady() async {
     let page = ReadyVoicePage()
-    var access = DesktopPermissionSystemAccess()
+    var access = DesktopPermissionSystemAccess.permissionFixture()
     access.microphone = { .authorized }
     access.hasMicrophone = { true }
     access.microphoneIdentity = { "input" }
@@ -117,7 +117,7 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     var requests: [URLRequest] = []
     var fails = false
     var profile = DesktopEnvironmentConfiguration.lan
-    let service = DesktopPermissionChecklist(selectedProfile: { profile }, activationNotificationCenter: NotificationCenter(),
+    let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { profile }, activationNotificationCenter: NotificationCenter(),
         requestEndpoint: { request in
             requests.append(request)
             #expect(request.httpMethod == "HEAD" && request.httpBody == nil)
@@ -142,10 +142,10 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     fails = true
     service.invalidateAfterActivation()
     await service.window.coordinator.refresh()
-    #expect(readyRow(service, .localNetwork)?.state == .failed && requests.count == 7)
+    #expect(readyRow(service, .localNetwork)?.state == .failed && requests.count == 9)
     service.invalidateAfterActivation()
     await service.window.coordinator.refresh()
-    #expect(requests.count == 7)
+    #expect(requests.count == 9)
     fails = false
     #expect(await service.adapter.setup(.localNetwork).verified)
     profile = .production
@@ -153,13 +153,62 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     #expect(await service.adapter.setup(.localNetwork).state == .notNeeded)
     profile = .lan
     #expect(await service.adapter.observe(.localNetwork).state == .verificationRequired)
-    #expect(requests.count == 10)
+    #expect(requests.count == 12)
+}
+
+@Test @MainActor func localNetworkPermissionPublicEndpointFailureStillAttemptsBothLANServices() async {
+    var requests: [URLRequest] = []
+    var access = DesktopPermissionSystemAccess.permissionFixture()
+    access.openPrivacySettings = { _ in Issue.record("Network attempts must not open Settings") }
+    let profile = DesktopEnvironmentConfiguration.lan
+    let service = DesktopPermissionChecklist(access: access, selectedProfile: { profile },
+        activationNotificationCenter: NotificationCenter(), requestEndpoint: { request in
+            requests.append(request)
+            #expect(request.httpMethod == "HEAD" && request.httpBody == nil)
+            #expect(request.value(forHTTPHeaderField: "Authorization") == nil)
+            if request.url == profile.appURL { throw URLError(.cannotFindHost) }
+            return HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!
+        })
+    let result = await service.adapter.setup(.localNetwork)
+    #expect(requests.map(\.url) == [profile.appURL, profile.gatewayURL, profile.mcpURL])
+    #expect(result.state == .failed && !result.verified)
+    #expect(result.detail.contains("DNS") && result.detail.contains(profile.appURL.host!))
+}
+
+@Test @MainActor func localNetworkPermissionCancellationStopsLaterRequestsWithoutOpeningSettings() async {
+    var pending: CheckedContinuation<HTTPURLResponse, Error>?
+    var requests = 0
+    var access = DesktopPermissionSystemAccess.permissionFixture()
+    access.openPrivacySettings = { _ in Issue.record("Canceled setup must not open Settings") }
+    let service = DesktopPermissionChecklist(access: access, selectedProfile: { .lan },
+        activationNotificationCenter: NotificationCenter(), requestEndpoint: { _ in
+            requests += 1
+            return try await withCheckedThrowingContinuation { pending = $0 }
+        })
+    let task = Task { await service.adapter.setup(.localNetwork) }
+    while pending == nil { await Task.yield() }
+    task.cancel()
+    pending?.resume(throwing: URLError(.cancelled))
+    #expect(await task.value.state == .checking)
+    #expect(requests == 1)
+    #expect(await service.adapter.observe(.localNetwork).verified == false)
+}
+
+@Test @MainActor func localNetworkPermissionSessionWaitsForApprovalWithABoundedDeadline() {
+    let session = DesktopPermissionChecklist.makeConnectionSession()
+    defer { session.invalidateAndCancel() }
+    #expect(session.configuration.waitsForConnectivity)
+    #expect(session.configuration.timeoutIntervalForResource == 15)
+    #expect(session.configuration.urlCache == nil)
+    let normal = DesktopControlNetworkSession.makeWithoutRedirects()
+    defer { normal.invalidateAndCancel() }
+    #expect(normal.configuration.waitsForConnectivity == false)
 }
 
 @Test @MainActor func localNetworkPermissionDirectRedirectIsReachableButFollowedResponseCannotVerify() async {
     var followed = false
     var requests = 0
-    let service = DesktopPermissionChecklist(selectedProfile: { .lan }, activationNotificationCenter: NotificationCenter(),
+    let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .lan }, activationNotificationCenter: NotificationCenter(),
         requestEndpoint: { request in
             requests += 1
             return HTTPURLResponse(url: followed ? URL(string: "https://unselected.example")! : request.url!.appendingPathComponent("/"),
@@ -170,14 +219,14 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     #expect(await service.adapter.setup(.localNetwork).state == .failed)
     #expect(await service.adapter.observe(.localNetwork).state == .failed)
     service.cancelVerification()
-    #expect(await service.adapter.observe(.localNetwork).state == .failed && requests == 4)
+    #expect(await service.adapter.observe(.localNetwork).state == .failed && requests == 6)
 }
 
 @Test @MainActor func localNetworkPermissionCanceledRefreshCannotOverwriteSuccessorOrCallNextEndpoint() async {
     var calls = 0
     var pending: CheckedContinuation<HTTPURLResponse, Error>?
     var oldURL: URL?
-    let service = DesktopPermissionChecklist(selectedProfile: { .lan }, activationNotificationCenter: NotificationCenter(),
+    let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .lan }, activationNotificationCenter: NotificationCenter(),
         requestEndpoint: { request in
             calls += 1
             if calls == 4 {
@@ -203,7 +252,7 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     let mail = home.appendingPathComponent("Library/Mail")
     defer { try? FileManager.default.removeItem(at: home) }
     var probes = 0
-    let service = DesktopPermissionChecklist(selectedProfile: { .production }, protectedAccessAction: { .check },
+    let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .production }, protectedAccessAction: { .check },
         verifyProtectedAccess: {
             probes += 1
             try await DesktopFileSystem().verifyProtectedDirectoryAccess(home: home)
@@ -233,7 +282,7 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     page.result = .failure(DesktopVoicePermissionError.emptyRecording)
     var status = AVAuthorizationStatus.notDetermined
     var prompts = 0
-    var access = DesktopPermissionSystemAccess()
+    var access = DesktopPermissionSystemAccess.permissionFixture()
     access.microphone = { status }
     access.requestMicrophone = { prompts += 1; status = .authorized; return true }
     access.hasMicrophone = { true }

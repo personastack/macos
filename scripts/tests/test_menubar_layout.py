@@ -56,7 +56,7 @@ class MenuBarLayoutTests(unittest.TestCase):
         ]
         positions = [body.index(marker) for marker in markers]
         self.assertEqual(positions, sorted(positions))
-        self.assertEqual(body.count("Task { await toggleRelay() }"), 1)
+        self.assertEqual(body.count("toggleRelay()"), 1)
         self.assertIn(".disabled(!action.isEnabled)", body)
         self.assertIn("NSApp.terminate(nil)", block(body, 'Button("Quit PersonaStack")'))
         self.assertNotIn('Button(', body[positions[-1] + len(markers[-1]):])
@@ -87,7 +87,7 @@ class MenuBarLayoutTests(unittest.TestCase):
         self.assertIn("DesktopConcernNotificationsMenuItem()", settings)
         self.assertIn("DesktopServerSettingsMenuItem()", settings)
         self.assertIn("registerLoginItem()", block(settings, 'Button("Launch at Login")'))
-        self.assertIn(".disabled(SMAppService.mainApp.status == .enabled)", settings)
+        self.assertIn(".disabled(DesktopLoginItemRegistration.loginStatus() == .enabled)", settings)
         self.assertNotIn("Text(loginItemError)", settings)
         self.assertIn("DesktopAutomaticUpdatesMenuItem()", settings)
         preference = block(self.updater, "struct DesktopAutomaticUpdatesMenuItem")

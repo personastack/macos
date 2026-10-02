@@ -17,16 +17,19 @@ final class DesktopNotificationAuthorization {
         self.request = request
     }
 
-    func requestIfNeeded() async throws -> Bool {
+    func requestIfNeeded(explicit: Bool = false) async throws -> Bool {
         if let pending { return try await pending.value }
-        let operation = Task { [settings, request] in
-            switch await settings() {
-            case .notDetermined: return try await request([.alert, .sound])
-            case .authorized, .provisional, .ephemeral: return true
-            case .denied: return false
-            @unknown default: return false
-            }
+        let status = explicit ? UNAuthorizationStatus.notDetermined : await settings()
+        // Another caller may have started approval during the settings read.
+        // Only an actual approval request is shared with explicit Setup.
+        if let pending { return try await pending.value }
+        switch status {
+        case .notDetermined: break
+        case .authorized, .provisional, .ephemeral: return true
+        case .denied: return false
+        @unknown default: return false
         }
+        let operation = Task { [request] in try await request([.alert, .sound]) }
         pending = operation
         defer { pending = nil }
         return try await operation.value
@@ -68,6 +71,10 @@ final class DesktopNotificationCoordinator: NSObject, UNUserNotificationCenterDe
 
     func requestAuthorizationIfNeeded() async throws -> Bool {
         try await authorization.requestIfNeeded()
+    }
+
+    func requestAuthorizationForSetup() async throws -> Bool {
+        try await authorization.requestIfNeeded(explicit: true)
     }
 
     func verifyPermissionDelivery() async throws -> Bool {

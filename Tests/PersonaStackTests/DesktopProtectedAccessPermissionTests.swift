@@ -151,7 +151,7 @@ struct DesktopProtectedAccessPermissionTests {
     @Test @MainActor func protectedAccessPassiveStatusDoesNotPromptOrProbe() async {
         var choices = 0
         var probes = 0
-        let service = DesktopPermissionChecklist(selectedProfile: { .production }, protectedAccessAction: {
+        let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .production }, protectedAccessAction: {
             choices += 1; return .check
         }, verifyProtectedAccess: { probes += 1 }, activationNotificationCenter: NotificationCenter())
         for _ in 0..<3 { #expect(await service.adapter.observe(.fullDiskAccess).state == .verificationRequired) }
@@ -160,7 +160,7 @@ struct DesktopProtectedAccessPermissionTests {
 
     @Test @MainActor func protectedAccessSuccessIsOperationEvidenceNeverUniversalApproval() async {
         var probes = 0
-        let service = DesktopPermissionChecklist(selectedProfile: { .production }, protectedAccessAction: { .check },
+        let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .production }, protectedAccessAction: { .check },
             verifyProtectedAccess: { probes += 1 }, activationNotificationCenter: NotificationCenter())
         let result = await service.adapter.setup(.fullDiskAccess)
         #expect(result.state == .ready && result.verified && result.requiresVerification)
@@ -174,9 +174,9 @@ struct DesktopProtectedAccessPermissionTests {
         for action in [DesktopProtectedAccessSetupAction.cancel, .settings] {
             var probes = 0
             var settings: [String] = []
-            let service = DesktopPermissionChecklist(selectedProfile: { .production }, protectedAccessAction: { action },
+            let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .production }, protectedAccessAction: { action },
                 verifyProtectedAccess: { probes += 1 }, activationNotificationCenter: NotificationCenter())
-            let adapter = DesktopPermissionChecklistSystemAdapter(hooks: service.adapter.hooks, openSettings: { settings.append($0) })
+            let adapter = DesktopPermissionChecklistSystemAdapter(hooks: service.adapter.hooks, access: .permissionFixture(), openSettings: { settings.append($0) })
             let result = await adapter.setup(.fullDiskAccess)
             #expect(result.state == (action == .cancel ? .checking : .notGranted))
             #expect(probes == 0)
@@ -187,10 +187,10 @@ struct DesktopProtectedAccessPermissionTests {
     @Test @MainActor func protectedAccessDenialOpensOnlyFullDiskSettingsAndInconclusiveDoesNot() async {
         for code in [EPERM, EACCES, ENOENT, EIO, ELOOP] {
             var settings: [String] = []
-            let service = DesktopPermissionChecklist(selectedProfile: { .production }, protectedAccessAction: { .check },
+            let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .production }, protectedAccessAction: { .check },
                 verifyProtectedAccess: { throw NSError(domain: NSPOSIXErrorDomain, code: Int(code)) },
                 activationNotificationCenter: NotificationCenter())
-            let adapter = DesktopPermissionChecklistSystemAdapter(hooks: service.adapter.hooks, openSettings: { settings.append($0) })
+            let adapter = DesktopPermissionChecklistSystemAdapter(hooks: service.adapter.hooks, access: .permissionFixture(), openSettings: { settings.append($0) })
             let result = await adapter.setup(.fullDiskAccess)
             let denied = code == EPERM || code == EACCES
             let expected: DesktopPermissionState = denied ? .denied : (code == ENOENT ? .verificationRequired : .failed)
@@ -205,7 +205,7 @@ struct DesktopProtectedAccessPermissionTests {
         let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(
             observe: { _ in .init(.unsupported, detail: "Retired evidence") },
             setup: { _ in .init(.denied, detail: "Earlier denial", verificationKey: "retired") }
-        ), openSettings: { settings.append($0) })
+        ), access: .permissionFixture(), openSettings: { settings.append($0) })
         #expect(await adapter.setup(.fullDiskAccess).state == .checking)
         #expect(settings.isEmpty)
     }
@@ -213,7 +213,7 @@ struct DesktopProtectedAccessPermissionTests {
     @Test @MainActor func protectedAccessPrecancelDoesNotDisplayConsentOrProbe() async {
         var choices = 0
         var probes = 0
-        let service = DesktopPermissionChecklist(selectedProfile: { .production }, protectedAccessAction: {
+        let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .production }, protectedAccessAction: {
             choices += 1; return .check
         }, verifyProtectedAccess: { probes += 1 }, activationNotificationCenter: NotificationCenter())
         let check = Task { await service.adapter.setup(.fullDiskAccess) }
@@ -226,10 +226,10 @@ struct DesktopProtectedAccessPermissionTests {
         var pending: CheckedContinuation<DesktopProtectedAccessSetupAction, Never>?
         var probes = 0
         var settings: [String] = []
-        let service = DesktopPermissionChecklist(selectedProfile: { .production }, protectedAccessAction: {
+        let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .production }, protectedAccessAction: {
             await withCheckedContinuation { pending = $0 }
         }, verifyProtectedAccess: { probes += 1 }, activationNotificationCenter: NotificationCenter())
-        let adapter = DesktopPermissionChecklistSystemAdapter(hooks: service.adapter.hooks, openSettings: { settings.append($0) })
+        let adapter = DesktopPermissionChecklistSystemAdapter(hooks: service.adapter.hooks, access: .permissionFixture(), openSettings: { settings.append($0) })
         let check = Task { await adapter.setup(.fullDiskAccess) }
         while pending == nil { await Task.yield() }
         check.cancel()
@@ -245,10 +245,10 @@ struct DesktopProtectedAccessPermissionTests {
             let notifications = NotificationCenter()
             var pending: CheckedContinuation<Void, Never>?
             var settings: [String] = []
-            let service = DesktopPermissionChecklist(selectedProfile: { profile }, protectedAccessAction: { .check },
+            let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { profile }, protectedAccessAction: { .check },
                 verifyProtectedAccess: { await withCheckedContinuation { pending = $0 } },
                 activationNotificationCenter: notifications)
-            let adapter = DesktopPermissionChecklistSystemAdapter(hooks: service.adapter.hooks, openSettings: { settings.append($0) })
+            let adapter = DesktopPermissionChecklistSystemAdapter(hooks: service.adapter.hooks, access: .permissionFixture(), openSettings: { settings.append($0) })
             let check = Task { await adapter.setup(.fullDiskAccess) }
             while pending == nil { await Task.yield() }
             if activate { notifications.post(name: NSApplication.didBecomeActiveNotification, object: nil) }
@@ -263,13 +263,13 @@ struct DesktopProtectedAccessPermissionTests {
     @Test @MainActor func protectedAccessInvalidationAndLateAttemptCannotReplaceNewResult() async {
         var pending: CheckedContinuation<Void, Never>?
         var probes = 0
-        let service = DesktopPermissionChecklist(selectedProfile: { .production }, protectedAccessAction: { .check },
+        let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .production }, protectedAccessAction: { .check },
             verifyProtectedAccess: {
                 probes += 1
                 if probes == 1 { await withCheckedContinuation { pending = $0 } }
                 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT)) }
             }, activationNotificationCenter: NotificationCenter())
-        let adapter = DesktopPermissionChecklistSystemAdapter(hooks: service.adapter.hooks, openSettings: { _ in Issue.record("No settings action expected") })
+        let adapter = DesktopPermissionChecklistSystemAdapter(hooks: service.adapter.hooks, access: .permissionFixture(), openSettings: { _ in Issue.record("No settings action expected") })
         let old = Task { await adapter.setup(.fullDiskAccess) }
         while pending == nil { await Task.yield() }
         #expect(await adapter.setup(.fullDiskAccess).state == .checking)
@@ -284,7 +284,7 @@ struct DesktopProtectedAccessPermissionTests {
 
     @Test @MainActor func protectedAccessCanceledProbeCannotStoreEvidence() async {
         var pending: CheckedContinuation<Void, Never>?
-        let service = DesktopPermissionChecklist(selectedProfile: { .production }, protectedAccessAction: { .check },
+        let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .production }, protectedAccessAction: { .check },
             verifyProtectedAccess: { await withCheckedContinuation { pending = $0 } },
             activationNotificationCenter: NotificationCenter())
         let check = Task { await service.adapter.setup(.fullDiskAccess) }
@@ -298,7 +298,7 @@ struct DesktopProtectedAccessPermissionTests {
     @Test @MainActor func protectedAccessCachedOperationEvidenceRefreshesOnActivationAndExpiresOnEnvironmentChange() async {
         let notifications = NotificationCenter()
         var profile = DesktopEnvironmentConfiguration.production
-        let service = DesktopPermissionChecklist(selectedProfile: { profile }, protectedAccessAction: { .check },
+        let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { profile }, protectedAccessAction: { .check },
             verifyProtectedAccess: {}, activationNotificationCenter: notifications)
         let first = await service.adapter.setup(.fullDiskAccess)
         #expect(await service.adapter.observe(.fullDiskAccess) == first)
@@ -317,7 +317,7 @@ struct DesktopProtectedAccessPermissionTests {
         var action = DesktopProtectedAccessSetupAction.settings
         var probes = 0
         var settings: [String] = []
-        let service = DesktopPermissionChecklist(selectedProfile: { .production }, protectedAccessAction: { action },
+        let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .production }, protectedAccessAction: { action },
             verifyProtectedAccess: {
                 probes += 1
                 try await DesktopFileSystem().verifyProtectedDirectoryAccess(home: home)
@@ -350,7 +350,7 @@ struct DesktopProtectedAccessPermissionTests {
         var denied = false
         var probes = 0
         var settings: [String] = []
-        let service = DesktopPermissionChecklist(selectedProfile: { .production }, protectedAccessAction: { .check },
+        let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .production }, protectedAccessAction: { .check },
             verifyProtectedAccess: {
                 probes += 1
                 if denied { throw NSError(domain: NSPOSIXErrorDomain, code: Int(EPERM)) }
@@ -381,7 +381,7 @@ struct DesktopProtectedAccessPermissionTests {
     @Test @MainActor func protectedAccessReopenRefreshesReadyAndConsentCancelPreservesIt() async {
         var action = DesktopProtectedAccessSetupAction.check
         var probes = 0
-        let service = DesktopPermissionChecklist(selectedProfile: { .production }, protectedAccessAction: { action },
+        let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .production }, protectedAccessAction: { action },
             verifyProtectedAccess: { probes += 1 }, activationNotificationCenter: NotificationCenter())
         let model = protectedAccessCoordinator(service: service, openSettings: { _ in Issue.record("Unexpected Settings open") })
         model.open()
@@ -414,7 +414,7 @@ private func protectedAccessCoordinator(service: DesktopPermissionChecklist,
     }, setup: { id in
         guard id == .fullDiskAccess else { Issue.record("Unexpected setup"); return nil }
         return await hooks.setup(id)
-    }), openSettings: openSettings)
+    }), access: service.adapter.access, openSettings: openSettings)
     return DesktopPermissionChecklistCoordinator(adapter: adapter)
 }
 

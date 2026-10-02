@@ -12,10 +12,16 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
     var setupValues: [DesktopPermissionID: DesktopPermissionObservation] = [:]
     var observed: [DesktopPermissionID] = []
     var requested: [DesktopPermissionID] = []
+    var checked: [DesktopPermissionID] = []
     var pendingSetup: CheckedContinuation<DesktopPermissionObservation, Never>?
     var delaySetup = false
     var suspendedObservation: DesktopPermissionID?
     var pendingObservation: CheckedContinuation<DesktopPermissionObservation, Never>?
+
+    func check(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation {
+        checked.append(permission)
+        return await observe(permission)
+    }
 
     func observe(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation {
         observed.append(permission)
@@ -33,6 +39,57 @@ private final class PermissionChecklistFake: DesktopPermissionChecklistAdapting 
         }
         return setupValues[permission] ?? values[permission] ?? .init(.ready, detail: "Ready")
     }
+}
+
+@Test @MainActor func permissionChecklistCheckReplacesEarlierSetupFailureWithoutRequestingAccess() async {
+    let fake = PermissionChecklistFake()
+    fake.values[.notifications] = .init(.denied, detail: "Previous decision")
+    fake.setupValues[.notifications] = .init(.failed, detail: "Earlier request failed")
+    let model = DesktopPermissionChecklistCoordinator(adapter: fake)
+    model.open()
+    defer { model.cancel() }
+    await model.refresh()
+    model.setup(.notifications)
+    while model.busyPermission != nil { await Task.yield() }
+    #expect(model.rows.first { $0.id == .notifications }?.state == .failed)
+    fake.values[.notifications] = .init(.ready, detail: "Current macOS decision")
+    model.check(.notifications)
+    while model.busyPermission != nil { await Task.yield() }
+    #expect(model.rows.first { $0.id == .notifications }?.state == .ready)
+    #expect(fake.checked == [.notifications] && fake.requested == [.notifications])
+}
+
+@Test @MainActor func permissionNotificationDeliveryFailureSurvivesPollingUntilSuccessfulCheck() async {
+    var reject = true
+    var submissions = 0
+    var access = DesktopPermissionSystemAccess.permissionFixture()
+    access.notificationSettings = { (.authorized, .enabled, .enabled) }
+    access.verifyNotificationDelivery = {
+        submissions += 1
+        if reject { throw NSError(domain: UNErrorDomain, code: UNError.Code.notificationsNotAllowed.rawValue) }
+        return true
+    }
+    let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(observe: { id in
+        id == .notifications ? nil : .init(.ready, detail: "Fixture ready")
+    }), access: access)
+    let model = DesktopPermissionChecklistCoordinator(adapter: adapter)
+    model.open()
+    defer { model.cancel() }
+    await model.refresh()
+    #expect(model.rows.first { $0.id == .notifications }?.state == .verificationRequired)
+    model.check(.notifications)
+    while model.busyPermission != nil { await Task.yield() }
+    #expect(model.rows.first { $0.id == .notifications }?.state == .failed)
+    await model.refresh()
+    #expect(model.rows.first { $0.id == .notifications }?.state == .failed)
+    #expect(submissions == 1)
+    reject = false
+    model.check(.notifications)
+    while model.busyPermission != nil { await Task.yield() }
+    await model.refresh()
+    #expect(model.rows.first { $0.id == .notifications }?.state == .ready)
+    #expect(model.rows.first { $0.id == .notifications }?.observation.detail.contains("verified notification delivery") == true)
+    #expect(submissions == 2)
 }
 
 @MainActor
@@ -323,8 +380,8 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     #expect(DesktopPermissionChecklistSystemAdapter.notificationObservation(authorization: .denied, alerts: .disabled, sounds: .disabled).state == .denied)
     #expect(DesktopPermissionChecklistSystemAdapter.notificationObservation(authorization: .authorized, alerts: .enabled, sounds: .disabled).state == .notGranted)
     let allowed = DesktopPermissionChecklistSystemAdapter.notificationObservation(authorization: .authorized, alerts: .enabled, sounds: .enabled)
-    #expect(!allowed.requiresVerification)
-    #expect(DesktopPermissionRow(id: .notifications, observation: allowed).isComplete)
+    #expect(allowed.requiresVerification && !allowed.verified)
+    #expect(!DesktopPermissionRow(id: .notifications, observation: allowed).isComplete)
     #expect(DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(.lockedScreenControl).state == .unsupported)
     #expect(DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(.fullDiskAccess).state == .verificationRequired)
     #expect(DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(.speechRecognition).state == .notNeeded)
@@ -481,7 +538,7 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     let notifications = NotificationCenter()
     var powerChecks = 0
     var directoryChecks = 0
-    let service = DesktopPermissionChecklist(directoryURL: { _ in URL(fileURLWithPath: "/fake-directory") },
+    let service = DesktopPermissionChecklist(access: .permissionFixture(), directoryURL: { _ in URL(fileURLWithPath: "/fake-directory") },
         verifyDirectory: { _ in directoryChecks += 1 }, selectedProfile: { .production },
         verifyPowerAvailability: { powerChecks += 1; return true }, activationNotificationCenter: notifications)
     let power = await service.adapter.setup(.awakeDuringRemoteWork)
@@ -496,7 +553,7 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
 @Test @MainActor func permissionChecklistActivationFencesPendingDirectoryProof() async {
     let notifications = NotificationCenter()
     var pending: CheckedContinuation<Void, Never>?
-    let service = DesktopPermissionChecklist(directoryURL: { _ in URL(fileURLWithPath: "/fake-directory") },
+    let service = DesktopPermissionChecklist(access: .permissionFixture(), directoryURL: { _ in URL(fileURLWithPath: "/fake-directory") },
         verifyDirectory: { _ in await withCheckedContinuation { pending = $0 } }, selectedProfile: { .production },
         activationNotificationCenter: notifications)
     let check = Task { await service.adapter.setup(.documentsFiles) }
@@ -666,12 +723,13 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     #expect(revealed == [runningCopy])
     #expect(fake.requested.isEmpty)
     fake.values[.accessibility] = .init(.ready, detail: "Approved")
+    fake.values[.fullDiskAccess] = .init(.restartRequired, detail: "Add this app to Full Disk Access")
     await model.refresh()
     owner.revealCurrentApplication()
-    #expect(revealed == [runningCopy])
+    #expect(revealed == [runningCopy, runningCopy])
     model.cancel()
     owner.revealCurrentApplication()
-    #expect(revealed == [runningCopy] && fake.requested.isEmpty)
+    #expect(revealed == [runningCopy, runningCopy] && fake.requested.isEmpty)
 }
 
 @Test @MainActor func permissionChecklistFullControlAcknowledgementGatesFinish() async throws {
@@ -706,146 +764,38 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     window.completeSetup()
 }
 
-@Test @MainActor func permissionChecklistInstallsMissingLockedControlThenRequiresVerifiedRetry() async throws {
+@Test(arguments: [DesktopLockedControlSetupVerifier.Snapshot.absent, .mismatch, .unsupported]) @MainActor func permissionChecklistUnverifiedLockedControlKeepsFinishOpenWithoutInstaller(
+    snapshot: DesktopLockedControlSetupVerifier.Snapshot
+) async throws {
     let model = DesktopPermissionChecklistCoordinator(adapter: PermissionChecklistFake())
-    let suite = "permission-checklist-installer-\(UUID().uuidString)"
+    let suite = "permission-checklist-main-installer-\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suite))
     defer { defaults.removePersistentDomain(forName: suite) }
-    var inspections = 0
-    let verifier = DesktopLockedControlSetupVerifier(defaults: defaults, operations: .init(inspect: {
-        inspections += 1
-        return inspections == 1 ? .absent : .ready
-    }))
-    let package = URL(fileURLWithPath: "/tmp/LockedControlInstaller.pkg")
-    var opened: [URL] = []
+    var current = snapshot
+    let verifier = DesktopLockedControlSetupVerifier(defaults: defaults, operations: .init(inspect: { current }))
     var acknowledgements = 0
-    var prompts: [DesktopLockedControlSetupVerifier.Readiness] = []
     let window = DesktopPermissionChecklistWindow(coordinator: model, lockedControlVerifier: verifier,
-        authorizeFullControl: { _ in
-            acknowledgements += 1
-            return true
-        },
-        installerPackageURL: { package },
-        openInstallerPackage: { opened.append($0); return true },
-        setupPromptAction: { readiness in prompts.append(readiness); return .install })
+        authorizeFullControl: { _ in acknowledgements += 1; return true })
     model.open()
     await model.refresh()
     let finishRequest = Task { try await model.waitForFinish() }
     while !model.isAwaitingFinish { await Task.yield() }
 
     await window.finish()
-
-    #expect(opened == [package])
-    #expect(prompts == [.absent])
+    #expect(model.completionError.contains(snapshot.detail))
+    if snapshot.readiness != .unsupported {
+        #expect(model.completionError.contains("main PersonaStack installer"))
+    }
     #expect(acknowledgements == 0)
     #expect(!verifier.permitsLockedControl)
-    #expect(model.isAwaitingFinish && !model.isFinishing)
+    #expect(model.isAwaitingFinish && !model.isFinishing && model.canFinish)
 
+    current = .ready
     await window.finish()
     try await finishRequest.value
-    #expect(inspections == 2)
     #expect(acknowledgements == 1)
-    #expect(verifier.permitsLockedControl)
-    #expect(model.isFinishing)
-    window.completeSetup()
-}
-
-@Test @MainActor func permissionChecklistMissingInstallerKeepsFinishIncompleteWithActionableDetail() async throws {
-    let model = DesktopPermissionChecklistCoordinator(adapter: PermissionChecklistFake())
-    let verifier = DesktopLockedControlSetupVerifier(operations: .init(inspect: { .absent }))
-    var detail = ""
-    var prompts = 0
-    var opened = 0
-    let window = DesktopPermissionChecklistWindow(coordinator: model, lockedControlVerifier: verifier,
-        installerPackageURL: { nil }, openInstallerPackage: { _ in opened += 1; return true },
-        setupPromptAction: { _ in prompts += 1; return .install },
-        showInstallerUnavailable: { detail = $0 })
-    model.open()
-    await model.refresh()
-    let finishRequest = Task { try await model.waitForFinish() }
-    while !model.isAwaitingFinish { await Task.yield() }
-
-    await window.finish()
-
-    #expect(detail.contains("does not include the locked-control installer"))
-    #expect(prompts == 0 && opened == 0)
-    #expect(verifier.snapshot.readiness == .absent)
-    #expect(model.isAwaitingFinish && !model.isFinishing)
-    model.cancel()
-    await #expect(throws: CancellationError.self) { try await finishRequest.value }
-}
-
-@Test @MainActor func permissionChecklistCancellingMismatchRetryPreservesReadinessAndFinishState() async throws {
-    let model = DesktopPermissionChecklistCoordinator(adapter: PermissionChecklistFake())
-    let verifier = DesktopLockedControlSetupVerifier(operations: .init(inspect: { .mismatch }))
-    var prompts: [DesktopLockedControlSetupVerifier.Readiness] = []
-    var opened = 0
-    let window = DesktopPermissionChecklistWindow(coordinator: model, lockedControlVerifier: verifier,
-        installerPackageURL: { URL(fileURLWithPath: "/tmp/LockedControlInstaller.pkg") },
-        openInstallerPackage: { _ in opened += 1; return true },
-        setupPromptAction: { readiness in prompts.append(readiness); return .cancel })
-    model.open()
-    await model.refresh()
-    let finishRequest = Task { try await model.waitForFinish() }
-    while !model.isAwaitingFinish { await Task.yield() }
-
-    await window.finish()
-
-    #expect(prompts == [.mismatch])
-    #expect(opened == 0)
-    #expect(verifier.snapshot.readiness == .mismatch)
-    #expect(model.isAwaitingFinish && !model.isFinishing)
-    model.cancel()
-    await #expect(throws: CancellationError.self) { try await finishRequest.value }
-}
-
-@Test @MainActor func permissionChecklistPartialInstallOffersExplicitInstallerRetryThenFreshReadback() async throws {
-    let model = DesktopPermissionChecklistCoordinator(adapter: PermissionChecklistFake())
-    let suite = "permission-checklist-mismatch-retry-\(UUID().uuidString)"
-    let defaults = try #require(UserDefaults(suiteName: suite))
-    defer { defaults.removePersistentDomain(forName: suite) }
-    var inspections = 0
-    let verifier = DesktopLockedControlSetupVerifier(defaults: defaults, operations: .init(inspect: {
-        inspections += 1
-        return inspections == 1 ? .mismatch : .ready
-    }))
-    let package = URL(fileURLWithPath: "/tmp/LockedControlInstaller.pkg")
-    var opened: [URL] = []
-    var prompts: [DesktopLockedControlSetupVerifier.Readiness] = []
-    var accepted = 0
-    let window = DesktopPermissionChecklistWindow(coordinator: model, lockedControlVerifier: verifier,
-        authorizeFullControl: { _ in
-            accepted += 1
-            return true
-        },
-        installerPackageURL: { package },
-        openInstallerPackage: { opened.append($0); return true },
-        setupPromptAction: { readiness in
-            prompts.append(readiness)
-            return readiness == .mismatch ? .install : .cancel
-        })
-    model.open()
-    await model.refresh()
-    let finishRequest = Task { try await model.waitForFinish() }
-    while !model.isAwaitingFinish { await Task.yield() }
-
-    #expect(opened.isEmpty)
-    await window.finish()
-    #expect(opened == [package])
-    #expect(prompts == [.mismatch])
-    #expect(verifier.snapshot.readiness == .mismatch)
-    #expect(accepted == 0)
-    #expect(model.isAwaitingFinish && !model.isFinishing)
-
-    await window.finish()
-    try await finishRequest.value
-
-    #expect(inspections == 2)
-    #expect(opened == [package])
-    #expect(verifier.snapshot.readiness == .ready)
-    #expect(accepted == 1)
-    #expect(verifier.permitsLockedControl)
-    #expect(model.isFinishing)
+    #expect(verifier.permitsLockedControl && model.isFinishing)
+    #expect(model.completionError.isEmpty)
     window.completeSetup()
 }
 
@@ -855,14 +805,9 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     let verifier = DesktopLockedControlSetupVerifier(operations: .init(inspect: {
         await withCheckedContinuation { pendingInspection = $0 }
     }))
-    var prompts = 0
-    var installerLaunches = 0
     var acknowledgements = 0
     let window = DesktopPermissionChecklistWindow(coordinator: model, lockedControlVerifier: verifier,
-        authorizeFullControl: { _ in acknowledgements += 1; return true },
-        installerPackageURL: { URL(fileURLWithPath: "/tmp/LockedControlInstaller.pkg") },
-        openInstallerPackage: { _ in installerLaunches += 1; return true },
-        setupPromptAction: { _ in prompts += 1; return .install })
+        authorizeFullControl: { _ in acknowledgements += 1; return true })
     model.open()
     await model.refresh()
     let previousRequest = Task { try await model.waitForFinish() }
@@ -882,7 +827,7 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     await staleFinish.value
 
     #expect(model.canFinish && model.isAwaitingFinish && !model.isFinishing)
-    #expect(prompts == 0 && installerLaunches == 0 && acknowledgements == 0)
+    #expect(model.completionError.isEmpty && acknowledgements == 0)
     model.cancel()
     await #expect(throws: CancellationError.self) { try await currentRequest.value }
 }

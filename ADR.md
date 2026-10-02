@@ -8,3 +8,7 @@
 - 2026-09-15: The macOS client accepts one main-frame `my.personastack.ai` WebKit bridge event for new concerns. The event is schema-checked and carries no concern or account data. The client owns only generic notification presentation while it is running.
 - 2026-09-15: The desktop source and primary GitHub release remain private. Every tagged installer is also published to a versioned public `personastack/homebrew-tap` Git tag, which owns the Homebrew cask and its public immutable download URL.
 - 2026-09-23: Desktop Control expands the macOS client from a presentation-only shell into the per-user native execution/transport owner while preserving API and gateway authority. Use one API-enrolled installation identity, one outbound connection to `agent-gateway`, one shared local control owner, and the pinned standalone signed `CuaDriver.app` identity for GUI permission attribution. Keep file/process operations native and finite. Do not expose arbitrary local MCP tools, workspace-separated desktop illusions, durable action replay, or a new cloud service.
+
+# 2026-10-02 - One PersonaStack installation
+
+- Decision: Eric requires our locked-control component to be part of the main PersonaStack install. The main signed package installs the app and component together. Desktop Control setup verifies the installation without launching a separate helper installer. Unsigned local builds retain the signing boundary and report locked control as unavailable.

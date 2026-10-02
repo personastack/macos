@@ -35,9 +35,22 @@ struct DesktopLockedControlSetupVerifierTests {
         let bundleURL = URL(fileURLWithPath: "/tmp/candidate with spaces.bundle")
         #expect(DesktopLockedControlSetupVerifier.pinnedCodeSignatureArguments(bundleURL, pin: Data()) == [
             "--verify", "--strict", "--deep", "-R",
-            "=identifier \"ai.personastack.locked-grant-candidate\" and certificate leaf = H\"da39a3ee5e6b4b0d3255bfef95601890afd80709\"",
+            "=identifier \"ai.personastack.locked-grant-candidate\" and anchor apple generic and certificate leaf = H\"da39a3ee5e6b4b0d3255bfef95601890afd80709\"",
             "/tmp/candidate with spaces.bundle",
         ])
+    }
+
+    @Test func unsupportedBuildCannotRecordLockedControlConsent() async {
+        let fixture = LockedControlSetupVerifierFixture(.unsupported)
+        #expect(await fixture.verifier.refresh() == .unsupported)
+        #expect(!fixture.verifier.recordAcknowledgement())
+        #expect(!fixture.verifier.permitsLockedControl)
+    }
+
+    @Test func mainAppVerificationRequiresItsOwnIdentity() {
+        let args = DesktopLockedControlSetupVerifier.pinnedCodeSignatureArguments(
+            URL(fileURLWithPath: "/Applications/PersonaStack.app"), pin: Data(), identifier: "ai.personastack.desktop")
+        #expect(args[4].contains("identifier \"ai.personastack.desktop\" and anchor apple generic"))
     }
 
     @Test func constructorUsesCachedFailClosedStateWithoutInspection() {

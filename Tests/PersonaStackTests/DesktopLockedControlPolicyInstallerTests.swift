@@ -13,6 +13,9 @@ private final class PolicyInstallFixture: DesktopLockedControlPolicyInstalling {
     var driftBeforeActivation = false
     var loseReadback = false
     var screensaverReads = 0
+    var omitsAllowRootOnReadback = false
+    var updatesModifiedOnWrite = false
+    var policyWriteOverrides: [String: Any] = [:]
 
     func verifyPayload() throws {
         calls.append("verify")
@@ -33,12 +36,107 @@ private final class PolicyInstallFixture: DesktopLockedControlPolicyInstalling {
         calls.append("write:" + name)
         if failActivation && name == Policy.screensaverRight { throw Policy.Failure.verificationFailed }
         rights[name] = value
+        if omitsAllowRootOnReadback && name == Policy.right { rights[name]?["allow-root"] = nil }
+        if updatesModifiedOnWrite {
+            let previous = value["modified"] as? Double ?? 100.0
+            rights[name]?["modified"] = previous + 1.0
+        }
+        if name == Policy.screensaverRight {
+            for (key, value) in policyWriteOverrides { rights[name]?[key] = value }
+        }
     }
+    func removeRight(_ name: String) throws { calls.append("remove:" + name); rights[name] = nil }
+    func removeReceipt() throws { calls.append("receipt.remove"); receipt = nil }
     var writes: [String] { calls.filter { $0.hasPrefix("write:") || $0 == "receipt.write" } }
 }
 
 @Suite struct DesktopLockedControlPolicyInstallerTests {
     typealias Policy = DesktopLockedControlPolicy
+
+    @Test func mechanismsReadbackOmitsUserClassAllowRootField() throws {
+        let system = PolicyInstallFixture()
+        system.omitsAllowRootOnReadback = true
+        try DesktopLockedControlPolicyInstaller.install(using: system)
+        #expect(system.rights[Policy.right]?["allow-root"] == nil)
+        #expect(Policy.validLeaf(system.rights[Policy.right]!))
+        system.calls = []
+        try DesktopLockedControlPolicyInstaller.install(using: system)
+        #expect(system.writes.isEmpty)
+        try DesktopLockedControlPolicyInstaller.uninstall(using: system)
+        #expect(system.rights[Policy.right] == nil)
+    }
+
+    @Test func explicitRootBypassAndMalformedBooleansStillFailVerification() {
+        for rootValue: Any in [true, 0, "false"] {
+            var leaf = Policy.leaf
+            leaf["allow-root"] = rootValue
+            #expect(!Policy.validLeaf(leaf))
+        }
+    }
+
+    @Test func uninstallRestoresManualPolicyBeforeRemovingPrivateArtifacts() throws {
+        let system = PolicyInstallFixture()
+        try DesktopLockedControlPolicyInstaller.install(using: system)
+        system.calls = []
+        try DesktopLockedControlPolicyInstaller.uninstall(using: system)
+        #expect(system.calls.first == "verify")
+        #expect(system.rights[Policy.screensaverRight]?["rule"] as? [String] == ["manual.one", "manual.two"])
+        #expect(system.rights[Policy.screensaverRight]?["comment"] as? String == "keep")
+        #expect(system.rights[Policy.right] == nil && system.receipt == nil)
+        let writes = system.calls.filter { $0.hasPrefix("write:") || $0.hasPrefix("remove:") || $0 == "receipt.remove" }
+        #expect(writes == ["write:" + Policy.screensaverRight, "remove:" + Policy.right, "receipt.remove"])
+        try DesktopLockedControlPolicyInstaller.uninstall(using: system)
+    }
+
+    @Test func uninstallAcceptsAuthdModifiedTimestampWithoutLosingPolicyFields() throws {
+        let system = PolicyInstallFixture()
+        let created = 50.0
+        system.rights[Policy.screensaverRight]?["created"] = created
+        system.rights[Policy.screensaverRight]?["modified"] = 100.0
+        system.updatesModifiedOnWrite = true
+        try DesktopLockedControlPolicyInstaller.install(using: system)
+        system.calls = []
+        try DesktopLockedControlPolicyInstaller.uninstall(using: system)
+        #expect(system.rights[Policy.screensaverRight]?["modified"] as? Double == 102.0)
+        #expect(system.rights[Policy.screensaverRight]?["created"] as? Double == created)
+        #expect(system.rights[Policy.screensaverRight]?["rule"] as? [String] == ["manual.one", "manual.two"])
+        #expect(system.rights[Policy.screensaverRight]?["k-of-n"] as? Int == 1)
+        #expect(system.rights[Policy.screensaverRight]?["comment"] as? String == "keep")
+        #expect(system.rights[Policy.right] == nil && system.receipt == nil)
+        #expect(system.calls.contains("remove:" + Policy.right) && system.calls.contains("receipt.remove"))
+        try DesktopLockedControlPolicyInstaller.uninstall(using: system)
+    }
+
+    @Test(arguments: ["rule", "k-of-n", "class", "comment", "created", "foreign"])
+    func uninstallRejectsChangedAuthorizationFieldsDespiteModifiedTimestamp(field: String) throws {
+        let system = PolicyInstallFixture()
+        system.rights[Policy.screensaverRight]?["created"] = 50.0
+        system.updatesModifiedOnWrite = true
+        try DesktopLockedControlPolicyInstaller.install(using: system)
+        let changes: [String: Any] = [
+            "rule": ["manual.two", "manual.one"], "k-of-n": 2, "class": "allow",
+            "comment": "changed", "created": 51.0, "foreign": true
+        ]
+        system.policyWriteOverrides = [field: changes[field]!]
+        system.calls = []
+        #expect(throws: Policy.Failure.verificationFailed) {
+            try DesktopLockedControlPolicyInstaller.uninstall(using: system)
+        }
+        #expect(system.rights[Policy.right] != nil && system.receipt != nil)
+        #expect(!system.calls.contains(where: { $0.hasPrefix("remove:") || $0 == "receipt.remove" }))
+    }
+
+    @Test func uninstallRefusesForeignPolicyWithoutRemovingPayloadEvidence() throws {
+        let system = PolicyInstallFixture()
+        try DesktopLockedControlPolicyInstaller.install(using: system)
+        system.rights[Policy.screensaverRight]?["rule"] = [Policy.right, "manual.one", "foreign"]
+        system.calls = []
+        #expect(throws: Policy.Failure.conflictingInstallation) {
+            try DesktopLockedControlPolicyInstaller.uninstall(using: system)
+        }
+        #expect(system.writes.isEmpty)
+        #expect(!system.calls.contains(where: { $0.hasPrefix("remove:") || $0 == "receipt.remove" }))
+    }
 
     @Test func installPreservesManualFallbacksAndVerifiesReadback() throws {
         let system = PolicyInstallFixture()

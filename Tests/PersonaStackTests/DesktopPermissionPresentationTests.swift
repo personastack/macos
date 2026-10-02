@@ -33,7 +33,7 @@ private final class PresentationFixture {
     lazy var service = makeService()
 
     private func makeService() -> DesktopPermissionChecklist {
-        var access = DesktopPermissionSystemAccess()
+        var access = DesktopPermissionSystemAccess.permissionFixture()
         access.accessibility = { self.accessibilityGranted ?? self.granted }
         access.screenRecording = { self.granted }
         access.microphone = { self.granted ? .authorized : .notDetermined }
@@ -115,7 +115,7 @@ private final class PresentationFixture {
     #expect(fixture.row(.fullDiskAccess)?.state == .denied)
     #expect(fixture.row(.localNetwork)?.state == .failed)
     #expect(fixture.voice.recordings == 0 && fixture.grantRequests.isEmpty)
-    #expect(fixture.diskChecks == 1 && fixture.requests.count == 1)
+    #expect(fixture.diskChecks == 1 && fixture.requests.count == 3)
     fixture.close()
     fixture.granted = true
     fixture.denyDisk = false

@@ -13,8 +13,8 @@ case "$target" in
     archive="$work_dir/PersonaStack.zip"
     ditto -c -k --keepParent "$target" "$archive"
     ;;
-  *.dmg) archive="$target" ;;
-  *) printf '%s\n' 'Only an app bundle or DMG can be notarized.' >&2; exit 2 ;;
+  *.dmg|*.pkg) archive="$target" ;;
+  *) printf '%s\n' 'Only an app bundle, installer package or DMG can be notarized.' >&2; exit 2 ;;
 esac
 
 notary() {

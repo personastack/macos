@@ -4,7 +4,7 @@ import Foundation
 import PersonaStackCore
 import Security
 
-/// Invoked only by the explicit macOS Installer package. No network, app
+/// Invoked only by the main macOS Installer or an explicit uninstall. No network, app
 /// credentials, user-controlled arguments, or long-running privileged service.
 final class SystemPolicyInstaller: DesktopLockedControlPolicyInstalling {
     typealias Policy = DesktopLockedControlPolicy
@@ -12,7 +12,8 @@ final class SystemPolicyInstaller: DesktopLockedControlPolicyInstalling {
 
     init() throws {
         guard getuid() == 0, geteuid() == 0,
-              CommandLine.arguments == [CommandLine.arguments[0], "--apply"] else { throw InstallError.denied }
+              CommandLine.arguments.count == 2,
+              ["--apply", "--remove"].contains(CommandLine.arguments[1]) else { throw InstallError.denied }
         guard AuthorizationCreate(nil, nil, [], &authorization) == errAuthorizationSuccess else {
             throw InstallError.denied
         }
@@ -84,6 +85,22 @@ final class SystemPolicyInstaller: DesktopLockedControlPolicyInstalling {
         }
     }
 
+    func removeRight(_ name: String) throws {
+        guard let authorization,
+              AuthorizationRightRemove(authorization, name) == errAuthorizationSuccess
+        else { throw InstallError.writeFailed }
+    }
+
+    func removeReceipt() throws {
+        var metadata = stat()
+        guard lstat(Policy.receiptPath, &metadata) == 0 else {
+            if errno == ENOENT { return }
+            throw InstallError.readFailed
+        }
+        try protectedPath(Policy.receiptPath, directory: false)
+        guard unlink(Policy.receiptPath) == 0 else { throw InstallError.writeFailed }
+    }
+
     private func verifySignature(path: String, identifier: String, digest: String) throws {
         var code: SecStaticCode?
         var requirement: SecRequirement?
@@ -92,7 +109,7 @@ final class SystemPolicyInstaller: DesktopLockedControlPolicyInstalling {
               SecRequirementCreateWithString(expression as CFString, [], &requirement) == errSecSuccess,
               let code, let requirement,
               SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate | kSecCSCheckAllArchitectures), requirement) == errSecSuccess
-        else { throw InstallError.denied }
+        else { throw InstallError.untrustedSignature }
     }
 
     private func protectedPath(_ path: String, directory: Bool) throws {
@@ -108,14 +125,31 @@ final class SystemPolicyInstaller: DesktopLockedControlPolicyInstalling {
         }
     }
 
-    enum InstallError: Error { case denied, readFailed, writeFailed }
+    enum InstallError: Error { case denied, readFailed, writeFailed, untrustedSignature }
 }
 
 do {
-    try DesktopLockedControlPolicyInstaller.install(using: SystemPolicyInstaller())
-    print("PersonaStack locked-control policy installed and verified.")
+    let system = try SystemPolicyInstaller()
+    if CommandLine.arguments[1] == "--remove" {
+        try DesktopLockedControlPolicyInstaller.uninstall(using: system)
+        print("PersonaStack locked-control policy removed and verified.")
+    } else {
+        try DesktopLockedControlPolicyInstaller.install(using: system)
+        print("PersonaStack locked-control policy installed and verified.")
+    }
 } catch {
     // No policy contents, paths from external input, or authorization material.
-    fputs("PersonaStack locked-control setup could not be verified. Review the installed policy before retrying.\n", stderr)
+    let detail: String
+    switch error {
+    case SystemPolicyInstaller.InstallError.untrustedSignature:
+        detail = "The locked-control payload must use PersonaStack's pinned Developer ID signature. Unsigned development builds cannot install it."
+    case DesktopLockedControlPolicy.Failure.invalidPolicy:
+        detail = "This Mac's lock-screen authorization policy is not supported. The policy was not replaced."
+    case DesktopLockedControlPolicy.Failure.conflictingInstallation, DesktopLockedControlPolicy.Failure.changedPolicy:
+        detail = "The installed lock-screen policy conflicts with the expected PersonaStack configuration. Review it before reinstalling."
+    default:
+        detail = "Verify administrator access and reinstall using the main signed PersonaStack installer."
+    }
+    fputs("PersonaStack locked-control setup failed. \(detail)\n", stderr)
     exit(1)
 }

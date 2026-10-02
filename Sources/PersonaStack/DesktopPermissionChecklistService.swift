@@ -113,7 +113,7 @@ final class DesktopPermissionChecklist {
          windowFactory: (@MainActor (DesktopPermissionChecklistCoordinator) -> DesktopPermissionChecklistWindow)? = nil) {
         self.voiceContext = voiceContext
         self.requestEndpoint = requestEndpoint ?? { request in
-            let session = DesktopControlNetworkSession.makeWithoutRedirects()
+            let session = Self.makeConnectionSession()
             defer { session.invalidateAndCancel() }
             let (_, response) = try await session.data(for: request)
             guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
@@ -338,6 +338,7 @@ final class DesktopPermissionChecklist {
         case .microphone: return await setupMicrophone()
         case .fullDiskAccess: return await setupProtectedAccess(automatic: true)
         case .localNetwork: return await setupConnection(id)
+        case .awakeDuringRemoteWork: return await setup(id)
         default: return await observe(id)
         }
     }
@@ -500,6 +501,16 @@ final class DesktopPermissionChecklist {
         return (responseURL.path.isEmpty ? "/" : responseURL.path) == (endpoint.path.isEmpty ? "/" : endpoint.path)
     }
 
+    /// Wait for the OS's Local Network alert without navigating away from the
+    /// setup window. The resource deadline also bounds connectivity waiting.
+    static func makeConnectionSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.waitsForConnectivity = true
+        configuration.timeoutIntervalForResource = 15
+        configuration.urlCache = nil
+        return DesktopControlNetworkSession.makeWithoutRedirects(configuration: configuration)
+    }
+
     private func setupConnection(_ id: DesktopPermissionID) async -> DesktopPermissionObservation {
         guard !Task.isCancelled, let profile else { return .init(.notGranted, detail: "Configure the selected server environment first.") }
         if id == .localNetwork {
@@ -514,22 +525,30 @@ final class DesktopPermissionChecklist {
         explicitObservations.removeValue(forKey: id)
         defer { if connectionAttempts[id] == attempt { connectionAttempts.removeValue(forKey: id) } }
         let endpoints = id == .localNetwork ? [profile.appURL, profile.gatewayURL, profile.mcpURL] : [profile.appURL]
+        var failure: (error: Error, endpoint: URL)?
         let value: DesktopPermissionObservation
-        do {
-            for endpoint in endpoints {
-                try Task.checkCancellation()
-                guard generation == verificationGeneration, key == evidenceKey(id), connectionAttempts[id] == attempt else { throw CancellationError() }
+        for endpoint in endpoints {
+            guard !Task.isCancelled, generation == verificationGeneration, key == evidenceKey(id), connectionAttempts[id] == attempt else {
+                return .init(.checking, detail: "Setup changed or was cancelled. Retry the connection check.")
+            }
+            do {
                 var request = URLRequest(url: endpoint)
                 request.httpMethod = "HEAD"
                 request.timeoutInterval = 4
                 request.cachePolicy = .reloadIgnoringLocalCacheData
                 let response = try await requestEndpoint(request)
                 guard Self.responseMatchesEndpoint(response.url, endpoint) else { throw URLError(.badServerResponse) }
+            } catch {
+                // A public app endpoint can fail before any LAN operation was
+                // attempted. Still contact the selected gateway and MCP hosts.
+                if failure == nil { failure = (error, endpoint) }
             }
+        }
+        if let failure {
+            value = .init(.failed, detail: Self.connectionFailure(failure.error, endpoint: failure.endpoint, localNetwork: id == .localNetwork), verificationKey: key)
+        } else {
             value = .init(.ready, detail: "The configured service endpoints responded. Account and relay authorization are verified by the existing setup flow.",
                           verificationKey: key, requiresVerification: true, verified: true)
-        } catch {
-            value = .init(.failed, detail: "The selected service could not be reached directly. Check network approval, DNS, service availability, and certificate settings. Retry after recovery.", verificationKey: key)
         }
         guard !Task.isCancelled, generation == verificationGeneration, key == evidenceKey(id), connectionAttempts[id] == attempt else {
             return .init(.checking, detail: "Setup changed or was cancelled. Retry the connection check.")
@@ -537,5 +556,33 @@ final class DesktopPermissionChecklist {
         authorizedRefreshKeys[id] = value.state == .ready ? key : nil
         explicitObservations[id] = value
         return value
+    }
+
+    private static func connectionFailure(_ error: Error, endpoint: URL, localNetwork: Bool) -> String {
+        let reason: String
+        switch (error as NSError).domain == NSURLErrorDomain ? (error as NSError).code : nil {
+        case URLError.cannotFindHost.rawValue, URLError.dnsLookupFailed.rawValue:
+            reason = "DNS could not resolve the service. Check the selected server address and your network's DNS."
+        case URLError.secureConnectionFailed.rawValue, URLError.serverCertificateHasBadDate.rawValue,
+             URLError.serverCertificateUntrusted.rawValue, URLError.serverCertificateHasUnknownRoot.rawValue,
+             URLError.serverCertificateNotYetValid.rawValue:
+            reason = "The service's secure connection or certificate could not be verified. Check its certificate and this Mac's clock."
+        case URLError.timedOut.rawValue:
+            reason = "The service did not respond in time. Check its availability and your network connection."
+        case URLError.cannotConnectToHost.rawValue, URLError.networkConnectionLost.rawValue:
+            reason = "A connection to the service could not be established. Check its availability and your network connection."
+        case URLError.notConnectedToInternet.rawValue:
+            reason = "The network is unavailable or macOS blocked the connection. This does not establish which permission is enabled."
+        case URLError.appTransportSecurityRequiresSecureConnection.rawValue:
+            reason = "macOS requires a secure connection to this service. Check the selected server configuration."
+        case URLError.badServerResponse.rawValue:
+            reason = "The response did not match the selected service. Check its address and redirect configuration."
+        default:
+            reason = "The selected service could not be reached. Check its availability and your network connection."
+        }
+        let recovery = localNetwork
+            ? " macOS does not expose the Local Network grant or let apps reset it. If PersonaStack is already enabled in Settings, turn its entries off and back on, then quit and reopen the app."
+            : ""
+        return "Connection check failed for \(endpoint.host ?? "the selected service"). \(reason)\(recovery)"
     }
 }

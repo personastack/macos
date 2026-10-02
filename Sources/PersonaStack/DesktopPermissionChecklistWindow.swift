@@ -3,7 +3,6 @@ import SwiftUI
 import PersonaStackCore
 
 enum DesktopProtectedAccessSetupAction { case check, settings, cancel }
-enum DesktopLockedControlSetupPromptAction { case install, cancel }
 
 @MainActor
 final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
@@ -16,10 +15,6 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     private let showApplicationInFinder: (URL) -> Void
     private let lockedControlVerifier: DesktopLockedControlSetupVerifier
     private let authorizeFullControl: @MainActor (DesktopLockedControlSetupVerifier) -> Bool
-    private let installerPackageURL: @MainActor () -> URL?
-    private let openInstallerPackage: @MainActor (URL) -> Bool
-    private let setupPromptAction: @MainActor (DesktopLockedControlSetupVerifier.Readiness) -> DesktopLockedControlSetupPromptAction
-    private let showInstallerUnavailable: @MainActor (String) -> Void
     var onCancel: (() -> Void)?
     var onStopVerification: (() -> Void)?
     var onPresent: (() -> Void)?
@@ -30,20 +25,12 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
              NSWorkspace.shared.activateFileViewerSelecting([$0])
          },
          lockedControlVerifier: DesktopLockedControlSetupVerifier = .shared,
-         authorizeFullControl: @escaping @MainActor (DesktopLockedControlSetupVerifier) -> Bool = DesktopPermissionChecklistWindow.confirmFullControl,
-         installerPackageURL: @escaping @MainActor () -> URL? = DesktopPermissionChecklistWindow.lockedControlInstallerPackageURL,
-         openInstallerPackage: @escaping @MainActor (URL) -> Bool = { NSWorkspace.shared.open($0) },
-         setupPromptAction: @escaping @MainActor (DesktopLockedControlSetupVerifier.Readiness) -> DesktopLockedControlSetupPromptAction = DesktopPermissionChecklistWindow.promptLockedControlSetup,
-         showInstallerUnavailable: @escaping @MainActor (String) -> Void = DesktopPermissionChecklistWindow.showInstallerUnavailable) {
+         authorizeFullControl: @escaping @MainActor (DesktopLockedControlSetupVerifier) -> Bool = DesktopPermissionChecklistWindow.confirmFullControl) {
         self.coordinator = coordinator
         self.applicationURL = applicationURL
         self.showApplicationInFinder = showApplicationInFinder
         self.lockedControlVerifier = lockedControlVerifier
         self.authorizeFullControl = authorizeFullControl
-        self.installerPackageURL = installerPackageURL
-        self.openInstallerPackage = openInstallerPackage
-        self.setupPromptAction = setupPromptAction
-        self.showInstallerUnavailable = showInstallerUnavailable
         super.init()
         activationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
@@ -71,8 +58,7 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     func failSetup(message: String) { coordinator.failSetup(message) }
 
     func revealCurrentApplication() {
-        guard coordinator.isVisible, !coordinator.isFinishing,
-              coordinator.rows.first(where: { $0.id == .accessibility })?.state == .notGranted else { return }
+        guard coordinator.isVisible, !coordinator.isFinishing else { return }
         showApplicationInFinder(applicationURL)
     }
 
@@ -87,18 +73,10 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
         guard isCurrentFinishAttempt(generation) else { return }
         switch readiness {
         case .absent, .mismatch:
-            guard let packageURL = installerPackageURL() else {
-                guard isCurrentFinishAttempt(generation) else { return }
-                showInstallerUnavailable("This PersonaStack build does not include the locked-control installer. Update PersonaStack, then retry Finish Setup.")
-                return
-            }
-            guard setupPromptAction(readiness) == .install else { return }
-            guard isCurrentFinishAttempt(generation) else { return }
-            guard openInstallerPackage(packageURL) else {
-                guard isCurrentFinishAttempt(generation) else { return }
-                showInstallerUnavailable("macOS could not open the locked-control installer. Check that the PersonaStack app is in Applications, then retry Finish Setup.")
-                return
-            }
+            coordinator.reportSetupPrerequisite("Locked-screen control is included in the main PersonaStack installer. Reinstall PersonaStack using Install PersonaStack.pkg, then retry Finish Setup. " + lockedControlVerifier.snapshot.detail)
+            return
+        case .unsupported:
+            coordinator.reportSetupPrerequisite(lockedControlVerifier.snapshot.detail)
             return
         case .ready:
             break
@@ -125,38 +103,6 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return false }
         return true
-    }
-
-    private static func lockedControlInstallerPackageURL() -> URL? {
-        Bundle.main.url(forResource: "LockedControlInstaller", withExtension: "pkg")
-    }
-
-    private static func promptLockedControlSetup(_ readiness: DesktopLockedControlSetupVerifier.Readiness) -> DesktopLockedControlSetupPromptAction {
-        let alert = NSAlert()
-        switch readiness {
-        case .absent:
-            alert.messageText = "Install full Desktop Control?"
-            alert.informativeText = "Full Desktop Control lets authorized PersonaStack agents continue working while this Mac is locked. The installer adds the local control component and authorization policy. macOS Installer will ask for administrator approval. Finish Setup stays open until you install it and retry verification."
-            alert.addButton(withTitle: "Open Installer")
-            alert.addButton(withTitle: "Cancel")
-            return alert.runModal() == .alertFirstButtonReturn ? .install : .cancel
-        case .mismatch:
-            alert.messageText = "Retry full Desktop Control installation?"
-            alert.informativeText = "PersonaStack could not verify the installed component and policy. The installer can resume an interrupted setup when its existing files match. Conflicting system state stays unchanged. Finish Setup remains open until a later verification succeeds."
-            alert.addButton(withTitle: "Retry Installer")
-            alert.addButton(withTitle: "Cancel")
-            return alert.runModal() == .alertFirstButtonReturn ? .install : .cancel
-        case .ready:
-            return .cancel
-        }
-    }
-
-    private static func showInstallerUnavailable(_ detail: String) {
-        let alert = NSAlert()
-        alert.messageText = "Full Desktop Control setup is unavailable"
-        alert.informativeText = detail
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
     }
 
     func cancel() {
@@ -239,11 +185,13 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
         value.makeKeyAndOrderFront(nil)
         coordinator.startPresentationVerification()
         coordinator.startAutomaticSetup()
+        Task { await lockedControlVerifier.refresh() }
     }
 
     func makeWindowIfNeeded() -> NSWindow {
         if let window { return window }
         let content = DesktopPermissionChecklistView(coordinator: coordinator,
+            lockedControlVerifier: lockedControlVerifier,
             cancel: { [weak self] in self?.cancel() }, finish: { [weak self] in
                 Task { @MainActor in await self?.finish() }
             },
@@ -267,6 +215,7 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
 
 private struct DesktopPermissionChecklistView: View {
     @ObservedObject var coordinator: DesktopPermissionChecklistCoordinator
+    @ObservedObject var lockedControlVerifier: DesktopLockedControlSetupVerifier
     let cancel: () -> Void
     let finish: () -> Void
     let revealApplication: () -> Void
@@ -279,17 +228,23 @@ private struct DesktopPermissionChecklistView: View {
                 Text("Allow PersonaStack to work on this Mac")
                     .font(.title2.weight(.semibold))
             }
-            Text("Accessibility (Required) must be Ready before you finish setup. Screen Capture adds screenshot-based control. Microphone and file access are optional. " +
-                 (DesktopLockedControlSetupVerifier.shared.permitsLockedControl
-                    ? "Full Desktop Control can continue after this Mac locks."
-                    : "Desktop Control works while this Mac is unlocked."))
-                .foregroundStyle(.secondary)
-            Text("Opening this window checks current access. Granted microphone access uses a short recording that is discarded. Accessibility checks macOS approval and, when needed, reads an application role without clicking, typing or reading window contents. Screen Capture reads macOS approval without taking a screenshot. The disk check reads one protected folder listing without reading file contents. Network checks contact only your selected services.")
-                .font(.caption).foregroundStyle(.secondary)
-            Text("Updates from an older unsigned build can leave an enabled permission tied to the old app. Follow the recovery steps below if macOS still denies access. This window checks approval automatically.")
-                .font(.caption).foregroundStyle(.secondary)
             ScrollView {
                 LazyVStack(spacing: 0) {
+                    HStack(alignment: .top, spacing: 12) {
+                        Image(systemName: lockedControlVerifier.snapshot.readiness == .ready ? "checkmark.circle.fill" : "exclamationmark.circle")
+                            .foregroundStyle(lockedControlVerifier.snapshot.readiness == .ready ? Color.green : Color.secondary)
+                            .frame(width: 20).accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Locked-screen control").font(.headline)
+                            Text(lockedControlVerifier.snapshot.detail).font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 8)
+                        Button("Verify Installation") {
+                            Task { await lockedControlVerifier.refresh() }
+                        }.disabled(lockedControlVerifier.isChecking || coordinator.isFinishing)
+                        if lockedControlVerifier.isChecking { ProgressView().controlSize(.small) }
+                    }.padding(.vertical, 12)
+                    Divider()
                     ForEach(coordinator.permissionRows) { row in
                         rowView(row)
                         Divider()
@@ -333,10 +288,16 @@ private struct DesktopPermissionChecklistView: View {
                 if row.id == .fullDiskAccess {
                     Text("Optional for setup.").font(.caption).foregroundStyle(.secondary)
                 }
-                if !automatic || !row.isComplete {
+                Group {
                     Text(row.state.title).font(.caption.weight(.semibold))
                     Text(row.observation.detail).font(.caption).foregroundStyle(.secondary)
-                    if row.id == .accessibility && row.state == .notGranted {
+                    if [.localNetwork, .notifications, .launchAtLogin].contains(row.id) && !row.isComplete && row.state != .checking {
+                        Button("Open Settings") { coordinator.openSettings(row.id) }
+                            .buttonStyle(.link)
+                            .font(.caption)
+                            .disabled(coordinator.isFinishing || coordinator.busyPermission == row.id)
+                    }
+                    if !row.isComplete && (DesktopPermissionReset.arguments(for: row.id) != nil || row.id == .localNetwork) {
                         Button("Show PersonaStack in Finder", action: revealApplication)
                             .buttonStyle(.link)
                             .font(.caption)
@@ -345,11 +306,13 @@ private struct DesktopPermissionChecklistView: View {
                 }
             }
             Spacer(minLength: 8)
-            if !row.isComplete && (!automatic || (row.state != .checking && coordinator.automaticBusyPermission == nil)) {
-                Button(automatic ? "Retry" : row.setupTitle) { coordinator.setup(row.id) }
-                    .disabled(coordinator.isFinishing || coordinator.busyPermission != nil || coordinator.verificationBusyPermission == row.id)
+            HStack(spacing: 8) {
+                Button("Check") { coordinator.check(row.id) }
+                    .accessibilityLabel("Check \(row.displayTitle)")
+                Button("Setup") { coordinator.setup(row.id) }
                     .accessibilityLabel(row.setupTitle)
             }
+            .disabled(coordinator.isFinishing || coordinator.busyPermission != nil || coordinator.verificationBusyPermission == row.id || (automatic && coordinator.automaticBusyPermission != nil))
             if coordinator.busyPermission == row.id || coordinator.automaticBusyPermission == row.id || coordinator.verificationBusyPermission == row.id { ProgressView().controlSize(.small) }
         }
         .padding(.vertical, 12)

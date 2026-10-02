@@ -194,8 +194,8 @@ final class DesktopControlRedirectBlocker: NSObject, URLSessionTaskDelegate, @un
 }
 
 enum DesktopControlNetworkSession {
-    static func makeWithoutRedirects() -> URLSession {
-        URLSession(configuration: .ephemeral, delegate: DesktopControlRedirectBlocker.shared, delegateQueue: nil)
+    static func makeWithoutRedirects(configuration: URLSessionConfiguration = .ephemeral) -> URLSession {
+        URLSession(configuration: configuration, delegate: DesktopControlRedirectBlocker.shared, delegateQueue: nil)
     }
 }
 

@@ -21,8 +21,11 @@ codesign --force --timestamp --options runtime --keychain "$PERSONASTACK_CODESIG
 codesign --force --timestamp --options runtime --keychain "$PERSONASTACK_CODESIGN_KEYCHAIN" \
     --identifier ai.personastack.locked-control-installer --sign "$PERSONASTACK_CODESIGN_IDENTITY" \
     "$helper_parent/LockedControlInstaller"
-codesign --verify --strict --deep "$plugin_parent/PersonaStackLockedGrantCandidate.bundle"
-codesign --verify --strict "$helper_parent/LockedControlInstaller"
+pin=$(shasum -a 1 "$root_dir/Resources/ReleaseSigningCertificate.der" | awk '{print $1}')
+codesign --verify --strict --deep -R "=identifier \"ai.personastack.locked-grant-candidate\" and anchor apple generic and certificate leaf = H\"$pin\"" \
+    "$plugin_parent/PersonaStackLockedGrantCandidate.bundle"
+codesign --verify --strict -R "=identifier \"ai.personastack.locked-control-installer\" and anchor apple generic and certificate leaf = H\"$pin\"" \
+    "$helper_parent/LockedControlInstaller"
 # The enclosing signed app seals the embedded package. Public distribution also
 # requires a Developer ID Installer signature and normal notarization gates.
 /usr/bin/pkgbuild --root "$payload" --install-location / --ownership recommended \

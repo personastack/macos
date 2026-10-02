@@ -22,6 +22,8 @@ class ValidateAppcastTests(unittest.TestCase):
         filename: Optional[str] = None,
         render_cask: bool = False,
         cask_url: Optional[str] = None,
+        installation_type: str = "package",
+        cask_artifact: str = 'pkg "Install PersonaStack.pkg"',
     ) -> subprocess.CompletedProcess[str]:
         version = "1.2.3"
         tap_tag = f"desktop-v{version}"
@@ -40,7 +42,7 @@ class ValidateAppcastTests(unittest.TestCase):
     <item>
       <description sparkle:format="{notes_format}">{escape(embedded_notes)}</description>
       <enclosure url="{archive_url or expected_url}" length="{len(dmg_bytes)}"
-                 sparkle:edSignature="fixture-signature" />
+                 sparkle:edSignature="fixture-signature" sparkle:installationType="{installation_type}" />
       <sparkle:version>{version}</sparkle:version>
     </item>
   </channel>
@@ -54,6 +56,7 @@ edSignature: fixture-feed-signature
   sha256 "{digest}"
   url "{cask_url or expected_url}"
   auto_updates true
+  {cask_artifact}
 end
 '''
 
@@ -93,6 +96,16 @@ end
     def test_accepts_certificate_signed_installer(self) -> None:
         result = self.run_validator(filename="PersonaStack-1.2.3-developerid.dmg", render_cask=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_application_update_that_skips_control_component(self) -> None:
+        result = self.run_validator(installation_type="application")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("main package", result.stderr)
+
+    def test_rejects_cask_that_only_copies_app(self) -> None:
+        result = self.run_validator(cask_artifact='app "PersonaStack.app"')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("same main", result.stderr)
 
     def test_rejects_cask_selecting_a_different_installer(self) -> None:
         result = self.run_validator(cask_url="https://example.invalid/other.dmg")

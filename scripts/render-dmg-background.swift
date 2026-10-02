@@ -60,21 +60,6 @@ for (x, y, radius) in stars {
   context.fillEllipse(in: CGRect(x: x - radius, y: y - radius, width: radius * 2, height: radius * 2))
 }
 
-context.setStrokeColor(CGColor(red: 0.31, green: 0.56, blue: 1, alpha: 0.82))
-context.setLineWidth(3)
-context.setLineCap(.round)
-context.move(to: CGPoint(x: 295, y: 250))
-context.addLine(to: CGPoint(x: 445, y: 250))
-context.strokePath()
-context.setFillColor(CGColor(red: 0.39, green: 0.64, blue: 1, alpha: 0.95))
-let arrow = CGMutablePath()
-arrow.move(to: CGPoint(x: 445, y: 250))
-arrow.addLine(to: CGPoint(x: 430, y: 260))
-arrow.addLine(to: CGPoint(x: 430, y: 240))
-arrow.closeSubpath()
-context.addPath(arrow)
-context.fillPath()
-
 func drawText(_ text: String, at point: CGPoint, font: NSFont, color: NSColor) {
   let attributes: [NSAttributedString.Key: Any] = [
     .font: font,
@@ -84,13 +69,13 @@ func drawText(_ text: String, at point: CGPoint, font: NSFont, color: NSColor) {
 }
 
 drawText("Install PersonaStack", at: CGPoint(x: 36, y: 420), font: .systemFont(ofSize: 23, weight: .semibold), color: .white)
-drawText("Drag the app to Applications to install", at: CGPoint(x: 36, y: 394), font: .systemFont(ofSize: 12, weight: .regular), color: NSColor(white: 0.78, alpha: 1))
+drawText("Open Install PersonaStack.pkg to install the app and Desktop Control", at: CGPoint(x: 36, y: 394), font: .systemFont(ofSize: 12, weight: .regular), color: NSColor(white: 0.78, alpha: 1))
 
 // Finder uses black filenames over picture backgrounds. Keep both native labels
 // readable beneath the 112-point icons positioned by package-macos.sh.
 NSColor(red: 0.82, green: 0.86, blue: 0.93, alpha: 1).setFill()
-for centerX in [CGFloat(180), CGFloat(560)] {
-  NSBezierPath(roundedRect: CGRect(x: centerX - 63, y: 157, width: 126, height: 22), xRadius: 5, yRadius: 5).fill()
+for centerX in [CGFloat(370)] {
+  NSBezierPath(roundedRect: CGRect(x: centerX - 105, y: 157, width: 210, height: 22), xRadius: 5, yRadius: 5).fill()
 }
 
 context.restoreGState()

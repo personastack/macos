@@ -49,7 +49,10 @@ public enum DesktopLockedControlPolicy {
         value["class"] as? String == "evaluate-mechanisms"
             && value["mechanisms"] as? [String] == [mechanism]
             && integer(value["tries"]) == 1 && boolean(value["shared"]) == false
-            && boolean(value["allow-root"]) == false && integer(value["version"]) == 1
+            // authd emits allow-root only for the user class. Mechanism rules
+            // omit it on readback. Still reject any explicit non-false value.
+            && (value["allow-root"] == nil || boolean(value["allow-root"]) == false)
+            && integer(value["version"]) == 1
     }
 
     public static func decode(_ data: Data) -> [String: Any]? {
@@ -94,9 +97,42 @@ public protocol DesktopLockedControlPolicyInstalling {
     func readReceipt() throws -> [String: Any]?
     func writeRight(_ name: String, value: [String: Any]) throws
     func writeReceipt(_ value: [String: Any]) throws
+    func removeRight(_ name: String) throws
+    func removeReceipt() throws
 }
 
 public enum DesktopLockedControlPolicyInstaller {
+    /// Detach our branch before a package uninstall removes the plug-in.
+    /// Unexpected policy changes require operator review.
+    public static func uninstall(using system: any DesktopLockedControlPolicyInstalling) throws {
+        typealias Policy = DesktopLockedControlPolicy
+        try system.verifyPayload()
+        guard let current = try system.readRight(Policy.screensaverRight),
+              let rules = Policy.rules(current) else { throw Policy.Failure.invalidPolicy }
+        if rules.contains(Policy.right) {
+            guard let leaf = try system.readRight(Policy.right), let receipt = try system.readReceipt(),
+                  Policy.matches(leaf: leaf, policy: current, receipt: receipt)
+            else { throw Policy.Failure.conflictingInstallation }
+            var restored = current
+            restored["rule"] = Array(rules.dropFirst())
+            restored["k-of-n"] = 1
+            guard let live = try system.readRight(Policy.screensaverRight),
+                  NSDictionary(dictionary: live).isEqual(to: current) else { throw Policy.Failure.changedPolicy }
+            try system.writeRight(Policy.screensaverRight, value: restored)
+            // authd changes modified on a successful write. All authorization
+            // fields and fallback order must still match the restored policy.
+            guard let live = try system.readRight(Policy.screensaverRight),
+                  NSDictionary(dictionary: live.filter { $0.key != "modified" })
+                    .isEqual(to: restored.filter { $0.key != "modified" })
+            else { throw Policy.Failure.verificationFailed }
+        }
+        if let leaf = try system.readRight(Policy.right) {
+            guard Policy.validLeaf(leaf) else { throw Policy.Failure.conflictingInstallation }
+            try system.removeRight(Policy.right)
+        }
+        try system.removeReceipt()
+    }
+
     /// Write the inert receipt and leaf first. The final policy write activates
     /// only our branch and retains every original manual-authentication delegate.
     /// A retry reuses matching inert artifacts. Conflicting state needs review.

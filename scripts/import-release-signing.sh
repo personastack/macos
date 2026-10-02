@@ -10,6 +10,8 @@ root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 : "${GITHUB_ENV:?GITHUB_ENV is required}"
 : "${PERSONASTACK_CODESIGN_CERTIFICATE_P12_BASE64:?release signing certificate is required}"
 : "${PERSONASTACK_CODESIGN_CERTIFICATE_PASSWORD:?release signing certificate password is required}"
+: "${PERSONASTACK_INSTALLER_CERTIFICATE_P12_BASE64:?Developer ID Installer certificate is required for the main package}"
+: "${PERSONASTACK_INSTALLER_CERTIFICATE_PASSWORD:?Developer ID Installer certificate password is required}"
 certificate="$root_dir/Resources/ReleaseSigningCertificate.der"
 identity_dir="$RUNNER_TEMP/personastack-release-signing"
 mkdir -p "$identity_dir"
@@ -24,6 +26,15 @@ security set-keychain-settings -lut 7200 "$keychain"
 security unlock-keychain -p "$PERSONASTACK_CODESIGN_CERTIFICATE_PASSWORD" "$keychain"
 security import "$identity_dir/identity.p12" -k "$keychain" \
   -P "$PERSONASTACK_CODESIGN_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+printf '%s' "$PERSONASTACK_INSTALLER_CERTIFICATE_P12_BASE64" | "$openssl_bin" base64 -d -A > "$identity_dir/installer.p12"
+"$openssl_bin" pkcs12 -in "$identity_dir/installer.p12" -clcerts -nokeys \
+  -passin env:PERSONASTACK_INSTALLER_CERTIFICATE_PASSWORD | \
+  "$openssl_bin" x509 -outform DER > "$identity_dir/installer-certificate.der"
+installer_subject=$("$openssl_bin" x509 -inform DER -in "$identity_dir/installer-certificate.der" -noout -subject -nameopt RFC2253)
+printf '%s' "$installer_subject" | grep -Eq '(^|,)OU=5T2T8KL852(,|$)' || { echo 'Installer certificate uses a different team.' >&2; exit 1; }
+printf '%s' "$installer_subject" | grep -Fq 'CN=Developer ID Installer:' || { echo 'A Developer ID Installer certificate is required.' >&2; exit 1; }
+security import "$identity_dir/installer.p12" -k "$keychain" \
+  -P "$PERSONASTACK_INSTALLER_CERTIFICATE_PASSWORD" -T /usr/bin/productsign
 security import "$root_dir/Resources/DeveloperIDG2CA.cer" -k "$keychain"
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
   -k "$PERSONASTACK_CODESIGN_CERTIFICATE_PASSWORD" "$keychain" >/dev/null
@@ -40,3 +51,5 @@ if sys.argv[1] not in keychains:
 PYTHON
 identity=$("$openssl_bin" x509 -inform DER -in "$certificate" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')
 printf 'PERSONASTACK_CODESIGN_IDENTITY=%s\nPERSONASTACK_CODESIGN_KEYCHAIN=%s\n' "$identity" "$keychain" >> "$GITHUB_ENV"
+installer_identity=$("$openssl_bin" x509 -inform DER -in "$identity_dir/installer-certificate.der" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')
+printf 'PERSONASTACK_INSTALLER_SIGNING_IDENTITY=%s\n' "$installer_identity" >> "$GITHUB_ENV"

@@ -12,7 +12,7 @@ SCRIPT = Path(__file__).resolve().parents[1] / "notarize.sh"
 
 
 class NotarizationTests(unittest.TestCase):
-    def run_notarization(self, status="Accepted", submit_exit=0, staple_exit=0):
+    def run_notarization(self, status="Accepted", submit_exit=0, staple_exit=0, extension="dmg"):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             shim = root / "xcrun"
@@ -37,7 +37,7 @@ if args[:2] == ['stapler', 'staple']:
                        PERSONASTACK_NOTARY_ISSUER_ID="fixture-issuer",
                        CALL_LOG=str(log), VERDICT=status,
                        SUBMIT_EXIT=str(submit_exit), STAPLE_EXIT=str(staple_exit))
-            result = subprocess.run([str(SCRIPT), str(root / "Fixture.dmg")],
+            result = subprocess.run([str(SCRIPT), str(root / f"Fixture.{extension}")],
                                     env=env, capture_output=True, text=True)
             calls = [json.loads(line) for line in log.read_text().splitlines()]
             return result, calls
@@ -48,6 +48,13 @@ if args[:2] == ['stapler', 'staple']:
         self.assertEqual([c[:2] for c in calls],
                          [["notarytool", "submit"], ["stapler", "staple"], ["stapler", "validate"]])
         self.assertIn("--wait", calls[0])
+
+    def test_main_package_is_submitted_and_stapled_without_repacking(self):
+        result, calls = self.run_notarization(extension="pkg")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(calls[0][2].endswith("Fixture.pkg"))
+        self.assertEqual([call[:2] for call in calls],
+                         [["notarytool", "submit"], ["stapler", "staple"], ["stapler", "validate"]])
 
     def test_rejected_submission_reads_log_without_stapling(self):
         result, calls = self.run_notarization(status="Invalid")
