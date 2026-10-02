@@ -4,6 +4,9 @@ import Foundation
 /// A session-private Unix socket. Credentials never travel through WebKit.
 public final class LocalRunSocket: @unchecked Sendable {
     private let lock = NSLock()
+    private let writer = DispatchQueue(label: "ai.personastack.local-run.writer", qos: .userInitiated)
+    private var queuedWriteBytes = 0
+    private static let maximumQueuedWriteBytes = 32 * LocalRunFrameDecoder.maximumFrameBytes
     private var descriptor: Int32 = -1
     private var closed = false
     private var continuation: AsyncThrowingStream<LocalRunFrame, Error>.Continuation?
@@ -30,6 +33,7 @@ public final class LocalRunSocket: @unchecked Sendable {
     private func tryConnect(_ path: String) -> Bool {
         let candidate = socket(AF_UNIX, SOCK_STREAM, 0)
         guard candidate >= 0 else { return false }
+        guard fcntl(candidate, F_SETFD, FD_CLOEXEC) == 0 else { Darwin.close(candidate); return false }
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
@@ -55,26 +59,57 @@ public final class LocalRunSocket: @unchecked Sendable {
 
     public func send(_ frame: LocalRunFrame) throws {
         let data = try frame.encoded()
-        try lock.withLock {
-            guard descriptor >= 0, !closed else { throw LocalRunError.connectionFailed }
+        do {
+            try lock.withLock {
+                guard descriptor >= 0, !closed else { throw LocalRunError.connectionFailed }
+                guard queuedWriteBytes + data.count <= Self.maximumQueuedWriteBytes else { throw LocalRunError.connectionFailed }
+                queuedWriteBytes += data.count
+                writer.async { [self] in writeQueued(data) }
+            }
+        } catch {
+            finish(LocalRunError.connectionFailed)
+            throw error
+        }
+    }
+
+    private func writeQueued(_ data: Data) {
+        defer { lock.withLock { queuedWriteBytes -= data.count } }
+        do {
+            let fd = try duplicateDescriptor()
+            defer { Darwin.close(fd) }
             try data.withUnsafeBytes { buffer in
                 var offset = 0
                 while offset < buffer.count {
-                    let sent = Darwin.write(descriptor, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
+                    let sent = Darwin.write(fd, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
                     if sent < 0 && errno == EINTR { continue }
                     guard sent > 0 else { throw LocalRunError.connectionFailed }
                     offset += sent
                 }
             }
+        } catch {
+            finish(LocalRunError.connectionFailed)
+        }
+    }
+
+    private func duplicateDescriptor() throws -> Int32 {
+        try lock.withLock {
+            guard descriptor >= 0, !closed else { throw LocalRunError.connectionFailed }
+            // Close can shut down the connection without allowing a reused fd
+            // to redirect an in-flight read or write to an unrelated file.
+            let duplicate = fcntl(descriptor, F_DUPFD_CLOEXEC, 0)
+            guard duplicate >= 0 else { throw LocalRunError.connectionFailed }
+            return duplicate
         }
     }
 
     private func read(_ sessionID: String) {
+        let fd: Int32
+        do { fd = try duplicateDescriptor() }
+        catch { finish(LocalRunError.connectionFailed); return }
+        defer { Darwin.close(fd) }
         var decoder = LocalRunFrameDecoder(sessionID: sessionID)
         var buffer = [UInt8](repeating: 0, count: 65536)
-        while true {
-            let fd = lock.withLock { closed ? -1 : descriptor }
-            guard fd >= 0 else { return }
+        while !lock.withLock({ closed }) {
             let count = Darwin.read(fd, &buffer, buffer.count)
             if count < 0 && errno == EINTR { continue }
             guard count > 0 else { finish(LocalRunError.connectionFailed); return }
@@ -87,16 +122,15 @@ public final class LocalRunSocket: @unchecked Sendable {
         }
     }
 
-    private func finish(_ error: Error) {
-        lock.withLock { continuation?.finish(throwing: error); continuation = nil }
-        close()
+    public func close() {
+        finish(nil)
     }
 
-    public func close() {
+    private func finish(_ error: Error?) {
         lock.withLock {
             closed = true
             if descriptor >= 0 { _ = Darwin.shutdown(descriptor, SHUT_RDWR); Darwin.close(descriptor); descriptor = -1 }
-            continuation?.finish()
+            continuation?.finish(throwing: error)
             continuation = nil
         }
     }
