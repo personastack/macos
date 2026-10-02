@@ -192,6 +192,9 @@ public struct DesktopControlDiagnostics: Codable, Equatable, Sendable {
 }
 
 public enum DesktopControlFrameCodec {
+    // Keep in sync with agentgatewayruntime.DesktopControlFrameLimit.
+    public static let maximumFrameBytes = 8 * 1024 * 1024
+
     public static func decode(_ data: Data) throws -> DesktopControlFrame {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .custom { decoder in

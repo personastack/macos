@@ -57,13 +57,7 @@ actor DesktopControlGatewayConnection {
 
     func connect() async throws {
         guard !connected, socket == nil else { throw DesktopControlGatewayConnectionError.alreadyConnected }
-        guard (try? installation.requireBoundGateway()) != nil else {
-            throw DesktopControlGatewayConnectionError.invalidURL
-        }
-        var request = URLRequest(url: installation.gatewayWebsocketURL, timeoutInterval: 15)
-        request.setValue(installation.installationID, forHTTPHeaderField: "X-Desktop-Control-Installation-ID")
-        request.setValue("Bearer \(installation.machineCredential)", forHTTPHeaderField: "Authorization")
-        let task = session.webSocketTask(with: request)
+        let task = try makeSocket()
         socket = task
         task.resume()
         do {
@@ -78,6 +72,18 @@ actor DesktopControlGatewayConnection {
             stop()
             throw error
         }
+    }
+
+    func makeSocket() throws -> URLSessionWebSocketTask {
+        guard (try? installation.requireBoundGateway()) != nil else {
+            throw DesktopControlGatewayConnectionError.invalidURL
+        }
+        var request = URLRequest(url: installation.gatewayWebsocketURL, timeoutInterval: 15)
+        request.setValue(installation.installationID, forHTTPHeaderField: "X-Desktop-Control-Installation-ID")
+        request.setValue("Bearer \(installation.machineCredential)", forHTTPHeaderField: "Authorization")
+        let task = session.webSocketTask(with: request)
+        task.maximumMessageSize = DesktopControlFrameCodec.maximumFrameBytes
+        return task
     }
 
     func isConnected() -> Bool { connected }
