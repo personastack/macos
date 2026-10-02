@@ -14,7 +14,7 @@ public actor LocalRunHostExecutor {
 
     public func execute(_ request: LocalRunHostRequest, requestID: String) async -> LocalRunReply {
         guard !closed, request.operation == "exec", let arguments = request.command,
-              !arguments.isEmpty, arguments.count <= 128,
+              !arguments.isEmpty, arguments.count <= 128, (request.stdin?.utf8.count ?? 0) <= 256 * 1024,
               arguments.allSatisfy({ !$0.contains("\0") && $0.utf8.count <= 65536 }) else {
             return LocalRunReply(request_id: requestID, stderr: "Native command unavailable.", exit_code: 126)
         }
@@ -24,16 +24,16 @@ public actor LocalRunHostExecutor {
         else if directory == "/host" { directory = "/" }
         else if directory.hasPrefix("/host/") { directory = String(directory.dropFirst(5)) }
         let epoch = generation
+        var executionID: UUID?
+        defer { if let executionID { active.remove(executionID) } }
         do {
             var result = try await shell.start(command: arguments.map(Self.quote).joined(separator: " "), workingDirectory: directory)
+            executionID = result.executionID
             active.insert(result.executionID)
-            let executionID = result.executionID
-            defer { active.remove(executionID) }
             guard !closed, generation == epoch else { try await shell.cancel(id: result.executionID); throw LocalRunError.staleSession }
-            if let input = request.stdin, !input.isEmpty {
-                try await shell.write(id: result.executionID, input: .data(Data(input.utf8)))
+            if result.state == .running {
+                try await writeInput(request.stdin, to: result.executionID)
             }
-            try await shell.write(id: result.executionID, input: .close)
             var stdout = Data(), stderr = Data()
             while true {
                 for chunk in result.chunks {
@@ -46,7 +46,20 @@ public actor LocalRunHostExecutor {
             return LocalRunReply(request_id: requestID, stdout: String(decoding: stdout, as: UTF8.self),
                                  stderr: String(decoding: stderr, as: UTF8.self), exit_code: Int(result.exitCode ?? 130))
         } catch {
+            if let executionID { await shell.cancelAfterFailure(id: executionID) }
             return LocalRunReply(request_id: requestID, stderr: "The native command could not complete. Check macOS permissions.", exit_code: 126)
+        }
+    }
+
+    private func writeInput(_ input: String?, to executionID: UUID) async throws {
+        let data = Data((input ?? "").utf8)
+        for offset in stride(from: 0, to: data.count, by: DesktopShellExecutor.maximumInputBytes) {
+            let end = min(offset + DesktopShellExecutor.maximumInputBytes, data.count)
+            try await shell.write(id: executionID, input: .data(data.subdata(in: offset..<end)))
+        }
+        do { try await shell.write(id: executionID, input: .close) }
+        catch DesktopShellError.missingExecution {
+            // The child can exit between start/read and EOF. Preserve its result.
         }
     }
 

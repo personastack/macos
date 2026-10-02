@@ -158,7 +158,18 @@ public actor DesktopShellExecutor {
         Self.forward(FileHandle(fileDescriptor: child.stdout, closeOnDealloc: true), stream: .stdout, to: self, id: id)
         Self.forward(FileHandle(fileDescriptor: child.stderr, closeOnDealloc: true), stream: .stderr, to: self, id: id)
         Self.wait(child.pid, on: self, id: id)
-        return try await read(id: id, after: 0, wait: .seconds(1))
+        do {
+            return try await read(id: id, after: 0, wait: .seconds(1))
+        } catch {
+            // The caller has not received the execution ID yet and cannot clean it up.
+            await cancelAfterFailure(id: id)
+            throw error
+        }
+    }
+
+    func cancelAfterFailure(id: UUID) async {
+        // A cancelled task or expired command deadline must still release its child.
+        await Task.detached { try? await self.stopProcess(id: id) }.value
     }
 
     public func read(id: UUID, after cursor: UInt64, wait: Duration = .zero) async throws -> DesktopProcessRead {
