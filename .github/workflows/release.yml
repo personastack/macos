@@ -146,7 +146,7 @@ jobs:
             --title "PersonaStack $version" \
             --notes-file "$GITHUB_WORKSPACE/release-notes/$version.md" \
             --latest
-          gh release view -R personastack/macos-desktop "$GITHUB_REF_NAME" --json body -q .body \
+          gh release view -R personastack/macos "$GITHUB_REF_NAME" --json body -q .body \
             >"$tap_dir/Downloads/PersonaStack-$version-developerid.md"
           sparkle_zip=$(mktemp)
           sparkle_dir=$(mktemp -d)

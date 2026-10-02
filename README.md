@@ -11,7 +11,7 @@
 <img src="https://img.shields.io/badge/macOS-14%2B-20232A?logo=apple&logoColor=white" alt="macOS 14 or later">
 </p>
 
-<p><a href="https://personastack.ai">Website</a> · <a href="https://github.com/personastack/macos-desktop/releases/latest">Latest download</a></p>
+<p><a href="https://personastack.ai">Website</a> · <a href="https://github.com/personastack/macos/releases/latest">Latest download</a></p>
 
 <img src="docs/desktop-app.png" alt="PersonaStack sign-in screen in the macOS app" width="1000">
 
