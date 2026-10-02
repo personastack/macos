@@ -288,7 +288,8 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
     )
     await pausedRuntime.waitForLockCleanupForTesting()
     let frame = DesktopControlFrame(type: "command", requestID: "status-paused", target: owner,
-                                    operation: "desktop_control_status", arguments: .object([:]))
+                                    operation: "desktop_control_status", arguments: .object([:]),
+                                    deadlineAt: Date().addingTimeInterval(45))
     let pausedResponse = await pausedRuntime.handleForTesting(frame, connectionID: connectionID)
     #expect(pausedResponse.type == "result")
     guard case .object(let pausedValues)? = pausedResponse.result else {
@@ -313,7 +314,8 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
         readiness: "ready", cleanupInProgress: true
     )
     let cleanupFrame = DesktopControlFrame(type: "command", requestID: "status-cleanup", target: owner,
-                                           operation: "desktop_control_status", arguments: .object([:]))
+                                           operation: "desktop_control_status", arguments: .object([:]),
+                                           deadlineAt: Date().addingTimeInterval(45))
     let cleanupResponse = await cleanupRuntime.handleForTesting(cleanupFrame, connectionID: connectionID)
     #expect(cleanupResponse.type == "result")
     guard case .object(let cleanupValues)? = cleanupResponse.result else {
@@ -338,7 +340,8 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
     let target = DesktopControlTarget(installationID: installation.installationID, workspaceID: "workspace-a",
                                      configID: "config-a", personaID: "persona-a", runID: "run-a", generation: 1)
     let frame = DesktopControlFrame(type: "command", requestID: "status-unavailable", target: target,
-                                    operation: "desktop_control_status", arguments: .object([:]))
+                                    operation: "desktop_control_status", arguments: .object([:]),
+                                    deadlineAt: Date().addingTimeInterval(45))
 
     let response = await runtime.handleForTesting(frame, connectionID: connectionID)
     #expect(response.type == "result")
