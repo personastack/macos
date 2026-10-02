@@ -6,6 +6,194 @@ import Testing
 import WebKit
 @testable import PersonaStack
 
+@MainActor
+private final class LockedRuntimeBoundaryFixture {
+    let executor: DesktopControlCommandExecutor
+    let connectionID = UUID()
+    let transport: LockedRuntimeTransportFixture
+    private(set) var controller: DesktopLockedControlRuntimeController!
+    weak var runtime: DesktopControlRuntime?
+    var consoleLock: DesktopControlSessionLock.Snapshot = .locked
+    var actualUnlocked = false
+    var guiReady = false
+
+    init(executor: DesktopControlCommandExecutor, holdBegin: Bool = false) {
+        self.executor = executor
+        transport = LockedRuntimeTransportFixture(holdBegin: holdBegin)
+        let boundary = self
+        let currentTransport = transport
+        let operations = DesktopLockedControlRuntimeController.Operations(
+            inputs: { [weak boundary] in
+                guard let boundary else {
+                    return .init(lease: nil, connectionID: nil,
+                        console: .init(userID: 0, sessionID: "", lock: .unknown),
+                        consentGranted: false, driverPID: 0, guiReady: false)
+                }
+                return .init(lease: boundary.executor.currentLease, connectionID: boundary.connectionID,
+                      console: .init(userID: 501, sessionID: "7", lock: boundary.consoleLock),
+                      consentGranted: true, driverPID: 4242, guiReady: boundary.guiReady)
+            },
+            actualSessionIsUnlocked: { [weak boundary] in boundary?.actualUnlocked ?? false },
+            prepareGUI: { [weak boundary] lease, connectionID, pid in
+                guard let boundary else { return false }
+                guard boundary.executor.currentLease?.token == lease.token,
+                      boundary.connectionID == connectionID, pid == 4242,
+                      boundary.actualUnlocked else { return false }
+                boundary.guiReady = true
+                return true
+            },
+            now: { .now },
+            monotonicNowNanoseconds: { DispatchTime.now().uptimeNanoseconds },
+            sleep: { try await Task.sleep(for: $0) })
+        controller = DesktopLockedControlRuntimeController(
+            transportFactory: { currentTransport }, operations: operations)
+        currentTransport.onBegin = { [weak boundary] in
+            guard let boundary else { return }
+            guard !currentTransport.holdBegin else { return }
+            boundary.consoleLock = .unlocked
+            boundary.actualUnlocked = true
+            boundary.runtime?.receiveSessionLockForTesting(.unlocked)
+        }
+    }
+
+    func ownedCuaObservation() -> DesktopControlOwnedCuaObservation {
+        .init(running: true, processIdentifier: 4242, guiReady: guiReady)
+    }
+
+    func setConsole(_ value: DesktopControlSessionLock.Snapshot) {
+        consoleLock = value
+        actualUnlocked = value == .unlocked
+        if value == .locked { guiReady = false }
+        runtime?.receiveSessionLockForTesting(value == .unlocked ? .unlocked : .locked)
+    }
+}
+
+@MainActor
+private final class LockedRuntimeTransportFixture: DesktopLockedControlRuntimeTransport {
+    var onConnectionLost: (@MainActor @Sendable () -> Void)?
+    var events: [String] = []
+    var onBegin: (@MainActor () -> Void)?
+    let holdBegin: Bool
+    private(set) var sentGrant: DesktopLockedControlGrant?
+    private(set) var sentDriverPID: Int32?
+    var endStatus = DesktopCrashSupervisorControlStatus(result: .accepted, state: .idle, mayStillUnlock: false)
+    private var beginContinuation: CheckedContinuation<DesktopCrashSupervisorControlStatus, Error>?
+    private var beginWaiter: CheckedContinuation<Void, Never>?
+    private(set) var beginEntered = false
+
+    init(holdBegin: Bool) { self.holdBegin = holdBegin }
+    func connect() async throws { events.append("connect") }
+    func begin(grant: DesktopLockedControlGrant, ownedCuaPID: Int32) async throws -> DesktopCrashSupervisorControlStatus {
+        events.append("begin")
+        sentGrant = grant
+        sentDriverPID = ownedCuaPID
+        beginEntered = true
+        beginWaiter?.resume()
+        beginWaiter = nil
+        if holdBegin {
+            return try await withCheckedThrowingContinuation { beginContinuation = $0 }
+        }
+        onBegin?()
+        return .init(result: .accepted, state: .controlling, mayStillUnlock: false)
+    }
+    func status() async throws -> DesktopCrashSupervisorControlStatus {
+        .init(result: .accepted, state: .controlling, mayStillUnlock: false)
+    }
+    func heartbeat(grant: DesktopLockedControlGrant, ownedCuaPID: Int32) async throws -> DesktopCrashSupervisorControlStatus {
+        events.append("heartbeat")
+        return .init(result: .accepted, state: .controlling, mayStillUnlock: false)
+    }
+    func end() async throws -> DesktopCrashSupervisorControlStatus {
+        events.append("end")
+        return endStatus
+    }
+    func invalidate() { events.append("invalidate") }
+
+    func waitUntilBegin() async {
+        if beginEntered { return }
+        await withCheckedContinuation { beginWaiter = $0 }
+    }
+
+    func completeLateBegin() {
+        beginContinuation?.resume(returning: .init(result: .accepted, state: .controlling, mayStillUnlock: false))
+        beginContinuation = nil
+    }
+}
+
+@MainActor
+private final class NativeCommandCompletionGate {
+    private var arrivalWaiter: CheckedContinuation<Void, Never>?
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+    private(set) var arrived = false
+
+    func suspendCompletion() async {
+        arrived = true
+        arrivalWaiter?.resume()
+        arrivalWaiter = nil
+        await withCheckedContinuation { releaseWaiter = $0 }
+    }
+
+    func waitUntilArrived() async {
+        if arrived { return }
+        await withCheckedContinuation { arrivalWaiter = $0 }
+    }
+
+    func resume() {
+        releaseWaiter?.resume()
+        releaseWaiter = nil
+    }
+}
+
+@MainActor
+private func makeLockedControlRuntimeWorkflowFixture(holdBegin: Bool = false, preacquire: Bool = true,
+                                                    initialLock: DesktopControlSessionLock.State = .unlocked,
+                                                    acknowledgedSetup: Bool = true) async throws
+    -> (runtime: DesktopControlRuntime, boundary: LockedRuntimeBoundaryFixture,
+        executor: DesktopControlCommandExecutor, power: DesktopControlPowerAssertion,
+        owner: DesktopControlTarget, defaultsName: String, defaults: UserDefaults) {
+    let defaultsName = "PersonaStackLockedRuntimeTest-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    let verifier = DesktopLockedControlSetupVerifier(defaults: defaults,
+        operations: .init(inspect: { .ready }))
+    #expect((await verifier.refresh()).readiness == .ready)
+    if acknowledgedSetup { #expect(verifier.recordAcknowledgement()) }
+
+    let power = DesktopControlPowerAssertion.testFixture()
+    let executor = DesktopControlCommandExecutor(powerAssertion: power)
+    let owner = DesktopControlTarget(installationID: "locked-runtime-install", workspaceID: "workspace",
+        configID: "config", personaID: "persona", runID: "run", generation: 7, configVersion: 9)
+    if preacquire {
+        let acquire = DesktopControlFrame(type: "command", requestID: "existing-lease", target: owner,
+            operation: "desktop_control_acquire", arguments: .object([:]),
+            deadlineAt: Date().addingTimeInterval(45))
+        #expect((await executor.handle(acquire, proxy: nil)).type == "result")
+    }
+    let boundary = LockedRuntimeBoundaryFixture(executor: executor, holdBegin: holdBegin)
+    let installationData = Data(#"{"installation_id":"locked-runtime-install","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws"}"#.utf8)
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: installationData)
+    let connectionID = boundary.connectionID
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []), credentials: EmptyDesktopControlCredentialStore(),
+        executor: executor, connectionID: connectionID, installation: installation, connected: true,
+        readiness: "ready", sessionLockState: initialLock, preferences: defaults,
+        lockedControlSetupVerifier: verifier, lockedControlController: boundary.controller,
+        ownedCuaObservation: { boundary.ownedCuaObservation() }, allowsAutomaticCuaRecovery: true,
+        hostPermissions: { (true, true) })
+    boundary.runtime = runtime
+    return (runtime, boundary, executor, power, owner, defaultsName, defaults)
+}
+
+private func lockedControlFrame(_ operation: String, target: DesktopControlTarget,
+                                arguments: DesktopControlJSONValue = .object([:])) -> DesktopControlFrame {
+    DesktopControlFrame(type: "command", requestID: UUID().uuidString, target: target,
+        operation: operation, arguments: arguments, deadlineAt: Date().addingTimeInterval(45))
+}
+
+private func desktopControlReleaseFrame(target: DesktopControlTarget, token: String) -> DesktopControlFrame {
+    lockedControlFrame("desktop_control_release", target: target,
+        arguments: .object(["control_token": .string(token)]))
+}
+
 private func waitForCredentialRead(_ semaphore: DispatchSemaphore) -> Bool {
     semaphore.wait(timeout: .now() + 2) == .success
 }
@@ -306,7 +494,11 @@ for line in sys.stdin:
             if os.path.exists(os.path.join(root,'exit-proxy')): os._exit(1)
             pixels = 'bad' if os.path.exists(os.path.join(root,'invalid-pixels')) else base64.b64encode(png).decode()
             result = {'content':[{'type':'image','mimeType':'image/png','data':pixels}]}
-        elif name == 'get_accessibility_tree': result = {'content':[{'type':'text','text':'{"application":"fixture","children":[]}'}]}
+        elif name == 'get_accessibility_tree':
+            if os.path.exists(os.path.join(root, 'exit-proxy')):
+                os.remove(os.path.join(root, 'exit-proxy'))
+                os._exit(1)
+            result = {'content':[{'type':'text','text':'{"application":"fixture","children":[]}'}]}
         elif name in ['get_window_state', 'click', 'type_text']:
             arguments = request['params']['arguments']
             with open(os.path.join(root, 'input-target.json')) as source: target = json.load(source)
@@ -744,6 +936,37 @@ func enrolledRuntimeKeepsUnlockRecoveryDuringPermissionRepair(grantedAfterUnlock
     #expect(runtime.readiness == "cua_unavailable")
 }
 
+@Test @MainActor func unlockedGuiRecoveryReplacesOnlyExitedProxyAndKeepsOwnedDaemon() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-proxy-recovery-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let executable = try makeRuntimeDriverFixture(root)
+    let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
+        credentials: PermissionPreparationCredentialStore(installation: nil),
+        sessionLockState: .unlocked, hostPermissions: { (true, true) })
+    do {
+        try await runtime.startUnconfirmedPermissionRuntimeForTesting()
+        let originalPID = try #require(runtime.ownedCuaProcessIdentifierForTesting)
+        try Data().write(to: root.appendingPathComponent("exit-proxy"))
+
+        let readiness = await runtime.recoverExitedCuaProxyForTesting()
+
+        #expect(readiness == "ready")
+        #expect(runtime.isCuaReady())
+        #expect(runtime.ownedCuaProcessIdentifierForTesting == originalPID)
+        let daemonStarts = try String(contentsOf: root.appendingPathComponent("daemon-starts"), encoding: .utf8)
+        #expect(daemonStarts.split(separator: "\n").count == 1)
+        let proxyStarts = try String(contentsOf: root.appendingPathComponent("proxy-starts"), encoding: .utf8)
+        #expect(proxyStarts.split(separator: "\n").count == 2)
+        let calls = try runtimeFixtureCalls(root)
+        #expect(!calls.contains("click") && !calls.contains("type_text"))
+        await runtime.shutdownForQuit()
+    } catch {
+        await runtime.shutdownForQuit()
+        throw error
+    }
+}
+
 @Test @MainActor func startupReadsKeychainAwayFromTheMainActor() async {
     let runtime = DesktopControlRuntime.makeForTesting(
         installer: DesktopControlInstallerFixture(errors: []),
@@ -787,6 +1010,28 @@ func enrolledRuntimeKeepsUnlockRecoveryDuringPermissionRepair(grantedAfterUnlock
     #expect(replyError != nil)
     #expect(runtime.finishSetupCalls == 0)
     #expect(manager.registeredPage(for: view) == nil)
+}
+
+@Test @MainActor func localStopFencesAdmissionBeforeAsyncCleanupStarts() async throws {
+    let connection = UUID()
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []), credentials: EmptyDesktopControlCredentialStore(),
+        connectionID: connection, connected: true, readiness: "ready", sessionLockState: .unlocked)
+    let generation = try #require(runtime.beginPause())
+    #expect(runtime.paused)
+    #expect(runtime.readiness == "paused")
+    #expect(throws: CancellationError.self) { try runtime.beginResume() }
+    #expect(throws: CancellationError.self) { try runtime.beginRepair() }
+    #expect(runtime.beginPause() == nil)
+    #expect(runtime.isCurrentLifecycle(generation))
+    let target = DesktopControlTarget(installationID: "install", workspaceID: "workspace", configID: "config",
+                                      personaID: "persona", runID: "run", generation: 1)
+    let frame = DesktopControlFrame(type: "command", requestID: "stopped", target: target,
+                                     operation: "desktop_control_acquire", arguments: .object([:]),
+                                     deadlineAt: Date().addingTimeInterval(30))
+    #expect(await runtime.handleForTesting(frame, connectionID: connection).errorCode == "desktop_paused")
+    await runtime.pause(generation: generation)
+    #expect(throws: Never.self) { try runtime.beginResume() }
 }
 
 @Test @MainActor func macOSLockFencesCommandsBeforeAsynchronousHeartbeat() async {
@@ -912,7 +1157,9 @@ private struct SavedDesktopControlCredentialStore: DesktopControlCredentialStori
     var installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
     try installation.bindEnvironment(DesktopEnvironmentConfiguration.production.appPageURL,
                                      configuration: .production)
-    let credentials = SuspendedDesktopControlCredentialStore(installation: installation)
+    // The read is released explicitly after environment cleanup. Allow the
+    // parallel AppKit suite to run without the fixture manufacturing an error.
+    let credentials = SuspendedDesktopControlCredentialStore(installation: installation, waitSeconds: 10)
     let changed = try DesktopEnvironmentConfiguration(
         appURL: "https://my.personastack.ai",
         gatewayURL: "https://gateway-alt.example",
@@ -1254,6 +1501,275 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     #expect(!lock.allowsControl)
     lock.receive(.unlocked)
     #expect(lock.allowsControl)
+}
+
+@Test @MainActor func desktopLockSeparatesOrdinaryLockFromInactiveLifecycle() {
+    let workspace = NotificationCenter()
+    let activation = NotificationCenter()
+    var snapshot = DesktopControlSessionLock.Snapshot.unlocked
+    let lock = DesktopControlSessionLock(workspaceCenter: workspace, activationCenter: activation,
+                                         snapshotReader: { snapshot })
+    var lifecycleLosses = 0
+    lock.onLifecycleLoss = { lifecycleLosses += 1 }
+
+    lock.receive(.locked)
+    #expect(!lock.allowsControl)
+    #expect(lock.isAwakeAndActive)
+    #expect(lifecycleLosses == 0)
+
+    workspace.post(name: NSWorkspace.willSleepNotification, object: nil)
+    #expect(!lock.isAwakeAndActive)
+    #expect(lifecycleLosses == 1)
+    workspace.post(name: NSWorkspace.didWakeNotification, object: nil)
+    #expect(lock.isAwakeAndActive)
+
+    workspace.post(name: NSWorkspace.sessionDidResignActiveNotification, object: nil)
+    #expect(!lock.isAwakeAndActive)
+    #expect(lifecycleLosses == 2)
+    snapshot = .locked
+    workspace.post(name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
+    #expect(lock.isAwakeAndActive)
+    #expect(!lock.allowsControl)
+}
+
+@Test @MainActor func desktopControlRuntimeAcquiresFromLockedSessionUsingRealExecutorLease() async throws {
+    let fixture = try await makeLockedControlRuntimeWorkflowFixture(preacquire: false, initialLock: .locked)
+    defer { fixture.defaults.removePersistentDomain(forName: fixture.defaultsName) }
+
+    let acquire = lockedControlFrame("desktop_control_acquire", target: fixture.owner)
+    let response = await fixture.runtime.handleForTesting(acquire, connectionID: fixture.boundary.connectionID)
+    #expect(response.type == "result")
+    #expect(fixture.boundary.controller.state == .controlling)
+    #expect(fixture.boundary.transport.events.filter { $0 == "begin" }.count == 1)
+    #expect(fixture.boundary.transport.sentGrant?.leaseToken == fixture.executor.currentLease?.token)
+    #expect(fixture.boundary.transport.sentGrant?.connectionID == fixture.boundary.connectionID)
+    #expect(fixture.boundary.transport.sentDriverPID == 4242)
+
+    let token = try #require(fixture.executor.currentLease?.token.uuidString.lowercased())
+    let release = await fixture.runtime.handleForTesting(
+        desktopControlReleaseFrame(target: fixture.owner, token: token),
+        connectionID: fixture.boundary.connectionID)
+    #expect(release.type == "result")
+    await fixture.runtime.waitForLockCleanupForTesting()
+    #expect(fixture.boundary.transport.events.contains("end"))
+    #expect(!fixture.power.isHeld)
+}
+
+@Test @MainActor func desktopControlColdLockedAcquireDefersGUIProofUntilSupervisorUnlock() async throws {
+    let fixture = try await makeLockedControlRuntimeWorkflowFixture(preacquire: false, initialLock: .locked)
+    defer { fixture.defaults.removePersistentDomain(forName: fixture.defaultsName) }
+    #expect(!fixture.runtime.isCuaReady())
+    #expect(fixture.boundary.ownedCuaObservation().running)
+    #expect(!fixture.boundary.ownedCuaObservation().guiReady)
+
+    let response = await fixture.runtime.handleForTesting(
+        lockedControlFrame("desktop_control_acquire", target: fixture.owner),
+        connectionID: fixture.boundary.connectionID)
+
+    #expect(response.type == "result")
+    #expect(fixture.boundary.controller.state == .controlling)
+    #expect(fixture.boundary.guiReady)
+    #expect(fixture.boundary.transport.events.filter { $0 == "begin" }.count == 1)
+    #expect(fixture.boundary.transport.sentGrant?.leaseToken == fixture.executor.currentLease?.token)
+
+    let token = try #require(fixture.executor.currentLease?.token.uuidString.lowercased())
+    _ = await fixture.runtime.handleForTesting(
+        desktopControlReleaseFrame(target: fixture.owner, token: token),
+        connectionID: fixture.boundary.connectionID)
+    await fixture.runtime.waitForLockCleanupForTesting()
+}
+
+@Test @MainActor func desktopControlUnqualifiedLockedAcquireHasNoLeaseOrSupervisorEffects() async throws {
+    let fixture = try await makeLockedControlRuntimeWorkflowFixture(preacquire: false, initialLock: .locked,
+                                                                   acknowledgedSetup: false)
+    defer { fixture.defaults.removePersistentDomain(forName: fixture.defaultsName) }
+    await fixture.runtime.waitForLockCleanupForTesting()
+
+    let response = await fixture.runtime.handleForTesting(
+        lockedControlFrame("desktop_control_acquire", target: fixture.owner),
+        connectionID: fixture.boundary.connectionID)
+
+    #expect(response.type == "failure")
+    #expect(response.errorCode == "locked")
+    #expect(fixture.executor.currentLease == nil)
+    #expect(fixture.boundary.transport.events.isEmpty)
+    #expect(!fixture.power.isHeld)
+}
+
+@Test @MainActor func desktopControlRuntimeStartsSupervisorOnLockForExistingLease() async throws {
+    let fixture = try await makeLockedControlRuntimeWorkflowFixture()
+    defer { fixture.defaults.removePersistentDomain(forName: fixture.defaultsName) }
+    let originalToken = try #require(fixture.executor.currentLease?.token)
+
+    fixture.runtime.receiveSessionLockForTesting(.locked)
+    await fixture.runtime.waitForLockedControlStartForTesting()
+
+    #expect(fixture.boundary.controller.state == .controlling)
+    #expect(fixture.boundary.transport.events.filter { $0 == "begin" }.count == 1)
+    #expect(fixture.boundary.transport.sentGrant?.leaseToken == originalToken)
+    #expect(fixture.executor.currentLease?.token == originalToken)
+
+    let token = originalToken.uuidString.lowercased()
+    let release = await fixture.runtime.handleForTesting(
+        desktopControlReleaseFrame(target: fixture.owner, token: token),
+        connectionID: fixture.boundary.connectionID)
+    #expect(release.type == "result")
+    await fixture.runtime.waitForLockCleanupForTesting()
+    #expect(!fixture.power.isHeld)
+}
+
+@Test @MainActor func desktopControlWrongTokenReleaseDoesNotReachSupervisor() async throws {
+    let fixture = try await makeLockedControlRuntimeWorkflowFixture()
+    defer { fixture.defaults.removePersistentDomain(forName: fixture.defaultsName) }
+    fixture.runtime.receiveSessionLockForTesting(.locked)
+    await fixture.runtime.waitForLockedControlStartForTesting()
+    let eventCount = fixture.boundary.transport.events.count
+
+    let response = await fixture.runtime.handleForTesting(
+        desktopControlReleaseFrame(target: fixture.owner, token: "wrong-token"),
+        connectionID: fixture.boundary.connectionID)
+
+    #expect(response.type == "failure")
+    #expect(response.errorCode == "desktop_control_required")
+    #expect(fixture.executor.currentLease != nil)
+    #expect(fixture.boundary.transport.events.count == eventCount)
+    #expect(!fixture.boundary.transport.events.contains("end"))
+
+    let token = try #require(fixture.executor.currentLease?.token.uuidString.lowercased())
+    _ = await fixture.runtime.handleForTesting(desktopControlReleaseFrame(target: fixture.owner, token: token),
+                                                connectionID: fixture.boundary.connectionID)
+    await fixture.runtime.waitForLockCleanupForTesting()
+}
+
+@Test @MainActor func desktopControlRevocationDuringBeginFencesLateSupervisorSuccess() async throws {
+    let fixture = try await makeLockedControlRuntimeWorkflowFixture(holdBegin: true)
+    defer { fixture.defaults.removePersistentDomain(forName: fixture.defaultsName) }
+    fixture.runtime.receiveSessionLockForTesting(.locked)
+    await fixture.boundary.transport.waitUntilBegin()
+    #expect(fixture.boundary.controller.state == .preparing)
+
+    let revokeTarget = DesktopControlTarget(installationID: fixture.owner.installationID,
+        workspaceID: fixture.owner.workspaceID, configID: fixture.owner.configID,
+        personaID: "", runID: "", generation: 0, configVersion: 10)
+    let revoke = lockedControlFrame("desktop_control_revoke_config", target: revokeTarget)
+    let response = await fixture.runtime.handleForTesting(revoke, connectionID: fixture.boundary.connectionID)
+    #expect(response.type == "result")
+    #expect(fixture.executor.currentLease == nil)
+    #expect(fixture.boundary.controller.state == .needsAttention)
+    #expect(fixture.boundary.transport.events.contains("invalidate"))
+
+    fixture.boundary.transport.completeLateBegin()
+    await fixture.runtime.waitForLockedControlStartForTesting()
+    await fixture.runtime.waitForLockCleanupForTesting()
+    #expect(fixture.boundary.controller.state != .controlling)
+    #expect(fixture.executor.currentLease == nil)
+    #expect(!fixture.power.isHeld)
+}
+
+@Test @MainActor func desktopControlReleaseReportsSupervisorCleanupFailure() async throws {
+    let fixture = try await makeLockedControlRuntimeWorkflowFixture()
+    defer { fixture.defaults.removePersistentDomain(forName: fixture.defaultsName) }
+    fixture.runtime.receiveSessionLockForTesting(.locked)
+    await fixture.runtime.waitForLockedControlStartForTesting()
+    fixture.boundary.transport.endStatus = .init(result: .denied, state: .needsAttention, mayStillUnlock: true)
+    let token = try #require(fixture.executor.currentLease?.token.uuidString.lowercased())
+
+    let response = await fixture.runtime.handleForTesting(
+        desktopControlReleaseFrame(target: fixture.owner, token: token),
+        connectionID: fixture.boundary.connectionID)
+
+    #expect(response.type == "failure")
+    #expect(response.errorCode == "locked_control_cleanup_pending")
+    #expect(fixture.boundary.transport.events.contains("end"))
+    #expect(fixture.boundary.controller.state == .needsAttention)
+    #expect(fixture.executor.currentLease == nil)
+    await fixture.runtime.waitForLockCleanupForTesting()
+}
+
+@Test @MainActor func desktopControlSleepStopsLockedSupervisorAndReleasesLease() async throws {
+    let fixture = try await makeLockedControlRuntimeWorkflowFixture()
+    defer { fixture.defaults.removePersistentDomain(forName: fixture.defaultsName) }
+    fixture.runtime.receiveSessionLockForTesting(.locked)
+    await fixture.runtime.waitForLockedControlStartForTesting()
+    #expect(fixture.boundary.controller.state == .controlling)
+
+    fixture.runtime.signalLifecycleLossForTesting()
+    await fixture.runtime.waitForLockCleanupForTesting()
+
+    #expect(fixture.boundary.transport.events.contains("end"))
+    #expect(fixture.boundary.controller.state == .idle)
+    #expect(fixture.executor.currentLease == nil)
+    #expect(!fixture.power.isHeld)
+}
+
+@Test @MainActor func desktopControlNativeCompletionSurvivesOrdinaryLockWithSameLease() async throws {
+    let fixture = try await makeLockedControlRuntimeWorkflowFixture()
+    defer { fixture.defaults.removePersistentDomain(forName: fixture.defaultsName) }
+    fixture.runtime.receiveSessionLockForTesting(.locked)
+    await fixture.runtime.waitForLockedControlStartForTesting()
+    let token = try #require(fixture.executor.currentLease?.token)
+    let gate = NativeCommandCompletionGate()
+    var nativeResponse: DesktopControlFrame?
+    fixture.runtime.pauseNativeCommandCompletionForTesting { _, response in
+        nativeResponse = response
+        await gate.suspendCompletion()
+    }
+
+    let frame = lockedControlFrame("desktop_control_file", target: fixture.owner,
+        arguments: .object(["action": .string("stat"), "path": .string("/"),
+                            "control_token": .string(token.uuidString.lowercased())]))
+    let command = Task { await fixture.runtime.handleForTesting(frame, connectionID: fixture.boundary.connectionID) }
+    await gate.waitUntilArrived()
+    #expect(nativeResponse?.type == "result")
+    fixture.boundary.setConsole(.locked)
+    #expect(fixture.executor.currentLease?.token == token)
+    gate.resume()
+
+    let response = await command.value
+    #expect(response.type == "result")
+    #expect(fixture.executor.currentLease?.token == token)
+    #expect(!fixture.boundary.transport.events.contains("end"))
+
+    let release = await fixture.runtime.handleForTesting(
+        desktopControlReleaseFrame(target: fixture.owner, token: token.uuidString.lowercased()),
+        connectionID: fixture.boundary.connectionID)
+    #expect(release.type == "result")
+    await fixture.runtime.waitForLockCleanupForTesting()
+}
+
+@Test @MainActor func desktopControlNativeCompletionAfterRevocationIsDenied() async throws {
+    let fixture = try await makeLockedControlRuntimeWorkflowFixture()
+    defer { fixture.defaults.removePersistentDomain(forName: fixture.defaultsName) }
+    fixture.runtime.receiveSessionLockForTesting(.locked)
+    await fixture.runtime.waitForLockedControlStartForTesting()
+    let token = try #require(fixture.executor.currentLease?.token)
+    let gate = NativeCommandCompletionGate()
+    var nativeResponse: DesktopControlFrame?
+    fixture.runtime.pauseNativeCommandCompletionForTesting { _, response in
+        nativeResponse = response
+        await gate.suspendCompletion()
+    }
+
+    let frame = lockedControlFrame("desktop_control_file", target: fixture.owner,
+        arguments: .object(["action": .string("stat"), "path": .string("/"),
+                            "control_token": .string(token.uuidString.lowercased())]))
+    let command = Task { await fixture.runtime.handleForTesting(frame, connectionID: fixture.boundary.connectionID) }
+    await gate.waitUntilArrived()
+    #expect(nativeResponse?.type == "result")
+    let revokeTarget = DesktopControlTarget(installationID: fixture.owner.installationID,
+        workspaceID: fixture.owner.workspaceID, configID: fixture.owner.configID,
+        personaID: "", runID: "", generation: 0, configVersion: 10)
+    let revoke = lockedControlFrame("desktop_control_revoke_config", target: revokeTarget)
+    let revokeResponse = await fixture.runtime.handleForTesting(revoke, connectionID: fixture.boundary.connectionID)
+    #expect(revokeResponse.type == "result")
+    #expect(fixture.executor.currentLease == nil)
+    gate.resume()
+
+    let response = await command.value
+    #expect(response.type == "failure")
+    #expect(response.errorCode == "locked")
+    #expect(fixture.executor.currentLease == nil)
+    await fixture.runtime.waitForLockCleanupForTesting()
 }
 
 @Test @MainActor func lockDuringForegroundConfirmationInvalidatesApproval() throws {
@@ -2553,4 +3069,20 @@ struct DesktopControlKeychainRaceTests {
         #expect(preferences.string(forKey: changedErrorKey) == "Current changed-profile state")
         #expect(!runtime.hasActiveInstallation && !runtime.gatewayConnected)
     }
+}
+
+
+@Test @MainActor func desktopLockedStatusKeepsRawLockFactsWhenQualifiedControlIsAvailable() {
+    let original = DesktopControlFrame(type: "result", result: .object(["native_executor_ready": .bool(true)]))
+    let response = DesktopControlRuntime.enrichStatus(original, connected: true, guiReadiness: "ready",
+        nativeExecutorReady: true, paused: false, locked: true, sessionUnlocked: false,
+        lockedSessionAvailable: true)
+    guard case .object(let result)? = response.result else { Issue.record("Missing status result"); return }
+    #expect(result["locked"] == .bool(true))
+    #expect(result["session_unlocked"] == .bool(false))
+    #expect(result["control_available"] == .bool(true))
+    let unsupported = DesktopControlRuntime.enrichStatus(original, connected: true, guiReadiness: "ready",
+        nativeExecutorReady: true, paused: false, locked: true, sessionUnlocked: false)
+    guard case .object(let unavailable)? = unsupported.result else { Issue.record("Missing unsupported status"); return }
+    #expect(unavailable["control_available"] == .bool(false))
 }

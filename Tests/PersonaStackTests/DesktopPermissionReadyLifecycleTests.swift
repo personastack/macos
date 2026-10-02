@@ -55,6 +55,10 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     let service = DesktopPermissionChecklist(access: access, selectedProfile: { .production },
         activationNotificationCenter: NotificationCenter(), voiceContext: {
             .init(identity: document, url: DesktopEnvironmentConfiguration.production.appURL, page: page)
+        }, windowFactory: { coordinator in
+            let verifier = DesktopLockedControlSetupVerifier(operations: .init(inspect: { .ready }))
+            return DesktopPermissionChecklistWindow(coordinator: coordinator, lockedControlVerifier: verifier,
+                authorizeFullControl: { _ in true })
         })
     isolateReadyRows(service, [.microphone])
     await openReadyChecklist(service)
@@ -66,7 +70,7 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     service.window.cancel()
     await openReadyChecklist(service)
     #expect(readyRow(service, .microphone)?.isComplete == true && page.tests == 1)
-    service.window.finish()
+    await service.window.finish()
     await openReadyChecklist(service)
     #expect(readyRow(service, .microphone)?.isComplete == true && page.tests == 1)
     status = .denied

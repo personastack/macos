@@ -5,6 +5,22 @@ import UserNotifications
 import WebKit
 
 @main
+@MainActor
+enum DesktopEntryPoint {
+    static func main() {
+        if DesktopCrashRecoverySupervisor.dispatchSupervisorIfRequested() { return }
+        if CommandLine.arguments.contains("--personastack-permission-diagnostics") {
+            DesktopAccessibilityPermission.printDiagnostics()
+            return
+        }
+        if !CommandLine.arguments.contains(DesktopCrashRecoverySupervisor.recoveryLaunchArgument) {
+            DesktopCrashRecoveryPolicy.resumeAfterExplicitLaunch()
+        }
+        guard DesktopApplicationInstanceLock.acquireOrActivateExisting() else { return }
+        PersonaStackApp.main()
+    }
+}
+
 struct PersonaStackApp: App {
     @NSApplicationDelegateAdaptor(PersonaStackTerminationDelegate.self) private var terminationDelegate
     @ObservedObject private var serverSettings = DesktopEnvironmentSettings.shared
@@ -14,10 +30,6 @@ struct PersonaStackApp: App {
         return image
     }()
     init() {
-        if CommandLine.arguments.contains("--personastack-permission-diagnostics") {
-            DesktopAccessibilityPermission.printDiagnostics()
-            exit(0)
-        }
         let foregroundUpdateRelaunch = UserDefaults.standard.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
         guard let configuration = try? LaunchConfiguration.selectedEnvironment(),
               UserDefaults.standard.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(configuration)) else { return }
@@ -40,6 +52,9 @@ struct PersonaStackApp: App {
                     .frame(minWidth: 1172, minHeight: 700)
                     .background(Color(nsColor: WindowPresentation.canvasColor).ignoresSafeArea())
                     .background(WindowPresentationConfigurator(applicationDelegate: terminationDelegate))
+                    .overlay {
+                        MainWebViewLoadRecoveryOverlay(coordinator: MainWebViewHost.shared.coordinator)
+                    }
                 DesktopUpdateToast()
                     .padding(18)
             }
@@ -60,9 +75,7 @@ struct PersonaStackApp: App {
         MenuBarExtra {
             DesktopControlMenu()
         } label: {
-            Image(nsImage: menuBarIcon)
-                .renderingMode(.original)
-                .accessibilityLabel("PersonaStack Desktop")
+            DesktopControlStatusIcon(image: menuBarIcon)
         }
         .menuBarExtraStyle(.menu)
 
@@ -74,6 +87,25 @@ struct PersonaStackApp: App {
     }
 }
 
+private struct DesktopControlStatusIcon: View {
+    let image: NSImage
+    @ObservedObject private var presentation = DesktopControlPresentationStore.shared
+
+    var body: some View {
+        Image(nsImage: image)
+            .renderingMode(.original)
+            .overlay(alignment: .bottomTrailing) {
+                if presentation.snapshot.activity != nil {
+                    Circle().fill(.blue).frame(width: 7, height: 7)
+                } else if presentation.snapshot.state == .needsAttention {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.system(size: 9)).foregroundStyle(.orange)
+                }
+            }
+            .accessibilityLabel("PersonaStack Desktop. \(presentation.snapshot.message)")
+    }
+}
+
 @MainActor
 final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     var reopenMainWindow: (@MainActor () -> Void)?
@@ -81,6 +113,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     private let shutdown: @MainActor () async -> Void
     private let reply: @MainActor (NSApplication) -> Void
     private let timeout: Duration
+    private let recordQuitIntent: @MainActor () -> Void
     private var terminating = false
     private var replied = false
     private var timeoutTask: Task<Void, Never>?
@@ -92,6 +125,13 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         }
         reply = { $0.reply(toApplicationShouldTerminate: true) }
         timeout = .seconds(10)
+        recordQuitIntent = {
+            let preferences = UserDefaults.standard
+            preferences.synchronize()
+            DesktopCrashRecoveryPolicy.recordTerminationIntent(
+                isUpdateRelaunch: preferences.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey),
+                preferences: preferences)
+        }
         super.init()
     }
 
@@ -104,6 +144,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         DesktopUpdater.shared.start()
         guard UserDefaults.standard.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey) else { return }
         UserDefaults.standard.removeObject(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
+        _ = UserDefaults.standard.synchronize()
         shouldRestoreMainWindowAfterUpdate = true
         NSApp.setActivationPolicy(.regular)
         Task { @MainActor [weak self] in
@@ -130,6 +171,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         self.shutdown = shutdown
         self.reply = reply
         self.timeout = timeout
+        recordQuitIntent = {}
         super.init()
     }
 
@@ -142,6 +184,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if !terminating { DesktopUpdater.shared.applicationWillTerminate() }
         guard !terminating else { return .terminateLater }
+        recordQuitIntent()
         terminating = true
         Task { @MainActor in
             await shutdown()
@@ -334,9 +377,11 @@ struct PersonaStackWebView: NSViewRepresentable {
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler {
         weak var webView: WKWebView?
         let appURL: URL
+        let loadRecovery = MainWebViewLoadRecovery()
         private let scheduleNotification: (UNNotificationRequest) -> Void
         private let concernNotificationsEnabled: () -> Bool
         private let cancelPermissionVerification: () -> Void
+        private let loadRequest: @MainActor (WKWebView, URLRequest) -> AnyObject?
         private var popupWindows: [ObjectIdentifier: NSWindow] = [:]
         private(set) var isRetired = false
         private(set) var documentGeneration = UUID()
@@ -350,6 +395,9 @@ struct PersonaStackWebView: NSViewRepresentable {
             scheduleNotification: @escaping (UNNotificationRequest) -> Void = { request in
                 UNUserNotificationCenter.current().add(request)
             },
+            loadRequest: @escaping @MainActor (WKWebView, URLRequest) -> AnyObject? = { webView, request in
+                webView.load(request)
+            },
             cancelPermissionVerification: @escaping () -> Void = {
                 DesktopPermissionChecklist.shared.cancelVerification()
             },
@@ -357,6 +405,7 @@ struct PersonaStackWebView: NSViewRepresentable {
         ) {
             self.appURL = appURL
             self.scheduleNotification = scheduleNotification
+            self.loadRequest = loadRequest
             self.concernNotificationsEnabled = concernNotificationsEnabled
             self.cancelPermissionVerification = cancelPermissionVerification
             super.init()
@@ -366,18 +415,41 @@ struct PersonaStackWebView: NSViewRepresentable {
         }
 
         func start(_ url: URL) {
-            webView?.load(URLRequest(url: url))
+            guard !isRetired, let webView else { return }
+            let request = URLRequest(url: url)
+            guard let navigation = loadRequest(webView, request) else { return }
+            loadRecovery.navigationStarted(navigation)
+        }
+
+        func retry() {
+            start(appURL)
         }
 
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
             guard webView === self.webView else { return }
             invalidateDocumentVerification()
-            start(appURL)
+            retry()
         }
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-            guard webView === self.webView else { return }
+            guard webView === self.webView, let navigation else { return }
             invalidateDocumentVerification()
+            loadRecovery.navigationStarted(navigation)
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            guard webView === self.webView, let navigation else { return }
+            loadRecovery.navigationSucceeded(navigation)
+        }
+
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            guard webView === self.webView, let navigation else { return }
+            loadRecovery.navigationFailed(navigation, error: error)
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            guard webView === self.webView, let navigation else { return }
+            loadRecovery.navigationFailed(navigation, error: error)
         }
 
         private func invalidateDocumentVerification() {
@@ -506,6 +578,7 @@ struct PersonaStackWebView: NSViewRepresentable {
         func retire() {
             guard !isRetired else { return }
             isRetired = true
+            loadRecovery.reset()
             invalidateDocumentVerification()
             for window in popupWindows.values {
                 if let popup = window.contentViewController?.view as? WKWebView {
@@ -549,8 +622,8 @@ struct PersonaStackWebView: NSViewRepresentable {
         }
 
         func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String) async -> URL? {
-            let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
-            return downloads.appendingPathComponent(suggestedFilename)
+            guard let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else { return nil }
+            return DesktopDownloadDestination.choose(suggestedFilename: suggestedFilename, directory: downloads)
         }
     }
 }

@@ -51,14 +51,28 @@ test -n "$arm64_binary"
 test -n "$x86_64_binary"
 
 rm -rf "$bundle_dir" "$staging_dir" "$rw_dmg"
-mkdir -p "$bundle_dir/Contents/MacOS" "$bundle_dir/Contents/Resources" "$bundle_dir/Contents/Frameworks" "$staging_dir"
+mkdir -p "$bundle_dir/Contents/MacOS" "$bundle_dir/Contents/Resources" "$bundle_dir/Contents/Frameworks" \
+  "$bundle_dir/Contents/Library/LaunchAgents" "$staging_dir"
 lipo -create \
   "$arm64_binary" \
   "$x86_64_binary" \
   -output "$bundle_dir/Contents/MacOS/PersonaStack"
+installer_binary="$root_dir/build/PersonaStackLockedControlInstaller"
+lipo -create \
+  "$(dirname "$arm64_binary")/PersonaStackLockedControlInstaller" \
+  "$(dirname "$x86_64_binary")/PersonaStackLockedControlInstaller" \
+  -output "$installer_binary"
+if [ "$configuration" = release ]; then
+  : "${PERSONASTACK_INSTALLER_SIGNING_IDENTITY:?Developer ID Installer identity is required for the embedded setup package}"
+fi
+"$root_dir/scripts/package-locked-control.sh" "$installer_binary" \
+  "$bundle_dir/Contents/Resources/LockedControlInstaller.pkg"
 cp "$root_dir/Resources/Info.plist" "$bundle_dir/Contents/Info.plist"
 cp "$root_dir/Resources/AppIcon.icns" "$bundle_dir/Contents/Resources/AppIcon.icns"
 cp "$root_dir/Resources/MenuBarIcon.png" "$bundle_dir/Contents/Resources/MenuBarIcon.png"
+cp "$root_dir/Resources/ReleaseSigningCertificate.der" "$bundle_dir/Contents/Resources/ReleaseSigningCertificate.der"
+cp "$root_dir/Resources/LaunchAgents/ai.personastack.desktop.crash-recovery.plist" \
+  "$bundle_dir/Contents/Library/LaunchAgents/ai.personastack.desktop.crash-recovery.plist"
 cp "$root_dir/.build/checkouts/Sparkle/LICENSE" "$bundle_dir/Contents/Resources/Sparkle-LICENSE.txt"
 sparkle_framework="$root_dir/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
 if [ ! -d "$sparkle_framework" ]; then

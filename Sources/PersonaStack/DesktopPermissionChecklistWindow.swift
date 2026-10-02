@@ -3,6 +3,7 @@ import SwiftUI
 import PersonaStackCore
 
 enum DesktopProtectedAccessSetupAction { case check, settings, cancel }
+enum DesktopLockedControlSetupPromptAction { case install, cancel }
 
 @MainActor
 final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
@@ -10,8 +11,15 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     private var activationObserver: NSObjectProtocol?
     private var permissionSelection: (id: UUID, permission: DesktopPermissionID, window: NSWindow)?
+    private var isRefreshingLockedControlEvidence = false
     private let applicationURL: URL
     private let showApplicationInFinder: (URL) -> Void
+    private let lockedControlVerifier: DesktopLockedControlSetupVerifier
+    private let authorizeFullControl: @MainActor (DesktopLockedControlSetupVerifier) -> Bool
+    private let installerPackageURL: @MainActor () -> URL?
+    private let openInstallerPackage: @MainActor (URL) -> Bool
+    private let setupPromptAction: @MainActor (DesktopLockedControlSetupVerifier.Readiness) -> DesktopLockedControlSetupPromptAction
+    private let showInstallerUnavailable: @MainActor (String) -> Void
     var onCancel: (() -> Void)?
     var onStopVerification: (() -> Void)?
     var onPresent: (() -> Void)?
@@ -20,10 +28,22 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
          applicationURL: URL = Bundle.main.bundleURL,
          showApplicationInFinder: @escaping (URL) -> Void = {
              NSWorkspace.shared.activateFileViewerSelecting([$0])
-         }) {
+         },
+         lockedControlVerifier: DesktopLockedControlSetupVerifier = .shared,
+         authorizeFullControl: @escaping @MainActor (DesktopLockedControlSetupVerifier) -> Bool = DesktopPermissionChecklistWindow.confirmFullControl,
+         installerPackageURL: @escaping @MainActor () -> URL? = DesktopPermissionChecklistWindow.lockedControlInstallerPackageURL,
+         openInstallerPackage: @escaping @MainActor (URL) -> Bool = { NSWorkspace.shared.open($0) },
+         setupPromptAction: @escaping @MainActor (DesktopLockedControlSetupVerifier.Readiness) -> DesktopLockedControlSetupPromptAction = DesktopPermissionChecklistWindow.promptLockedControlSetup,
+         showInstallerUnavailable: @escaping @MainActor (String) -> Void = DesktopPermissionChecklistWindow.showInstallerUnavailable) {
         self.coordinator = coordinator
         self.applicationURL = applicationURL
         self.showApplicationInFinder = showApplicationInFinder
+        self.lockedControlVerifier = lockedControlVerifier
+        self.authorizeFullControl = authorizeFullControl
+        self.installerPackageURL = installerPackageURL
+        self.openInstallerPackage = openInstallerPackage
+        self.setupPromptAction = setupPromptAction
+        self.showInstallerUnavailable = showInstallerUnavailable
         super.init()
         activationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
@@ -56,10 +76,87 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
         showApplicationInFinder(applicationURL)
     }
 
-    func finish() {
-        guard coordinator.canFinish else { return }
+    func finish() async {
+        guard coordinator.canFinish, !isRefreshingLockedControlEvidence else { return }
+        let generation = coordinator.operationGeneration
+        isRefreshingLockedControlEvidence = true
+        defer { isRefreshingLockedControlEvidence = false }
+        // Read the installed candidate at the explicit Finish action. Cached
+        // absence from an earlier background check must not skip consent.
+        let readiness = await lockedControlVerifier.refresh().readiness
+        guard isCurrentFinishAttempt(generation) else { return }
+        switch readiness {
+        case .absent, .mismatch:
+            guard let packageURL = installerPackageURL() else {
+                guard isCurrentFinishAttempt(generation) else { return }
+                showInstallerUnavailable("This PersonaStack build does not include the locked-control installer. Update PersonaStack, then retry Finish Setup.")
+                return
+            }
+            guard setupPromptAction(readiness) == .install else { return }
+            guard isCurrentFinishAttempt(generation) else { return }
+            guard openInstallerPackage(packageURL) else {
+                guard isCurrentFinishAttempt(generation) else { return }
+                showInstallerUnavailable("macOS could not open the locked-control installer. Check that the PersonaStack app is in Applications, then retry Finish Setup.")
+                return
+            }
+            return
+        case .ready:
+            break
+        }
+        if !lockedControlVerifier.permitsLockedControl {
+            guard authorizeFullControl(lockedControlVerifier), isCurrentFinishAttempt(generation),
+                  lockedControlVerifier.recordAcknowledgement() else { return }
+        }
+        guard isCurrentFinishAttempt(generation) else { return }
         if coordinator.isAwaitingFinish { coordinator.finish(); onStopVerification?() }
         else { completeSetup() }
+    }
+
+    private func isCurrentFinishAttempt(_ generation: UUID) -> Bool {
+        !Task.isCancelled && coordinator.operationGeneration == generation && coordinator.canFinish
+    }
+
+    private static func confirmFullControl(_ verifier: DesktopLockedControlSetupVerifier) -> Bool {
+        guard !verifier.permitsLockedControl else { return true }
+        let alert = NSAlert()
+        alert.messageText = "Allow full Desktop Control after locking?"
+        alert.informativeText = "Your authorized PersonaStack agents will be able to control apps, files, and commands while this Mac is locked. PersonaStack temporarily unlocks the session, conceals the displays, and locks it again when control ends. Local input ends remote control."
+        alert.addButton(withTitle: "Allow Full Control")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return false }
+        return true
+    }
+
+    private static func lockedControlInstallerPackageURL() -> URL? {
+        Bundle.main.url(forResource: "LockedControlInstaller", withExtension: "pkg")
+    }
+
+    private static func promptLockedControlSetup(_ readiness: DesktopLockedControlSetupVerifier.Readiness) -> DesktopLockedControlSetupPromptAction {
+        let alert = NSAlert()
+        switch readiness {
+        case .absent:
+            alert.messageText = "Install full Desktop Control?"
+            alert.informativeText = "Full Desktop Control lets authorized PersonaStack agents continue working while this Mac is locked. The installer adds the local control component and authorization policy. macOS Installer will ask for administrator approval. Finish Setup stays open until you install it and retry verification."
+            alert.addButton(withTitle: "Open Installer")
+            alert.addButton(withTitle: "Cancel")
+            return alert.runModal() == .alertFirstButtonReturn ? .install : .cancel
+        case .mismatch:
+            alert.messageText = "Retry full Desktop Control installation?"
+            alert.informativeText = "PersonaStack could not verify the installed component and policy. The installer can resume an interrupted setup when its existing files match. Conflicting system state stays unchanged. Finish Setup remains open until a later verification succeeds."
+            alert.addButton(withTitle: "Retry Installer")
+            alert.addButton(withTitle: "Cancel")
+            return alert.runModal() == .alertFirstButtonReturn ? .install : .cancel
+        case .ready:
+            return .cancel
+        }
+    }
+
+    private static func showInstallerUnavailable(_ detail: String) {
+        let alert = NSAlert()
+        alert.messageText = "Full Desktop Control setup is unavailable"
+        alert.informativeText = detail
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     func cancel() {
@@ -147,7 +244,9 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     func makeWindowIfNeeded() -> NSWindow {
         if let window { return window }
         let content = DesktopPermissionChecklistView(coordinator: coordinator,
-            cancel: { [weak self] in self?.cancel() }, finish: { [weak self] in self?.finish() },
+            cancel: { [weak self] in self?.cancel() }, finish: { [weak self] in
+                Task { @MainActor in await self?.finish() }
+            },
             revealApplication: { [weak self] in self?.revealCurrentApplication() })
         let value = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 670, height: 740),
                              styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
@@ -180,7 +279,10 @@ private struct DesktopPermissionChecklistView: View {
                 Text("Allow PersonaStack to work on this Mac")
                     .font(.title2.weight(.semibold))
             }
-            Text("Accessibility (Required) must be Ready before you finish setup. Screen Capture adds screenshot-based control. Microphone and file access are optional. Desktop Control works while this Mac is unlocked.")
+            Text("Accessibility (Required) must be Ready before you finish setup. Screen Capture adds screenshot-based control. Microphone and file access are optional. " +
+                 (DesktopLockedControlSetupVerifier.shared.permitsLockedControl
+                    ? "Full Desktop Control can continue after this Mac locks."
+                    : "Desktop Control works while this Mac is unlocked."))
                 .foregroundStyle(.secondary)
             Text("Opening this window checks current access. Granted microphone access uses a short recording that is discarded. Accessibility checks macOS approval and, when needed, reads an application role without clicking, typing or reading window contents. Screen Capture reads macOS approval without taking a screenshot. The disk check reads one protected folder listing without reading file contents. Network checks contact only your selected services.")
                 .font(.caption).foregroundStyle(.secondary)

@@ -40,5 +40,5 @@ for code in "$framework/Versions/B/XPCServices/Installer.xpc" \
   grep -Fq '(runtime)' "$verification_dir/details"
   grep -q '^Timestamp=' "$verification_dir/details"
 done
-otool -l "$bundle/Contents/MacOS/PersonaStack" | grep -A2 LC_RPATH | grep -Fq '@executable_path/../Frameworks'
+sh "$root_dir/scripts/verify-sparkle-runtime.sh" "$bundle"
 otool -L "$bundle/Contents/MacOS/PersonaStack" | grep -Fq '@rpath/Sparkle.framework/Versions/B/Sparkle'

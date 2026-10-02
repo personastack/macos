@@ -40,9 +40,10 @@ public struct DesktopControlTarget: Codable, Equatable, Sendable {
     public let runID: String
     public let generation: Int64
     public let configVersion: Int64?
+    public let ownerDisplay: DesktopControlOwnerDisplay?
 
     public init(installationID: String, workspaceID: String, configID: String, personaID: String, runID: String, generation: Int64,
-                configVersion: Int64? = nil) {
+                configVersion: Int64? = nil, ownerDisplay: DesktopControlOwnerDisplay? = nil) {
         self.installationID = installationID
         self.workspaceID = workspaceID
         self.configID = configID
@@ -50,6 +51,19 @@ public struct DesktopControlTarget: Codable, Equatable, Sendable {
         self.runID = runID
         self.generation = generation
         self.configVersion = configVersion
+        self.ownerDisplay = ownerDisplay?.validated
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        installationID = try container.decode(String.self, forKey: .installationID)
+        workspaceID = try container.decode(String.self, forKey: .workspaceID)
+        configID = try container.decode(String.self, forKey: .configID)
+        personaID = try container.decode(String.self, forKey: .personaID)
+        runID = try container.decode(String.self, forKey: .runID)
+        generation = try container.decode(Int64.self, forKey: .generation)
+        configVersion = try container.decodeIfPresent(Int64.self, forKey: .configVersion)
+        ownerDisplay = (try? container.decode(DesktopControlOwnerDisplay.self, forKey: .ownerDisplay))?.validated
     }
 
     enum CodingKeys: String, CodingKey {
@@ -59,7 +73,36 @@ public struct DesktopControlTarget: Codable, Equatable, Sendable {
         case personaID = "persona_id"
         case runID = "run_id"
         case configVersion = "config_version"
+        case ownerDisplay = "owner_display"
         case generation
+    }
+}
+
+public struct DesktopControlOwnerDisplay: Codable, Equatable, Sendable {
+    public let personaName: String
+    public let workspaceName: String
+
+    public init(personaName: String, workspaceName: String) {
+        self.personaName = personaName
+        self.workspaceName = workspaceName
+    }
+
+    fileprivate var validated: DesktopControlOwnerDisplay? {
+        guard isValidName(personaName), isValidName(workspaceName) else { return nil }
+        return self
+    }
+
+    private func isValidName(_ value: String) -> Bool {
+        !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+            value.unicodeScalars.count <= 128 &&
+            !value.unicodeScalars.contains {
+                CharacterSet.controlCharacters.contains($0) || $0.properties.generalCategory == .format
+            }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case personaName = "persona_name"
+        case workspaceName = "workspace_name"
     }
 }
 

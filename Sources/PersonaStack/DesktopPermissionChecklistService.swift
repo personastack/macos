@@ -109,7 +109,8 @@ final class DesktopPermissionChecklist {
          verifyPowerAvailability: @escaping () -> Bool = { DesktopControlPowerAssertion.verifyAvailability() },
          activationNotificationCenter: NotificationCenter = .default,
          voiceContext: @escaping @MainActor () -> DesktopVoicePermissionContext? = DesktopVoicePermissionContext.current,
-         requestEndpoint: (@MainActor (URLRequest) async throws -> HTTPURLResponse)? = nil) {
+         requestEndpoint: (@MainActor (URLRequest) async throws -> HTTPURLResponse)? = nil,
+         windowFactory: (@MainActor (DesktopPermissionChecklistCoordinator) -> DesktopPermissionChecklistWindow)? = nil) {
         self.voiceContext = voiceContext
         self.requestEndpoint = requestEndpoint ?? { request in
             let session = DesktopControlNetworkSession.makeWithoutRedirects()
@@ -135,7 +136,8 @@ final class DesktopPermissionChecklist {
         }
         let adapter = DesktopPermissionChecklistSystemAdapter(access: access)
         self.adapter = adapter
-        window = DesktopPermissionChecklistWindow(coordinator: DesktopPermissionChecklistCoordinator(adapter: adapter))
+        let coordinator = DesktopPermissionChecklistCoordinator(adapter: adapter)
+        window = windowFactory?(coordinator) ?? DesktopPermissionChecklistWindow(coordinator: coordinator)
         window.onPresent = { [weak self] in self?.preparePresentation() }
         window.onCancel = { [weak self] in self?.cancelVerification() }
         window.onStopVerification = { [weak self] in self?.cancelVerification() }
@@ -210,6 +212,7 @@ final class DesktopPermissionChecklist {
         case .accessibility: return adapter.accessibilityObservation()
         case .microphone: return observeMicrophone()
         case .automaticUpdates: return observeUpdates()
+        case .lockedScreenControl: return observeLockedControl()
         case .backgroundOperation:
             return .init(.ready, detail: "PersonaStack keeps its menu bar and existing relay alive when ordinary windows close.")
         case .messagingConnection:
@@ -245,6 +248,17 @@ final class DesktopPermissionChecklist {
             return "\(ownerKey):\(resourceVerificationGenerations[id] ?? resourceVerificationGeneration)"
         default: return ownerKey
         }
+    }
+
+    private func observeLockedControl() -> DesktopPermissionObservation {
+        let verifier = DesktopLockedControlSetupVerifier.shared
+        guard verifier.snapshot.readiness == .ready else {
+            return .init(.unsupported, detail: verifier.snapshot.detail)
+        }
+        guard verifier.permitsLockedControl else {
+            return .init(.notGranted, detail: "Finish Setup to allow full Desktop Control after locking.")
+        }
+        return .init(.ready, detail: "The local control component and authorization policy are installed. Full control after locking is allowed.")
     }
 
     private func observeMicrophone() -> DesktopPermissionObservation? {
@@ -310,12 +324,8 @@ final class DesktopPermissionChecklist {
             explicitObservations[id] = value
             return value
         case .lockedScreenControl:
-            let alert = NSAlert()
-            alert.messageText = "Locked-Screen Control Is Not Available Yet"
-            alert.informativeText = "A signed helper must first prove safe unattended access to this Mac. Current remote control remains unavailable while the screen is locked."
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
-            return await observe(id) ?? DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(id)
+            _ = await DesktopLockedControlSetupVerifier.shared.refresh()
+            return observeLockedControl()
         default: return nil
         }
     }

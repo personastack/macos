@@ -12,6 +12,7 @@ final class DesktopControlSessionLock {
     private var observedLock = false
     private var sleeping = false
     private var inactive = false
+    var onLifecycleLoss: (() -> Void)?
 
     init(observeSystem: Bool = true,
          workspaceCenter: NotificationCenter = NSWorkspace.shared.notificationCenter,
@@ -28,6 +29,7 @@ final class DesktopControlSessionLock {
         }
         observe(workspaceCenter, NSWorkspace.willSleepNotification) { monitor in
             monitor.sleeping = true
+            monitor.onLifecycleLoss?()
             monitor.publish(.locked)
         }
         observe(workspaceCenter, NSWorkspace.didWakeNotification) { monitor in
@@ -36,6 +38,7 @@ final class DesktopControlSessionLock {
         }
         observe(workspaceCenter, NSWorkspace.sessionDidResignActiveNotification) { monitor in
             monitor.inactive = true
+            monitor.onLifecycleLoss?()
             monitor.publish(.locked)
         }
         observe(workspaceCenter, NSWorkspace.sessionDidBecomeActiveNotification) { monitor in
@@ -54,6 +57,7 @@ final class DesktopControlSessionLock {
     }
 
     var allowsControl: Bool { state == .unlocked }
+    var isAwakeAndActive: Bool { !sleeping && !inactive }
     var readiness: String { state == .unknown ? "unknown" : "locked" }
 
     /// The lock key is not a documented API contract. Absence must never be

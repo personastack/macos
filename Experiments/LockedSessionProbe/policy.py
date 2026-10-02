@@ -11,11 +11,11 @@ MECHANISM = "PersonaStackLockedSessionProbe:observe-screensaver,privileged"
 MAX_PLIST_BYTES = 1024 * 1024
 
 
-def leaf():
+def leaf(mechanism=MECHANISM):
     # authd retries a denying mechanism indefinitely when tries is zero.
     return {
         "class": "evaluate-mechanisms",
-        "mechanisms": [MECHANISM],
+        "mechanisms": [mechanism],
         "tries": 1,
         "shared": False,
         "allow-root": False,
@@ -41,29 +41,29 @@ def delegates(policy):
     return rules
 
 
-def compose(original):
+def compose(original, right=RIGHT):
     rules = delegates(original)
     if len(rules) >= 64:
         raise ValueError("no room for a probe delegate within the 64-delegate limit")
-    if RIGHT in rules:
+    if right in rules:
         raise ValueError("owned probe delegate already exists")
     candidate = copy.deepcopy(original)
     # Deny falls through to every original branch in its original order.
-    candidate["rule"] = [RIGHT, *rules]
+    candidate["rule"] = [right, *rules]
     candidate["k-of-n"] = 1
     return candidate
 
 
-def remove(current, original):
-    expected = compose(original)
+def remove(current, original, right=RIGHT):
+    expected = compose(original, right)
     rules = delegates(current)
-    if RIGHT not in rules:
+    if right not in rules:
         return copy.deepcopy(current)
-    if rules.count(RIGHT) != 1 or current.get("k-of-n") != 1:
+    if rules.count(right) != 1 or current.get("k-of-n") != 1:
         raise ValueError("ambiguous probe delegate; inspect policy manually")
     if current == expected:
         return copy.deepcopy(original)
-    remaining = [rule for rule in rules if rule != RIGHT]
+    remaining = [rule for rule in rules if rule != right]
     if not remaining:
         raise ValueError("refusing to remove the only authorization delegate")
     result = copy.deepcopy(current)
@@ -93,7 +93,7 @@ def write_new(path, policy):
         output.write(data)
 
 
-def main():
+def main(right=RIGHT, mechanism=MECHANISM, receipt_factory=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     leaf_command = commands.add_parser("leaf")
@@ -105,14 +105,20 @@ def main():
     remove_command.add_argument("current")
     remove_command.add_argument("original")
     remove_command.add_argument("output")
+    if receipt_factory is not None:
+        receipt_command = commands.add_parser("receipt")
+        receipt_command.add_argument("original")
+        receipt_command.add_argument("output")
     arguments = parser.parse_args()
     try:
         if arguments.action == "leaf":
-            result = leaf()
+            result = leaf(mechanism)
+        elif arguments.action == "receipt":
+            result = receipt_factory(read_policy(arguments.original))
         elif arguments.action == "compose":
-            result = compose(read_policy(arguments.original))
+            result = compose(read_policy(arguments.original), right)
         else:
-            result = remove(read_policy(arguments.current), read_policy(arguments.original))
+            result = remove(read_policy(arguments.current), read_policy(arguments.original), right)
         write_new(arguments.output, result)
     except (OSError, ValueError) as error:
         parser.exit(1, f"offline policy composition failed: {error}\n")

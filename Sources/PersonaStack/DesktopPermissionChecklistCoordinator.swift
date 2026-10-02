@@ -61,6 +61,7 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     var canFinish: Bool {
         isVisible && !isFinishing && !needsNewSetupRequest && busyPermission != .accessibility && verificationBusyPermission != .accessibility && rows.filter(\.isRequiredForUnlockedSetup).allSatisfy(\.isComplete)
     }
+    var operationGeneration: UUID { generation }
     var isAwaitingFinish: Bool { continuation != nil }
     var permissionRows: [DesktopPermissionRow] {
         DesktopPermissionID.setupPermissions.compactMap { id in

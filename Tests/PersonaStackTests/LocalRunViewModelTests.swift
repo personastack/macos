@@ -5,6 +5,96 @@ import Testing
 
 @MainActor
 struct LocalRunViewModelTests {
+    @Test func rejectedFirstMessageAllowsAFreshTurn() throws {
+        let socket = LocalRunRecordingTransport()
+        let model = LocalRunViewModel(sessionID: "session", workspace: URL(fileURLWithPath: "/tmp"), socket: socket)
+        model.receive(LocalRunFrame(type: "ready", sessionID: "session"))
+        model.draft = "First message"
+        model.send()
+        let first = try #require(socket.frames.last)
+        model.receive(LocalRunFrame(type: "error", sessionID: "session", requestID: first.request_id,
+                                    turnID: first.turn_id, text: "Rejected message"))
+        #expect(model.ready && !model.busy && model.status == "Ready")
+        #expect(model.failure == "Rejected message")
+        model.draft = "Try again"
+        model.send()
+        let retry = try #require(socket.frames.last)
+        #expect(retry.type == "send")
+        #expect(retry.turn_id != first.turn_id)
+        #expect(retry.request_id != first.request_id)
+    }
+
+    @Test func failedTurnKeepsTheSessionReadyForAnotherMessage() throws {
+        let socket = LocalRunRecordingTransport()
+        let model = LocalRunViewModel(sessionID: "session", workspace: URL(fileURLWithPath: "/tmp"), socket: socket)
+        model.receive(LocalRunFrame(type: "ready", sessionID: "session"))
+        model.draft = "Start"
+        model.send()
+        let turn = try #require(socket.frames.last?.turn_id)
+        var question = try JSONDecoder().decode(LocalRunFrame.self, from: Data(#"{"version":1,"type":"input_requested","session_id":"session","request_id":"question","control":{"kind":"question","prompt":"Choose","allow_text":true}}"#.utf8))
+        question.turn_id = turn
+        model.receive(question)
+        model.receive(LocalRunFrame(type: "error", sessionID: "session", turnID: turn, text: "Provider failed"))
+        #expect(model.ready && !model.busy && model.status == "Ready")
+        #expect(model.items.last?.closed == true)
+        model.draft = "Next message"
+        model.send()
+        #expect(socket.frames.count == 2)
+        #expect(socket.frames.last?.type == "send")
+        #expect(socket.frames.last?.turn_id != turn)
+        model.receive(LocalRunFrame(type: "error", sessionID: "session", text: "Session closed"))
+        #expect(!model.ready && !model.busy && model.status == "Agent unavailable")
+    }
+
+    @Test func rejectedFollowUpAndInterruptPreserveTheActiveTurn() throws {
+        let socket = LocalRunRecordingTransport()
+        let model = LocalRunViewModel(sessionID: "session", workspace: URL(fileURLWithPath: "/tmp"), socket: socket)
+        model.receive(LocalRunFrame(type: "ready", sessionID: "session"))
+        model.draft = "Start"
+        model.send()
+        let turn = try #require(socket.frames.last?.turn_id)
+        model.draft = "Follow up"
+        model.send()
+        let followUp = try #require(socket.frames.last)
+        #expect(followUp.type == "steer" && followUp.turn_id == turn)
+        model.receive(LocalRunFrame(type: "error", sessionID: "session", requestID: followUp.request_id,
+                                    turnID: turn, text: "Follow up rejected"))
+        #expect(model.ready && model.busy && model.status == "Working…")
+        model.interrupt()
+        let interrupt = try #require(socket.frames.last)
+        #expect(interrupt.type == "interrupt")
+        model.receive(LocalRunFrame(type: "error", sessionID: "session", requestID: interrupt.request_id,
+                                    turnID: turn, text: "Interrupt rejected"))
+        #expect(model.ready && model.busy && model.status == "Working…")
+        model.receive(LocalRunFrame(type: "turn_completed", sessionID: "session", turnID: turn))
+        model.draft = "New turn"
+        model.send()
+        #expect(socket.frames.last?.type == "send")
+        #expect(socket.frames.last?.turn_id != turn)
+    }
+
+    @Test func oldTurnErrorsAndCompletionDoNotClearANewerTurn() throws {
+        let socket = LocalRunRecordingTransport()
+        let model = LocalRunViewModel(sessionID: "session", workspace: URL(fileURLWithPath: "/tmp"), socket: socket)
+        model.receive(LocalRunFrame(type: "ready", sessionID: "session"))
+        model.draft = "First"
+        model.send()
+        let first = try #require(socket.frames.last)
+        model.receive(LocalRunFrame(type: "turn_completed", sessionID: "session", turnID: first.turn_id))
+        model.draft = "Second"
+        model.send()
+        let second = try #require(socket.frames.last)
+        model.receive(LocalRunFrame(type: "error", sessionID: "session", requestID: first.request_id,
+                                    turnID: first.turn_id, text: "Old rejection"))
+        model.receive(LocalRunFrame(type: "error", sessionID: "session", turnID: first.turn_id, text: "Old failure"))
+        model.receive(LocalRunFrame(type: "turn_completed", sessionID: "session", turnID: first.turn_id))
+        #expect(model.ready && model.busy && model.failure == nil)
+        model.draft = "Follow up"
+        model.send()
+        #expect(socket.frames.last?.type == "steer")
+        #expect(socket.frames.last?.turn_id == second.turn_id)
+    }
+
     @Test func localRunTranscriptReplacesSnapshotsWithinTurnAndKeepsLaterTurns() throws {
         let model = LocalRunViewModel(sessionID: "session", workspace: URL(fileURLWithPath: "/tmp"))
         func event(_ turn: String, _ text: String) throws -> LocalRunFrame {
@@ -62,6 +152,17 @@ struct LocalRunViewModelTests {
         #expect(!model.ready)
         #expect(model.closing)
     }
+}
+
+private final class LocalRunRecordingTransport: LocalRunTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var sent: [LocalRunFrame] = []
+    var frames: [LocalRunFrame] { lock.withLock { sent } }
+    func connect(path: String, sessionID: String, secret: String) async throws -> AsyncThrowingStream<LocalRunFrame, Error> {
+        throw LocalRunError.connectionFailed
+    }
+    func send(_ frame: LocalRunFrame) throws { lock.withLock { sent.append(frame) } }
+    func close() {}
 }
 
 private actor LocalRunRedemptionGate {

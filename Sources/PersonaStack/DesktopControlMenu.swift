@@ -22,6 +22,7 @@ struct DesktopControlMenu: View {
     @AppStorage("desktopControlLoginItemError") private var loginItemError = ""
     @AppStorage("desktopControlRepairError") private var repairError = ""
     @ObservedObject private var status = DesktopControlMenuStatus()
+    @ObservedObject private var presentation = DesktopControlPresentationStore.shared
 
     private var relayEnabled: Bool {
         get { serverSettings.hasTrustedConfiguration && UserDefaults.standard.bool(forKey: preferenceKey(DesktopControlPreferenceKeys.relayEnabled)) }
@@ -59,6 +60,11 @@ struct DesktopControlMenu: View {
         }
         Divider()
         connectionStatus
+        if let activity = presentation.snapshot.activity {
+            Text(activity.ownerLabel)
+            Text("\(activity.operation?.rawValue ?? "Control session") · \(activity.elapsedLabel)")
+                .font(.caption)
+        }
         if !loginItemError.isEmpty {
             Text(loginItemError)
                 .font(.caption)
@@ -66,7 +72,7 @@ struct DesktopControlMenu: View {
         }
         if let action = relayAction {
             Button(action.title) {
-                Task { await toggleRelay() }
+                toggleRelay()
             }
             .disabled(!action.isEnabled)
         }
@@ -80,7 +86,7 @@ struct DesktopControlMenu: View {
             Button("Launch at Login") {
                 registerLoginItem()
             }
-            .disabled(SMAppService.mainApp.status == .enabled)
+            .disabled(DesktopLoginItemRegistration.loginStatus() == .enabled)
             Divider()
             DesktopAutomaticUpdatesMenuItem()
         }
@@ -94,8 +100,8 @@ struct DesktopControlMenu: View {
     }
 
     private var connectionStatus: some View {
-        Label(relayStatus, systemImage: relayEnabled ? "dot.radiowaves.left.and.right" : "pause.circle")
-            .foregroundStyle(relayEnabled ? .green : .secondary)
+        Label(relayStatus, systemImage: presentation.snapshot.symbol)
+            .foregroundStyle(statusColor)
             .onReceive(status.objectWillChange) { _ in
                 DesktopLoginItemRegistration.clearResolvedApprovalError()
                 let savedRepairError = UserDefaults.standard.string(forKey: "desktopControlRepairError") ?? ""
@@ -109,7 +115,9 @@ struct DesktopControlMenu: View {
         DesktopMenuRelayAction(relayEnabled: relayEnabled, relayPaused: relayPaused,
                                hasError: !relayError.isEmpty,
                                hasTrustedConfiguration: serverSettings.hasTrustedConfiguration,
-                               environmentSwitchPending: DesktopControlRuntime.shared.hasPendingEnvironmentSwitch)
+                               environmentSwitchPending: DesktopControlRuntime.shared.hasPendingEnvironmentSwitch,
+                               activelyControlling: presentation.snapshot.activity != nil,
+                               cleanupPending: presentation.snapshot.cleanupPending)
     }
 
     @ViewBuilder
@@ -126,6 +134,9 @@ struct DesktopControlMenu: View {
         }
         Button("Permissions and Setup…") {
             DesktopPermissionChecklist.shared.window.presentForRepair()
+        }
+        Button("Diagnostics…") {
+            DesktopControlDiagnosticsWindow.shared.present()
         }
         if relayEnabled && DesktopControlRuntime.shared.requiresForegroundSessionConfirmation {
             Button("Confirm This Mac Is Unlocked") {
@@ -159,35 +170,39 @@ struct DesktopControlMenu: View {
         if !serverSettings.hasTrustedConfiguration { return "Set all three server URLs to enable Desktop Control" }
         if DesktopControlRuntime.shared.hasPendingEnvironmentSwitch { return "Server change incomplete. Retry Server Settings, repair, or disconnect." }
         if status.isRepairing { return "Repairing Cua Service…" }
-        if !relayError.isEmpty { return "Desktop Control needs attention" }
-        if !relayEnabled { return "Relay paused" }
-        if relayPaused { return "Remote control paused. Connection active." }
-        let runtime = DesktopControlRuntime.shared
-        if let message = runtime.sessionRecoveryMessage { return message }
-        if !runtime.isCuaReady() { return "Cua service needs attention" }
-        switch runtime.readiness {
-        case "permission_required": return "Cua permissions need attention"
-        case "cua_unavailable": return "Cua service needs attention"
-        case "locked": return "Mac is locked"
-        case "paused": return "Remote control paused"
-        case "upgrade_required": return "Desktop update required"
-        case "ready": break
-        default: return "Desktop Control is starting"
+        return presentation.snapshot.message
+    }
+
+    private var statusColor: Color {
+        switch presentation.snapshot.state {
+        case .ready: .green
+        case .controlling: .blue
+        case .needsAttention: .orange
+        default: .secondary
         }
-        return runtime.gatewayConnected ? "Connected to PersonaStack" : "Waiting for PersonaStack connection"
     }
 
     @MainActor
-    private func toggleRelay() async {
+    private func toggleRelay() {
         loginItemError = ""
-        if relayEnabled && !relayPaused && relayError.isEmpty {
-            let runtime = DesktopControlRuntime.shared
+        let runtime = DesktopControlRuntime.shared
+        if runtime.presentationSnapshot().activity != nil || (relayEnabled && !relayPaused && relayError.isEmpty) {
             guard let generation = runtime.beginPause() else { return }
-            await runtime.pause(generation: generation)
-            guard runtime.isCurrentLifecycle(generation) else { return }
-            relayPaused = runtime.paused
+            relayPaused = true
+            presentation.refresh()
+            Task {
+                await runtime.pause(generation: generation)
+                guard runtime.isCurrentLifecycle(generation) else { return }
+                relayPaused = runtime.paused
+                presentation.refresh()
+            }
             return
         }
+        Task { await resumeRelay() }
+    }
+
+    @MainActor
+    private func resumeRelay() async {
         let runtime = DesktopControlRuntime.shared
         var generation: UUID?
         relayError = ""
@@ -244,7 +259,7 @@ struct DesktopControlMenu: View {
     private func registerLoginItem() {
         loginItemError = ""
         do {
-            let status = try DesktopLoginItemRegistration.registerIfNeeded()
+            let status = try DesktopLoginItemRegistration.registerAndMigrateLegacy()
             if status != .enabled {
                 loginItemError = status == .requiresApproval
                     ? DesktopLoginItemRegistration.approvalMessage
@@ -303,11 +318,15 @@ struct DesktopMenuRelayAction: Equatable {
     let isEnabled: Bool
 
     init?(relayEnabled: Bool, relayPaused: Bool, hasError: Bool,
-          hasTrustedConfiguration: Bool, environmentSwitchPending: Bool) {
-        guard relayEnabled || !environmentSwitchPending else { return nil }
-        if hasError { title = "Retry Remote Control" }
+          hasTrustedConfiguration: Bool, environmentSwitchPending: Bool,
+          activelyControlling: Bool = false, cleanupPending: Bool = false) {
+        guard relayEnabled || !environmentSwitchPending || activelyControlling else { return nil }
+        if cleanupPending { title = "Stopping Control…" }
+        else if activelyControlling { title = "Stop Control" }
+        else if hasError { title = "Retry Remote Control" }
         else if !relayEnabled { title = "Start Desktop Control" }
         else { title = relayPaused ? "Resume Remote Control" : "Pause Remote Control" }
-        isEnabled = !environmentSwitchPending && (relayEnabled || hasTrustedConfiguration)
+        isEnabled = !cleanupPending && (activelyControlling
+            || (!environmentSwitchPending && (relayEnabled || hasTrustedConfiguration)))
     }
 }

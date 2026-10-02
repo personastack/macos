@@ -31,6 +31,28 @@ The build uses the pinned Developer ID Application certificate for PersonaStack,
 
 After moving from an unsigned or self-signed build to Developer ID signing, macOS may require permission approval again. For Accessibility, remove the old PersonaStack entry in Privacy & Security and add PersonaStack.app from Applications. For Screen Recording and Microphone, turn PersonaStack off and on. Relaunch if macOS requests it, then retry the Setup buttons.
 
+### Check installed-app permissions
+
+Use **Desktop Control → Diagnostics…** for the running app's permission state. To collect a read-only preflight from a separate macOS-launched app process:
+
+```sh
+open -n -W -a /Applications/PersonaStack.app \
+  --stdout /tmp/personastack-permissions.txt \
+  --stderr /tmp/personastack-permissions-errors.txt \
+  --args --personastack-permission-diagnostics
+cat /tmp/personastack-permissions.txt
+```
+
+Launching `Contents/MacOS/PersonaStack` directly from Terminal can use Terminal's responsible-app permissions. That result does not prove PersonaStack has its own grants. Preflight also does not prove actual capture or input. Complete those checks through the app's permissions checklist.
+
 ## Updates
 
 PersonaStack checks for updates while it is running. Open the menu-bar dropdown or the **PersonaStack** menu and choose **Check for Updates…** to check now. You can opt into background downloads in the menu-bar dropdown. Prepared updates install when you quit PersonaStack. The app does not restart without your action.
+
+## Unattended Desktop Control implementation
+
+The current source includes an explicit local setup package, lease-scoped supervisor, nested diagnostics, controller activity, bounded recovery and WebView Retry. Full control remains one on/off choice. The locked-session component still needs dedicated-Mac physical qualification. Installing the ordinary app does not install an authorization plug-in or change the screensaver policy.
+
+`PersonaStackLockedControlInstaller` is a one-shot package payload tool. `scripts/package-locked-control.sh COMPILED_INSTALLER OUTPUT_PKG` builds the signed plug-in payload and a macOS Installer package without installing it. App packaging embeds that package. Release packaging requires `PERSONASTACK_INSTALLER_SIGNING_IDENTITY` for a Developer ID Installer signature in addition to the existing Developer ID Application identity. Public distribution remains subject to the repository's notarization gates.
+
+The installer uses Apple's `AuthorizationRightGet` and `AuthorizationRightSet` APIs. The policy schema and actual locked-session flow still require OS-build qualification. See `Experiments/LockedSessionCandidate/README.md` and the unattended-control plan for the unrun physical gates. Do not run the package on the working development Mac as a substitute for that evidence.

@@ -43,8 +43,14 @@ struct DesktopPermissionSystemAccess {
     var requestNotifications: () async throws -> Void = {
         _ = try await DesktopNotificationCoordinator.shared.requestAuthorizationIfNeeded()
     }
-    var loginStatus: () -> SMAppService.Status = { SMAppService.mainApp.status }
-    var registerLogin: () throws -> Void = { try SMAppService.mainApp.register() }
+    var loginStatus: () -> SMAppService.Status = { DesktopLoginItemRegistration.loginStatus() }
+    var registerLogin: () throws -> Void = { _ = try DesktopLoginItemRegistration.registerIfNeeded() }
+    var legacyLoginStatus: () -> SMAppService.Status = { SMAppService.mainApp.status }
+    var unregisterLegacyLogin: () throws -> Void = { try SMAppService.mainApp.unregister() }
+    var unregisterCrashRecoveryAgent: () throws -> Void = {
+        try SMAppService.agent(plistName: DesktopLoginItemRegistration.crashRecoveryAgentPlistName).unregister()
+    }
+    var registerLegacyLogin: () throws -> Void = { try SMAppService.mainApp.register() }
     var openLoginSettings: () -> Void = { SMAppService.openSystemSettingsLoginItems() }
 }
 
@@ -229,7 +235,12 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
 
     private func setupLogin(automatic: Bool) -> DesktopPermissionObservation {
         do {
-            let status = try DesktopLoginItemRegistration.registerIfNeeded(status: access.loginStatus, register: access.registerLogin)
+            let status = try DesktopLoginItemRegistration.registerAndMigrateLegacy(
+                status: access.loginStatus, register: access.registerLogin,
+                unregisterAgent: access.unregisterCrashRecoveryAgent,
+                legacyStatus: access.legacyLoginStatus,
+                unregisterLegacy: access.unregisterLegacyLogin,
+                registerLegacy: access.registerLegacyLogin)
             if !automatic && status != .enabled { access.openLoginSettings() }
             if status == .notFound || status == .notRegistered {
                 return .init(.failed, detail: DesktopLoginItemRegistration.unconfirmedMessage)

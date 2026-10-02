@@ -297,6 +297,7 @@ final class DesktopUpdater: NSObject, ObservableObject {
     private func requestForegroundRestart() {
         rememberRestartTarget()
         preferences.set(true, forKey: Self.foregroundUpdateRelaunchKey)
+        _ = preferences.synchronize()
     }
 
     static let foregroundUpdateRelaunchKey = "desktopUpdateForegroundRelaunch"
@@ -541,6 +542,7 @@ extension DesktopUpdater: SPUUpdaterDelegate {
             if preferences.string(forKey: "desktopUpdateRestartTargetVersion") == offeredVersion {
                 preferences.removeObject(forKey: "desktopUpdateRestartTargetVersion")
                 preferences.removeObject(forKey: Self.foregroundUpdateRelaunchKey)
+                _ = preferences.synchronize()
             }
         }
         isReady = false
@@ -579,6 +581,7 @@ extension DesktopUpdater: SPUUpdaterDelegate {
         if preferences.string(forKey: "desktopUpdateRestartTargetVersion") == version {
             preferences.removeObject(forKey: "desktopUpdateRestartTargetVersion")
             preferences.removeObject(forKey: Self.foregroundUpdateRelaunchKey)
+            _ = preferences.synchronize()
         }
     }
 

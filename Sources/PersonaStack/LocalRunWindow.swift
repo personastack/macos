@@ -3,6 +3,14 @@ import Combine
 import PersonaStackCore
 import SwiftUI
 
+protocol LocalRunTransport: Sendable {
+    func connect(path: String, sessionID: String, secret: String) async throws -> AsyncThrowingStream<LocalRunFrame, Error>
+    func send(_ frame: LocalRunFrame) throws
+    func close()
+}
+
+extension LocalRunSocket: LocalRunTransport {}
+
 struct LocalRunTranscriptItem: Identifiable {
     let id: String
     var kind: String
@@ -33,7 +41,7 @@ final class LocalRunViewModel: ObservableObject {
     let workspace: URL
     private var turnID: String?
     private let runtime: LocalRunContainer
-    private let socket = LocalRunSocket()
+    private let socket: any LocalRunTransport
     private let host: LocalRunHostExecutor
     private let redeemBundle: @Sendable (URL, String, String, String, String) async throws -> LocalRunBundle
     private let revokeBundle: @Sendable (URL, LocalRunBundle) async throws -> Void
@@ -46,11 +54,15 @@ final class LocalRunViewModel: ObservableObject {
     private var generation = UUID()
     private var closeTask: Task<Bool, Never>?
     private var pendingReplies: [String: String] = [:]
+    private var pendingStartRequestID: String?
+    private var pendingInterruptRequestID: String?
 
     init(sessionID: String, workspace: URL, runtime: LocalRunContainer = LocalRunContainer(),
+         socket: any LocalRunTransport = LocalRunSocket(),
          redeem: @escaping @Sendable (URL, String, String, String, String) async throws -> LocalRunBundle = { try await LocalRunAPI.redeem(appURL: $0, personaID: $1, sessionID: $2, ticket: $3, verifier: $4) },
          revoke: @escaping @Sendable (URL, LocalRunBundle) async throws -> Void = { try await LocalRunAPI.revoke(appURL: $0, bundle: $1) }) {
         self.sessionID = sessionID; self.workspace = workspace; self.runtime = runtime
+        self.socket = socket
         redeemBundle = redeem; revokeBundle = revoke
         host = LocalRunHostExecutor(workspace: workspace)
     }
@@ -100,8 +112,10 @@ final class LocalRunViewModel: ObservableObject {
         guard ready, !closing, !message.isEmpty, message.utf8.count <= 256 * 1024 else { return }
         let id = turnID ?? UUID().uuidString.lowercased()
         do {
+            let requestID = UUID().uuidString
             try socket.send(LocalRunFrame(type: busy ? "steer" : "send", sessionID: sessionID,
-                                          requestID: UUID().uuidString, turnID: id, text: message))
+                                          requestID: requestID, turnID: id, text: message))
+            if !busy { pendingStartRequestID = requestID }
             turnID = id; busy = true; status = "Working…"
             items.append(LocalRunTranscriptItem(id: UUID().uuidString, kind: "user", text: message))
             draft = ""
@@ -111,7 +125,9 @@ final class LocalRunViewModel: ObservableObject {
         guard ready, busy, let turnID else { return }
         Task { await host.cancelActive() }
         do {
-            try socket.send(LocalRunFrame(type: "interrupt", sessionID: sessionID, requestID: UUID().uuidString, turnID: turnID))
+            let requestID = UUID().uuidString
+            try socket.send(LocalRunFrame(type: "interrupt", sessionID: sessionID, requestID: requestID, turnID: turnID))
+            pendingInterruptRequestID = requestID
             status = "Stopping turn…"
         } catch { fail(LocalRunError.connectionFailed.rawValue) }
     }
@@ -133,23 +149,48 @@ final class LocalRunViewModel: ObservableObject {
         case "ready": ready = true; status = "Ready"
         case "text", "commentary", "tool_start", "tool_update", "tool_result", "input_requested": upsert(event)
         case "turn_completed", "turn_interrupted":
+            guard turnID == nil || event.turn_id == turnID else { return }
             if event.type == "turn_interrupted" { Task { await host.cancelActive() } }
             if let text = event.text, !text.isEmpty { upsert(event) }
-            if let finishedTurn = event.turn_id {
-                for index in items.indices where items[index].id.hasPrefix(finishedTurn + ":") && items[index].control != nil { items[index].closed = true }
-            }
-            pendingReplies.removeAll()
-            controlText.removeAll(); questionText.removeAll(); questionSelections.removeAll()
-            busy = false; turnID = nil
-            status = event.type == "turn_interrupted" ? "Stopped" : "Ready"
+            finishTurn(event.turn_id, status: event.type == "turn_interrupted" ? "Stopped" : "Ready")
         case "error":
-            failure = event.text ?? "The agent could not complete that action."
-            if let request = event.request_id, let itemID = pendingReplies.removeValue(forKey: request),
-               let index = items.firstIndex(where: { $0.id == itemID }) { items[index].answered = false }
-            if event.request_id == nil { busy = false; ready = false; status = "Agent unavailable" }
+            receiveError(event)
         case "host_request": executeHost(event)
         default: break
         }
+    }
+
+    private func receiveError(_ event: LocalRunFrame) {
+        if let eventTurn = event.turn_id, let turnID, eventTurn != turnID { return }
+        failure = event.text ?? "The agent could not complete that action."
+        if let request = event.request_id {
+            if let itemID = pendingReplies.removeValue(forKey: request),
+               let index = items.firstIndex(where: { $0.id == itemID }) { items[index].answered = false }
+            if request == pendingStartRequestID {
+                finishTurn(turnID, status: "Ready")
+            } else if request == pendingInterruptRequestID {
+                pendingInterruptRequestID = nil
+                status = busy ? "Working…" : "Ready"
+            }
+        } else if let failedTurn = event.turn_id {
+            // The worker emits a turn failure without closing the session.
+            finishTurn(failedTurn, status: "Ready")
+        } else {
+            finishTurn(turnID, status: "Agent unavailable")
+            ready = false
+        }
+    }
+
+    private func finishTurn(_ finishedTurn: String?, status: String) {
+        if let finishedTurn {
+            for index in items.indices where items[index].id.hasPrefix(finishedTurn + ":") && items[index].control != nil {
+                items[index].closed = true
+            }
+        }
+        pendingReplies.removeAll()
+        pendingStartRequestID = nil; pendingInterruptRequestID = nil
+        controlText.removeAll(); questionText.removeAll(); questionSelections.removeAll()
+        busy = false; turnID = nil; self.status = status
     }
 
     private func upsert(_ event: LocalRunFrame) {

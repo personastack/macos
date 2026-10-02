@@ -153,6 +153,10 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
         var access = DesktopPermissionSystemAccess()
         access.loginStatus = { status }
         access.registerLogin = { registrations += 1; status = registeredStatus }
+        access.legacyLoginStatus = { .notRegistered }
+        access.unregisterLegacyLogin = { Issue.record("Must not unregister the legacy login service") }
+        access.unregisterCrashRecoveryAgent = { Issue.record("Must not unregister the fake agent") }
+        access.registerLegacyLogin = { Issue.record("Must not restore the legacy login service") }
         access.openLoginSettings = { settingsOpened += 1 }
         let adapter = DesktopPermissionChecklistSystemAdapter(access: access)
         let expected: DesktopPermissionState = registeredStatus == .enabled ? .ready : .notGranted
@@ -173,6 +177,10 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
         var access = DesktopPermissionSystemAccess()
         access.loginStatus = { initialStatus }
         access.registerLogin = { registrations += 1 }
+        access.legacyLoginStatus = { .notRegistered }
+        access.unregisterLegacyLogin = { Issue.record("Must not unregister the legacy login service") }
+        access.unregisterCrashRecoveryAgent = { Issue.record("Must not unregister the fake agent") }
+        access.registerLegacyLogin = { Issue.record("Must not restore the legacy login service") }
         access.openLoginSettings = { settingsOpened += 1 }
         let adapter = DesktopPermissionChecklistSystemAdapter(access: access)
         let passive = await adapter.observe(.launchAtLogin)
@@ -211,6 +219,10 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
     access.requestAccessibility = { Issue.record("Automatic setup must not request Accessibility") }
     access.loginStatus = { .notRegistered }
     access.registerLogin = { throw CocoaError(.fileWriteNoPermission) }
+    access.legacyLoginStatus = { .notRegistered }
+    access.unregisterLegacyLogin = { Issue.record("Must not unregister the legacy login service") }
+    access.unregisterCrashRecoveryAgent = { Issue.record("Must not unregister the fake agent") }
+    access.registerLegacyLogin = { Issue.record("Must not restore the legacy login service") }
     let adapter = DesktopPermissionChecklistSystemAdapter(access: access,
         openSettings: { _ in Issue.record("Automatic setup must not open Settings") })
     #expect(await adapter.setupAutomatically(.accessibility).state == .notGranted)

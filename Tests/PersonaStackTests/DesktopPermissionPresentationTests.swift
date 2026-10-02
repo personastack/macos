@@ -56,6 +56,10 @@ private final class PresentationFixture {
                 self.requests.append(request.url!)
                 if self.denyNetwork { throw URLError(.notConnectedToInternet) }
                 return HTTPURLResponse(url: request.url!, statusCode: 302, httpVersion: nil, headerFields: nil)!
+            }, windowFactory: { coordinator in
+                let verifier = DesktopLockedControlSetupVerifier(operations: .init(inspect: { .ready }))
+                return DesktopPermissionChecklistWindow(coordinator: coordinator, lockedControlVerifier: verifier,
+                    authorizeFullControl: { _ in true })
             })
         let hooks = service.adapter.hooks
         service.adapter.hooks = .init(observe: { id in
@@ -136,7 +140,7 @@ private final class PresentationFixture {
     while fixture.voice.pending == nil { await Task.yield() }
     #expect(fixture.service.window.coordinator.canFinish)
     let requests = fixture.requests.count
-    fixture.service.window.finish()
+    await fixture.service.window.finish()
     fixture.voice.pending?(.success(true))
     for _ in 0..<10 { await Task.yield() }
     #expect(fixture.requests.count == requests)

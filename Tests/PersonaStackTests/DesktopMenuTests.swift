@@ -48,4 +48,22 @@ import Testing
         #expect(action.title == "Retry Remote Control")
         #expect(!action.isEnabled)
     }
+
+    @Test func liveActivityOffersStopWithoutSavedRelayPreference() throws {
+        let action = try #require(DesktopMenuRelayAction(
+            relayEnabled: false, relayPaused: false, hasError: false,
+            hasTrustedConfiguration: false, environmentSwitchPending: false,
+            activelyControlling: true))
+        #expect(action.title == "Stop Control")
+        #expect(action.isEnabled)
+    }
+
+    @Test func cleanupPendingDisablesControlStopAction() throws {
+        let action = try #require(DesktopMenuRelayAction(
+            relayEnabled: true, relayPaused: true, hasError: false,
+            hasTrustedConfiguration: true, environmentSwitchPending: false,
+            activelyControlling: true, cleanupPending: true))
+        #expect(action.title == "Stopping Control…")
+        #expect(!action.isEnabled)
+    }
 }

@@ -3,12 +3,14 @@ import Foundation
 /// Created only after native redeems an API-authorized launch ticket. It is never
 /// registered as a WebKit command handler or a remotely reachable HTTP service.
 public actor LocalRunHostExecutor {
-    private let shell = DesktopShellExecutor()
+    private let shell: DesktopShellExecutor
     private let workspace: URL
     private var closed = false
     private var generation = UUID()
     private var active: Set<UUID> = []
-    public init(workspace: URL) { self.workspace = workspace }
+    public init(workspace: URL, shell: DesktopShellExecutor = DesktopShellExecutor()) {
+        self.workspace = workspace; self.shell = shell
+    }
 
     public func execute(_ request: LocalRunHostRequest, requestID: String) async -> LocalRunReply {
         guard !closed, request.operation == "exec", let arguments = request.command,

@@ -38,7 +38,36 @@ final class DesktopControlCommandExecutor {
     private let files = DesktopFileSystem()
     private let shell = DesktopShellExecutor()
     private let powerAssertion: DesktopControlPowerAssertion
-    private var lease: Lease?
+    private var lease: Lease? { didSet { leaseStateChanged?() } }
+    /// Native-only lifecycle signal. This never crosses the WebView bridge.
+    var leaseStateChanged: (@MainActor () -> Void)?
+
+    struct LeaseSnapshot: Equatable, Sendable {
+        let token: UUID
+        let installationID: String
+        let workspaceID: String
+        let configID: String
+        let personaID: String
+        let runID: String
+        let generation: Int64
+        let configVersion: Int64
+        let expires: ContinuousClock.Instant
+        let hardExpires: ContinuousClock.Instant
+    }
+
+    var currentLease: LeaseSnapshot? {
+        guard !closed, !unavailable, !cleanupInProgress, !revocationInProgress,
+              let lease = validLease(), let token = UUID(uuidString: lease.token) else { return nil }
+        return LeaseSnapshot(token: token, installationID: lease.owner.installationID,
+            workspaceID: lease.owner.workspaceID, configID: lease.owner.configID,
+            personaID: lease.owner.personaID, runID: lease.owner.runID,
+            generation: lease.owner.generation, configVersion: lease.configVersion,
+            expires: min(lease.started + .seconds(1800), lease.lastActivity + .seconds(90)),
+            hardExpires: lease.started + .seconds(1800))
+    }
+
+    private var leaseOwnerDisplay: DesktopControlOwnerDisplay?
+    private var presentedOperations: [UUID: (token: String, kind: DesktopControlActivityKind, started: ContinuousClock.Instant)] = [:]
     private var cleanupLease: Lease?
     private var cleanupInProgress = false
     private var cleanupSucceeded = false
@@ -88,6 +117,27 @@ final class DesktopControlCommandExecutor {
                                          openFileHandles: handleCount,
                                          bufferedOutputBytes: shellState.bufferedOutputBytes,
                                          outputGapsTotal: shellState.outputGapsTotal)
+    }
+
+    var presentationActivity: DesktopControlActivity? {
+        guard !closed, !unavailable, !cleanupInProgress, !revocationInProgress,
+              let current = validLease() else { return nil }
+        let operation = presentedOperations.values.filter { $0.token == current.token }
+            .max { $0.started < $1.started }?.kind
+        let elapsed = current.started.duration(to: now()).components.seconds
+        return DesktopControlActivity(personaName: leaseOwnerDisplay?.personaName,
+                                      workspaceName: leaseOwnerDisplay?.workspaceName,
+                                      operation: operation, elapsedSeconds: Int(max(0, elapsed)))
+    }
+
+    private func beginPresentation(_ frame: DesktopControlFrame, owner: Owner) -> UUID? {
+        guard let current = validLease(), current.owner == owner,
+              case .object(let args)? = frame.arguments,
+              case .string(let token)? = args["control_token"], token == current.token,
+              let kind = DesktopControlActivityKind(operation: frame.operation) else { return nil }
+        let id = UUID()
+        presentedOperations[id] = (token, kind, now())
+        return id
     }
 
     /// Local permission setup must never interleave its input with remote work.
@@ -322,6 +372,8 @@ final class DesktopControlCommandExecutor {
 #endif
         }
         defer { if operationActive { activeOperations -= 1 } }
+        let presentationID = beginPresentation(frame, owner: owner)
+        defer { if let presentationID { presentedOperations.removeValue(forKey: presentationID) } }
         do {
             let result: Any
             switch frame.operation {
@@ -330,6 +382,7 @@ final class DesktopControlCommandExecutor {
                 result = ["available": ready, "native_executor_ready": ready, "busy": validLease() != nil || nativeVerificationID != nil]
             case "desktop_control_acquire":
                 result = try await acquire(owner, scope: scope, configVersion: configVersion)
+                if validLease()?.owner == owner { leaseOwnerDisplay = target.ownerDisplay }
             case "desktop_control_release":
                 try requireLease(owner, arguments: frame.arguments, renew: false)
                 guard await clearExpiredLease() else {

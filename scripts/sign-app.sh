@@ -6,6 +6,9 @@ bundle=${1:?usage: sign-app.sh APP_BUNDLE}
 : "${PERSONASTACK_CODESIGN_IDENTITY:?Developer ID Application identity is required}"
 : "${PERSONASTACK_CODESIGN_KEYCHAIN:?signing keychain is required}"
 
+# Validate dependency lookup before signing any nested code.
+sh "$root_dir/scripts/verify-sparkle-runtime.sh" "$bundle"
+
 sign() {
   codesign --force --timestamp --options runtime \
     --keychain "$PERSONASTACK_CODESIGN_KEYCHAIN" \
