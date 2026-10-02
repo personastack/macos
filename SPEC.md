@@ -6,6 +6,7 @@ PersonaStack for macOS presents a selected PersonaStack web surface in a dedicat
 
 ## Authority
 
+- The canonical public source repository is `https://github.com/personastack/macos`. Its `.github/workflows/release.yml` owns native app builds and public source releases.
 - `my.personastack.ai` owns the hosted browser experience, cookies, public OAuth callbacks, and browser-facing composition.
 - `personastack-api` owns identity, authorization, and product state.
 - This client owns the macOS application bundle, WebKit configuration, native window behavior, local harness configuration through each CLI plugin manager, local Desktop Control executor and Cua lifecycle, per-user machine credential custody, authenticated outbound gateway connection, and installer packaging. It does not gain a second human login, workspace/persona authorization, integration/configuration store, or general product-state authority. The API is authoritative for device enrollment, selected configuration, current grants, and revocation. The gateway routes only currently authorized, finite requests to this installation.
@@ -122,7 +123,9 @@ PersonaStack for macOS presents a selected PersonaStack web surface in a dedicat
 
 ## Installer distribution
 
-Each semantic version is a universal macOS disk image with a branded Finder background, a drag arrow, and an Applications shortcut. Users install by dragging `PersonaStack.app` onto `Applications`. A public GitHub release retains the immutable `PersonaStack-<version>-developerid.dmg` installer. The app and embedded Sparkle code are signed with the pinned Developer ID Application certificate for PersonaStack, LLC (team `5T2T8KL852`), hardened runtime and secure timestamps. The release submits both the app and signed DMG to Apple notarization, staples their accepted tickets, and requires Gatekeeper assessment before publication. The release workflow copies the same DMG into a versioned public `personastack/homebrew-tap` Git tag and updates the `personastack` cask. Homebrew installs it with `brew install --cask personastack/tap/personastack`. Earlier unsigned release artifacts remain immutable.
+Release signing credentials, signing continuity fixtures, app/DMG signing, notarization and Sparkle signing are used only for public releases triggered by pushed `v*` tags. Validation-only `workflow_dispatch` runs execute tests, packaging policy and both architecture builds without release credentials, notarization submissions or installer publication.
+
+Each semantic version is a universal macOS disk image with a branded Finder background, a drag arrow, and an Applications shortcut. Users install by dragging `PersonaStack.app` onto `Applications`. A public `personastack/macos` GitHub release retains the immutable `PersonaStack-<version>-developerid.dmg` installer. The app and embedded Sparkle code are signed with the pinned Developer ID Application certificate for PersonaStack, LLC (team `5T2T8KL852`), hardened runtime and secure timestamps. The release submits both the app and signed DMG to Apple notarization, staples their accepted tickets, and requires Gatekeeper assessment before publication. The release workflow copies the same DMG into a versioned public `personastack/homebrew-tap` Git tag and updates the `personastack` cask. Homebrew installs it with `brew install --cask personastack/tap/personastack`. Earlier unsigned release artifacts remain immutable.
 
 Light rounded backgrounds keep the native PersonaStack and Applications labels readable against the dark artwork. Finder uses 12-point labels below the 112-point icons without item information.
 

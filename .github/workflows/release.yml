@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Numeric version to validate without publishing
+        description: Numeric version to validate without signing or publishing
         required: true
         type: string
   push:
@@ -28,13 +28,16 @@ jobs:
       - name: Validate authored release notes
         run: python3 scripts/release_notes.py "$RELEASE_VERSION" "release-notes/$RELEASE_VERSION.md"
       - name: Import pinned release signing identity
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           PERSONASTACK_CODESIGN_CERTIFICATE_P12_BASE64: ${{ secrets.PERSONASTACK_DEVELOPER_ID_P12_BASE64 }}
           PERSONASTACK_CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.PERSONASTACK_DEVELOPER_ID_PASSWORD }}
         run: ./scripts/import-release-signing.sh
       - name: Test signing identity across updates
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         run: ./scripts/test-signing-continuity.sh
       - name: Configure Apple notarization
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           NOTARY_KEY: ${{ secrets.PERSONASTACK_NOTARY_KEY_P8_BASE64 }}
           NOTARY_KEY_ID: ${{ secrets.PERSONASTACK_NOTARY_KEY_ID }}
@@ -52,6 +55,7 @@ jobs:
           printf 'PERSONASTACK_NOTARY_KEY_PATH=%s\nPERSONASTACK_NOTARY_KEY_ID=%s\nPERSONASTACK_NOTARY_ISSUER_ID=%s\n' \
             "$key_path" "$NOTARY_KEY_ID" "$NOTARY_ISSUER_ID" >> "$GITHUB_ENV"
       - name: Validate updater release configuration
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           SPARKLE_PUBLIC_KEY: ${{ vars.PERSONASTACK_SPARKLE_PUBLIC_ED_KEY }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.PERSONASTACK_SPARKLE_PRIVATE_ED_KEY }}
@@ -80,17 +84,19 @@ jobs:
             "${test_scheduling[@]}" \
             --filter '(LocalRun|[Pp]ermission|[Pp]rotected|[Vv]olume|[Vv]oice|[Mm]icrophone|[Dd]irectory|[Cc]ua|[Dd]esktopControl|DesktopMenu|DesktopUpdater|[Nn]otification|[Cc]oncern|[Kk]eychain|[Cc]redential|[Ll]ogin)'
       - name: Build certificate-signed installer
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           PERSONASTACK_DEFAULT_URL: https://my.personastack.ai/user/personas
           PERSONASTACK_SPARKLE_PUBLIC_ED_KEY: ${{ vars.PERSONASTACK_SPARKLE_PUBLIC_ED_KEY }}
         run: VERSION="$RELEASE_VERSION" ./scripts/package-macos.sh
-      - name: Save validation installer
+      - name: Build validation binaries
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
-        with:
-          name: PersonaStack-validation-${{ env.RELEASE_VERSION }}
-          path: artifacts/PersonaStack-${{ env.RELEASE_VERSION }}-developerid.dmg
-          if-no-files-found: error
+        run: |
+          swift run PersonaStackPolicyCheck
+          for architecture in arm64 x86_64; do
+            swift build --scratch-path "build/validation-$architecture" \
+              --triple "$architecture-apple-macosx14.0" -c release --product PersonaStack
+          done
       - name: Publish GitHub release
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
@@ -146,7 +152,7 @@ jobs:
             --title "PersonaStack $version" \
             --notes-file "$GITHUB_WORKSPACE/release-notes/$version.md" \
             --latest
-          gh release view -R personastack/macos "$GITHUB_REF_NAME" --json body -q .body \
+          gh release view -R "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" --json body -q .body \
             >"$tap_dir/Downloads/PersonaStack-$version-developerid.md"
           sparkle_zip=$(mktemp)
           sparkle_dir=$(mktemp -d)
@@ -201,7 +207,7 @@ jobs:
           git commit -m "feat: publish signed PersonaStack appcast $version"
           git push origin HEAD:main
       - name: Remove temporary signing keychain
-        if: always()
+        if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         run: |
           signing_dir="$RUNNER_TEMP/personastack-release-signing"
           if [ -f "$signing_dir/signing.keychain-db" ]; then

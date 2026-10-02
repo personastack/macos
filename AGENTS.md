@@ -1,4 +1,4 @@
-# macos-desktop instructions
+# macos instructions
 
 - Keep hosted user, workspace, integration, persona, and billing state under `my.personastack.ai` and `personastack-api`. The native app may own a local Cua runtime, per-user machine credential in a private native credential file, local process/filesystem operations, and the authenticated machine connection to `agent-gateway`. It must not become a second human auth/API/product-state/datastore authority.
 - Gate remote machine commands through the authenticated gateway contract and current API-projected persona/config/workspace scope. Local Run commands instead require a native-redeemed API startup ticket and that window's authenticated private worker socket. Local runs do not require Desktop Control enrollment. Never accept bearer credentials, machine IDs, arbitrary URLs, paths, commands, or raw frames from an untrusted WebView bridge as authorization.
