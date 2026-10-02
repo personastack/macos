@@ -10,7 +10,8 @@ private final class DesktopControlMenuStatus: ObservableObject {
     private var refresh: AnyCancellable?
 
     init() {
-        refresh = Timer.publish(every: 2, on: .main, in: .common)
+        // Menu tracking must not rebuild SwiftUI's native submenu hierarchy.
+        refresh = Timer.publish(every: 2, on: .main, in: .default)
             .autoconnect()
             .sink { [weak self] _ in self?.revision &+= 1 }
     }
@@ -21,7 +22,7 @@ struct DesktopControlMenu: View {
     @ObservedObject private var serverSettings = DesktopEnvironmentSettings.shared
     @AppStorage("desktopControlLoginItemError") private var loginItemError = ""
     @AppStorage("desktopControlRepairError") private var repairError = ""
-    @ObservedObject private var status = DesktopControlMenuStatus()
+    @StateObject private var status = DesktopControlMenuStatus()
     @ObservedObject private var presentation = DesktopControlPresentationStore.shared
 
     private var relayEnabled: Bool {

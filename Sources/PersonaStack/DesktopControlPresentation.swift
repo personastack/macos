@@ -183,13 +183,21 @@ final class DesktopControlPresentationStore: ObservableObject {
     static let shared = DesktopControlPresentationStore()
     @Published private(set) var snapshot: DesktopControlPresentation
     private var timer: AnyCancellable?
+    private let snapshotProvider: () -> DesktopControlPresentation
 
-    private init() {
-        snapshot = DesktopControlRuntime.shared.presentationSnapshot()
-        timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect().sink { [weak self] _ in
+    init(snapshotProvider: @escaping () -> DesktopControlPresentation = { DesktopControlRuntime.shared.presentationSnapshot() }) {
+        self.snapshotProvider = snapshotProvider
+        snapshot = snapshotProvider()
+        // This projection drives MenuBarExtra as well as its content. Defer
+        // polling during native menu tracking so open submenus stay open.
+        timer = Timer.publish(every: 1, on: .main, in: .default).autoconnect().sink { [weak self] _ in
             self?.refresh()
         }
     }
 
-    func refresh() { snapshot = DesktopControlRuntime.shared.presentationSnapshot() }
+    func refresh() {
+        let current = snapshotProvider()
+        guard current != snapshot else { return }
+        snapshot = current
+    }
 }

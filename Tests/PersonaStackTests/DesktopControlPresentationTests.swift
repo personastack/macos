@@ -1,9 +1,24 @@
 import Foundation
+import Combine
 import PersonaStackCore
 import Testing
 @testable import PersonaStack
 
 @Suite struct DesktopControlPresentationTests {
+    @Test @MainActor func unchangedPollingDoesNotInvalidateMenuPresentation() {
+        var current = DesktopControlPresentation(enabled: true, paused: false, connected: true, readiness: "ready")
+        let store = DesktopControlPresentationStore(snapshotProvider: { current })
+        var changes = 0
+        let observation = store.objectWillChange.sink { changes += 1 }
+        for _ in 0..<5 { store.refresh() }
+        #expect(changes == 0)
+        current = DesktopControlPresentation(enabled: true, paused: true, connected: true, readiness: "ready")
+        store.refresh()
+        #expect(changes == 1 && store.snapshot.state == .paused)
+        store.refresh()
+        #expect(changes == 1)
+        withExtendedLifetime(observation) {}
+    }
     private var activity: DesktopControlActivity {
         .init(personaName: "Prototype", workspaceName: "Home", operation: .shell, elapsedSeconds: 125)
     }

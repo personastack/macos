@@ -145,6 +145,8 @@ Packaging requires `PERSONASTACK_CODESIGN_IDENTITY` and `PERSONASTACK_CODESIGN_K
 
 ## Desktop Control relay
 
+- Menu-bar presentation timers defer refreshes during native menu tracking, so hovering an open Settings, Updates, or Desktop Control submenu does not dismiss it. The shared presentation store publishes only changed snapshots. Runtime heartbeat, lease enforcement, and command execution continue independently of menu presentation.
+
 - Permission rows label process restarts as `PersonaStack app restart required`. When a required permission has that state, the checklist replaces Finish Setup with Restart PersonaStack. If an update is ready, Sparkle exclusively owns installation and relaunch through its retained callback. Otherwise the explicit action schedules a bounded wait for this process to exit, then reopens the same app bundle through LaunchServices in the foreground. Normal quit cleanup still runs. A scheduling failure or missing ready-update callback leaves setup open with recovery guidance. Restart does not complete enrollment or grant permissions. Optional permission restarts do not replace Finish Setup.
 
 - The native WebSocket receive buffer permits the API/Gateway contract's 8 MiB frames. Configure it before starting the socket so supported large file patches reach the native executor without dropping the relay.
