@@ -284,6 +284,19 @@ final class DesktopControlCommandExecutor {
         }
         guard isStatus || !revocationInProgress else {
             return Self.failure(frame, "desktop_control_revocation_in_progress", "Another Desktop Control configuration is being cleaned up. Retry after it finishes.")
+        await DesktopControlExecution.$deadline.withValue(frame.deadlineAt) {
+            await execute(frame, proxy: proxy, onChunk: onChunk)
+        }
+    }
+
+    private func execute(_ frame: DesktopControlFrame, proxy: CuaMCPProxy?,
+                         onChunk: (@Sendable (DesktopControlFrame) async throws -> Void)?) async -> DesktopControlFrame {
+        do {
+            guard frame.deadlineAt != nil else { throw DesktopControlExecution.Expired() }
+            try DesktopControlExecution.check()
+        } catch {
+            return Self.failure(frame, "desktop_command_expired", "The command expired or was cancelled before execution. No new action was started.")
+        }
         }
         guard isStatus || (!closed && !unavailable && nativeVerificationID == nil) else {
             return Self.failure(frame, "desktop_executor_unavailable", "The desktop control service is paused or recovering.")
@@ -387,6 +400,14 @@ final class DesktopControlCommandExecutor {
 
     static func isPermissionDenied(_ error: NSError) -> Bool {
         if error.domain == NSCocoaErrorDomain {
+        } catch is DesktopControlExecution.Expired {
+            return Self.failure(frame, "desktop_command_expired", "The command deadline elapsed before its next operation. Check the current state before retrying; earlier steps may have completed.")
+        } catch is CancellationError {
+            return Self.failure(frame, "outcome_unknown", "The command was cancelled. Check the desktop before repeating an action.")
+        } catch let error as CuaMCPProxyError where error == .timeout || error == .interrupted || error == .processExited {
+            return Self.failure(frame, "outcome_unknown", "Cua stopped answering after dispatch. Check the desktop before repeating an action.")
+        } catch let error as DesktopCuaFailure {
+            return Self.failure(frame, error.code, error.message)
             return error.code == NSFileReadNoPermissionError || error.code == NSFileWriteNoPermissionError
         }
         return error.domain == NSPOSIXErrorDomain && (error.code == Int(EACCES) || error.code == Int(EPERM))
@@ -467,6 +488,7 @@ final class DesktopControlCommandExecutor {
         } == true
         if matches {
             guard await cleanupLeaseAndResources(lease) else {
+        try DesktopControlExecution.check()
                 return Self.failure(frame, "desktop_control_revoke_incomplete", "The Mac could not confirm that every command or process stopped.")
             }
         } else if cleanupMatches {
@@ -624,7 +646,9 @@ final class DesktopControlCommandExecutor {
               let rawArguments = values["arguments"] else { throw CommandError.invalidArguments }
         let allowed = Self.allowedTools(for: frame.operation ?? "")
         guard allowed.contains(name) else { throw CommandError.invalidArguments }
-        let encoded = try JSONEncoder().encode(rawArguments)
+        let preparedArguments = try Self.cuaArguments(name: name, arguments: rawArguments,
+                                                     controlToken: lease?.token ?? "")
+        let encoded = try JSONEncoder().encode(preparedArguments)
         let response = try await proxy.callTool(name: name, argumentsJSON: encoded)
         guard let object = try JSONSerialization.jsonObject(with: response) as? [String: Any],
               let result = object["result"] as? [String: Any], object["error"] == nil else {
@@ -633,7 +657,7 @@ final class DesktopControlCommandExecutor {
         }
         guard !Self.isCuaToolError(result) else {
             logger.error("Cua tool returned an error tool=\(name, privacy: .public)")
-            throw CommandError.commandFailed
+            throw DesktopCuaFailure.from(result, tool: name)
         }
         return try Self.boundedCuaImageResult(result)
     }
@@ -664,6 +688,20 @@ final class DesktopControlCommandExecutor {
                   let height = properties[kCGImagePropertyPixelHeight] as? Int,
                   width > 0, height > 0, width <= 80_000_000 / height,
                   let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+    static func cuaArguments(name: String, arguments: DesktopControlJSONValue,
+                             controlToken: String) throws -> DesktopControlJSONValue {
+        guard name == "get_browser_state" || name.hasPrefix("browser_") else { return arguments }
+        guard !controlToken.isEmpty, case .object(var fields) = arguments else { throw CommandError.invalidArguments }
+        if name == "browser_prepare" {
+            guard fields.count == 1, fields["confirm"] == .bool(true) else { throw CommandError.invalidArguments }
+            return .object(["session": .string(controlToken), "allow_launch": .bool(true),
+                            "profile": .object(["mode": .string("isolated_new")])])
+        }
+        if let session = fields["session"], session != .string(controlToken) { throw CommandError.invalidArguments }
+        fields["session"] = .string(controlToken)
+        return .object(fields)
+    }
+
                 throw CommandError.commandFailed
             }
             var replacement: Data?
@@ -889,7 +927,7 @@ final class DesktopControlCommandExecutor {
         case "desktop_control_application": return ["launch_app", "bring_to_front", "kill_app", "list_apps"]
         case "desktop_control_window": return ["list_windows", "get_window_state", "set_window_frame", "bring_to_front", "invoke_menu"]
         case "desktop_control_clipboard": return ["clipboard_read", "clipboard_write"]
-        case "desktop_control_browser": return ["get_browser_state", "browser_navigate", "browser_click", "browser_type", "browser_pointer", "browser_dialog", "browser_download", "browser_set_input_files"]
+        case "desktop_control_browser": return ["browser_prepare", "get_browser_state", "browser_navigate", "browser_click", "browser_type", "browser_pointer", "browser_dialog", "browser_download", "browser_set_input_files"]
         default: return []
         }
     }
@@ -1071,3 +1109,6 @@ private extension DesktopShellError {
         }
     }
 }
+        case .inputOutcomeUnknown: "outcome_unknown"
+        case .inputOutcomeUnknown:
+            "Command input may have been partly delivered. Read process output and inspect its state before sending more input. Do not repeat the entire input blindly."

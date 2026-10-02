@@ -109,6 +109,7 @@ public actor DesktopFileSystem {
     public func openHandleCount() -> Int { openFiles.count }
 
     public func metadata(path: String) throws -> DesktopFileEntry {
+        try DesktopControlExecution.check()
         guard let url = Self.url(path) else { throw DesktopFileSystemError.invalidPath }
         var info = stat()
         guard lstat(url.path, &info) == 0 else { throw Self.operationError(errno, fallback: .invalidPath) }
@@ -116,6 +117,7 @@ public actor DesktopFileSystem {
     }
 
     public func list(path: String, offset: Int = 0, limit: Int = 100) throws -> DesktopFilePage {
+        try DesktopControlExecution.check()
         guard offset >= 0, (1...Self.maxPageSize).contains(limit),
               let input = Self.url(path) else { throw DesktopFileSystemError.notDirectory }
         let url = input.resolvingSymlinksInPath().standardizedFileURL
@@ -271,6 +273,7 @@ public actor DesktopFileSystem {
     public func search(root: String, nameContains: String? = nil, nameGlob: String? = nil,
                        contentContains: String? = nil, limit: Int = 100,
                        continuation: String? = nil, timeLimit: TimeInterval = 2) throws -> DesktopFileSearchPage {
+        try DesktopControlExecution.check()
         guard (1...Self.maxPageSize).contains(limit),
               (nameContains?.isEmpty == false || nameGlob?.isEmpty == false || contentContains?.isEmpty == false),
               let inputURL = Self.url(root) else {
@@ -380,6 +383,7 @@ public actor DesktopFileSystem {
 
     public func open(path: String) throws -> (id: UUID, path: String, size: UInt64, modifiedAt: Date,
                                                revision: String, firstRead: DesktopFileRead) {
+        try DesktopControlExecution.check()
         guard openFiles.count < Self.maxOpenFiles else { throw DesktopFileSystemError.tooManyOpenFiles }
         guard let input = Self.url(path) else { throw DesktopFileSystemError.invalidPath }
         let resolved = input.resolvingSymlinksInPath().standardizedFileURL
@@ -399,6 +403,7 @@ public actor DesktopFileSystem {
     }
 
     public func read(id: UUID, offset: UInt64, length: Int = 256 * 1024) throws -> DesktopFileRead {
+        try DesktopControlExecution.check()
         guard let file = openFiles[id] else { throw DesktopFileSystemError.missingHandle }
         return try read(id: id, offset: offset, length: length, alignUTF8: file.alignUTF8)
     }
@@ -424,6 +429,7 @@ public actor DesktopFileSystem {
 
     public func readLines(id: UUID, startLine: Int, lineCount: Int,
                           length: Int = DesktopFileSystem.maxReadBytes) throws -> DesktopFileRead {
+        try DesktopControlExecution.check()
         guard openFiles[id] != nil else { throw DesktopFileSystemError.missingHandle }
         guard startLine >= 1, (1...10_000).contains(lineCount), (1...Self.maxReadBytes).contains(length) else {
             throw DesktopFileSystemError.invalidRange
@@ -489,11 +495,13 @@ public actor DesktopFileSystem {
     }
 
     public func close(id: UUID) throws {
+        try DesktopControlExecution.check()
         guard let file = openFiles.removeValue(forKey: id) else { throw DesktopFileSystemError.missingHandle }
         try file.handle.close()
     }
 
     public func write(path: String, content: Data, mode: DesktopFileWriteMode, offset: UInt64? = nil) throws -> DesktopFileEntry {
+        try DesktopControlExecution.check()
         guard content.count <= Self.maxReadBytes else { throw DesktopFileSystemError.contentTooLarge }
         guard let url = Self.url(path) else { throw DesktopFileSystemError.invalidPath }
         if let offset {
@@ -532,6 +540,7 @@ public actor DesktopFileSystem {
     }
 
     public func patch(path: String, expected: String, replacement: String) throws -> DesktopFileEntry {
+        try DesktopControlExecution.check()
         guard let url = Self.url(path) else { throw DesktopFileSystemError.invalidPath }
         let descriptor = try Self.openRegularFile(url.path, flags: O_RDONLY)
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
@@ -551,17 +560,20 @@ public actor DesktopFileSystem {
     }
 
     public func makeDirectory(path: String) throws {
+        try DesktopControlExecution.check()
         guard let url = Self.url(path) else { throw DesktopFileSystemError.invalidPath }
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
     }
 
     public func move(source: String, destination: String) throws {
+        try DesktopControlExecution.check()
         guard let from = Self.url(source), let to = Self.url(destination) else { throw DesktopFileSystemError.invalidPath }
         guard !FileManager.default.fileExists(atPath: to.path) else { throw DesktopFileSystemError.destinationExists }
         try FileManager.default.moveItem(at: from, to: to)
     }
 
     public func remove(path: String) throws {
+        try DesktopControlExecution.check()
         guard let url = Self.url(path), url.path != "/" else { throw DesktopFileSystemError.invalidPath }
         var info = stat()
         guard lstat(url.path, &info) == 0 else { throw Self.operationError(errno, fallback: .invalidPath) }

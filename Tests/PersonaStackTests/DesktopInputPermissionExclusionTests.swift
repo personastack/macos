@@ -27,7 +27,7 @@ struct DesktopInputPermissionExclusionTests {
     }
     private func frame(_ operation: String, target: DesktopControlTarget? = nil) -> DesktopControlFrame {
         .init(type: "command", requestID: UUID().uuidString, target: target ?? owner(), operation: operation,
-              arguments: .object([:]))
+              arguments: .object([:]), deadlineAt: Date().addingTimeInterval(45))
     }
 
     @Test func nativeCheckExcludesAcquireAndInputButStatusStaysReadable() async throws {

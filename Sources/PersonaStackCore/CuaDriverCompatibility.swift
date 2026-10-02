@@ -47,7 +47,7 @@ public enum CuaDriverCompatibility {
 
     /// PersonaStack's reviewed GUI surface. Upstream tools are never exposed automatically.
     public static let exposedTools: Set<String> = [
-        "bring_to_front", "browser_click", "browser_dialog", "browser_download", "browser_navigate",
+        "bring_to_front", "browser_prepare", "browser_click", "browser_dialog", "browser_download", "browser_navigate",
         "browser_pointer", "browser_set_input_files", "browser_type", "check_permissions", "click",
         "clipboard_read", "clipboard_write", "double_click", "drag", "get_accessibility_tree",
         "get_browser_state", "get_cursor_position", "get_desktop_state", "get_screen_size",

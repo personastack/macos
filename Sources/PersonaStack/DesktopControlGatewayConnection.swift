@@ -32,7 +32,11 @@ actor DesktopControlGatewayConnection {
     private var heartbeats: Task<Void, Never>?
     private var commandTasks: [String: Task<Void, Never>] = [:]
     private var connected = false
-    private var readiness = "ready"
+    private var readiness = "unknown"
+    private var readinessRevision: UInt64 = 0
+    private var cachedDiagnostics: DesktopControlDiagnostics?
+    private var snapshotTask: Task<Void, Never>?
+    private var snapshotGeneration = UUID()
     private var diagnosticsSupported = false
 
     init(installation: DesktopControlInstallation,
@@ -81,9 +85,10 @@ actor DesktopControlGatewayConnection {
     func setReadiness(_ value: String) async {
         guard ["unknown", "ready", "permission_required", "cua_unavailable", "paused", "locked", "upgrade_required"].contains(value) else { return }
         readiness = value
+        readinessRevision &+= 1
         guard connected else { return }
         do {
-            try await send(await heartbeatFrame())
+            try await send(heartbeatFrame())
         } catch {
             await disconnected()
         }
@@ -92,6 +97,10 @@ actor DesktopControlGatewayConnection {
     func stop() {
         reader?.cancel()
         heartbeats?.cancel()
+        snapshotTask?.cancel()
+        snapshotTask = nil
+        snapshotGeneration = UUID()
+        cachedDiagnostics = nil
         for task in commandTasks.values { task.cancel() }
         commandTasks.removeAll()
         reader = nil
@@ -176,7 +185,7 @@ actor DesktopControlGatewayConnection {
         while !Task.isCancelled, connected {
             do {
                 try await Task.sleep(for: .seconds(15))
-                try await send(await heartbeatFrame())
+                try await send(heartbeatFrame())
             } catch {
                 await disconnected()
                 return
@@ -184,15 +193,44 @@ actor DesktopControlGatewayConnection {
         }
     }
 
-    private func heartbeatFrame() async -> DesktopControlFrame {
-        let diagnostics = diagnosticsSupported ? await diagnosticsProvider() : nil
-        if let currentReadiness = await readinessProvider(),
+    // Sending presence must never wait behind a tool, filesystem read, or repair.
+    // One bounded provider task refreshes these snapshots between heartbeats.
+    func heartbeatFrame() -> DesktopControlFrame {
+        refreshSnapshot()
+        return DesktopControlFrame(type: "heartbeat", lastHeartbeat: Date(), readiness: readiness,
+                                   diagnostics: diagnosticsSupported ? cachedDiagnostics : nil)
+    }
+
+    private func refreshSnapshot() {
+        guard snapshotTask == nil else { return }
+        let generation = snapshotGeneration
+        let revision = readinessRevision
+        snapshotTask = Task { [weak self, readinessProvider, diagnosticsProvider] in
+            let currentReadiness = await readinessProvider()
+            guard !Task.isCancelled else { return }
+            let diagnostics = await diagnosticsProvider()
+            guard !Task.isCancelled, let self else { return }
+            await self.applySnapshot(currentReadiness, diagnostics: diagnostics,
+                                     generation: generation, revision: revision)
+        }
+    }
+
+    private func applySnapshot(_ currentReadiness: String?, diagnostics: DesktopControlDiagnostics,
+                               generation: UUID, revision: UInt64) {
+        guard generation == snapshotGeneration else { return }
+        snapshotTask = nil
+        cachedDiagnostics = diagnostics
+        // An explicit lock/pause/readiness update wins over an older observation.
+        if revision == readinessRevision, let currentReadiness,
            ["unknown", "ready", "permission_required", "cua_unavailable", "paused", "locked", "upgrade_required"].contains(currentReadiness) {
             readiness = currentReadiness
         }
-        return DesktopControlFrame(type: "heartbeat", lastHeartbeat: Date(), readiness: readiness,
-                                   diagnostics: diagnostics)
     }
+
+#if DEBUG
+    func waitForSnapshotForTesting() async { await snapshotTask?.value }
+    func cachedReadinessForTesting() -> String { readiness }
+#endif
 
     private func send(_ frame: DesktopControlFrame) async throws {
         guard let socket, connected else { throw DesktopControlGatewayConnectionError.socketUnavailable }

@@ -67,6 +67,7 @@ public enum DesktopShellError: Error, Equatable {
     case tooManyProcesses
     case missingExecution
     case invalidInput
+    case inputOutcomeUnknown
     case cancellationUnconfirmed
 }
 
@@ -114,6 +115,10 @@ public actor DesktopShellExecutor {
 
     public init() {}
 
+#if DEBUG
+    func inputClosePendingForTesting(_ id: UUID) -> Bool { sessions[id]?.inputClosed == true }
+#endif
+
     public func diagnostics() -> DesktopShellDiagnostics {
         DesktopShellDiagnostics(
             activeProcesses: sessions.values.filter { $0.state == .running }.count,
@@ -123,6 +128,7 @@ public actor DesktopShellExecutor {
     }
 
     public func start(command: String, workingDirectory: String, timeout: TimeInterval = 300) async throws -> DesktopProcessRead {
+        try DesktopControlExecution.check()
         guard !command.isEmpty, command.utf8.count <= Self.maximumCommandBytes else { throw DesktopShellError.invalidCommand }
         guard workingDirectory.hasPrefix("/") else {
             throw DesktopShellError.invalidWorkingDirectory
@@ -156,6 +162,7 @@ public actor DesktopShellExecutor {
     }
 
     public func read(id: UUID, after cursor: UInt64, wait: Duration = .zero) async throws -> DesktopProcessRead {
+        try DesktopControlExecution.check()
         let end = ContinuousClock.now + min(max(wait, .zero), .seconds(10))
         while true {
             guard let session = sessions[id] else { throw DesktopShellError.missingExecution }
@@ -174,6 +181,7 @@ public actor DesktopShellExecutor {
     }
 
     public func write(id: UUID, input: DesktopProcessInput) async throws {
+        try DesktopControlExecution.check()
         switch input {
         case .data(let data):
             guard !data.isEmpty, data.count <= Self.maximumInputBytes else { throw DesktopShellError.invalidInput }
@@ -182,19 +190,7 @@ public actor DesktopShellExecutor {
             session.queuedInputBytes += data.count
             session.pendingInputOperations += 1
             sessions[id] = session
-            let inputQueue = session.inputQueue
-            let inputDescriptor = session.stdin.fileDescriptor
-            let inputCancellation = session.inputCancellation
-            try await withCheckedThrowingContinuation { continuation in
-                inputQueue.async {
-                    do {
-                        try Self.writeInput(data, descriptor: inputDescriptor, cancellation: inputCancellation)
-                        continuation.resume()
-                    }
-                    catch { continuation.resume(throwing: DesktopShellError.invalidInput) }
-                    Task { await self.finishInputWrite(id, byteCount: data.count) }
-                }
-            }
+            try await performQueuedInput(id: id, session: session, data: data)
         case .close:
             guard var session = sessions[id], session.terminalState == nil, !session.inputClosed else {
                 throw DesktopShellError.missingExecution
@@ -202,15 +198,7 @@ public actor DesktopShellExecutor {
             session.inputClosed = true
             session.pendingInputOperations += 1
             sessions[id] = session
-            let stdin = session.stdin
-            let inputQueue = session.inputQueue
-            try await withCheckedThrowingContinuation { continuation in
-                inputQueue.async {
-                    do { try stdin.close(); continuation.resume() }
-                    catch { continuation.resume(throwing: DesktopShellError.invalidInput) }
-                    Task { await self.finishInputOperation(id) }
-                }
-            }
+            try await performQueuedInput(id: id, session: session, data: nil)
         case .interrupt:
             guard let session = sessions[id], session.terminalState == nil else { throw DesktopShellError.missingExecution }
             guard kill(-session.processID, SIGINT) == 0 else { throw DesktopShellError.missingExecution }
@@ -218,6 +206,11 @@ public actor DesktopShellExecutor {
     }
 
     public func cancel(id: UUID) async throws {
+        try DesktopControlExecution.check()
+        try await stopProcess(id: id)
+    }
+
+    private func stopProcess(id: UUID) async throws {
         guard var session = sessions[id] else { throw DesktopShellError.missingExecution }
         session.inputCancellation.cancel()
         sessions[id] = session
@@ -251,6 +244,7 @@ public actor DesktopShellExecutor {
     }
 
     public func status(id: UUID) throws -> DesktopProcessRead {
+        try DesktopControlExecution.check()
         guard let session = sessions[id] else { throw DesktopShellError.missingExecution }
         let earliest = session.chunks.first?.sequence ?? session.nextSequence + 1
         return DesktopProcessRead(executionID: id, chunks: [], nextCursor: 0,
@@ -264,7 +258,7 @@ public actor DesktopShellExecutor {
         requestStopAll()
         let groupsToStop = sessions.filter { !$0.value.processTerminated }.map(\.key)
         for id in groupsToStop {
-            do { try await cancel(id: id) }
+            do { try await stopProcess(id: id) }
             catch { /* The process-group check below is authoritative. */ }
         }
         for (id, var session) in Array(sessions) where session.state == .running {
@@ -614,26 +608,68 @@ public actor DesktopShellExecutor {
         return false
     }
 
-    private func finishInputWrite(_ id: UUID, byteCount: Int) {
+    private func performQueuedInput(id: UUID, session: Session, data: Data?) async throws {
+        let deadline = DesktopControlExecution.deadline
+        let commandCancellation = DesktopShellInputCancellation()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                session.inputQueue.async {
+                    var closeStarted = false
+                    let result = Result<Void, Error> {
+                        if let data {
+                            try Self.writeInput(data, descriptor: session.stdin.fileDescriptor,
+                                                cancellation: session.inputCancellation,
+                                                commandCancellation: commandCancellation, deadline: deadline)
+                        } else {
+                            try Self.checkInput(cancellation: session.inputCancellation,
+                                                commandCancellation: commandCancellation, deadline: deadline)
+                            closeStarted = true
+                            do { try session.stdin.close() }
+                            catch { throw DesktopShellError.inputOutcomeUnknown }
+                        }
+                    }
+                    let reopenInput = data == nil && !closeStarted
+                    Task {
+                        await self.finishInputOperation(id, byteCount: data?.count ?? 0, reopenInput: reopenInput)
+                        continuation.resume(with: result)
+                    }
+                }
+            }
+        } onCancel: {
+            commandCancellation.cancel()
+        }
+    }
+
+    private func finishInputOperation(_ id: UUID, byteCount: Int, reopenInput: Bool) {
         guard var session = sessions[id] else { return }
         session.queuedInputBytes = max(0, session.queuedInputBytes - byteCount)
         session.pendingInputOperations = max(0, session.pendingInputOperations - 1)
+        if reopenInput { session.inputClosed = false }
         sessions[id] = session
     }
 
-    private func finishInputOperation(_ id: UUID) {
-        guard var session = sessions[id] else { return }
-        session.pendingInputOperations = max(0, session.pendingInputOperations - 1)
-        sessions[id] = session
+    private static func checkInput(cancellation: DesktopShellInputCancellation,
+                                   commandCancellation: DesktopShellInputCancellation,
+                                   deadline: Date?, bytesWritten: Int = 0) throws {
+        if let deadline, deadline <= Date() {
+            if bytesWritten > 0 { throw DesktopShellError.inputOutcomeUnknown }
+            throw DesktopControlExecution.Expired()
+        }
+        if cancellation.isCancelled() || commandCancellation.isCancelled() {
+            if bytesWritten > 0 { throw DesktopShellError.inputOutcomeUnknown }
+            throw CancellationError()
+        }
     }
 
     private static func writeInput(_ data: Data, descriptor: Int32,
-                                   cancellation: DesktopShellInputCancellation) throws {
+                                   cancellation: DesktopShellInputCancellation,
+                                   commandCancellation: DesktopShellInputCancellation, deadline: Date?) throws {
         try data.withUnsafeBytes { buffer in
             guard let baseAddress = buffer.baseAddress else { throw DesktopShellError.invalidInput }
             var offset = 0
             while offset < data.count {
-                guard !cancellation.isCancelled() else { throw DesktopShellError.invalidInput }
+                try checkInput(cancellation: cancellation, commandCancellation: commandCancellation,
+                               deadline: deadline, bytesWritten: offset)
                 let written = Darwin.write(descriptor, baseAddress.advanced(by: offset), data.count - offset)
                 if written > 0 {
                     offset += written
@@ -645,6 +681,7 @@ public actor DesktopShellExecutor {
                     _ = poll(&state, 1, 100)
                     continue
                 }
+                if offset > 0 { throw DesktopShellError.inputOutcomeUnknown }
                 throw DesktopShellError.invalidInput
             }
         }

@@ -437,6 +437,93 @@ struct CuaMCPProxyTests {
         #expect(!FileManager.default.fileExists(atPath: service.directoryURL.path))
     }
 
+    @Test
+    func expiredCallIsRejectedBeforeWritingAndLeavesProxyUsable() async throws {
+        let script = #"""
+        #!/usr/bin/python3
+        import json, sys
+        for line in sys.stdin:
+            request = json.loads(line)
+            if request.get("method") == "notifications/initialized":
+                continue
+            if request.get("method") == "initialize":
+                result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.29.1"}}
+            else:
+                # An expired click must never reach this process.
+                result = {"tool":request["params"]["name"]}
+                if result["tool"] == "click":
+                    sys.exit(4)
+            print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
+        """#
+        let executable = try executableScript(script)
+        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
+        let proxy = CuaMCPProxy(executableURL: executable)
+        _ = try await proxy.start()
+        await #expect(throws: DesktopControlExecution.Expired.self) {
+            try await DesktopControlExecution.$deadline.withValue(.distantPast) {
+                _ = try await proxy.callTool(name: "click", argumentsJSON: Data("{}".utf8))
+            }
+        }
+        let response = try await proxy.callTool(name: "get_cursor_position", argumentsJSON: Data("{}".utf8))
+        #expect(String(decoding: response, as: UTF8.self).contains("get_cursor_position"))
+        await proxy.stop()
+    }
+
+    @Test
+    func commandExpiringBehindBusyProxyNeverReachesDriver() async throws {
+        let script = #"""
+        #!/usr/bin/python3
+        import json, pathlib, sys, time
+        root = pathlib.Path(__file__).parent
+        for line in sys.stdin:
+            request = json.loads(line)
+            if request.get("method") == "notifications/initialized":
+                continue
+            if request.get("method") == "initialize":
+                result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.29.1"}}
+            else:
+                name = request["params"]["name"]
+                if name == "get_desktop_state":
+                    (root / "entered").touch()
+                    end = time.monotonic() + 3
+                    while not (root / "release").exists() and time.monotonic() < end:
+                        time.sleep(0.01)
+                if name == "click":
+                    (root / "unexpected-click").touch()
+                result = {"tool":name}
+            print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
+        """#
+        let executable = try executableScript(script)
+        let root = executable.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let proxy = CuaMCPProxy(executableURL: executable)
+        do {
+            _ = try await proxy.start()
+            let busy = Task { try await proxy.callTool(name: "get_desktop_state", argumentsJSON: Data("{}".utf8)) }
+            let until = ContinuousClock.now + .seconds(2)
+            while !FileManager.default.fileExists(atPath: root.appendingPathComponent("entered").path), ContinuousClock.now < until {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            try #require(FileManager.default.fileExists(atPath: root.appendingPathComponent("entered").path))
+            let deadline = Date().addingTimeInterval(0.03)
+            let queued = Task {
+                try await DesktopControlExecution.$deadline.withValue(deadline) {
+                    try await proxy.callTool(name: "click", argumentsJSON: Data("{}".utf8))
+                }
+            }
+            try await Task.sleep(for: .milliseconds(60))
+            try Data().write(to: root.appendingPathComponent("release"))
+            _ = try await busy.value
+            await #expect(throws: DesktopControlExecution.Expired.self) { _ = try await queued.value }
+            #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("unexpected-click").path))
+            _ = try await proxy.callTool(name: "get_cursor_position", argumentsJSON: Data("{}".utf8))
+            await proxy.stop()
+        } catch {
+            await proxy.stop()
+            throw error
+        }
+    }
+
     private func executableScript(_ body: String) throws -> URL {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("cua-mcp-proxy-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)

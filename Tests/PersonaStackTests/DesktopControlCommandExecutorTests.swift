@@ -855,9 +855,9 @@ struct DesktopControlCommandExecutorTests {
     }
 
     @Test @MainActor
-    func sleepFencesControlUntilAnObservedUnlock() async {
+    func sleepRequiresFreshUnlockOrForegroundConfirmation() async {
         let workspaceCenter = NotificationCenter()
-        let monitor = DesktopControlSessionLock(workspaceCenter: workspaceCenter)
+        let monitor = DesktopControlSessionLock(workspaceCenter: workspaceCenter, snapshotReader: { .unknown })
         monitor.receive(.unlocked)
 
         workspaceCenter.post(name: NSWorkspace.willSleepNotification, object: nil)
@@ -866,8 +866,8 @@ struct DesktopControlCommandExecutorTests {
 
         workspaceCenter.post(name: NSWorkspace.didWakeNotification, object: nil)
         await Task.yield()
-        #expect(monitor.state == .locked)
-        monitor.receive(.unlocked)
+        #expect(monitor.state == .unknown)
+        monitor.confirmForegroundSetup()
         #expect(monitor.allowsControl)
     }
 

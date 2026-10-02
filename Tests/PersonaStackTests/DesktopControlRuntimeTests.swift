@@ -624,7 +624,7 @@ func enrolledRuntimeKeepsUnlockRecoveryDuringPermissionRepair(grantedAfterUnlock
         try await runtime.verifyCuaCapabilitiesForPermissions()
         let owner = DesktopControlTarget(installationID: "install", workspaceID: "workspace", configID: "config",
                                         personaID: "persona", runID: "run", generation: 1, configVersion: 1)
-        let acquire = DesktopControlFrame(type: "command", requestID: "acquire", target: owner, operation: "desktop_control_acquire", arguments: .object([:]))
+        let acquire = DesktopControlFrame(type: "command", requestID: "acquire", target: owner, operation: "desktop_control_acquire", arguments: .object([:]), deadlineAt: Date().addingTimeInterval(45))
         let first = await executor.handle(acquire, proxy: nil)
         #expect(first.type == "result")
         let target = RuntimeInputTarget(root: root)
@@ -795,7 +795,7 @@ func enrolledRuntimeKeepsUnlockRecoveryDuringPermissionRepair(grantedAfterUnlock
     let owner = DesktopControlTarget(installationID: "install", workspaceID: "workspace", configID: "config",
                                      personaID: "persona", runID: "run", generation: 1, configVersion: 1)
     let acquire = DesktopControlFrame(type: "command", requestID: "lock-power-acquire", target: owner,
-                                      operation: "desktop_control_acquire", arguments: .object([:]))
+                                      operation: "desktop_control_acquire", arguments: .object([:]), deadlineAt: Date().addingTimeInterval(45))
     #expect(await executor.handle(acquire, proxy: nil).type == "result")
     #expect(power.isHeld)
     let runtime = DesktopControlRuntime.makeForTesting(
@@ -826,7 +826,7 @@ private struct SavedDesktopControlCredentialStore: DesktopControlCredentialStori
     let owner = DesktopControlTarget(installationID: installation.installationID, workspaceID: "workspace", configID: "config",
                                      personaID: "persona", runID: "run", generation: 1, configVersion: 1)
     let acquire = DesktopControlFrame(type: "command", requestID: "quit-power-acquire", target: owner,
-                                      operation: "desktop_control_acquire", arguments: .object([:]))
+                                      operation: "desktop_control_acquire", arguments: .object([:]), deadlineAt: Date().addingTimeInterval(45))
     #expect(await executor.handle(acquire, proxy: nil).type == "result")
     #expect(power.isHeld)
     var cuaStops = 0
@@ -1164,7 +1164,7 @@ private final class DesktopControlSetupRuntimeFixture: DesktopControlSetupRuntim
                                      configID: "removed-config", personaID: "persona-a", runID: "run-a",
                                      generation: 1, configVersion: 1)
     let acquire = DesktopControlFrame(type: "command", requestID: "acquire-before-removal", target: owner,
-                                      operation: "desktop_control_acquire", arguments: .object([:]))
+                                      operation: "desktop_control_acquire", arguments: .object([:]), deadlineAt: Date().addingTimeInterval(45))
     #expect((await executor.handle(acquire, proxy: nil)).type == "result")
     executor.failNextCleanupForTesting()
     let installer = DesktopControlInstallerFixture(errors: [])
@@ -1254,6 +1254,21 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     #expect(!lock.allowsControl)
     lock.receive(.unlocked)
     #expect(lock.allowsControl)
+}
+
+@Test @MainActor func lockDuringForegroundConfirmationInvalidatesApproval() throws {
+    var runtime: DesktopControlRuntime!
+    runtime = DesktopControlRuntime.makeForTesting(
+        installer: DesktopControlInstallerFixture(errors: []),
+        credentials: EmptyDesktopControlCredentialStore(),
+        confirmForegroundSetup: {
+            runtime.receiveSessionLockForTesting(.locked)
+            runtime.receiveSessionLockForTesting(.unlocked)
+            return true
+        }
+    )
+    defer { runtime = nil }
+    #expect(throws: CancellationError.self) { try runtime.confirmForegroundSession() }
 }
 
 @Test @MainActor func restartConfirmationRequiresForegroundApprovalAndNeverOverridesLock() throws {
@@ -1444,7 +1459,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
                                      configID: "config-a", personaID: "persona-a", runID: "run-a",
                                      generation: 1, configVersion: 1)
     let acquire = DesktopControlFrame(type: "command", requestID: "acquire-idle-failure", target: owner,
-                                      operation: "desktop_control_acquire", arguments: .object([:]))
+                                      operation: "desktop_control_acquire", arguments: .object([:]), deadlineAt: Date().addingTimeInterval(45))
     #expect((await executor.handle(acquire, proxy: nil)).type == "result")
     executor.failNextCleanupForTesting()
     let runtime = DesktopControlRuntime.makeForTesting(
@@ -1493,7 +1508,7 @@ func setupIdleSyncReportsRealReconciliationFailureAndRecoversOnRetry(failure: St
                                      configID: "removed-config", personaID: "persona-a", runID: "run-a",
                                      generation: 1, configVersion: 1)
     let acquire = DesktopControlFrame(type: "command", requestID: "sync-before-removal", target: owner,
-                                      operation: "desktop_control_acquire", arguments: .object([:]))
+                                      operation: "desktop_control_acquire", arguments: .object([:]), deadlineAt: Date().addingTimeInterval(45))
     #expect((await executor.handle(acquire, proxy: nil)).type == "result")
     if failure == "executor" { executor.failNextCleanupForTesting() }
     var cuaShouldFail = failure == "cua"
@@ -2074,7 +2089,7 @@ func desktopControlAutomaticColdStartAndCapturePreserveEnrollmentAndRemoteLease(
         let owner = DesktopControlTarget(installationID: "install", workspaceID: "workspace", configID: "config",
             personaID: "persona", runID: "run", generation: 1, configVersion: 1)
         let acquire = DesktopControlFrame(type: "command", requestID: "acquire", target: owner,
-            operation: "desktop_control_acquire", arguments: .object([:]))
+            operation: "desktop_control_acquire", arguments: .object([:]), deadlineAt: Date().addingTimeInterval(45))
         let lease = await executor.handle(acquire, proxy: nil)
         #expect(lease.type == "result")
         let calls = try runtimeFixtureCalls(root)

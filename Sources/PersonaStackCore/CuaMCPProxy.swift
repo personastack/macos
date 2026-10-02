@@ -154,6 +154,7 @@ public actor CuaMCPProxy {
     }
 
     private func request(method: String, parameters: String, timeout: Int32) throws -> Data {
+        try DesktopControlExecution.check()
         if interruption.isInterrupted { throw CuaMCPProxyError.interrupted }
         guard started, process.isRunning else { throw CuaMCPProxyError.notStarted }
         do { try verifyDaemonIdentity() }
@@ -165,7 +166,7 @@ public actor CuaMCPProxy {
         let id = requestID
         let wire = "{\"jsonrpc\":\"2.0\",\"id\":\(id),\"method\":\"\(method)\",\"params\":\(parameters)}\n"
         guard let bytes = wire.data(using: .utf8) else { throw CuaMCPProxyError.invalidArguments }
-        let deadline = Date().addingTimeInterval(TimeInterval(timeout))
+        let deadline = try DesktopControlExecution.boundedDeadline(timeout: TimeInterval(timeout))
         do {
             try writeInput(bytes, deadline: deadline)
             return try readResponse(id: id, deadline: deadline)
@@ -195,6 +196,7 @@ public actor CuaMCPProxy {
             guard let base = raw.baseAddress else { return }
             var offset = 0
             while offset < raw.count {
+                try Task.checkCancellation()
                 if interruption.isInterrupted { throw CuaMCPProxyError.interrupted }
                 let remaining = deadline.timeIntervalSinceNow
                 guard remaining > 0 else { throw CuaMCPProxyError.timeout }
@@ -202,12 +204,12 @@ public actor CuaMCPProxy {
                     pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0),
                     pollfd(fd: interruption.readDescriptor, events: Int16(POLLIN), revents: 0)
                 ]
-                let milliseconds = Int32(max(1, min(remaining * 1000, Double(Int32.max))))
+                let milliseconds = Int32(max(1, min(remaining * 1000, 100)))
                 let ready = descriptors.withUnsafeMutableBufferPointer {
                     Darwin.poll($0.baseAddress, nfds_t($0.count), milliseconds)
                 }
                 if interruption.isInterrupted { throw CuaMCPProxyError.interrupted }
-                if ready == 0 { throw CuaMCPProxyError.timeout }
+                if ready == 0 { continue }
                 if ready < 0 {
                     if errno == EINTR { continue }
                     throw CuaMCPProxyError.processExited
@@ -229,6 +231,7 @@ public actor CuaMCPProxy {
     private func readResponse(id: Int64, deadline: Date) throws -> Data {
         let descriptor = output.fileHandleForReading.fileDescriptor
         while true {
+            try Task.checkCancellation()
             if interruption.isInterrupted { throw CuaMCPProxyError.interrupted }
             if let line = takeBufferedLine() {
                 guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
@@ -244,12 +247,12 @@ public actor CuaMCPProxy {
                 pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0),
                 pollfd(fd: interruption.readDescriptor, events: Int16(POLLIN), revents: 0)
             ]
-            let milliseconds = Int32(max(1, min(remaining * 1000, Double(Int32.max))))
+            let milliseconds = Int32(max(1, min(remaining * 1000, 100)))
             let pollResult = pollDescriptors.withUnsafeMutableBufferPointer {
                 Darwin.poll($0.baseAddress, nfds_t($0.count), milliseconds)
             }
             if interruption.isInterrupted { throw CuaMCPProxyError.interrupted }
-            if pollResult == 0 { throw CuaMCPProxyError.timeout }
+            if pollResult == 0 { continue }
             if pollResult < 0 {
                 if errno == EINTR { continue }
                 throw CuaMCPProxyError.processExited
