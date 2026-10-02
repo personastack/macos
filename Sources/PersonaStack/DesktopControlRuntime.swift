@@ -304,6 +304,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         guard confirmForegroundSetup(), generation == lockGeneration,
               sessionLock.state == .unknown else { throw CancellationError() }
         sessionLock.confirmForegroundSetup()
+        guard sessionLock.allowsControl else { throw CancellationError() }
     }
 
     private static func showForegroundSetupConfirmation() -> Bool {
@@ -404,7 +405,6 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func requireCurrentStartup(_ generation: UUID) throws {
-        guard sessionLock.allowsControl else { throw CancellationError() }
         try Task.checkCancellation()
         try requireCurrentLifecycle(generation)
     }
@@ -1496,12 +1496,13 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     static func shouldRetryGuiObservation(operation: String?, readiness: String) -> Bool {
-        guard !Task.isCancelled else { return nil }
         operation == "desktop_control_observe" && readiness == "ready"
     }
 
     private func heartbeatReadiness() async -> String? {
+        guard !Task.isCancelled else { return nil }
         await markExitedCuaProxyUnavailable()
+        guard !Task.isCancelled else { return nil }
         if Self.shouldProbeGuiRecovery(readiness: readiness, paused: paused,
                                        unlocked: sessionLock.allowsControl, cuaReady: isOwnedCuaRunning()),
            let proxy {
@@ -1514,6 +1515,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                     readiness = "ready"
                 }
             } catch {
+                guard !Task.isCancelled else { return nil }
                 if generation == lifecycleGeneration, readiness == previousReadiness {
                     readiness = Self.readiness(for: error)
                     if readiness == "cua_unavailable" {
@@ -1523,12 +1525,14 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                                 readiness = "ready"
                             }
                         } catch {
+                            guard !Task.isCancelled else { return nil }
                             if generation == lifecycleGeneration { readiness = Self.readiness(for: error) }
                         }
                     }
                 }
             }
         }
+        guard !Task.isCancelled else { return nil }
         guard readiness == "ready" else { return readiness }
         guard isCuaReady() else {
             readiness = "cua_unavailable"
@@ -1604,7 +1608,6 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             let validatedTools = try await candidate.validateToolCatalog(catalog)
             try await verifyCuaHostIdentity(candidate, generation: generation)
             try await verifyCuaReadiness(candidate, generation: generation, timeout: 25)
-        guard !Task.isCancelled else { return nil }
             try requireCurrentLifecycle(generation)
             guard proxy === failed, startingProxy === candidate, isOwnedCuaRunning() else {
                 throw CuaMCPProxyError.serviceMismatch
@@ -1620,7 +1623,6 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         }
     }
 
-                guard !Task.isCancelled else { return nil }
     static func reconciledGuiReadiness(permissionProbeSucceeded: Bool, failureReadiness: String) -> String {
         permissionProbeSucceeded ? "ready" : failureReadiness
     }
@@ -1630,14 +1632,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                              guiReadiness: String,
                              nativeExecutorReady: Bool,
                              paused: Bool,
-                            guard !Task.isCancelled else { return nil }
                              locked: Bool,
                              sessionUnlocked: Bool) -> DesktopControlFrame {
         guard frame.type == "result", case .object(var result)? = frame.result else { return frame }
         let guiReady = guiReadiness == "ready"
         let nativeReady = nativeExecutorReady && result["native_executor_ready"] == .bool(true)
         result["connected"] = .bool(connected)
-        guard !Task.isCancelled else { return nil }
         result["gui_readiness"] = .string(guiReadiness)
         result["gui_ready"] = .bool(guiReady)
         result["available"] = .bool(nativeReady)
