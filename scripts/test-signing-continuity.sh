@@ -36,9 +36,7 @@ PLIST
 make_bundle first /usr/bin/true 1.0.0
 make_bundle second /usr/bin/false 1.0.1
 for name in first second; do
-  codesign --force --timestamp=none --identifier ai.personastack.desktop \
-    --keychain "$PERSONASTACK_CODESIGN_KEYCHAIN" --sign "$PERSONASTACK_CODESIGN_IDENTITY" "$fixture_dir/$name.app"
-  "$root_dir/scripts/verify-app-signature.sh" "$fixture_dir/$name.app"
+  "$root_dir/scripts/sign-app.sh" "$fixture_dir/$name.app"
   codesign --display -r- "$fixture_dir/$name.app" 2>&1 | sed -n 's/^designated => //p' > "$fixture_dir/$name.requirement"
 done
 cmp "$fixture_dir/first.requirement" "$fixture_dir/second.requirement"

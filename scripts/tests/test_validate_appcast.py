@@ -91,7 +91,7 @@ end
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_accepts_certificate_signed_installer(self) -> None:
-        result = self.run_validator(filename="PersonaStack-1.2.3-selfsigned.dmg", render_cask=True)
+        result = self.run_validator(filename="PersonaStack-1.2.3-developerid.dmg", render_cask=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_rejects_cask_selecting_a_different_installer(self) -> None:
@@ -101,7 +101,7 @@ end
     def test_rejects_wrong_signing_kind_for_supplied_installer(self) -> None:
         result = self.run_validator(
             archive_url="https://raw.githubusercontent.com/personastack/homebrew-tap/desktop-v1.2.3/Downloads/PersonaStack-1.2.3-unsigned.dmg",
-            filename="PersonaStack-1.2.3-selfsigned.dmg",
+            filename="PersonaStack-1.2.3-developerid.dmg",
         )
         self.assertNotEqual(result.returncode, 0)
 

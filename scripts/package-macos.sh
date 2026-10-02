@@ -76,12 +76,11 @@ if [ -n "$sparkle_public_key" ]; then
     || /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $sparkle_public_key" "$bundle_dir/Contents/Info.plist"
 fi
 
-artifact_suffix=selfsigned
-# Seal the completed bundle. The certificate-backed designated requirement
-# stays constant across builds. Preserve Sparkle's existing nested signatures.
-codesign --force --timestamp=none --identifier ai.personastack.desktop \
-  --keychain "$signing_keychain" --sign "$signing_identity" "$bundle_dir"
+artifact_suffix=developerid
+"$root_dir/scripts/sign-app.sh" "$bundle_dir"
 "$root_dir/scripts/verify-update-bundle.sh" "$bundle_dir" "$version" "$sparkle_public_key"
+"$root_dir/scripts/notarize.sh" "$bundle_dir"
+spctl --assess --type execute --verbose=2 "$bundle_dir"
 
 cp -R "$bundle_dir" "$staging_dir/"
 mkdir -p "$staging_dir/.background"
@@ -128,4 +127,9 @@ rmdir "$mount_point" "$mount_root"
 trap - EXIT
 hdiutil convert "$rw_dmg" -ov -format UDZO -imagekey zlib-level=9 -o "$artifact_dir/PersonaStack-$version-$artifact_suffix.dmg" >/dev/null
 rm -f "$rw_dmg"
+codesign --force --timestamp --keychain "$signing_keychain" --sign "$signing_identity" \
+  "$artifact_dir/PersonaStack-$version-$artifact_suffix.dmg"
+"$root_dir/scripts/notarize.sh" "$artifact_dir/PersonaStack-$version-$artifact_suffix.dmg"
+spctl --assess --type open --context context:primary-signature --verbose=2 \
+  "$artifact_dir/PersonaStack-$version-$artifact_suffix.dmg"
 printf '%s\n' "$artifact_dir/PersonaStack-$version-$artifact_suffix.dmg"

@@ -29,7 +29,7 @@ def main() -> int:
         raise SystemExit("release item has no enclosure")
     url = enclosure.get("url", "")
     expected_name = Path(dmg_path).name
-    if expected_name not in (f"PersonaStack-{version}-unsigned.dmg", f"PersonaStack-{version}-selfsigned.dmg"):
+    if expected_name not in (f"PersonaStack-{version}-unsigned.dmg", f"PersonaStack-{version}-selfsigned.dmg", f"PersonaStack-{version}-developerid.dmg"):
         raise SystemExit("release archive filename is not a supported versioned installer")
     expected_url = f"https://raw.githubusercontent.com/personastack/homebrew-tap/{tap_tag}/Downloads/{expected_name}"
     if url != expected_url:

@@ -27,9 +27,9 @@ brew install --cask personastack/tap/personastack
 
 Open PersonaStack from Applications and sign in. Requires macOS 14 or later.
 
-The app uses a persistent self-signed certificate. It is not Developer ID signed or notarized. If macOS blocks its first launch, choose **Open Anyway** in **System Settings → Privacy & Security**.
+The build uses the pinned Developer ID Application certificate for PersonaStack, LLC (team `5T2T8KL852`). The app and Sparkle helpers use hardened runtime and secure timestamps. Release builds are notarized by Apple. Both the app and installer carry stapled notarization tickets.
 
-After updating from an unsigned build, reapprove permissions once. For Accessibility, remove the old PersonaStack entry in Privacy & Security and add PersonaStack.app from Applications. For Screen Recording and Microphone, turn PersonaStack off and on. Relaunch if macOS requests it, then retry the Setup buttons.
+After moving from an unsigned or self-signed build to Developer ID signing, macOS may require permission approval again. For Accessibility, remove the old PersonaStack entry in Privacy & Security and add PersonaStack.app from Applications. For Screen Recording and Microphone, turn PersonaStack off and on. Relaunch if macOS requests it, then retry the Setup buttons.
 
 ## Updates
 

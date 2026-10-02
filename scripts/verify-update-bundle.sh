@@ -27,5 +27,18 @@ test -x "$framework/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installe
 lipo "$framework/Versions/B/Sparkle" -verify_arch arm64
 lipo "$framework/Versions/B/Sparkle" -verify_arch x86_64
 codesign --verify --deep --strict "$framework"
+verification_dir=$(mktemp -d "${TMPDIR:-/tmp}/personastack-nested-signatures.XXXXXX")
+trap 'rm -rf "$verification_dir"' EXIT
+for code in "$framework/Versions/B/XPCServices/Installer.xpc" \
+  "$framework/Versions/B/XPCServices/Downloader.xpc" \
+  "$framework/Versions/B/Autoupdate" "$framework/Versions/B/Updater.app" "$framework"; do
+  codesign --verify --strict "$code"
+  codesign --display --verbose=4 "$code" > "$verification_dir/details" 2>&1
+  codesign --display --extract-certificates="$verification_dir/certificate" "$code" >/dev/null 2>&1
+  cmp "$root_dir/Resources/ReleaseSigningCertificate.der" "$verification_dir/certificate0"
+  grep -Fxq 'TeamIdentifier=5T2T8KL852' "$verification_dir/details"
+  grep -Fq '(runtime)' "$verification_dir/details"
+  grep -q '^Timestamp=' "$verification_dir/details"
+done
 otool -l "$bundle/Contents/MacOS/PersonaStack" | grep -A2 LC_RPATH | grep -Fq '@executable_path/../Frameworks'
 otool -L "$bundle/Contents/MacOS/PersonaStack" | grep -Fq '@rpath/Sparkle.framework/Versions/B/Sparkle'

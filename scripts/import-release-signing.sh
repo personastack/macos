@@ -24,6 +24,7 @@ security set-keychain-settings -lut 7200 "$keychain"
 security unlock-keychain -p "$PERSONASTACK_CODESIGN_CERTIFICATE_PASSWORD" "$keychain"
 security import "$identity_dir/identity.p12" -k "$keychain" \
   -P "$PERSONASTACK_CODESIGN_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+security import "$root_dir/Resources/DeveloperIDG2CA.cer" -k "$keychain"
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
   -k "$PERSONASTACK_CODESIGN_CERTIFICATE_PASSWORD" "$keychain" >/dev/null
 # codesign also searches the user keychain list when constructing the certificate chain.
