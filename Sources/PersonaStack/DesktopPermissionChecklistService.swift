@@ -8,12 +8,12 @@ import PersonaStackCore
 import WebKit
 
 enum DesktopPermissionAutomaticCheckError: Error {
-    case sessionConfirmationRequired, runtimeStartRequired
+    case sessionUnavailable, runtimeStartRequired
 
     var observation: DesktopPermissionObservation {
         switch self {
-        case .sessionConfirmationRequired:
-            .init(.verificationRequired, detail: "Unlock this Mac, then choose Setup Screen Capture to confirm the current session before the capture check can run.")
+        case .sessionUnavailable:
+            .init(.verificationRequired, detail: "Desktop Control is unavailable while this Mac is asleep or another login session is active.")
         case .runtimeStartRequired:
             .init(.verificationRequired, detail: "Choose Setup Screen Capture to start PersonaStack's desktop runtime. Screen approval is already present; capture still needs the running runtime.")
         }

@@ -843,32 +843,31 @@ struct DesktopControlCommandExecutorTests {
     @Test
     func sessionLockRequiresObservedUnlockAndImmediatelyRejectsRelock() {
         let monitor = DesktopControlSessionLock(observeSystem: false)
-        #expect(!monitor.allowsControl)
+        #expect(monitor.state != .unlocked)
         var states: [DesktopControlSessionLock.State] = []
         monitor.onChange = { states.append($0) }
         monitor.receive(.unlocked)
-        #expect(monitor.allowsControl)
+        #expect(monitor.state == .unlocked)
         monitor.receive(.locked)
-        #expect(!monitor.allowsControl)
+        #expect(monitor.state != .unlocked)
         monitor.receive(.locked)
         #expect(states == [.unlocked, .locked])
     }
 
     @Test @MainActor
-    func sleepRequiresFreshUnlockOrForegroundConfirmation() async {
+    func sleepRecoversWithoutUnlockConfirmation() async {
         let workspaceCenter = NotificationCenter()
         let monitor = DesktopControlSessionLock(workspaceCenter: workspaceCenter, snapshotReader: { .unknown })
         monitor.receive(.unlocked)
 
         workspaceCenter.post(name: NSWorkspace.willSleepNotification, object: nil)
-        for _ in 0..<20 where monitor.allowsControl { await Task.yield() }
+        for _ in 0..<20 where monitor.state == .unlocked { await Task.yield() }
         #expect(monitor.state == .locked)
 
         workspaceCenter.post(name: NSWorkspace.didWakeNotification, object: nil)
         await Task.yield()
         #expect(monitor.state == .unknown)
-        monitor.confirmForegroundSetup()
-        #expect(monitor.allowsControl)
+        #expect(monitor.isAwakeAndActive)
     }
 
     private func target(persona: String, workspace: String = "workspace-1", config: String = "config-1", configVersion: Int64? = nil,

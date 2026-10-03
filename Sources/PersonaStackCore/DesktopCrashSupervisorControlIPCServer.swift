@@ -5,6 +5,8 @@ import LockedControlAudit
 /// Long-lived controller-owned local endpoint. The production initializer uses
 /// audit-token code verification. Tests use the pure dispatcher and identity rule.
 public final class DesktopCrashSupervisorControlIPCServer: @unchecked Sendable {
+    static let requestFrameTimeoutNanoseconds: UInt64 = 5_000_000_000
+
     /// Runs synchronously under the IPC lifecycle lock. The handler must enqueue
     /// MainActor work and return a cached state promptly. It must not call back
     /// into this server or wait for the locked-session transition. It must validate
@@ -227,11 +229,9 @@ public final class DesktopCrashSupervisorControlIPCServer: @unchecked Sendable {
         while isCurrent(serverFD, generation: generation) {
             // An authenticated connection is not yet a lease. Bound the first
             // frame as well so an idle client cannot block this serial listener.
-            let timeout: UInt64 = 5_000_000_000
-            let requestDeadline = now().addingReportingOverflow(timeout)
-            guard !requestDeadline.overflow,
+            guard let requestDeadline = Self.requestFrameDeadline(startingAt: now()),
                   let frame = Self.readExactly(clientFD, count: DesktopCrashSupervisorControlIPCCodec.requestSize,
-                                               deadline: requestDeadline.partialValue),
+                                               deadline: requestDeadline),
                   let request = DesktopCrashSupervisorControlIPCCodec.decodeRequest(frame),
                   let currentIdentity = identityProvider(),
                   let currentPeer = peerProvider(clientFD, pinnedCertificate),
@@ -387,6 +387,12 @@ public final class DesktopCrashSupervisorControlIPCServer: @unchecked Sendable {
             offset += amount
         }
         return data
+    }
+
+    static func requestFrameDeadline(startingAt now: UInt64,
+                                     timeoutNanoseconds: UInt64 = requestFrameTimeoutNanoseconds) -> UInt64? {
+        let deadline = now.addingReportingOverflow(timeoutNanoseconds)
+        return deadline.overflow ? nil : deadline.partialValue
     }
 
     static func writeExactly(_ fd: Int32, _ data: Data, deadline: UInt64) -> Bool {

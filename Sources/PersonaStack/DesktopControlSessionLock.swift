@@ -56,13 +56,12 @@ final class DesktopControlSessionLock {
         })
     }
 
-    var allowsControl: Bool { state == .unlocked }
     var isAwakeAndActive: Bool { !sleeping && !inactive }
     var readiness: String { state == .unknown ? "unknown" : "locked" }
 
     /// The lock key is not a documented API contract. Absence must never be
-    /// interpreted as approval. A foreground confirmation remains the recovery
-    /// path when macOS cannot provide an explicit, current unlock observation.
+    /// interpreted as proof of unlock. Ordinary operations do not require that
+    /// proof. The protected locked-control supervisor still requires OS readback.
     static func currentSnapshot() -> Snapshot {
         classify(CGSessionCopyCurrentDictionary() as? [String: Any], userID: getuid())
     }
@@ -99,11 +98,6 @@ final class DesktopControlSessionLock {
             if observedLock || sleeping || inactive { publish(.locked) }
             else if state != .unlocked { publish(.unknown) }
         }
-    }
-
-    func confirmForegroundSetup() {
-        guard state == .unknown, !observedLock, !sleeping, !inactive else { return }
-        publish(.unlocked)
     }
 
     func receive(_ value: State) {

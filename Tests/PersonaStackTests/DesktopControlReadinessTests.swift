@@ -198,17 +198,17 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
 @Test func degradedGuiHeartbeatRechecksOnlyAnUnlockedUsableCuaService() {
     for readiness in ["permission_required", "cua_unavailable"] {
         #expect(DesktopControlRuntime.shouldProbeGuiRecovery(readiness: readiness, paused: false,
-                                                              unlocked: true, cuaReady: true))
+                                                              sessionAvailable: true, cuaReady: true))
         #expect(!DesktopControlRuntime.shouldProbeGuiRecovery(readiness: readiness, paused: true,
-                                                               unlocked: true, cuaReady: true))
+                                                               sessionAvailable: true, cuaReady: true))
         #expect(!DesktopControlRuntime.shouldProbeGuiRecovery(readiness: readiness, paused: false,
-                                                               unlocked: false, cuaReady: true))
+                                                               sessionAvailable: false, cuaReady: true))
         #expect(!DesktopControlRuntime.shouldProbeGuiRecovery(readiness: readiness, paused: false,
-                                                               unlocked: true, cuaReady: false))
+                                                               sessionAvailable: true, cuaReady: false))
     }
     for readiness in ["ready", "paused", "locked", "upgrade_required", "unknown"] {
         #expect(!DesktopControlRuntime.shouldProbeGuiRecovery(readiness: readiness, paused: false,
-                                                               unlocked: true, cuaReady: true))
+                                                               sessionAvailable: true, cuaReady: true))
     }
 }
 
@@ -298,8 +298,8 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
         return
     }
     #expect(pausedValues["connected"] == .bool(true))
-    #expect(pausedValues["gui_readiness"] == .string("locked"))
-    #expect(pausedValues["native_executor_ready"] == .bool(true))
+    #expect(pausedValues["gui_readiness"] == .string("permission_required"))
+    #expect(pausedValues["native_executor_ready"] == .bool(false))
     #expect(pausedValues["paused"] == .bool(true))
     #expect(pausedValues["locked"] == .bool(true))
     #expect(pausedValues["session_unlocked"] == .bool(false))

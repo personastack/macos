@@ -68,8 +68,9 @@ class MenuBarLayoutTests(unittest.TestCase):
         controls = block(self.menu, "private var desktopControlActions")
         self.assertIn("DesktopPermissionChecklist.shared.window.presentForRepair()",
                       block(controls, 'Button("Permissions and Setup…")'))
-        self.assertIn("relayEnabled && DesktopControlRuntime.shared.requiresForegroundSessionConfirmation", controls)
-        self.assertIn("try DesktopControlRuntime.shared.confirmForegroundSession()", controls)
+        self.assertNotIn("requiresForegroundSessionConfirmation", controls)
+        self.assertNotIn("confirmForegroundSession", controls)
+        self.assertNotIn('Button("Confirm This Mac Is Unlocked")', controls)
         self.assertIn("relayEnabled || DesktopControlRuntime.shared.hasPendingEnvironmentSwitch", controls)
         self.assertIn("Task { await repairCua() }", controls)
         self.assertIn(".disabled(status.isRepairing || DesktopControlRuntime.shared.isDisconnecting)", controls)

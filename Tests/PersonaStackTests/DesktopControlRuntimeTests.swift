@@ -342,9 +342,11 @@ func cuaFinishWaitsForPermissionTeardownBeforeSuccessorStartup(_ stage: String) 
     model.open()
     await model.refresh()
     model.setup(.screenRecording)
-    for _ in 0..<100 {
-        if FileManager.default.fileExists(atPath: root.appendingPathComponent("daemon-stopping").path) { break }
-        try await Task.sleep(for: .milliseconds(5))
+    // Await the child shutdown handshake, allowing parallel fixture startup load.
+    let stoppingDeadline = ContinuousClock.now + .seconds(5)
+    while !FileManager.default.fileExists(atPath: root.appendingPathComponent("daemon-stopping").path),
+          ContinuousClock.now < stoppingDeadline {
+        try await Task.sleep(for: .milliseconds(10))
     }
     #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("daemon-stopping").path))
     // Cancel after daemon shutdown has started. Cleanup must remain responsive
@@ -385,14 +387,14 @@ func cuaFinishWaitsForPermissionTeardownBeforeSuccessorStartup(_ stage: String) 
     #expect(await installer.repairArguments == [false])
 }
 
-@Test @MainActor func nativePermissionVerificationKeepsTheLockedSessionFence() async {
-    let installer = DesktopControlInstallerFixture(errors: [])
+@Test @MainActor func nativePermissionPreparationAttemptsLockedSessionAndReturnsActualFailure() async {
+    let installer = DesktopControlInstallerFixture(errors: [CuaDriverInstallError.invalidLayout])
     let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: EmptyDesktopControlCredentialStore(),
-                                                       readiness: "locked", sessionLockState: .locked)
-    await #expect(throws: DesktopControlEnrollmentError.nativeCapabilitiesUnavailable) { try await runtime.prepareCuaPermissions() }
+                                                       readiness: "unknown", sessionLockState: .locked)
+    await #expect(throws: CuaDriverInstallError.invalidLayout) { try await runtime.prepareCuaPermissions() }
     await #expect(throws: CuaMCPProxyError.permissionsRequired) { try await runtime.verifyCuaCapabilitiesForPermissions() }
-    #expect(await installer.repairArguments.isEmpty)
-    #expect(runtime.readiness == "locked")
+    #expect(await installer.repairArguments == [false])
+    #expect(runtime.readiness == "cua_unavailable")
 }
 
 private struct EmbeddedRuntimeDriverFixture: DesktopControlDriverInstalling {
@@ -488,7 +490,9 @@ for line in sys.stdin:
                 open(os.path.join(root, 'permissions-waiting'), 'w').close()
                 while os.path.exists(os.path.join(root, 'pause-permissions')): time.sleep(0.01)
             assert request['params']['arguments'] == {'prompt':False,'probe_direct_capture':False}
-            result = {'structuredContent':{'accessibility':True,'screen_recording':True,'source':{'attribution':'host','host_bundle_id':'ai.personastack.desktop','embedded':True,'disclaim_env':False,'pid':daemon,'responsible_ppid':host}}}
+            result = {'structuredContent':{'accessibility':not os.path.exists(os.path.join(root, 'permission-failure')),'screen_recording':True,'source':{'attribution':'host','host_bundle_id':'ai.personastack.desktop','embedded':True,'disclaim_env':False,'pid':daemon,'responsible_ppid':host}}}
+        elif name == 'launch_app':
+            result = {'isError':True,'content':[{'type':'text','text':'fixture operation failed'}]}
         elif name == 'get_desktop_state':
             assert not os.path.exists(os.path.join(root, 'screen-denied')), 'AX verification must not capture a screen'
             if os.path.exists(os.path.join(root,'exit-proxy')): os._exit(1)
@@ -634,7 +638,7 @@ func permissionOnlyUnlockWaitsForExplicitSetupWithoutCredentialsOrCapture(grante
         #expect(!preparedCalls.contains("get_desktop_state") && !preparedCalls.contains("get_accessibility_tree"))
         runtime.receiveSessionLockForTesting(.locked)
         await runtime.waitForSessionLockChangeForTesting()
-        #expect(runtime.readiness == "locked" && !runtime.isCuaReady())
+        #expect(runtime.readiness == (paused ? "paused" : "permission_required") && !runtime.isCuaReady())
         runtime.receiveSessionLockForTesting(.unlocked)
         await runtime.waitForSessionLockChangeForTesting()
         #expect(try runtimeFixtureCalls(root) == preparedCalls)
@@ -642,7 +646,7 @@ func permissionOnlyUnlockWaitsForExplicitSetupWithoutCredentialsOrCapture(grante
         #expect(!runtime.hasActiveInstallation && !runtime.gatewayConnected && !runtime.hasPendingRelayReconnectForTesting)
         #expect(runtime.paused == paused && runtime.readiness == (paused ? "paused" : "permission_required"))
         #expect(!runtime.isCuaReady())
-        // Only another explicit action can replace the interrupted proxy and verify.
+        // Only an explicit action can perform functional permission verification.
         try await runtime.prepareCuaPermissions()
         if granted {
             try await runtime.verifyCuaCapabilitiesForPermissions()
@@ -686,7 +690,7 @@ func fullSetupAfterPermissionPreparationRestoresAutomaticUnlockRecovery(grantedA
         #expect(recoveryCalls.contains("get_accessibility_tree") == grantedAfterUnlock)
         #expect(runtime.isCuaReady() == grantedAfterUnlock)
         #expect(runtime.readiness == (grantedAfterUnlock ? "ready" : "permission_required"))
-        #expect(credentials.readCount == 2 && !runtime.paused)
+        #expect(credentials.readCount == 1 && !runtime.paused)
         await runtime.shutdownForQuit()
     } catch { await runtime.shutdownForQuit(); throw error }
 }
@@ -1034,7 +1038,7 @@ func enrolledRuntimeKeepsUnlockRecoveryDuringPermissionRepair(grantedAfterUnlock
     #expect(throws: Never.self) { try runtime.beginResume() }
 }
 
-@Test @MainActor func macOSLockFencesCommandsBeforeAsynchronousHeartbeat() async {
+@Test @MainActor func macOSOrdinaryLockRetainsAuthorizedLease() async {
     let power = DesktopControlPowerAssertion.testFixture()
     let executor = DesktopControlCommandExecutor(powerAssertion: power)
     let owner = DesktopControlTarget(installationID: "install", workspaceID: "workspace", configID: "config",
@@ -1048,10 +1052,9 @@ func enrolledRuntimeKeepsUnlockRecoveryDuringPermissionRepair(grantedAfterUnlock
         credentials: EmptyDesktopControlCredentialStore(), executor: executor,
         sessionLockState: .locked
     )
-    #expect(runtime.lockCleanupStartedForTesting)
-    #expect(runtime.readiness == "locked")
+    #expect(!runtime.lockCleanupStartedForTesting)
     await runtime.waitForLockCleanupForTesting()
-    #expect(!power.isHeld)
+    #expect(power.isHeld)
     _ = await executor.close()
 }
 
@@ -1491,16 +1494,13 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     #expect(runtime.readiness == "permission_required")
 }
 
-@Test @MainActor func foregroundSetupConfirmationAllowsOnlyUnknownSession() {
-    let lock = DesktopControlSessionLock(observeSystem: false)
-    #expect(!lock.allowsControl)
-    lock.confirmForegroundSetup()
-    #expect(lock.allowsControl)
-    lock.receive(.locked)
-    lock.confirmForegroundSetup()
-    #expect(!lock.allowsControl)
-    lock.receive(.unlocked)
-    #expect(lock.allowsControl)
+@Test @MainActor func sessionObservationsDoNotRequireUnlockApproval() {
+    let monitor = DesktopControlSessionLock(observeSystem: false)
+    for state in [DesktopControlSessionLock.State.unknown, .locked, .unlocked] {
+        monitor.receive(state)
+        #expect(monitor.state == state)
+        #expect(monitor.isAwakeAndActive)
+    }
 }
 
 @Test @MainActor func desktopLockSeparatesOrdinaryLockFromInactiveLifecycle() {
@@ -1513,7 +1513,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     lock.onLifecycleLoss = { lifecycleLosses += 1 }
 
     lock.receive(.locked)
-    #expect(!lock.allowsControl)
+    #expect(lock.state != .unlocked)
     #expect(lock.isAwakeAndActive)
     #expect(lifecycleLosses == 0)
 
@@ -1529,7 +1529,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     snapshot = .locked
     workspace.post(name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
     #expect(lock.isAwakeAndActive)
-    #expect(!lock.allowsControl)
+    #expect(lock.state != .unlocked)
 }
 
 @Test @MainActor func desktopControlRuntimeAcquiresFromLockedSessionUsingRealExecutorLease() async throws {
@@ -1579,7 +1579,7 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     await fixture.runtime.waitForLockCleanupForTesting()
 }
 
-@Test @MainActor func desktopControlUnqualifiedLockedAcquireHasNoLeaseOrSupervisorEffects() async throws {
+@Test @MainActor func desktopControlUnqualifiedLockedAcquireAttemptsWithoutSupervisor() async throws {
     let fixture = try await makeLockedControlRuntimeWorkflowFixture(preacquire: false, initialLock: .locked,
                                                                    acknowledgedSetup: false)
     defer { fixture.defaults.removePersistentDomain(forName: fixture.defaultsName) }
@@ -1589,10 +1589,11 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
         lockedControlFrame("desktop_control_acquire", target: fixture.owner),
         connectionID: fixture.boundary.connectionID)
 
-    #expect(response.type == "failure")
-    #expect(response.errorCode == "locked")
-    #expect(fixture.executor.currentLease == nil)
+    #expect(response.type == "result")
+    #expect(fixture.executor.currentLease != nil)
     #expect(fixture.boundary.transport.events.isEmpty)
+    #expect(fixture.power.isHeld)
+    await fixture.runtime.shutdownForQuit()
     #expect(!fixture.power.isHeld)
 }
 
@@ -1772,49 +1773,15 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     await fixture.runtime.waitForLockCleanupForTesting()
 }
 
-@Test @MainActor func lockDuringForegroundConfirmationInvalidatesApproval() throws {
-    var runtime: DesktopControlRuntime!
-    runtime = DesktopControlRuntime.makeForTesting(
-        installer: DesktopControlInstallerFixture(errors: []),
-        credentials: EmptyDesktopControlCredentialStore(),
-        confirmForegroundSetup: {
-            runtime.receiveSessionLockForTesting(.locked)
-            runtime.receiveSessionLockForTesting(.unlocked)
-            return true
-        }
-    )
-    defer { runtime = nil }
-    #expect(throws: CancellationError.self) { try runtime.confirmForegroundSession() }
-}
 
-@Test @MainActor func restartConfirmationRequiresForegroundApprovalAndNeverOverridesLock() throws {
-    let denied = DesktopControlRuntime.makeForTesting(
-        installer: DesktopControlInstallerFixture(errors: []),
-        credentials: EmptyDesktopControlCredentialStore(),
-        confirmForegroundSetup: { false }
-    )
-    #expect(denied.requiresForegroundSessionConfirmation)
-    #expect(throws: CancellationError.self) { try denied.confirmForegroundSession() }
-    #expect(denied.requiresForegroundSessionConfirmation)
 
-    let approved = DesktopControlRuntime.makeForTesting(
-        installer: DesktopControlInstallerFixture(errors: []),
-        credentials: EmptyDesktopControlCredentialStore(),
-        confirmForegroundSetup: { true }
-    )
-    try approved.confirmForegroundSession()
-    #expect(!approved.requiresForegroundSessionConfirmation)
-    #expect(approved.sessionRecoveryMessage == nil)
-
-    let locked = DesktopControlRuntime.makeForTesting(
-        installer: DesktopControlInstallerFixture(errors: []),
-        credentials: EmptyDesktopControlCredentialStore(),
-        sessionLockState: .locked,
-        confirmForegroundSetup: { true }
-    )
-    #expect(!locked.requiresForegroundSessionConfirmation)
-    #expect(throws: DesktopControlEnrollmentError.self) { try locked.confirmForegroundSession() }
-    #expect(locked.sessionRecoveryMessage == "Unlock this Mac to enable remote control.")
+@Test @MainActor func ordinarySessionStatesNeverAskForUnlockConfirmation() {
+    for state in [DesktopControlSessionLock.State.unknown, .locked, .unlocked] {
+        let runtime = DesktopControlRuntime.makeForTesting(
+            installer: DesktopControlInstallerFixture(errors: []),
+            credentials: EmptyDesktopControlCredentialStore(), sessionLockState: state)
+        #expect(runtime.sessionRecoveryMessage == nil)
+    }
 }
 
 @Test @MainActor func repairAllowsOnlyOneForcedInstallAfterRetryableFailure() async throws {
@@ -1861,18 +1828,15 @@ private actor DesktopControlSetupEnrollmentFixture: DesktopControlSetupEnrollmen
     #expect(runtime.readiness == "permission_required")
 }
 
-@Test @MainActor func setupCancellationBeforeUnknownLockConfirmationDoesNotStartCua() async throws {
+@Test @MainActor func cancelledSetupDoesNotStartCuaWithoutUnlockConfirmation() async throws {
     let installer = DesktopControlInstallerFixture(errors: [])
-    let runtime = DesktopControlRuntime.makeForTesting(
-        installer: installer,
-        credentials: EmptyDesktopControlCredentialStore(),
-        confirmForegroundSetup: { false }
-    )
+    let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: EmptyDesktopControlCredentialStore())
     let generation = try runtime.beginResume()
-
-    await #expect(throws: CancellationError.self) {
+    let task = Task { @MainActor in
+        withUnsafeCurrentTask { $0?.cancel() }
         try await runtime.resumeForSetup(generation: generation)
     }
+    await #expect(throws: CancellationError.self) { try await task.value }
     #expect(await installer.repairArguments.isEmpty)
 }
 
@@ -2425,13 +2389,13 @@ func cuaFinishWaitsForCancelledStartupCleanupBeforeSuccessorUsesDaemon(_ stage: 
 }
 
 
-@Test @MainActor func desktopControlAutomaticPermissionPreparationRequiresKnownUnlockedSession() async {
+@Test @MainActor func desktopControlPermissionPreparationAttemptsWithoutKnownUnlock() async {
     for state in [DesktopControlSessionLock.State.unknown, .locked] {
-        let installer = DesktopControlInstallerFixture(errors: [])
+        let installer = DesktopControlInstallerFixture(errors: [CuaDriverInstallError.invalidLayout])
         let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: DeniedDesktopControlCredentialStore(),
-            sessionLockState: state, confirmForegroundSetup: { Issue.record("Automatic checks must not confirm a session"); return false })
-        await #expect(throws: DesktopPermissionAutomaticCheckError.self) { try await runtime.prepareCuaPermissionsAutomatically() }
-        #expect(await installer.repairArguments.isEmpty)
+            sessionLockState: state)
+        await #expect(throws: CuaDriverInstallError.invalidLayout) { try await runtime.prepareCuaPermissionsAutomatically() }
+        #expect(await installer.repairArguments == [false])
         #expect(!runtime.hasActiveInstallation && !runtime.gatewayConnected)
     }
 }
@@ -2443,10 +2407,8 @@ func permissionApprovalDoesNotConfirmOrUseTheRuntimeSession(warm: Bool, first: D
     defer { try? FileManager.default.removeItem(at: root) }
     let executable = try makeRuntimeDriverFixture(root)
     let credentials = PermissionPreparationCredentialStore(installation: nil)
-    var confirmations = 0
     let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
-        credentials: credentials, readiness: "paused", paused: true,
-        confirmForegroundSetup: { confirmations += 1; return true }, hostPermissions: { (true, true) })
+        credentials: credentials, readiness: "paused", paused: true, hostPermissions: { (true, true) })
     var access = DesktopPermissionSystemAccess.permissionFixture()
     access.accessibility = { true }
     access.screenRecording = { true }
@@ -2469,20 +2431,16 @@ func permissionApprovalDoesNotConfirmOrUseTheRuntimeSession(warm: Bool, first: D
         model.open()
         model.startPresentationVerification()
         while model.verificationBusyPermission != nil { await Task.yield() }
-        #expect(confirmations == 0 && runtime.requiresForegroundSessionConfirmation)
         #expect(model.rows.first { $0.id == .accessibility }?.state == .ready)
         #expect(model.rows.first { $0.id == .screenRecording }?.state == .ready)
         #expect(model.canFinish)
         for id in [first, first == .accessibility ? .screenRecording : .accessibility] {
-            let previousConfirmations = confirmations
             model.setup(id)
             while model.busyPermission != nil { await Task.yield() }
             #expect(model.rows.first { $0.id == id }?.isComplete == true)
-            if id == .accessibility { #expect(confirmations == previousConfirmations) }
         }
         let calls = warm ? try runtimeFixtureCalls(root) : []
         #expect(!calls.contains("click") && !calls.contains("type_text"))
-        #expect(confirmations == 0 && runtime.requiresForegroundSessionConfirmation)
         #expect(model.canFinish && runtime.paused && !runtime.gatewayConnected && !runtime.hasActiveInstallation)
         #expect(credentials.readCount == 0 && !runtime.hasPendingRelayReconnectForTesting)
         if warm {
@@ -2498,35 +2456,20 @@ func permissionApprovalDoesNotConfirmOrUseTheRuntimeSession(warm: Bool, first: D
     } catch { service.window.cancel(); await runtime.shutdownForQuit(); throw error }
 }
 
-@Test(arguments: ["cancel", "lock", "owner-change"]) @MainActor
-func permissionSetupConfirmationFencesWarmRuntime(outcome: String) async throws {
-    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-session-denied-\(UUID().uuidString)")
+@Test(arguments: [DesktopControlSessionLock.State.unknown, .locked]) @MainActor
+func permissionSetupReusesWarmRuntimeWithoutUnlockConfirmation(state: DesktopControlSessionLock.State) async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-session-attempt-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
     defer { try? FileManager.default.removeItem(at: root) }
     let executable = try makeRuntimeDriverFixture(root)
-    var confirmations = 0
-    var changeOwner: (() -> Void)?
     let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
-        credentials: DeniedDesktopControlCredentialStore(), confirmForegroundSetup: {
-            confirmations += 1
-            changeOwner?()
-            return outcome != "cancel"
-        }, hostPermissions: { (true, true) })
-    if outcome == "owner-change" { changeOwner = { _ = try? runtime.beginResume() } }
+        credentials: DeniedDesktopControlCredentialStore(), sessionLockState: state, hostPermissions: { (true, true) })
     do {
         try await runtime.startUnconfirmedPermissionRuntimeForTesting()
         let calls = try runtimeFixtureCalls(root)
-        if outcome == "lock" {
-            runtime.receiveSessionLockForTesting(.locked)
-            await runtime.waitForSessionLockChangeForTesting()
-            await #expect(throws: DesktopControlEnrollmentError.nativeCapabilitiesUnavailable) { try await runtime.prepareCuaPermissions() }
-            #expect(confirmations == 0)
-        } else {
-            await #expect(throws: CancellationError.self) { try await runtime.prepareCuaPermissions() }
-            #expect(confirmations == 1)
-        }
+        try await runtime.prepareCuaPermissions()
         #expect(try runtimeFixtureCalls(root) == calls)
-        #expect(!runtime.isCuaReady() && !runtime.gatewayConnected && !runtime.hasActiveInstallation)
+        #expect(!runtime.gatewayConnected && !runtime.hasActiveInstallation)
         await runtime.shutdownForQuit()
     } catch { await runtime.shutdownForQuit(); throw error }
 }
@@ -2534,8 +2477,7 @@ func permissionSetupConfirmationFencesWarmRuntime(outcome: String) async throws 
 @Test @MainActor func desktopControlAutomaticPermissionColdStartUsesOnlyIdlePermissionOwner() async {
     let installer = DesktopControlInstallerFixture(errors: [CuaDriverInstallError.invalidLayout])
     let runtime = DesktopControlRuntime.makeForTesting(installer: installer, credentials: DeniedDesktopControlCredentialStore(),
-        readiness: "paused", paused: true, sessionLockState: .unlocked,
-        confirmForegroundSetup: { Issue.record("Known unlocked checks need no confirmation"); return false })
+        readiness: "paused", paused: true, sessionLockState: .unlocked)
     await #expect(throws: CuaDriverInstallError.invalidLayout) { try await runtime.prepareCuaPermissionsAutomatically() }
     #expect(await installer.repairArguments == [false])
     #expect(runtime.paused && runtime.readiness == "paused")
@@ -2588,7 +2530,6 @@ func desktopControlAutomaticColdStartAndCapturePreserveEnrollmentAndRemoteLease(
     let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
     let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
         credentials: credentials, executor: executor, sessionLockState: .unlocked,
-        confirmForegroundSetup: { Issue.record("Automatic checks cannot confirm a session"); return false },
         hostPermissions: { (true, true) })
     func verify() async throws {
         if automatic { try await runtime.verifyCuaCapabilitiesAutomatically() }
@@ -3072,17 +3013,78 @@ struct DesktopControlKeychainRaceTests {
 }
 
 
-@Test @MainActor func desktopLockedStatusKeepsRawLockFactsWhenQualifiedControlIsAvailable() {
+@Test @MainActor func desktopLockedStatusKeepsRawLockFactsWhenOperationsAreAvailable() {
     let original = DesktopControlFrame(type: "result", result: .object(["native_executor_ready": .bool(true)]))
     let response = DesktopControlRuntime.enrichStatus(original, connected: true, guiReadiness: "ready",
-        nativeExecutorReady: true, paused: false, locked: true, sessionUnlocked: false,
-        lockedSessionAvailable: true)
+        nativeExecutorReady: true, paused: false, locked: true, sessionUnlocked: false)
     guard case .object(let result)? = response.result else { Issue.record("Missing status result"); return }
     #expect(result["locked"] == .bool(true))
     #expect(result["session_unlocked"] == .bool(false))
     #expect(result["control_available"] == .bool(true))
-    let unsupported = DesktopControlRuntime.enrichStatus(original, connected: true, guiReadiness: "ready",
-        nativeExecutorReady: true, paused: false, locked: true, sessionUnlocked: false)
-    guard case .object(let unavailable)? = unsupported.result else { Issue.record("Missing unsupported status"); return }
-    #expect(unavailable["control_available"] == .bool(false))
+
+}
+
+
+@Test(arguments: [DesktopControlSessionLock.State.unknown, .locked]) @MainActor
+func desktopControlAttemptsOperationsWithoutUnlockProof(state: DesktopControlSessionLock.State) async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-operation-attempt-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let executable = try makeRuntimeDriverFixture(root)
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: Data(#"{"installation_id":"attempt-test","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://gateway.test/v1/desktop-control/ws"}"#.utf8))
+    let connection = UUID()
+    let owner = DesktopControlTarget(installationID: installation.installationID, workspaceID: "workspace",
+        configID: "config", personaID: "persona", runID: "run", generation: 1, configVersion: 1)
+    let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
+    let verifier = DesktopLockedControlSetupVerifier(operations: .init(inspect: { .absent }))
+    let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
+        credentials: DeniedDesktopControlCredentialStore(), executor: executor, connectionID: connection,
+        installation: installation, connected: true, sessionLockState: state, lockedControlSetupVerifier: verifier, hostPermissions: { (true, true) })
+    do {
+        await runtime.waitForSessionLockChangeForTesting()
+        try await runtime.prepareCuaPermissions()
+        // Even without prior GUI readiness, an authenticated live driver can try the operation.
+        #expect(!runtime.isCuaReady())
+        let acquire = await runtime.handleForTesting(lockedControlFrame("desktop_control_acquire", target: owner), connectionID: connection)
+        #expect(acquire.type == "result")
+        let token = try #require(executor.currentLease?.token.uuidString.lowercased())
+        func gui(_ operation: String, _ tool: String, token: String) -> DesktopControlFrame {
+            lockedControlFrame(operation, target: owner, arguments: .object([
+                "control_token": .string(token), "tool": .string(tool), "arguments": .object([:])]))
+        }
+        let before = try runtimeFixtureCalls(root)
+        let denied = await runtime.handleForTesting(gui("desktop_control_observe", "get_accessibility_tree", token: "wrong"), connectionID: connection)
+        #expect(denied.type == "failure")
+        #expect(try runtimeFixtureCalls(root) == before)
+        let stale = await runtime.handleForTesting(gui("desktop_control_observe", "get_accessibility_tree", token: token), connectionID: UUID())
+        #expect(stale.errorCode == "desktop_connection_stale")
+        #expect(try runtimeFixtureCalls(root) == before)
+        let observed = await runtime.handleForTesting(gui("desktop_control_observe", "get_accessibility_tree", token: token), connectionID: connection)
+        #expect(observed.type == "result")
+        #expect(try runtimeFixtureCalls(root).filter { $0 == "get_accessibility_tree" }.count == 1)
+        let failed = await runtime.handleForTesting(gui("desktop_control_application", "launch_app", token: token), connectionID: connection)
+        #expect(failed.type == "failure" && failed.errorCode == "desktop_command_failed")
+        #expect(try runtimeFixtureCalls(root).filter { $0 == "launch_app" }.count == 1)
+        let stat = lockedControlFrame("desktop_control_file", target: owner, arguments: .object([
+            "control_token": .string(token), "action": .string("stat"), "path": .string(root.path)]))
+        #expect(await runtime.handleForTesting(stat, connectionID: connection).type == "result")
+        let status = await runtime.handleForTesting(lockedControlFrame("desktop_control_status", target: owner), connectionID: connection)
+        guard case .object(let values)? = status.result else { throw CuaMCPProxyError.invalidResponse }
+        #expect(values["session_unlocked"] == .bool(false))
+        #expect(values["locked"] == .bool(state == .locked))
+        #expect(values["control_available"] == .bool(true))
+        _ = await verifier.refresh()
+        #expect(runtime.readiness == "ready")
+        try Data().write(to: root.appendingPathComponent("permission-failure"))
+        let failedWithRecoveryError = await runtime.handleForTesting(gui("desktop_control_application", "launch_app", token: token), connectionID: connection)
+        #expect(failedWithRecoveryError.errorCode == "desktop_command_failed")
+        #expect(runtime.readiness == "permission_required")
+        #expect(try runtimeFixtureCalls(root).filter { $0 == "launch_app" }.count == 2)
+        let calls = try runtimeFixtureCalls(root)
+        _ = runtime.beginPause()
+        let paused = await runtime.handleForTesting(gui("desktop_control_application", "launch_app", token: token), connectionID: connection)
+        #expect(paused.errorCode == "desktop_paused")
+        #expect(try runtimeFixtureCalls(root) == calls)
+        await runtime.shutdownForQuit()
+    } catch { await runtime.shutdownForQuit(); throw error }
 }

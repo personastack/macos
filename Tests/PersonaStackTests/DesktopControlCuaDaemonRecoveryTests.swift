@@ -34,7 +34,7 @@ import Testing
         relayActive: Bool = true,
         ownedDaemonExited: Bool = true,
         paused: Bool = false,
-        sessionUnlocked: Bool = true,
+        sessionAvailable: Bool = true,
         disconnecting: Bool = false,
         environmentSwitchPending: Bool = false,
         repairInProgress: Bool = false,
@@ -48,7 +48,7 @@ import Testing
             relayActive: relayActive,
             ownedDaemonExited: ownedDaemonExited,
             paused: paused,
-            sessionUnlocked: sessionUnlocked,
+            sessionAvailable: sessionAvailable,
             disconnecting: disconnecting,
             environmentSwitchPending: environmentSwitchPending,
             repairInProgress: repairInProgress,
@@ -64,25 +64,25 @@ import Testing
     #expect(!makeEligibility(relayActive: false).shouldRecover)
     #expect(!makeEligibility(ownedDaemonExited: false).shouldRecover)
     #expect(!makeEligibility(paused: true).shouldRecover)
-    #expect(!makeEligibility(sessionUnlocked: false).shouldRecover)
+    #expect(!makeEligibility(sessionAvailable: false).shouldRecover)
     #expect(!makeEligibility(disconnecting: true).shouldRecover)
     #expect(!makeEligibility(environmentSwitchPending: true).shouldRecover)
     #expect(!makeEligibility(repairInProgress: true).shouldRecover)
     #expect(!makeEligibility(executorCleanupPending: true).shouldRecover)
     #expect(!makeEligibility(setupMayRunUnconfigured: true).shouldRecover)
-    #expect(!makeEligibility(sessionUnlocked: false).shouldRecover)
-    #expect(makeEligibility(sessionUnlocked: false, qualifiedLockedSession: true).shouldRecover)
-    #expect(!makeEligibility(sessionUnlocked: false, qualifiedLockedSession: true,
+    #expect(!makeEligibility(sessionAvailable: false).shouldRecover)
+    #expect(makeEligibility(sessionAvailable: false, qualifiedLockedSession: true).shouldRecover)
+    #expect(!makeEligibility(sessionAvailable: false, qualifiedLockedSession: true,
                              supervisorOwnsDaemon: true).shouldRecover)
-    #expect(!makeEligibility(sessionUnlocked: false, qualifiedLockedSession: false,
+    #expect(!makeEligibility(sessionAvailable: false, qualifiedLockedSession: false,
                              supervisorOwnsDaemon: false).shouldRecover)
-    #expect(!makeEligibility(paused: true, sessionUnlocked: false,
+    #expect(!makeEligibility(paused: true, sessionAvailable: false,
                              qualifiedLockedSession: true).shouldRecover)
-    #expect(!makeEligibility(relayActive: false, sessionUnlocked: false,
+    #expect(!makeEligibility(relayActive: false, sessionAvailable: false,
                              qualifiedLockedSession: true).shouldRecover)
-    #expect(!makeEligibility(ownedDaemonExited: false, sessionUnlocked: false,
+    #expect(!makeEligibility(ownedDaemonExited: false, sessionAvailable: false,
                              qualifiedLockedSession: true).shouldRecover)
-    #expect(!makeEligibility(sessionUnlocked: false, executorCleanupPending: true,
+    #expect(!makeEligibility(sessionAvailable: false, executorCleanupPending: true,
                              qualifiedLockedSession: true).shouldRecover)
 }
 

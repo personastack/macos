@@ -60,7 +60,7 @@ struct CuaDaemonRecoveryEligibility {
     let relayActive: Bool
     let ownedDaemonExited: Bool
     let paused: Bool
-    let sessionUnlocked: Bool
+    let sessionAvailable: Bool
     let disconnecting: Bool
     let environmentSwitchPending: Bool
     let repairInProgress: Bool
@@ -71,7 +71,7 @@ struct CuaDaemonRecoveryEligibility {
 
     var shouldRecover: Bool {
         automaticRecoveryAllowed && relayActive && ownedDaemonExited && !paused
-            && (sessionUnlocked || qualifiedLockedSession) && !supervisorOwnsDaemon
+            && (sessionAvailable || qualifiedLockedSession) && !supervisorOwnsDaemon
             && !disconnecting && !environmentSwitchPending && !repairInProgress && !executorCleanupPending
             && !setupMayRunUnconfigured
     }
@@ -124,7 +124,6 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private let relayStateReader: (any DesktopControlRelayStateReading)?
     private let preferences: UserDefaults
     private let configurationProvider: () throws -> DesktopEnvironmentConfiguration
-    private let confirmForegroundSetup: @MainActor () -> Bool
     private var cuaService: CuaEmbeddedService?
     private var selectedCuaExecutableURL: URL?
     private var verifiedCuaHostGeneration: UUID?
@@ -378,7 +377,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             connected: gatewayConnected, lastConnection: lastSuccessfulConnection,
             guiReady: readiness == "ready" && isCuaReady(),
             nativeReady: nativeExecutorReady,
-            session: sessionLock.allowsControl ? .unlocked : (sessionLock.state == .locked ? .locked : .unavailable),
+            session: sessionLock.state == .unlocked ? .unlocked : (sessionLock.state == .locked ? .locked : .unavailable),
             login: login, reconnectPending: reconnectTask != nil,
             cleanupPending: executorCleanupInProgress || pauseCleanupGeneration != nil,
             resources: generation == lifecycleGeneration && currentExecutor === executor ? resources : nil,
@@ -394,7 +393,6 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                  preferences: UserDefaults = .standard,
                  now: @escaping () -> Date = Date.init,
                  configurationProvider: @escaping () throws -> DesktopEnvironmentConfiguration = { try LaunchConfiguration.selectedEnvironment() },
-                 confirmForegroundSetup: @escaping @MainActor () -> Bool = DesktopControlRuntime.showForegroundSetupConfirmation,
                  lockedControlSetupVerifier: DesktopLockedControlSetupVerifier = .shared,
                  lockedControlController: DesktopLockedControlRuntimeController? = nil,
                  sessionLock: DesktopControlSessionLock = DesktopControlSessionLock(),
@@ -408,7 +406,6 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         self.preferences = preferences
         self.now = now
         self.configurationProvider = configurationProvider
-        self.confirmForegroundSetup = confirmForegroundSetup
         self.lockedControlSetupVerifier = lockedControlSetupVerifier
         self.lockedControlControllerOverride = lockedControlController
         self.sessionLock = sessionLock
@@ -428,7 +425,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                 self.sessionLockChangeTask = Task { await self.sessionLockChanged(lockGeneration) }
                 return
             }
-            if state != .unlocked {
+            if (state == .locked && self.canPreserveExecutorForLockedControl) || !self.sessionLock.isAwakeAndActive {
                 if self.canPreserveExecutorForLockedControl {
                     self.lockedControlController?.observeOrdinaryLock()
                     self.readiness = "ready"
@@ -465,7 +462,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             }
             guard self.sessionLock.state == .locked else { return }
             guard self.canPreserveExecutorForLockedControl else {
-                self.readiness = self.sessionLock.readiness
+                // Qualification only governs the protected supervisor path.
+                // Ordinary operation readiness comes from the driver itself.
                 self.lockedControlController?.requestStop()
                 return
             }
@@ -503,7 +501,6 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                                lockedControlController: DesktopLockedControlRuntimeController? = nil,
                                ownedCuaObservation: (@MainActor () -> DesktopControlOwnedCuaObservation?)? = nil,
                                allowsAutomaticCuaRecovery: Bool = false,
-                               confirmForegroundSetup: @escaping @MainActor () -> Bool = { true },
                                hostPermissions: @escaping @MainActor () -> (accessibility: Bool, screenRecording: Bool) = {
                                    (DesktopAccessibilityPermission.isGranted(), CGPreflightScreenCaptureAccess())
                                }) -> DesktopControlRuntime {
@@ -513,7 +510,6 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let testSessionLock = DesktopControlSessionLock(observeSystem: false, snapshotReader: { .unknown })
         let runtime = DesktopControlRuntime(installer: installer, credentials: credentials, relayStateReader: relayStateReader,
                                             preferences: preferences, now: now, configurationProvider: configurationProvider,
-                                            confirmForegroundSetup: confirmForegroundSetup,
                                             lockedControlSetupVerifier: verifier,
                                             lockedControlController: lockedControlController,
                                             sessionLock: testSessionLock,
@@ -665,34 +661,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     func resumeForSetup(generation: UUID) async throws {
         try requireCurrentLifecycle(generation)
         guard !disconnecting, !environmentSwitchPending else { throw CancellationError() }
-        try confirmForegroundSession()
+        guard sessionLock.isAwakeAndActive else { throw CancellationError() }
         try requireCurrentLifecycle(generation)
         setupMayRunUnconfigured = true
         try await startCua(forceRepairInstall: false, startPaused: false, generation: generation)
-    }
-
-    var requiresForegroundSessionConfirmation: Bool { sessionLock.state == .unknown }
-
-    func confirmForegroundSession() throws {
-        if sessionLock.state == .locked {
-            throw DesktopControlEnrollmentError.nativeCapabilitiesUnavailable
-        }
-        guard sessionLock.state == .unknown else { return }
-        let generation = lockGeneration
-        guard confirmForegroundSetup(), generation == lockGeneration,
-              sessionLock.state == .unknown else { throw CancellationError() }
-        sessionLock.confirmForegroundSetup()
-        guard sessionLock.allowsControl else { throw CancellationError() }
-    }
-
-    private static func showForegroundSetupConfirmation() -> Bool {
-        let alert = NSAlert()
-        alert.messageText = "Allow Desktop Control on this Mac?"
-        alert.informativeText = "Continue setup while this Mac is unlocked. Desktop Control starts only after setup and an authorized remote session."
-        alert.addButton(withTitle: "Continue setup")
-        alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        return alert.runModal() == .alertFirstButtonReturn
     }
 
     func beginRepair(expectedGeneration: UUID? = nil) throws -> UUID {
@@ -850,7 +822,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         }
         try requireCurrentStartup(generation)
         paused = startPaused
-        readiness = startPaused ? "paused" : (sessionLock.allowsControl ? (verifyCapabilities || wasVerifiedReady ? "ready" : "permission_required") : sessionLock.readiness)
+        readiness = startPaused ? "paused" : (sessionLock.isAwakeAndActive ? (verifyCapabilities || wasVerifiedReady ? "ready" : "permission_required") : sessionLock.readiness)
         // Permission-only startup never reads enrollment or activates a relay.
         if verifyCapabilities, let saved = try? await readSavedInstallation() {
             try requireCurrentStartup(generation)
@@ -1131,31 +1103,18 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private var controlSessionIsUsable: Bool {
+        guard sessionLock.isAwakeAndActive else { return false }
         if let controller = lockedControlController, controller.state != .idle {
             return controller.permitsExecution
         }
-        return sessionLock.allowsControl || canPreserveExecutorForLockedControl
-    }
-
-    private func commandSessionStillAuthorized(for operation: String?) -> Bool {
-        if Self.requiresCua(operation) {
-            if let controller = lockedControlController, controller.state != .idle {
-                return controller.permitsExecution
-            }
-            return sessionLock.allowsControl
-        }
-        if let controller = lockedControlController, controller.state != .idle {
-            return controller.permitsExecution
-        }
-        return sessionLock.allowsControl || canPreserveExecutorForLockedControl
+        return sessionLock.isAwakeAndActive
     }
 
     private func nativeCommandCompletionStillAuthorized(
         lease admittedLease: DesktopControlCommandExecutor.LeaseSnapshot,
         connectionID: UUID,
         lifecycle: UUID,
-        lockGeneration admittedLockGeneration: UUID,
-        operation: String?
+        lockGeneration admittedLockGeneration: UUID
     ) -> Bool {
         guard lifecycleGeneration == lifecycle,
               Self.acceptsCommand(connectionID: connectionID,
@@ -1170,16 +1129,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
               sessionLock.isAwakeAndActive else { return false }
 
         guard lockGeneration != admittedLockGeneration else {
-            return commandSessionStillAuthorized(for: operation)
+            return controlSessionIsUsable
         }
-        switch sessionLock.state {
-        case .unknown:
-            return false
-        case .unlocked:
-            return true
-        case .locked:
-            return canPreserveExecutorForLockedControl
-        }
+        // Preserve the actual result of admitted native work across an ordinary
+        // screen lock. Scope, lease, connection and awake-session fences above
+        // still reject a completion after its authority ends.
+        return true
     }
 
     private static func sameLeaseScope(_ lhs: DesktopControlCommandExecutor.LeaseSnapshot,
@@ -1204,11 +1159,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     var hasActiveInstallation: Bool { activeInstallation != nil }
 
     var sessionRecoveryMessage: String? {
-        switch sessionLock.state {
-        case .unknown: "Confirm this Mac is unlocked to enable remote control."
-        case .locked: "Unlock this Mac to enable remote control."
-        case .unlocked: nil
-        }
+        sessionLock.isAwakeAndActive ? nil : "Desktop Control is unavailable while this Mac is asleep or another login session is active."
     }
 
     func isCuaReady() -> Bool {
@@ -1237,17 +1188,17 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     /// Opening the checklist cannot replace a runtime or interrupt remote work.
-    /// An unlocked idle process may start its existing permission-only owner.
+    /// An idle process may start its existing permission-only owner without unlock confirmation.
     func prepareCuaPermissionsAutomatically() async throws {
         try Task.checkCancellation()
-        guard sessionLock.allowsControl else { throw DesktopPermissionAutomaticCheckError.sessionConfirmationRequired }
+        guard sessionLock.isAwakeAndActive else { throw DesktopPermissionAutomaticCheckError.sessionUnavailable }
         if isOwnedCuaRunning(), let proxy, let service = cuaService {
             let generation = lifecycleGeneration
             let lock = lockGeneration
             let running = await proxy.isProcessRunning()
             try requireCurrentStartup(generation)
             guard self.proxy === proxy, cuaService === service, lockGeneration == lock,
-                  sessionLock.allowsControl else { throw CancellationError() }
+                  sessionLock.isAwakeAndActive else { throw CancellationError() }
             if running { return }
         }
         guard canStartAutomaticPermissionRuntime else { throw DesktopPermissionAutomaticCheckError.runtimeStartRequired }
@@ -1261,12 +1212,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         defer { executor.endNativeVerification(id) }
         try requireCurrentStartup(generation)
         try executor.requireNativeVerification(id)
-        guard self.executor === executor, lockGeneration == lock, sessionLock.allowsControl,
+        guard self.executor === executor, lockGeneration == lock, sessionLock.isAwakeAndActive,
               canStartAutomaticPermissionRuntime else { throw CancellationError() }
         try await startPermissionCua(generation: generation, remainPaused: paused)
         try requireCurrentStartup(generation)
         try executor.requireNativeVerification(id)
-        guard self.executor === executor, lockGeneration == lock, sessionLock.allowsControl else { throw CancellationError() }
+        guard self.executor === executor, lockGeneration == lock, sessionLock.isAwakeAndActive else { throw CancellationError() }
     }
 
     private var canStartAutomaticPermissionRuntime: Bool {
@@ -1282,9 +1233,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         // A cached credential is not an active relay. Retain only existing relay recovery.
         allowsAutomaticCuaRecovery = gateway != nil || pendingGateway != nil || reconnectTask != nil
         let preflightGeneration = lifecycleGeneration
-        // The running daemon proves ownership, not an unlocked session. Explicit
-        // Setup must confirm even when it can reuse that daemon after app launch.
-        try confirmForegroundSession()
+        // Screen lock observations do not gate permission preparation.
+        guard sessionLock.isAwakeAndActive else { throw CancellationError() }
         try requireCurrentStartup(preflightGeneration)
         let ownedDaemonRunning = isOwnedCuaRunning()
         if let existing = proxy {
@@ -1307,7 +1257,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         }
         let remainPaused = paused
         let generation = try beginResume()
-        try confirmForegroundSession()
+        guard sessionLock.isAwakeAndActive else { throw CancellationError() }
         try await startPermissionCua(generation: generation, remainPaused: remainPaused)
     }
 
@@ -1324,7 +1274,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         allowsAutomaticCuaRecovery = gateway != nil || pendingGateway != nil || reconnectTask != nil
         let remainPaused = paused
         let generation = try beginResume()
-        try confirmForegroundSession()
+        guard sessionLock.isAwakeAndActive else { throw CancellationError() }
         await stopLocalControl(generation: generation)
         try Task.checkCancellation()
         try requireCurrentLifecycle(generation)
@@ -1353,7 +1303,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     func verifyCuaCapabilitiesAutomatically() async throws {
-        guard sessionLock.allowsControl, isOwnedCuaRunning(), let proxy, let service = cuaService else {
+        guard sessionLock.isAwakeAndActive, isOwnedCuaRunning(), let proxy, let service = cuaService else {
             throw CuaMCPProxyError.permissionsRequired
         }
         let generation = lifecycleGeneration
@@ -1368,7 +1318,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             try requireCurrentStartup(generation)
             try executor.requireNativeVerification(id)
             guard self.executor === executor, self.proxy === proxy, cuaService === service, service.isRunning,
-                  sessionLock.allowsControl, lockGeneration == lock,
+                  sessionLock.isAwakeAndActive, lockGeneration == lock,
                   !disconnecting, !environmentSwitchPending, !repairInProgress,
                   !executorCleanupInProgress, !executorCleanupFailed else { throw CancellationError() }
             let grants = hostPermissions()
@@ -1387,7 +1337,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             target.invalidate()
             if inputPermissionTarget === target { inputPermissionTarget = nil }
         }
-        guard sessionLock.allowsControl, hostPermissions().accessibility, isOwnedCuaRunning(), let proxy, let service = cuaService,
+        guard sessionLock.isAwakeAndActive, hostPermissions().accessibility, isOwnedCuaRunning(), let proxy, let service = cuaService,
               !disconnecting, !environmentSwitchPending, !repairInProgress,
               !executorCleanupInProgress, !executorCleanupFailed else { throw CuaMCPProxyError.permissionsRequired }
         let generation = lifecycleGeneration
@@ -1406,7 +1356,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             try requireCurrentLifecycle(generation)
             try executor.requireNativeVerification(id)
             guard self.executor === executor, self.proxy === proxy, cuaService === service,
-                  service.isRunning, hostPermissions().accessibility, isOwnedCuaRunning(), sessionLock.allowsControl, lockGeneration == lock,
+                  service.isRunning, hostPermissions().accessibility, isOwnedCuaRunning(), sessionLock.isAwakeAndActive, lockGeneration == lock,
                   !repairInProgress, !executorCleanupInProgress, !executorCleanupFailed else { throw CancellationError() }
         }
         try requireCurrent()
@@ -1420,7 +1370,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     func probeNativeCapabilities(generation: UUID) async throws {
         try requireCurrentLifecycle(generation)
-        guard !paused, sessionLock.allowsControl, readiness == "ready", isCuaReady(), nativeExecutorReady else {
+        guard !paused, sessionLock.isAwakeAndActive, readiness == "ready", isCuaReady(), nativeExecutorReady else {
             throw DesktopControlEnrollmentError.nativeCapabilitiesUnavailable
         }
         let probeExecutor = DesktopControlCommandExecutor()
@@ -1601,15 +1551,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             || lockedControlController?.state == .controlling {
             return
         }
-        if !sessionLock.allowsControl {
-            if canPreserveExecutorForLockedControl {
-                readiness = "ready"
-                await gateway?.setReadiness("ready")
-                return
-            }
+        if !sessionLock.isAwakeAndActive {
             readiness = sessionLock.readiness
             await cleanupExecutor()
-            guard self.lockGeneration == lockGeneration, !sessionLock.allowsControl else { return }
+            guard self.lockGeneration == lockGeneration, !sessionLock.isAwakeAndActive else { return }
             await gateway?.setReadiness(sessionLock.readiness)
             return
         }
@@ -1648,7 +1593,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         guard let proxy else { return }
         do {
             try await verifyCuaReadiness(proxy, generation: generation)
-            guard self.lockGeneration == lockGeneration, sessionLock.allowsControl,
+            guard self.lockGeneration == lockGeneration, sessionLock.isAwakeAndActive,
                   generation == lifecycleGeneration, !paused, !executorCleanupFailed else { return }
             readiness = "ready"
         } catch {
@@ -1918,7 +1863,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         }
         let isStatus = frame.operation == "desktop_control_status"
         let isLockedAcquire = frame.operation == "desktop_control_acquire"
-            && !sessionLock.allowsControl && canPreserveExecutorForLockedControl
+            && canPreserveExecutorForLockedControl
         guard isStatus || (!executorCleanupInProgress && !executorCleanupFailed) else {
             return Self.failure(for: frame, code: "desktop_executor_unavailable")
         }
@@ -1937,9 +1882,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         }
         let isLockedRelease = frame.operation == "desktop_control_release"
             && (lockedControlController.map { $0.state != .idle } ?? false)
-        guard isStatus || sessionLock.allowsControl || isLockedAcquire || isLockedRelease else {
-            return Self.failure(for: frame, code: sessionLock.state == .unknown ? "desktop_session_confirmation_required" : "locked",
-                                message: sessionRecoveryMessage ?? "Confirm this Mac is unlocked from the Desktop Control menu.")
+        guard isStatus || sessionLock.isAwakeAndActive || isLockedAcquire || isLockedRelease else {
+            return Self.failure(for: frame, code: "desktop_executor_unavailable",
+                                message: sessionRecoveryMessage ?? "The desktop login session is unavailable.")
         }
         guard isStatus || !paused else {
             return Self.failure(for: frame, code: "desktop_paused", message: "Desktop Control is paused on this Mac.")
@@ -1955,8 +1900,11 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                 readiness = "cua_unavailable"
                 await gateway?.setReadiness(readiness)
             }
-            guard readiness == "ready" else {
-                return Self.failure(for: frame, code: readiness, message: "GUI control needs attention on this Mac. Review Cua permissions and service status in PersonaStack Desktop.")
+            guard hostPermissions().accessibility else {
+                return Self.failure(for: frame, code: "permission_required", message: "Allow PersonaStack Accessibility access to use desktop control.")
+            }
+            guard isOwnedCuaRunning() else {
+                return Self.failure(for: frame, code: "cua_unavailable", message: "The desktop control service is unavailable. Repair Desktop Control in PersonaStack.")
             }
         }
         if isLockedAcquire {
@@ -1998,9 +1946,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             if let admittedNativeLease {
                 commandStillAuthorized = nativeCommandCompletionStillAuthorized(
                     lease: admittedNativeLease, connectionID: connectionID, lifecycle: commandGeneration,
-                    lockGeneration: commandLockGeneration, operation: frame.operation)
+                    lockGeneration: commandLockGeneration)
             } else {
-                commandStillAuthorized = commandSessionStillAuthorized(for: frame.operation)
+                commandStillAuthorized = controlSessionIsUsable
             }
             if !commandStillAuthorized {
                 return Self.failure(for: frame, code: "locked", message: "This Mac locked while the command was running. Check whether the action completed before retrying.")
@@ -2013,8 +1961,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                                      nativeExecutorReady: nativeExecutorReady,
                                      paused: paused,
                                      locked: sessionLock.state == .locked,
-                                     sessionUnlocked: sessionLock.allowsControl,
-                                     lockedSessionAvailable: canPreserveExecutorForLockedControl)
+                                     sessionUnlocked: sessionLock.state == .unlocked)
         }
         if frame.operation == "desktop_control_release", response.type == "result",
            executor.currentLease == nil,
@@ -2033,16 +1980,15 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                Self.acceptsCommand(connectionID: connectionID,
                                    currentConnectionID: gatewayConnectionID,
                                    disconnecting: disconnecting),
-               !paused, commandSessionStillAuthorized(for: frame.operation),
+               !paused, controlSessionIsUsable,
                !executorCleanupInProgress, !executorCleanupFailed {
                 let retried = await executor.handle(frame, proxy: proxy, onChunk: onChunk)
-                guard commandSessionStillAuthorized(for: frame.operation) else {
+                guard controlSessionIsUsable else {
                     return Self.failure(for: frame, code: "locked", message: "This Mac locked while the command was running. Check whether the action completed before retrying.")
                 }
                 return retried
             }
-            if readiness == "ready" { return response }
-            return Self.failure(for: frame, code: readiness, message: "Cua could not complete GUI control. Review its permissions and service status in PersonaStack Desktop.")
+            return response
         }
         return response
     }
@@ -2072,21 +2018,20 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                 startLockedControlForCurrentLease()
                 return "ready"
             }
-            return sessionLock.readiness
         }
         await markExitedCuaProxyUnavailable()
         guard !Task.isCancelled else { return nil }
         await recoverExitedOwnedCuaDaemonIfNeeded()
         guard !Task.isCancelled else { return nil }
         if Self.shouldProbeGuiRecovery(readiness: readiness, paused: paused,
-                                       unlocked: sessionLock.allowsControl, cuaReady: isOwnedCuaRunning()),
+                                       sessionAvailable: sessionLock.isAwakeAndActive, cuaReady: isOwnedCuaRunning()),
            let proxy {
             let generation = lifecycleGeneration
             let previousReadiness = readiness
             do {
                 try await verifyCuaReadiness(proxy, generation: generation, timeout: 5)
                 if generation == lifecycleGeneration, readiness == previousReadiness,
-                   !paused, sessionLock.allowsControl, isCuaReady() {
+                   !paused, sessionLock.isAwakeAndActive, isCuaReady() {
                     readiness = "ready"
                 }
             } catch {
@@ -2096,7 +2041,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                     if readiness == "cua_unavailable" {
                         do {
                             try await replaceFailedCuaProxy(proxy, generation: generation)
-                            if generation == lifecycleGeneration, !paused, sessionLock.allowsControl {
+                            if generation == lifecycleGeneration, !paused, sessionLock.isAwakeAndActive {
                                 readiness = "ready"
                             }
                         } catch {
@@ -2131,7 +2076,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                 && preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(configuration)),
             ownedDaemonExited: daemonExited,
             paused: paused,
-            sessionUnlocked: sessionLock.allowsControl && hostPermissions().accessibility,
+            sessionAvailable: sessionLock.isAwakeAndActive && hostPermissions().accessibility,
             disconnecting: disconnecting,
             environmentSwitchPending: environmentSwitchPending,
             repairInProgress: repairInProgress,
@@ -2227,12 +2172,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             let catalog = try await replacement.listTools()
             let validatedTools = try await replacement.validateToolCatalog(catalog)
             try await verifyCuaHostIdentity(replacement, generation: generation)
-            if sessionLock.allowsControl {
+            // Qualified locked recovery must keep the daemon alive for the
+            // supervisor to establish its protected GUI session first.
+            if !canRecoverCuaDaemonWhileLocked(configuration: configuration) {
                 try await verifyCuaReadiness(replacement, generation: generation, timeout: 25)
-            } else {
-                guard canRecoverCuaDaemonWhileLocked(configuration: configuration) else {
-                    throw CancellationError()
-                }
             }
             try requireCurrentCuaDaemonRecovery(generation: generation, lock: lock,
                                                 connectionID: connectionID, configuration: configuration)
@@ -2242,7 +2185,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             proxy = replacement
             startingProxy = nil
             tools = validatedTools
-            readiness = sessionLock.allowsControl ? "ready" : sessionLock.readiness
+            readiness = sessionLock.isAwakeAndActive ? "ready" : sessionLock.readiness
             exitedCuaExecutableURL = nil
             cuaDaemonRecoveryBackoff.recordSuccess(at: now())
             await gateway?.setReadiness(readiness)
@@ -2260,7 +2203,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private func isCurrentCuaDaemonRecovery(generation: UUID, lock: UUID,
                                             connectionID: UUID, configuration: DesktopEnvironmentConfiguration) -> Bool {
         lifecycleGeneration == generation && lockGeneration == lock
-            && (sessionLock.allowsControl ? hostPermissions().accessibility
+            && (sessionLock.isAwakeAndActive ? hostPermissions().accessibility
                 : canRecoverCuaDaemonWhileLocked(configuration: configuration))
             && !paused && !disconnecting && !environmentSwitchPending && !repairInProgress
             && !executorCleanupInProgress && !executorCleanupFailed && !setupMayRunUnconfigured
@@ -2298,8 +2241,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         }
     }
 
-    static func shouldProbeGuiRecovery(readiness: String, paused: Bool, unlocked: Bool, cuaReady: Bool) -> Bool {
-        (readiness == "permission_required" || readiness == "cua_unavailable") && !paused && unlocked && cuaReady
+    static func shouldProbeGuiRecovery(readiness: String, paused: Bool, sessionAvailable: Bool, cuaReady: Bool) -> Bool {
+        (readiness == "permission_required" || readiness == "cua_unavailable") && !paused && sessionAvailable && cuaReady
     }
 
     private func readinessAfterGuiFailure(generation: UUID) async -> String {
@@ -2316,7 +2259,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             guard failureReadiness == "cua_unavailable" else { return failureReadiness }
             do {
                 try await replaceFailedCuaProxy(proxy, generation: generation)
-                return generation == lifecycleGeneration && !paused && sessionLock.allowsControl ? "ready" : readiness
+                return generation == lifecycleGeneration && !paused && sessionLock.isAwakeAndActive ? "ready" : readiness
             } catch {
                 return generation == lifecycleGeneration ? Self.readiness(for: error) : readiness
             }
@@ -2370,8 +2313,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                              nativeExecutorReady: Bool,
                              paused: Bool,
                              locked: Bool,
-                             sessionUnlocked: Bool,
-                             lockedSessionAvailable: Bool = false) -> DesktopControlFrame {
+                             sessionUnlocked: Bool) -> DesktopControlFrame {
         guard frame.type == "result", case .object(var result)? = frame.result else { return frame }
         let guiReady = guiReadiness == "ready"
         let nativeReady = nativeExecutorReady && result["native_executor_ready"] == .bool(true)
@@ -2383,7 +2325,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         result["paused"] = .bool(paused)
         result["locked"] = .bool(locked)
         result["session_unlocked"] = .bool(sessionUnlocked)
-        result["control_available"] = .bool(connected && guiReady && nativeReady && !paused && (sessionUnlocked || lockedSessionAvailable))
+        result["control_available"] = .bool(connected && guiReady && nativeReady && !paused)
         return DesktopControlFrame(version: frame.version, type: frame.type, requestID: frame.requestID,
                                    result: .object(result))
     }
@@ -2419,8 +2361,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         try verifyOwner()
 
         // Accessibility is sufficient for element actions. Checklist capture
-        // checks opt in separately. All proof stays in the unlocked session.
-        guard sessionLock.allowsControl else { return }
+        // checks opt in separately. Probes run only in an awake, active session.
+        guard sessionLock.isAwakeAndActive else { return }
         let probeLockGeneration = lockGeneration
         if requireScreenCapture {
             let screenshot = try await candidate.callTool(
@@ -2447,7 +2389,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
               content.contains(where: { $0["type"] as? String == "text" && !($0["text"] as? String ?? "").isEmpty }) else {
             throw CuaMCPProxyError.functionalProbeFailed
         }
-        guard cuaService === service, service.isRunning, sessionLock.allowsControl,
+        guard cuaService === service, service.isRunning, sessionLock.isAwakeAndActive,
               lockGeneration == probeLockGeneration else { throw CancellationError() }
         let permissions = hostPermissions()
         guard permissions.accessibility && (!requireScreenCapture || permissions.screenRecording) else { throw CuaMCPProxyError.permissionsRequired }

@@ -139,17 +139,6 @@ struct DesktopControlMenu: View {
         Button("Diagnostics…") {
             DesktopControlDiagnosticsWindow.shared.present()
         }
-        if relayEnabled && DesktopControlRuntime.shared.requiresForegroundSessionConfirmation {
-            Button("Confirm This Mac Is Unlocked") {
-                do {
-                    try DesktopControlRuntime.shared.confirmForegroundSession()
-                } catch is CancellationError {
-                    return
-                } catch {
-                    loginItemError = error.localizedDescription
-                }
-            }
-        }
         if relayEnabled || DesktopControlRuntime.shared.hasPendingEnvironmentSwitch {
             Button(status.isRepairing ? "Repairing Desktop Control…" : "Repair Desktop Control") {
                 Task { await repairCua() }
