@@ -694,7 +694,8 @@ public actor DesktopFileSystem {
         try handle.seek(toOffset: 0)
         let sample = try handle.read(upToCount: Self.maxReadBytes + 3) ?? Data()
         try handle.seek(toOffset: 0)
-        return isReadableText(sample)
+        let count = sample.count == Self.maxReadBytes + 3 ? utf8AlignedPrefixLength(sample) : sample.count
+        return isReadableText(Data(sample.prefix(count)))
     }
 
     private static func utf8AlignedPrefixLength(_ data: Data) -> Int {

@@ -870,6 +870,42 @@ struct DesktopControlCommandExecutorTests {
         #expect(monitor.isAwakeAndActive)
     }
 
+    @Test
+    func fileOffsetsDefaultOnlyWhenAbsentAndRejectInvalidWrites() async throws {
+        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
+        let owner = target(persona: "offset-owner")
+        let acquired = await executor.handle(command("desktop_control_acquire", owner, requestID: "acquire-offset"), proxy: nil)
+        guard case .object(let lease)? = acquired.result, let token = lease["control_token"] else {
+            Issue.record("missing lease token")
+            return
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("file.txt")
+        try Data("original".utf8).write(to: path)
+        let opened = await executor.handle(command("desktop_control_file", owner, requestID: "open-offset",
+            arguments: .object(["action": .string("open"), "control_token": token, "path": .string(path.path)])), proxy: nil)
+        guard case .object(let file)? = opened.result, let handle = file["handle"] else {
+            Issue.record("missing file handle")
+            await executor.close()
+            return
+        }
+        let read = await executor.handle(command("desktop_control_file", owner, requestID: "read-offset",
+            arguments: .object(["action": .string("read"), "control_token": token, "handle": handle])), proxy: nil)
+        #expect(read.type == "result")
+        let invalid: [DesktopControlJSONValue] = [.number(-1), .number(1.5), .bool(true), .string("1"), .null, .number(1e30)]
+        for (index, offset) in invalid.enumerated() {
+            try Data("original".utf8).write(to: path)
+            let write = await executor.handle(command("desktop_control_file", owner, requestID: "write-offset-\(index)",
+                arguments: .object(["action": .string("write"), "control_token": token, "path": .string(path.path),
+                    "mode": .string("replace"), "content_base64": .string(Data("X".utf8).base64EncodedString()), "offset": offset])), proxy: nil)
+            #expect(write.type == "failure")
+            #expect(try Data(contentsOf: path) == Data("original".utf8))
+        }
+        await executor.close()
+    }
+
     private func target(persona: String, workspace: String = "workspace-1", config: String = "config-1", configVersion: Int64? = nil,
                         installation: String = "install-1") -> DesktopControlTarget {
         DesktopControlTarget(installationID: installation, workspaceID: workspace, configID: config,

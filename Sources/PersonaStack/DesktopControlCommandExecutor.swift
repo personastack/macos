@@ -892,7 +892,7 @@ final class DesktopControlCommandExecutor {
                                                 length: args["length"] as? Int ?? 256 * 1024)
             } else {
                 guard args["line_count"] == nil else { throw CommandError.invalidArguments }
-                guard let offset = Self.uint64(args["offset"]) else { throw CommandError.invalidArguments }
+                let offset = try Self.optionalUInt64(args["offset"]) ?? 0
                 read = try await files.read(id: id, offset: offset, length: args["length"] as? Int ?? 256 * 1024)
             }
             var result = Self.fileContent(read)
@@ -912,7 +912,7 @@ final class DesktopControlCommandExecutor {
             case "append": writeMode = .append
             default: throw CommandError.invalidArguments
             }
-            return Self.entry(try await files.write(path: path, content: data, mode: writeMode, offset: Self.uint64(args["offset"])))
+            return Self.entry(try await files.write(path: path, content: data, mode: writeMode, offset: Self.optionalUInt64(args["offset"])))
         case "patch":
             guard let path = args["path"] as? String, let expected = args["expected"] as? String,
                   let replacement = args["replacement"] as? String else { throw CommandError.invalidArguments }
@@ -949,7 +949,7 @@ final class DesktopControlCommandExecutor {
     private func shellRead(_ arguments: DesktopControlJSONValue?) async throws -> Any {
         guard let args = Self.object(arguments), let id = Self.uuid(args["execution_id"]) else { throw CommandError.invalidArguments }
         let wait = min(max(args["wait_ms"] as? Int ?? 0, 0), 10_000)
-        return Self.process(try await shell.read(id: id, after: Self.uint64(args["cursor"]) ?? 0, wait: .milliseconds(wait)))
+        return Self.process(try await shell.read(id: id, after: Self.optionalUInt64(args["cursor"]) ?? 0, wait: .milliseconds(wait)))
     }
 
     private func shellWrite(_ arguments: DesktopControlJSONValue?) async throws -> Any {
@@ -991,7 +991,14 @@ final class DesktopControlCommandExecutor {
     }
 
     private static func uuid(_ value: Any?) -> UUID? { (value as? String).flatMap(UUID.init(uuidString:)) }
-    private static func uint64(_ value: Any?) -> UInt64? { (value as? NSNumber).flatMap { $0.int64Value >= 0 ? $0.uint64Value : nil } }
+    private static func optionalUInt64(_ value: Any?) throws -> UInt64? {
+        guard let value else { return nil }
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              let integer = UInt64(exactly: number.doubleValue), integer <= UInt64(Int64.max) else {
+            throw CommandError.invalidArguments
+        }
+        return integer
+    }
 
     private static func entry(_ entry: DesktopFileEntry) -> [String: Any] {
         ["path": entry.path, "name": entry.name, "kind": entry.kind.rawValue, "size": entry.size,

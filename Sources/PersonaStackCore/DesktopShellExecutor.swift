@@ -129,8 +129,8 @@ public actor DesktopShellExecutor {
 
     public func start(command: String, workingDirectory: String, timeout: TimeInterval = 300) async throws -> DesktopProcessRead {
         try DesktopControlExecution.check()
-        guard !command.isEmpty, command.utf8.count <= Self.maximumCommandBytes else { throw DesktopShellError.invalidCommand }
-        guard workingDirectory.hasPrefix("/") else {
+        guard !command.isEmpty, !command.contains("\0"), command.utf8.count <= Self.maximumCommandBytes else { throw DesktopShellError.invalidCommand }
+        guard workingDirectory.hasPrefix("/"), !workingDirectory.contains("\0"), workingDirectory.utf8.count <= 4096 else {
             throw DesktopShellError.invalidWorkingDirectory
         }
         let accessResult = workingDirectory.withCString { Darwin.access($0, X_OK) }
@@ -429,8 +429,9 @@ public actor DesktopShellExecutor {
                     await executor.finishStream(id)
                     return
                 }
-                var descriptorState = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
-                _ = poll(&descriptorState, 1, 100)
+                // The descriptor is nonblocking. Suspend instead of blocking a
+                // cooperative executor thread while other commands need cleanup.
+                try? await Task.sleep(for: .milliseconds(25))
             }
         }
     }
@@ -499,7 +500,7 @@ public actor DesktopShellExecutor {
         guard posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP)) == 0,
               posix_spawnattr_setpgroup(&attributes, 0) == 0 else { throw DesktopShellError.invalidCommand }
 
-        let childScript = command + "; _personastack_status=$?; wait; exit $_personastack_status"
+        let childScript = command + "\n_personastack_status=$?; wait; exit $_personastack_status"
         let childCommand = "/bin/zsh -lc " + shellQuote(childScript)
         let script = "cd -- " + shellQuote(workingDirectory) +
             " && trap 'wait; exit 143' TERM; trap 'wait; exit 130' INT; " +
@@ -540,9 +541,14 @@ public actor DesktopShellExecutor {
     private static func wait(_ pid: pid_t, on executor: DesktopShellExecutor, id: UUID) {
         Task.detached(priority: .utility) {
             var info = siginfo_t()
-            var waitResult = waitid(P_PID, id_t(pid), &info, WEXITED | WNOWAIT)
-            while waitResult == -1 && errno == EINTR {
-                waitResult = waitid(P_PID, id_t(pid), &info, WEXITED | WNOWAIT)
+            var waitResult: Int32
+            while true {
+                waitResult = waitid(P_PID, id_t(pid), &info, WEXITED | WNOWAIT | WNOHANG)
+                if waitResult == 0 && info.si_pid != 0 { break }
+                if waitResult == -1 && errno != EINTR { break }
+                // Waiting for a child must not occupy a cooperative executor
+                // thread needed by cancellation, deadlines, or pipe readers.
+                try? await Task.sleep(for: .milliseconds(25))
             }
             var cleanupConfirmed = false
             if waitResult == 0 {
