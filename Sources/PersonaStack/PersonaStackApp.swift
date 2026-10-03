@@ -302,6 +302,9 @@ final class MainWebViewHost {
         webView.frame = container.bounds
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
+        if let window = container.window {
+            MainWindowNavigation.install(on: window, webView: webView)
+        }
         requestNotificationAuthorizationIfNeeded()
     }
 
@@ -357,6 +360,7 @@ struct WindowPresentationConfigurator: NSViewRepresentable {
                 guard let window = self?.window else { return }
                 NSApp.setActivationPolicy(.regular)
                 WindowPresentation.configure(window)
+                MainWindowNavigation.install(on: window, webView: MainWebViewHost.shared.webView)
             }
         }
     }
