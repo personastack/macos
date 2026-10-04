@@ -167,6 +167,19 @@ struct LocalSessionFilesTests {
         #expect(fixture.servers.count == 3)
         #expect(fixture.installed.count == 2)
         #expect(try fixture.files.connections(harness, probe: fixture.probe, appURL: fixture.source.appURL).count == 2)
+        for (connection, installed) in [(a, first), (b, second)] {
+            let plugin = try #require(FileManager.default.contentsOfDirectory(at: installed.directory.appendingPathComponent("marketplace/plugins"), includingPropertiesForKeys: nil).first)
+            let hookData = try Data(contentsOf: plugin.appendingPathComponent("hooks/hooks.json"))
+            let document = try #require(JSONSerialization.jsonObject(with: hookData) as? [String: Any])
+            let hooks = try #require(document["hooks"] as? [String: [[String: Any]]])
+            let events = harness == .codex ? ["UserPromptSubmit", "Stop", "Interrupt", "SessionEnd"] : ["UserPromptSubmit", "Stop", "StopFailure", "SessionEnd"]
+            #expect(Set(hooks.keys) == Set(events))
+            for event in events {
+                let commands = try #require(hooks[event]?.first?["hooks"] as? [[String: Any]])
+                let command = try #require(commands.first?["command"] as? String)
+                #expect(command.contains("--connection '" + connection.uuidString.lowercased() + "' --event " + event))
+            }
+        }
         try fixture.files.remove(a.uuidString, harness: harness, probe: fixture.probe, appURL: fixture.source.appURL)
         #expect(!FileManager.default.fileExists(atPath: first.directory.path))
         #expect(FileManager.default.fileExists(atPath: second.directory.path))

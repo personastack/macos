@@ -21,27 +21,17 @@ private func run() async throws {
             }) else { return }
         }
     }
-    guard let event = argument("--event"), ["UserPromptSubmit", "Stop", "StopFailure", "Interrupt", "SessionEnd"].contains(event) else { throw LocalSessionError.invalidRequest }
+    guard let event = argument("--event") else { throw LocalSessionError.invalidRequest }
     let input = try HarnessHookInput.decode(FileHandle.standardInput.readData(ofLength: 512 * 1024 + 1))
-    let active = try store.lock(connectionID: connectionID, sessionID: input.sessionID)
-    defer { active.unlock() }
-    let previous = try active.read()
-    if event == "UserPromptSubmit" {
-        if let previous, let turnID = input.turnID, previous.turnID == turnID { return }
-        let turn = HarnessHookTurn(runID: UUID().uuidString.lowercased(), turnID: input.turnID, ownerPID: getppid())
-        try active.write(turn)
-        do {
-            guard try await HarnessActivityReporter.report(credential, sessionID: input.sessionID, runID: turn.runID, state: "start") else { try active.clear(); return }
-        } catch { try active.clear(); throw error }
+    let runID = try await HarnessHookDispatcher.dispatch(credential, event: event, input: input, store: store) { runID, state in
+        try await HarnessActivityReporter.report(credential, sessionID: input.sessionID, runID: runID, state: state)
+    }
+    if let runID {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
-        process.arguments = ["--connection", connectionID, "--renew", input.sessionID, "--run", turn.runID]
+        process.arguments = ["--connection", connectionID, "--renew", input.sessionID, "--run", runID]
         process.standardInput = FileHandle.nullDevice; process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
         try process.run()
-    } else if let previous {
-        if let turnID = input.turnID, previous.turnID != nil, previous.turnID != turnID { return }
-        try active.clear()
-        _ = try await HarnessActivityReporter.report(credential, sessionID: input.sessionID, runID: previous.runID, state: "stop")
     }
 }
 

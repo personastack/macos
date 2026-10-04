@@ -7,6 +7,10 @@ public struct HarnessActivityCredential: Codable, Sendable {
     public let appURL: URL
     public let harness: LocalSessionHarness
     public let routingEnabled: Bool
+    public init(bundle: LocalSessionBundle, appURL: URL) {
+        self.init(connectionID: bundle.connectionID, activityToken: bundle.activityToken,
+                  appURL: appURL, harness: bundle.harness, routingEnabled: true)
+    }
     public init(connectionID: String, activityToken: String, appURL: URL, harness: LocalSessionHarness, routingEnabled: Bool) {
         self.connectionID = connectionID; self.activityToken = activityToken; self.appURL = appURL
         self.harness = harness; self.routingEnabled = routingEnabled

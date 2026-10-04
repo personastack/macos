@@ -253,7 +253,7 @@ final class LocalSessionManager: NSObject, WKScriptMessageHandlerWithReply {
 
     nonisolated private static func saveCredential(_ bundle: LocalSessionBundle, appURL: URL) throws {
         let helper = Bundle.main.executableURL!.deletingLastPathComponent().appendingPathComponent("PersonaStackHarnessHook")
-        try HarnessActivityKeychain().store(.init(connectionID: bundle.connectionID, activityToken: bundle.activityToken, appURL: appURL, harness: bundle.harness, routingEnabled: false), helperURL: helper)
+        try HarnessActivityKeychain().store(.init(bundle: bundle, appURL: appURL), helperURL: helper)
     }
 
     nonisolated private static func revokeConnection(_ id: String) async throws {
