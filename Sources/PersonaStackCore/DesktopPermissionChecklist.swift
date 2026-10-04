@@ -5,13 +5,13 @@ public enum DesktopPermissionID: String, CaseIterable, Identifiable, Sendable {
     case backgroundOperation, localNetwork, desktopFiles, documentsFiles, downloadsFiles
     case removableVolumes, networkVolumes, fullDiskAccess, automation, lockedScreenControl
     case inputMonitoring, automaticUpdates, messagingConnection, awakeDuringRemoteWork
-    case camera, speechRecognition, systemAudio
+    case camera, speechRecognition, systemAudio, safariJavaScript, clipboard
 
     public var id: String { rawValue }
 
     /// OS approvals used by the current desktop and voice features. Folder
     /// grants are covered by Full Disk Access. Unused capabilities stay out.
-    public static let setupPermissions: [Self] = [.accessibility, .screenRecording, .fullDiskAccess, .microphone, .localNetwork]
+    public static let setupPermissions: [Self] = [.accessibility, .screenRecording, .directCapture, .automation, .safariJavaScript, .clipboard, .fullDiskAccess, .microphone, .localNetwork]
     public static let automaticSetup: [Self] = [.launchAtLogin, .notifications, .automaticUpdates, .awakeDuringRemoteWork]
 
     public var title: String {
@@ -26,7 +26,7 @@ public enum DesktopPermissionID: String, CaseIterable, Identifiable, Sendable {
         .networkVolumes: "Network Volumes", .fullDiskAccess: "Full Disk Access", .automation: "Application Automation",
         .lockedScreenControl: "Locked-Screen Control", .inputMonitoring: "Input Monitoring", .automaticUpdates: "Automatic Updates",
         .messagingConnection: "Messaging Connection", .awakeDuringRemoteWork: "Awake During Remote Work",
-        .camera: "Camera", .speechRecognition: "Speech Recognition", .systemAudio: "System Audio",
+        .camera: "Camera", .speechRecognition: "Speech Recognition", .systemAudio: "System Audio", .safariJavaScript: "Safari JavaScript", .clipboard: "Clipboard",
     ]
 }
 

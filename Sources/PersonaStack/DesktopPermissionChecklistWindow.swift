@@ -154,7 +154,7 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     func protectedAccessSetupAction() async -> DesktopProtectedAccessSetupAction {
         let alert = NSAlert()
         alert.messageText = "Setup Full Disk Access"
-        alert.informativeText = "If PersonaStack is already enabled in System Settings → Privacy & Security → Full Disk Access, choose Check Access. Otherwise, open Settings, add PersonaStack.app from Applications with + and enable it. Return here to check access. Quit and reopen PersonaStack if macOS requests it. Check Access authorizes a directory read in Library/Mail, or Library/Messages if Mail is absent. The same check runs automatically whenever you open this window. Entry names are discarded. No file contents are read or changed. A successful check marks this row Ready. Other folders can still have separate access restrictions."
+        alert.informativeText = "If PersonaStack is already enabled in System Settings → Privacy & Security → Full Disk Access, choose Check Access. Otherwise, open Settings, click + and select the running PersonaStack.app shown by Show PersonaStack in Finder. Enable its switch. Opening Settings does not add the app or approve access. Return here for an automatic protected-folder check. Quit and reopen PersonaStack if macOS requests it. Check Access authorizes a directory read in Library/Mail, or Library/Messages if Mail is absent. The same check runs automatically whenever you open this window. Entry names are discarded. No file contents are read or changed. A successful check marks this row Ready. Other folders can still have separate access restrictions."
         alert.icon = NSImage(named: NSImage.applicationIconName)
         alert.addButton(withTitle: "Check Access")
         alert.addButton(withTitle: "Open Settings")
@@ -295,19 +295,20 @@ private struct DesktopPermissionChecklistView: View {
     private func rowView(_ row: DesktopPermissionRow, automatic: Bool = false) -> some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: symbol(row.state))
-                .foregroundStyle(row.isComplete ? Color.green : Color.secondary)
+                .foregroundStyle(row.state == .restartRequired ? Color.yellow : row.isComplete ? Color.green : Color.secondary)
                 .frame(width: 20)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
                 Text(row.displayTitle).font(.headline)
-                if row.id == .fullDiskAccess {
+                if [.fullDiskAccess, .directCapture, .automation, .safariJavaScript, .clipboard].contains(row.id) {
                     Text("Optional for setup.").font(.caption).foregroundStyle(.secondary)
                 }
                 Group {
                     Text(row.state.title).font(.caption.weight(.semibold))
                     Text(row.observation.detail).font(.caption).foregroundStyle(.secondary)
-                    if [.localNetwork, .notifications, .launchAtLogin].contains(row.id) && !row.isComplete && row.state != .checking {
-                        Button("Open Settings") { coordinator.openSettings(row.id) }
+                    if [.localNetwork, .notifications, .launchAtLogin, .automation, .directCapture, .safariJavaScript, .clipboard].contains(row.id) && !row.isComplete && row.state != .checking {
+                        Button(row.id == .safariJavaScript ? "Open Safari" : "Open Settings") { coordinator.openSettings(row.id) }
+                            .accessibilityLabel(row.id == .safariJavaScript ? "Open Safari for Safari JavaScript setup" : "Open Settings for \(row.displayTitle)")
                             .buttonStyle(.link)
                             .font(.caption)
                             .disabled(coordinator.isFinishing || coordinator.busyPermission == row.id)

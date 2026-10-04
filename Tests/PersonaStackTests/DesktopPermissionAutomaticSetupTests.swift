@@ -30,7 +30,7 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
     model.open()
     defer { model.cancel() }
     await model.refresh()
-    #expect(model.permissionRows.map(\.id) == [.accessibility, .screenRecording, .fullDiskAccess, .microphone])
+    #expect(model.permissionRows.map(\.id) == [.accessibility, .screenRecording, .directCapture, .automation, .safariJavaScript, .clipboard, .fullDiskAccess, .microphone])
     #expect(model.automaticRows.map(\.id) == [.launchAtLogin, .notifications, .automaticUpdates, .awakeDuringRemoteWork])
     #expect(DesktopPermissionID.screenRecording.title == "Screen Capture")
     fake.values[.localNetwork] = .init(.verificationRequired, detail: "Selected LAN endpoints")
@@ -379,14 +379,15 @@ func notificationSetupResolvesRequestErrorsThroughFreshAuthorizationAndDelivery(
         openSettings: { _ in Issue.record("Check/passive/automatic must not open Settings") })
     let passive = await adapter.observe(.notifications)
     #expect(passive.state == .ready && passive.requiresVerification && !passive.verified)
-    #expect(await adapter.setupAutomatically(.notifications) == passive)
     #expect(submitted == 0)
+    #expect(await adapter.setupAutomatically(.notifications).state == .failed)
+    #expect(submitted == 1)
     let failed = await adapter.check(.notifications)
     #expect(failed.state == .failed && failed.detail.contains("allowed in Settings"))
     reject = false
     let ready = await adapter.check(.notifications)
     #expect(ready.state == .ready && ready.verified && ready.verificationKey == passive.verificationKey)
-    #expect(submitted == 2)
+    #expect(submitted == 3)
 }
 
 @Test(arguments: [true, false]) @MainActor
@@ -457,4 +458,31 @@ func notificationCheckRechecksAuthorizationAfterDelivery(denied: Bool) async {
     let result = await DesktopPermissionChecklistSystemAdapter(access: access).setup(.launchAtLogin)
     #expect(result.state == .failed && result.detail.contains("refused to remove"))
     #expect(legacy == .notRegistered)
+}
+
+@Test @MainActor func notificationGrantChangeVerifiesOnceAndRevocationRemovesReady() async {
+    var authorization = UNAuthorizationStatus.denied
+    var deliveries = 0
+    var access = DesktopPermissionSystemAccess.permissionFixture()
+    access.notificationSettings = { (authorization, .enabled, .enabled) }
+    access.verifyNotificationDelivery = { deliveries += 1; return true }
+    let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(observe: { id in
+        id == .notifications ? nil : .init(.notNeeded, detail: "Unrelated capability")
+    }), access: access, openSettings: { _ in Issue.record("Automatic approval must not open Settings") })
+    let model = DesktopPermissionChecklistCoordinator(adapter: adapter)
+    model.open()
+    defer { model.cancel() }
+    await model.refresh()
+    #expect(model.rows.first { $0.id == .notifications }?.state == .denied && deliveries == 0)
+    authorization = .authorized
+    await model.refresh()
+    #expect(model.rows.first { $0.id == .notifications }?.isComplete == true && deliveries == 1)
+    for _ in 0..<3 { await model.refresh() }
+    #expect(deliveries == 1)
+    authorization = .denied
+    await model.refresh()
+    #expect(model.rows.first { $0.id == .notifications }?.state == .denied)
+    authorization = .authorized
+    await model.refresh()
+    #expect(model.rows.first { $0.id == .notifications }?.isComplete == true && deliveries == 2)
 }

@@ -174,7 +174,11 @@ struct DesktopProtectedAccessPermissionTests {
         for action in [DesktopProtectedAccessSetupAction.cancel, .settings] {
             var probes = 0
             var settings: [String] = []
-            let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .production }, protectedAccessAction: { action },
+            var access = DesktopPermissionSystemAccess.permissionFixture()
+            access.openPrivacySettings = { settings.append($0) }
+            access.resetPermission = { _ in Issue.record("Normal FDA setup must not reset"); return .failed }
+            access.revealApplication = { Issue.record("Finder reveal must be explicit") }
+            let service = DesktopPermissionChecklist(access: access, selectedProfile: { .production }, protectedAccessAction: { action },
                 verifyProtectedAccess: { probes += 1 }, activationNotificationCenter: NotificationCenter())
             let adapter = DesktopPermissionChecklistSystemAdapter(hooks: service.adapter.hooks, access: .permissionFixture(), openSettings: { settings.append($0) })
             let result = await adapter.setup(.fullDiskAccess)
@@ -184,10 +188,14 @@ struct DesktopProtectedAccessPermissionTests {
         }
     }
 
-    @Test @MainActor func protectedAccessDenialOpensOnlyFullDiskSettingsAndInconclusiveDoesNot() async {
+    @Test @MainActor func protectedAccessDenialAndInconclusiveCheckNeverOpenSettings() async {
         for code in [EPERM, EACCES, ENOENT, EIO, ELOOP] {
             var settings: [String] = []
-            let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .production }, protectedAccessAction: { .check },
+            var access = DesktopPermissionSystemAccess.permissionFixture()
+            access.openPrivacySettings = { settings.append($0) }
+            access.resetPermission = { _ in Issue.record("Normal FDA setup must not reset"); return .failed }
+            access.revealApplication = { Issue.record("Finder reveal must be explicit") }
+            let service = DesktopPermissionChecklist(access: access, selectedProfile: { .production }, protectedAccessAction: { .check },
                 verifyProtectedAccess: { throw NSError(domain: NSPOSIXErrorDomain, code: Int(code)) },
                 activationNotificationCenter: NotificationCenter())
             let adapter = DesktopPermissionChecklistSystemAdapter(hooks: service.adapter.hooks, access: .permissionFixture(), openSettings: { settings.append($0) })
@@ -195,7 +203,7 @@ struct DesktopProtectedAccessPermissionTests {
             let denied = code == EPERM || code == EACCES
             let expected: DesktopPermissionState = denied ? .denied : (code == ENOENT ? .verificationRequired : .failed)
             #expect(result.state == expected && !result.verified)
-            #expect(settings == (denied ? ["com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles"] : []))
+            #expect(settings.isEmpty)
             #expect(await adapter.observe(.fullDiskAccess) == result)
         }
     }
@@ -311,13 +319,17 @@ struct DesktopProtectedAccessPermissionTests {
         #expect(await service.adapter.observe(.fullDiskAccess).verificationKey == nil)
     }
 
-    @Test @MainActor func protectedAccessSettingsReturnRequiresExplicitCheckAndThenBecomesReady() async throws {
+    @Test @MainActor func protectedAccessSettingsReturnAutomaticallyChecksThenBecomesReady() async throws {
         let home = try protectedAccessFixture()
         defer { try? FileManager.default.removeItem(at: home) }
         var action = DesktopProtectedAccessSetupAction.settings
         var probes = 0
         var settings: [String] = []
-        let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .production }, protectedAccessAction: { action },
+        var access = DesktopPermissionSystemAccess.permissionFixture()
+        access.openPrivacySettings = { settings.append($0) }
+        access.resetPermission = { _ in Issue.record("FDA must preserve approval"); return .failed }
+        access.revealApplication = { Issue.record("FDA Settings must not reveal Finder") }
+        let service = DesktopPermissionChecklist(access: access, selectedProfile: { .production }, protectedAccessAction: { action },
             verifyProtectedAccess: {
                 probes += 1
                 try await DesktopFileSystem().verifyProtectedDirectoryAccess(home: home)
@@ -333,10 +345,8 @@ struct DesktopProtectedAccessPermissionTests {
         #expect(probes == 0 && protectedAccessRow(model)?.isComplete == false)
         service.invalidateAfterActivation()
         await model.refresh()
-        #expect(protectedAccessRow(model)?.state == .notGranted)
-        #expect(protectedAccessRow(model)?.observation.detail.contains("Check Access") == true)
-        #expect(probes == 0)
-        action = .check
+        #expect(protectedAccessRow(model)?.state == .ready && probes == 1)
+        action = .cancel
         model.setup(.fullDiskAccess)
         while model.busyPermission != nil { await Task.yield() }
         #expect(protectedAccessRow(model)?.state == .ready)
@@ -373,7 +383,7 @@ struct DesktopProtectedAccessPermissionTests {
         #expect(protectedAccessRow(model)?.observation.verified == false)
         #expect(protectedAccessRow(model)?.observation.verificationKey == verified)
         #expect(protectedAccessRow(model)?.observation.detail.contains("quit and reopen") == true)
-        #expect(probes == 3 && settings.count == 1)
+        #expect(probes == 3 && settings.isEmpty)
         await model.refresh()
         #expect(protectedAccessRow(model)?.state == .denied)
     }

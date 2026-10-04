@@ -166,7 +166,7 @@ final class DesktopPermissionChecklist {
         let busy = window.coordinator.busyPermission ?? window.coordinator.verificationBusyPermission
         for id in [DesktopPermissionID.fullDiskAccess, .localNetwork, .messagingConnection] where id != busy {
             let running = id == .fullDiskAccess ? protectedAccessAttempt != nil : connectionAttempts[id] != nil
-            if !running, authorizedRefreshKeys[id] != nil { refreshNeeded.insert(id) }
+            if !running, explicitObservations[id] != nil { refreshNeeded.insert(id) }
         }
         if busy != .removableVolumes && busy != .networkVolumes { invalidateVolumeVerification() }
         // A TCC prompt returns focus before its own functional operation finishes.
@@ -410,8 +410,9 @@ final class DesktopPermissionChecklist {
         case .cancel:
             return explicitObservations[.fullDiskAccess] ?? .init(.checking, detail: "Protected-access check cancelled.")
         case .settings:
+            adapter.openSettings(.fullDiskAccess)
             authorizedRefreshKeys.removeValue(forKey: .fullDiskAccess)
-            return protectedAccessResult(.notGranted, detail: "Enable PersonaStack in Full Disk Access settings. If it is missing, click + and select PersonaStack.app from Applications. Return here and choose Setup Full Disk Access, then Check Access. Quit and reopen PersonaStack if macOS requests it.", attempt: attempt, key: key)
+            return protectedAccessResult(.notGranted, detail: "Enable PersonaStack in Full Disk Access settings. If it is missing, click + and select the running PersonaStack.app shown by Show PersonaStack in Finder. Enable its switch. Opening Settings does not add the app or approve access. Return here for an automatic protected-folder check. Quit and reopen PersonaStack if macOS requests it.", attempt: attempt, key: key)
         case .check: break
         }
         refreshNeeded.remove(.fullDiskAccess)
@@ -426,7 +427,7 @@ final class DesktopPermissionChecklist {
         if explicitObservations[.fullDiskAccess]?.verificationKey != key {
             explicitObservations.removeValue(forKey: .fullDiskAccess)
         }
-        if refreshNeeded.contains(.fullDiskAccess), authorizedRefreshKeys[.fullDiskAccess] == key,
+        if refreshNeeded.contains(.fullDiskAccess),
            protectedAccessAttempt == nil {
             refreshNeeded.remove(.fullDiskAccess)
             let attempt = UUID()
@@ -487,7 +488,7 @@ final class DesktopPermissionChecklist {
         let key = evidenceKey(id)
         if authorizedRefreshKeys[id] != key { authorizedRefreshKeys.removeValue(forKey: id) }
         if explicitObservations[id]?.verificationKey != key { explicitObservations.removeValue(forKey: id) }
-        if refreshNeeded.contains(id), authorizedRefreshKeys[id] == key, connectionAttempts[id] == nil {
+        if refreshNeeded.contains(id), connectionAttempts[id] == nil {
             return await setupConnection(id)
         }
         return evidence(id, detail: detail)
@@ -512,6 +513,9 @@ final class DesktopPermissionChecklist {
     }
 
     private func setupConnection(_ id: DesktopPermissionID) async -> DesktopPermissionObservation {
+        guard connectionAttempts[id] == nil else {
+            return .init(.checking, detail: "A connection check is already running.")
+        }
         guard !Task.isCancelled, let profile else { return .init(.notGranted, detail: "Configure the selected server environment first.") }
         if id == .localNetwork {
             if profile == .production { return .init(.notNeeded, detail: "The selected PersonaStack cloud services do not require LAN access.") }

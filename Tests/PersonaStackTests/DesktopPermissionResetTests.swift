@@ -16,39 +16,32 @@ extension DesktopPermissionSystemAccess {
         access.unregisterLoginForSetup = { }
         access.unregisterLegacyLoginForSetup = { }
         access.loginSignatureIsValid = { true }
+        access.automation = { _ in -1744 }
+        access.safariProcessIdentifier = { nil }
+        access.verifySafariJavaScript = { Issue.record("Unexpected Safari script"); return false }
+        access.openSafari = { Issue.record("Unexpected Safari launch") }
+        access.requestDirectCapture = { Issue.record("Unexpected capture"); return false }
+        access.clipboardAccess = { .ask }
+        access.requestClipboardAccess = { Issue.record("Unexpected clipboard read") }
         return access
     }
 }
 
 @Suite @MainActor
 struct DesktopPermissionResetTests {
-    @Test(arguments: [DesktopPermissionResetResult.cleared, .failed])
-    func fullDiskSetupRevealsAppAndReopensSettingsWithoutResettingAgain(result: DesktopPermissionResetResult) async {
-        var calls: [String] = []
+    @Test func fullDiskSetupUsesExistingOwnerWithoutResetOrFinder() async {
+        var setups = 0
         var access = DesktopPermissionSystemAccess.permissionFixture()
-        access.resetPermission = { id in
-            #expect(id == .fullDiskAccess)
-            calls.append("reset")
-            return result
-        }
-        access.revealApplication = { calls.append("reveal") }
-        let adapter = DesktopPermissionChecklistSystemAdapter(access: access,
-            openSettings: { section in
-                #expect(section == "com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles")
-                calls.append("settings")
-            })
-        let first = await adapter.setup(.fullDiskAccess)
-        #expect(first.state == (result == .cleared ? .restartRequired : .failed))
-        #expect(first.detail.contains("Click + in Full Disk Access"))
-        #expect(first.detail.contains("/Applications/PersonaStack.app"))
-        #expect(first.detail.contains("does not add the app"))
-        #expect(calls == ["reset", "reveal", "settings"])
-        #expect(await adapter.check(.fullDiskAccess) == first)
-        #expect(await adapter.observe(.fullDiskAccess) == first)
-        #expect(await adapter.setupAutomatically(.fullDiskAccess) == first)
-        #expect(calls == ["reset", "reveal", "settings"])
-        #expect(await adapter.setup(.fullDiskAccess) == first)
-        #expect(calls == ["reset", "reveal", "settings", "reveal", "settings"])
+        access.resetPermission = { _ in Issue.record("Full Disk Access setup must preserve approval"); return .failed }
+        access.revealApplication = { Issue.record("Finder must be explicit") }
+        let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(
+            setup: { id in
+                #expect(id == .fullDiskAccess)
+                setups += 1
+                return .init(.ready, detail: "Existing access verified", verificationKey: "grant", requiresVerification: true, verified: true)
+            }), access: access, openSettings: { _ in Issue.record("Already-enabled setup must not open Settings") })
+        #expect(await adapter.setup(.fullDiskAccess).verified)
+        #expect(setups == 1)
     }
 
     @Test func unpackagedTestRunnerCannotResetInstalledAppPermissions() async {
@@ -56,7 +49,7 @@ struct DesktopPermissionResetTests {
         #expect(await DesktopPermissionReset.reset(.accessibility) == .failed)
     }
 
-    @Test(arguments: [DesktopPermissionID.accessibility, .screenRecording, .microphone, .fullDiskAccess])
+    @Test(arguments: [DesktopPermissionID.accessibility, .screenRecording, .microphone])
     func explicitSetupClearsOnlyItsPermissionThenRequiresFreshProcess(permission: DesktopPermissionID) async {
         var calls: [String] = []
         var access = DesktopPermissionSystemAccess.permissionFixture()
@@ -151,7 +144,7 @@ struct DesktopPermissionResetTests {
 
     @Test(arguments: [
         (DesktopPermissionID.accessibility, "Accessibility"), (.screenRecording, "ScreenCapture"),
-        (.directCapture, "ScreenCapture"), (.microphone, "Microphone"), (.fullDiskAccess, "SystemPolicyAllFiles"),
+        (.microphone, "Microphone"), (.fullDiskAccess, "SystemPolicyAllFiles"),
         (.desktopFiles, "SystemPolicyDesktopFolder"), (.documentsFiles, "SystemPolicyDocumentsFolder"),
         (.downloadsFiles, "SystemPolicyDownloadsFolder"), (.removableVolumes, "SystemPolicyRemovableVolumes"),
         (.networkVolumes, "SystemPolicyNetworkVolumes")

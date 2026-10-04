@@ -28,6 +28,9 @@ private func isolateReadyRows(_ service: DesktopPermissionChecklist, _ ids: Set<
     }, setup: { id in
         guard ids.contains(id) else { Issue.record("Unexpected setup action"); return .init(.failed, detail: "Unexpected") }
         return await hooks.setup(id)
+    }, verifyAutomatically: { id in
+        guard ids.contains(id) else { return .init(.notNeeded, detail: "Unrelated fixture capability") }
+        return await hooks.verifyAutomatically(id)
     })
 }
 
@@ -78,8 +81,9 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     #expect(readyRow(service, .microphone)?.state == .denied)
     status = .authorized
     await service.window.coordinator.refresh()
-    #expect(readyRow(service, .microphone)?.isComplete == false)
-    _ = await service.adapter.setup(.microphone)
+    #expect(readyRow(service, .microphone)?.isComplete == true && page.tests == 2)
+    for _ in 0..<3 { await service.window.coordinator.refresh() }
+    #expect(page.tests == 2)
     input = "input-b"
     #expect(await service.adapter.observe(.microphone).verified == false)
     input = "input-a"
@@ -145,15 +149,19 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     #expect(readyRow(service, .localNetwork)?.state == .failed && requests.count == 9)
     service.invalidateAfterActivation()
     await service.window.coordinator.refresh()
-    #expect(requests.count == 9)
+    #expect(requests.count == 12)
     fails = false
-    #expect(await service.adapter.setup(.localNetwork).verified)
+    service.invalidateAfterActivation()
+    await service.window.coordinator.refresh()
+    #expect(readyRow(service, .localNetwork)?.isComplete == true && requests.count == 15)
+    for _ in 0..<3 { await service.window.coordinator.refresh() }
+    #expect(requests.count == 15)
     profile = .production
     #expect(await service.adapter.observe(.localNetwork).state == .notNeeded)
     #expect(await service.adapter.setup(.localNetwork).state == .notNeeded)
     profile = .lan
     #expect(await service.adapter.observe(.localNetwork).state == .verificationRequired)
-    #expect(requests.count == 12)
+    #expect(requests.count == 15)
 }
 
 @Test @MainActor func localNetworkPermissionPublicEndpointFailureStillAttemptsBothLANServices() async {
@@ -247,7 +255,7 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     #expect(calls == 7)
 }
 
-@Test @MainActor func protectedAccessReadyRefreshUsesRealOwnerAndNeverRepeatsAfterDenial() async throws {
+@Test @MainActor func protectedAccessReadyRefreshRetriesDenialOnActivationOnly() async throws {
     let home = try protectedAccessFixture()
     let mail = home.appendingPathComponent("Library/Mail")
     defer { try? FileManager.default.removeItem(at: home) }
@@ -274,7 +282,13 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     #expect(readyRow(service, .fullDiskAccess)?.state == .denied && probes == 3)
     service.invalidateAfterActivation()
     for _ in 0..<3 { await service.window.coordinator.refresh() }
-    #expect(probes == 3)
+    #expect(probes == 4)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: mail.path)
+    service.invalidateAfterActivation()
+    await service.window.coordinator.refresh()
+    #expect(readyRow(service, .fullDiskAccess)?.isComplete == true && probes == 5)
+    for _ in 0..<3 { await service.window.coordinator.refresh() }
+    #expect(probes == 5)
 }
 
 @Test @MainActor func microphonePermissionGrantedDuringSetupRetainsRecordingFailure() async {
@@ -305,4 +319,57 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     await service.window.coordinator.refresh()
     #expect(readyRow(service, .microphone)?.state == .denied)
     #expect(page.tests == 1)
+}
+
+@Test @MainActor func localNetworkPermissionOverlappingChecksShareOneOperationOwner() async {
+    var pending: CheckedContinuation<Void, Never>?
+    var requests = 0
+    let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .lan },
+        activationNotificationCenter: NotificationCenter(), requestEndpoint: { request in
+            requests += 1
+            if requests == 1 { await withCheckedContinuation { pending = $0 } }
+            return HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        })
+    let first = Task { await service.adapter.setup(.localNetwork) }
+    while pending == nil { await Task.yield() }
+    #expect(await service.adapter.setup(.localNetwork).state == .checking && requests == 1)
+    pending?.resume()
+    #expect(await first.value.verified && requests == 3)
+    #expect(await service.adapter.observe(.localNetwork).verified)
+}
+
+@Test @MainActor func microphoneAuthorizedResourceLossDoesNotRearmAutomaticRecording() async {
+    var status = AVAuthorizationStatus.authorized
+    var inputAvailable = true
+    var documentAvailable = true
+    let page = ReadyVoicePage()
+    var access = DesktopPermissionSystemAccess.permissionFixture()
+    access.microphone = { status }
+    access.hasMicrophone = { inputAvailable }
+    access.microphoneIdentity = { "input" }
+    let service = DesktopPermissionChecklist(access: access, selectedProfile: { .production },
+        activationNotificationCenter: NotificationCenter(), voiceContext: {
+            documentAvailable ? .init(identity: "document", url: DesktopEnvironmentConfiguration.production.appURL, page: page) : nil
+        })
+    isolateReadyRows(service, [.microphone])
+    await openReadyChecklist(service)
+    defer { service.window.cancel() }
+    service.window.coordinator.setup(.microphone)
+    while service.window.coordinator.busyPermission != nil { await Task.yield() }
+    #expect(page.tests == 1 && readyRow(service, .microphone)?.isComplete == true)
+    inputAvailable = false
+    await service.window.coordinator.refresh()
+    inputAvailable = true
+    await service.window.coordinator.refresh()
+    #expect(page.tests == 1 && readyRow(service, .microphone)?.state == .verificationRequired)
+    documentAvailable = false
+    await service.window.coordinator.refresh()
+    documentAvailable = true
+    await service.window.coordinator.refresh()
+    #expect(page.tests == 1 && readyRow(service, .microphone)?.state == .verificationRequired)
+    status = .denied
+    await service.window.coordinator.refresh()
+    status = .authorized
+    await service.window.coordinator.refresh()
+    #expect(page.tests == 2 && readyRow(service, .microphone)?.isComplete == true)
 }

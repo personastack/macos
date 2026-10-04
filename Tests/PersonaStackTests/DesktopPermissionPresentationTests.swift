@@ -87,7 +87,7 @@ private final class PresentationFixture {
     fixture.open()
     defer { fixture.close() }
     await fixture.settle()
-    #expect(fixture.service.window.coordinator.permissionRows.allSatisfy { $0.isComplete })
+    #expect(fixture.service.window.coordinator.permissionRows.filter { ![.directCapture, .automation, .safariJavaScript, .clipboard].contains($0.id) }.allSatisfy { $0.isComplete })
     #expect(fixture.diskChecks == 1 && fixture.voice.recordings == 1 && fixture.grantRequests.isEmpty)
     #expect(fixture.requests == [DesktopEnvironmentConfiguration.lan.appURL, DesktopEnvironmentConfiguration.lan.gatewayURL, DesktopEnvironmentConfiguration.lan.mcpURL])
     for _ in 0..<3 { await fixture.service.window.coordinator.refresh() }
@@ -97,7 +97,7 @@ private final class PresentationFixture {
     fixture.document = "document-b"
     fixture.open()
     await fixture.settle()
-    #expect(fixture.service.window.coordinator.permissionRows.allSatisfy { $0.isComplete })
+    #expect(fixture.service.window.coordinator.permissionRows.filter { ![.directCapture, .automation, .safariJavaScript, .clipboard].contains($0.id) }.allSatisfy { $0.isComplete })
     #expect(fixture.voice.recordings == 2 && fixture.diskChecks == 2 && fixture.requests.count == 6)
 }
 
@@ -122,7 +122,7 @@ private final class PresentationFixture {
     fixture.denyNetwork = false
     fixture.open()
     await fixture.settle()
-    #expect(fixture.service.window.coordinator.permissionRows.allSatisfy { $0.isComplete })
+    #expect(fixture.service.window.coordinator.permissionRows.filter { ![.directCapture, .automation, .safariJavaScript, .clipboard].contains($0.id) }.allSatisfy { $0.isComplete })
 }
 
 @Test @MainActor func permissionPresentationActiveVoiceIsNotInterruptedAndFinishCancelsPendingChecks() async {

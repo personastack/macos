@@ -10,7 +10,7 @@ protocol DesktopPermissionChecklistAdapting {
     func check(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation
     /// Called only by an explicit native Setup or Retry button.
     func setup(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation
-    /// Runs only on native presentation: verifies existing core grants without
+    /// Runs on native presentation or a changed grant: verifies core grants without
     /// requesting them, or performs the established automatic-settings policy.
     func setupAutomatically(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation
     func openLocalNetworkSettings()
@@ -55,6 +55,7 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     private var manuallyCheckedRows: Set<DesktopPermissionID> = []
     private var continuation: CheckedContinuation<Void, Error>?
     private var verificationKeys: [DesktopPermissionID: String] = [:]
+    private var automaticGrantKeys: [DesktopPermissionID: String] = [:]
     private var rowRevisions: [DesktopPermissionID: UUID] = [:]
     private struct SetupFailure {
         let observation: DesktopPermissionObservation
@@ -85,7 +86,7 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     var isAwaitingFinish: Bool { continuation != nil }
     var permissionRows: [DesktopPermissionRow] {
         DesktopPermissionID.setupPermissions.compactMap { id in
-            rows.first { $0.id == id && !(id == .localNetwork && $0.state == .notNeeded) }
+            rows.first { $0.id == id && !([.localNetwork, .clipboard].contains(id) && $0.state == .notNeeded) }
         }
     }
 
@@ -104,7 +105,7 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     }
 
     /// One functional verification pass belongs to each native presentation.
-    /// Polling and activation never start this pass again.
+    /// Later grant changes use one bounded verification of the changed row.
     func startPresentationVerification() {
         guard isVisible, !isFinishing, !presentationVerificationStarted else { return }
         presentationVerificationStarted = true
@@ -131,7 +132,16 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
                 self.rowRevisions[id] = UUID()
                 let revision = self.rowRevisions[id]
                 self.setupFailures.removeValue(forKey: id)
-                let operation = Task { await self.adapter.setupAutomatically(id) }
+                let operation = Task {
+                    if id == .microphone {
+                        let current = await self.adapter.observe(id)
+                        guard !Task.isCancelled, self.generation == expected, self.isVisible, !self.isFinishing else {
+                            return DesktopPermissionObservation(.checking, detail: "Check cancelled.")
+                        }
+                        self.rememberAutomaticGrant(current, id: id)
+                    }
+                    return await self.adapter.setupAutomatically(id)
+                }
                 self.presentationOperationTask = operation
                 let value = await withTaskCancellationHandler { await operation.value } onCancel: { operation.cancel() }
                 guard self.generation == expected, self.isVisible, !self.isFinishing, !Task.isCancelled else { return }
@@ -161,6 +171,7 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
                 let revision = self.rowRevisions[id]
                 let current = await self.adapter.observe(id)
                 guard self.generation == expected, self.isVisible, !Task.isCancelled else { return }
+                self.rememberAutomaticGrant(current, id: id)
                 let value = DesktopPermissionRow(id: id, observation: current).isComplete
                     ? current : await self.adapter.setupAutomatically(id)
                 guard self.generation == expected, self.isVisible, !Task.isCancelled else { return }
@@ -243,7 +254,8 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         for id in DesktopPermissionID.allCases {
             guard generation == expected, isVisible, !isFinishing, !Task.isCancelled else { return }
             // A check cannot race a deliberate functional verification.
-            guard busyPermission != id, automaticBusyPermission != id, !pendingPresentationRows.contains(id) else { continue }
+            guard busyPermission != id, automaticBusyPermission != id, !pendingPresentationRows.contains(id),
+                  !(id == .notifications && automaticSetupTask != nil) else { continue }
             let revision = rowRevisions[id]
             let task = Task { await adapter.observe(id) }
             observationTask = task
@@ -254,8 +266,44 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
             guard generation == expected, isVisible, !isFinishing, !task.isCancelled,
                   busyPermission != id, automaticBusyPermission != id, !pendingPresentationRows.contains(id),
                   rowRevisions[id] == revision else { continue }
+            let previous = rows.first { $0.id == id }?.observation
             apply(observation, id: id, explicit: false)
+            if previous?.state == .checking { rememberAutomaticGrant(observation, id: id) }
+            else { await verifyChangedGrant(observation, id: id, expected: expected) }
         }
+    }
+
+    private func verifyChangedGrant(_ observation: DesktopPermissionObservation, id: DesktopPermissionID,
+                                    expected: UUID) async {
+        guard [.notifications, .microphone].contains(id) else { return }
+        if observation.state != .ready {
+            if id == .notifications || [.denied, .notGranted, .restricted].contains(observation.state) {
+                automaticGrantKeys.removeValue(forKey: id)
+            }
+            return
+        }
+        // A new document or input needs fresh proof, but does not authorize
+        // recording again. Automatic recording follows an OS denial-to-grant.
+        if id == .microphone, automaticGrantKeys[id] != nil {
+            rememberAutomaticGrant(observation, id: id)
+            return
+        }
+        guard verificationBusyPermission == nil, observation.requiresVerification, !observation.verified,
+              let key = observation.verificationKey, automaticGrantKeys[id] != key else { return }
+        automaticGrantKeys[id] = key
+        verificationBusyPermission = id
+        rowRevisions[id] = UUID()
+        let revision = rowRevisions[id]
+        let operation = Task { await adapter.setupAutomatically(id) }
+        observationTask = operation
+        let value = await withTaskCancellationHandler { await operation.value } onCancel: { operation.cancel() }
+        if generation == expected { verificationBusyPermission = nil; observationTask = nil }
+        guard generation == expected, isVisible, !isFinishing, !operation.isCancelled,
+              rowRevisions[id] == revision else { return }
+        let baseline = await failureBaseline(value, id: id)
+        guard generation == expected, isVisible, !isFinishing, !Task.isCancelled,
+              rowRevisions[id] == revision else { return }
+        apply(value, id: id, explicit: true, failureBaseline: baseline)
     }
 
     func setup(_ id: DesktopPermissionID) {
@@ -356,6 +404,7 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         busyPermission = nil
         automaticBusyPermission = nil
         verificationKeys.removeAll()
+        automaticGrantKeys.removeAll()
         setupFailures.removeAll()
         rowRevisions.removeAll()
         resetObservations()
@@ -385,6 +434,12 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         setupFailures.removeValue(forKey: id)
         guard let index = rows.firstIndex(where: { $0.id == id }) else { return }
         rows[index].observation = .init(.verificationRequired, detail: "Use Setup \(id.title) to verify access again.")
+    }
+
+    private func rememberAutomaticGrant(_ observation: DesktopPermissionObservation, id: DesktopPermissionID) {
+        guard [.notifications, .microphone].contains(id), observation.state == .ready,
+              let key = observation.verificationKey else { return }
+        automaticGrantKeys[id] = key
     }
 
     private static func isSetupFailure(_ value: DesktopPermissionObservation) -> Bool {
@@ -423,6 +478,7 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         if value.state != .ready || verificationKeys[id] != value.verificationKey {
             verificationKeys.removeValue(forKey: id)
         }
+        if explicit { rememberAutomaticGrant(failureBaseline ?? value, id: id) }
         if explicit, value.state == .ready, value.verified, let key = value.verificationKey {
             verificationKeys[id] = key
         }

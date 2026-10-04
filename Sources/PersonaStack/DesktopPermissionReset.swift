@@ -15,7 +15,7 @@ enum DesktopPermissionReset {
         let service: String
         switch permission {
         case .accessibility: service = "Accessibility"
-        case .screenRecording, .directCapture: service = "ScreenCapture"
+        case .screenRecording: service = "ScreenCapture"
         case .microphone: service = "Microphone"
         case .fullDiskAccess: service = "SystemPolicyAllFiles"
         case .desktopFiles: service = "SystemPolicyDesktopFolder"

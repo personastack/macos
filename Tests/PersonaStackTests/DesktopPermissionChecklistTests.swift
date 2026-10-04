@@ -193,7 +193,7 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
         await model.refresh()
         #expect(model.rows.first { $0.id == id }?.state == .verificationRequired)
         #expect(model.canFinish == (id != .accessibility))
-        #expect(fake.requested == [id])
+        #expect(fake.requested == (id == .microphone ? [id, id] : [id]))
 
         fake.setupValues[id] = .init(.ready, detail: "Operation verified", verificationKey: "current-owner",
                                      requiresVerification: true, verified: true)
@@ -206,7 +206,7 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
         await model.refresh()
         #expect(model.rows.first { $0.id == id }?.state == denied.state)
         #expect(model.canFinish == (id != .accessibility))
-        #expect(fake.requested == [id, id])
+        #expect(fake.requested == (id == .microphone ? [id, id, id] : [id, id]))
         model.cancel()
     }
 }
@@ -479,14 +479,15 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
 
         fake.values[id] = .init(.ready, detail: "Changed owner or grant", verificationKey: "owner-grant-B", requiresVerification: true)
         await model.refresh()
-        #expect(model.rows.first { $0.id == id }?.state == .verificationRequired)
+        #expect(model.rows.first { $0.id == id }?.state == (id == .notifications ? .failed : .verificationRequired))
+        #expect(fake.requested == (id == .notifications ? [id, id] : [id]))
         fake.setupValues[id] = .init(.ready, detail: "Operation verified", verificationKey: "owner-grant-B", requiresVerification: true, verified: true)
         model.setup(id)
         while model.busyPermission != nil { await Task.yield() }
         await model.refresh()
         #expect(model.rows.first { $0.id == id }?.state == .ready)
         #expect(model.rows.first { $0.id == id }?.observation.detail == "Operation verified")
-        #expect(fake.requested == [id, id])
+        #expect(fake.requested == (id == .notifications ? [id, id, id] : [id, id]))
         fake.values[id] = .init(.denied, detail: "Permission revoked")
         await model.refresh()
         #expect(model.rows.first { $0.id == id }?.state == .denied)
@@ -700,13 +701,15 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     #expect(model.rows.first { $0.id == .microphone }?.observation.detail == "Earlier setup denial")
     fake.values[.microphone] = .init(.ready, detail: "New OS grant needs recording proof",
         verificationKey: "new-device-document", requiresVerification: true)
+    fake.setupValues[.microphone] = .init(.ready, detail: "New grant recording verified",
+        verificationKey: "new-device-document", requiresVerification: true, verified: true)
     let refresh = Task { await model.refresh() }
     fake.pendingObservation?.resume(returning: .init(.ready, detail: "Optional screen observation"))
     fake.pendingObservation = nil
     await refresh.value
-    #expect(model.rows.first { $0.id == .microphone }?.state == .verificationRequired)
-    #expect(model.rows.first { $0.id == .microphone }?.observation.detail == "New OS grant needs recording proof")
-    #expect(fake.requested == [.microphone])
+    #expect(model.rows.first { $0.id == .microphone }?.isComplete == true)
+    #expect(model.rows.first { $0.id == .microphone }?.observation.detail == "New grant recording verified")
+    #expect(fake.requested == [.microphone, .microphone])
 }
 
 @Test @MainActor func permissionRecoveryRevealsTheRunningCopyWithoutRequestingOrResettingAccess() async {
@@ -897,4 +900,31 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
         try DesktopApplicationRestart.request(applicationURL: appURL, installUpdate: { throw CocoaError(.executableNotLoadable) },
             start: { _ in Issue.record("Scheduled competing relaunch after update error") }, terminate: { Issue.record("Quit after update error") })
     }
+}
+
+@Test @MainActor func permissionPresentationCanceledMicrophoneObservationCannotSuppressNewGrantCheck() async {
+    let fake = PermissionChecklistFake()
+    fake.values[.microphone] = .init(.denied, detail: "Initial denial")
+    let model = DesktopPermissionChecklistCoordinator(adapter: fake)
+    model.open()
+    await model.refresh()
+    fake.suspendedObservation = .microphone
+    model.startPresentationVerification()
+    while fake.pendingObservation == nil { await Task.yield() }
+    model.cancel()
+    model.open()
+    defer { model.cancel() }
+    await model.refresh()
+    let grant = DesktopPermissionObservation(.ready, detail: "New approval", verificationKey: "new-grant",
+        requiresVerification: true)
+    fake.pendingObservation?.resume(returning: grant)
+    fake.pendingObservation = nil
+    for _ in 0..<10 { await Task.yield() }
+    #expect(!fake.requested.contains(.microphone))
+    fake.values[.microphone] = grant
+    fake.setupValues[.microphone] = .init(.ready, detail: "Recording verified", verificationKey: "new-grant",
+        requiresVerification: true, verified: true)
+    await model.refresh()
+    #expect(fake.requested.filter { $0 == .microphone }.count == 1)
+    #expect(model.rows.first { $0.id == .microphone }?.isComplete == true)
 }

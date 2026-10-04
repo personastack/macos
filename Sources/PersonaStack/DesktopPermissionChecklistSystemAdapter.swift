@@ -2,6 +2,7 @@ import AppKit
 @preconcurrency import ApplicationServices
 import AVFoundation
 import CoreGraphics
+import Carbon
 import ServiceManagement
 import ScreenCaptureKit
 import UserNotifications
@@ -39,6 +40,25 @@ struct DesktopPermissionSystemAccess {
             return !content.displays.isEmpty
         } catch { return false }
     }
+    var requestDirectCapture: () async -> Bool = {
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+            guard !Task.isCancelled, let display = content.displays.first else { return false }
+            let filter = SCContentFilter(display: display, excludingWindows: [])
+            let configuration = SCStreamConfiguration()
+            configuration.width = 1
+            configuration.height = 1
+            configuration.capturesAudio = false
+            let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+            return image.width > 0 && image.height > 0
+        } catch { return false }
+    }
+    var automation: (Bool) async -> OSStatus = { await DesktopBrowserPermission.automation(prompt: $0) }
+    var safariProcessIdentifier: () -> Int32? = { DesktopBrowserPermission.safariProcessIdentifier() }
+    var verifySafariJavaScript: () async -> Bool = { await DesktopBrowserPermission.verifyJavaScript() }
+    var openSafari: () -> Void = { DesktopBrowserPermission.openSafari() }
+    var clipboardAccess: () -> DesktopClipboardAccess = { DesktopClipboardPermission.status() }
+    var requestClipboardAccess: () -> Void = { DesktopClipboardPermission.request() }
     var microphone: () -> AVAuthorizationStatus = { AVCaptureDevice.authorizationStatus(for: .audio) }
     var requestMicrophone: () async -> Bool = { await AVCaptureDevice.requestAccess(for: .audio) }
     var microphoneIdentity: () -> String? = { AVCaptureDevice.default(for: .audio)?.uniqueID }
@@ -77,6 +97,8 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
     let access: DesktopPermissionSystemAccess
     private let openSettings: (String) -> Void
     private var resetObservations: [DesktopPermissionID: DesktopPermissionObservation] = [:]
+    private var directCaptureVerified = false
+    private var verifiedSafariProcess: Int32?
 
     init(hooks: DesktopPermissionChecklistHooks = .init(),
          access: DesktopPermissionSystemAccess = .init(),
@@ -92,8 +114,16 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         switch permission {
         case .accessibility:
             return accessibilityObservation()
-        case .screenRecording, .directCapture:
+        case .screenRecording:
             return screenCaptureObservation(permission)
+        case .directCapture:
+            return directCaptureObservation()
+        case .automation:
+            return await automationObservation()
+        case .safariJavaScript:
+            return await safariJavaScriptObservation()
+        case .clipboard:
+            return clipboardObservation()
         case .microphone:
             return microphoneObservation()
         case .notifications:
@@ -111,7 +141,7 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
             if permission == .fullDiskAccess { openFullDiskAccess() }
             return value
         }
-        if let reset = await resetForSetup(permission) { return reset }
+        if permission != .fullDiskAccess, let reset = await resetForSetup(permission) { return reset }
         return await setup(permission, automatic: false)
     }
 
@@ -119,9 +149,14 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
 
     func openSettings(_ permission: DesktopPermissionID) {
         switch permission {
+        case .fullDiskAccess: openFullDiskAccess()
         case .localNetwork: openLocalNetworkSettings()
         case .notifications: openNotificationSettings()
         case .launchAtLogin: access.openLoginSettings()
+        case .automation: openPrivacy("Automation")
+        case .directCapture: openPrivacy("ScreenCapture")
+        case .safariJavaScript: access.openSafari()
+        case .clipboard: openPrivacy("Pasteboard")
         default: break
         }
     }
@@ -130,6 +165,7 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         guard !Task.isCancelled else { return .init(.checking, detail: "Check cancelled.") }
         if let value = resetObservations[permission] { return value }
         if permission == .notifications { return await checkNotifications() }
+        if permission == .safariJavaScript { return await checkSafariJavaScript() }
         if DesktopPermissionID.setupPermissions.contains(permission) {
             return await setupAutomatically(permission)
         }
@@ -159,6 +195,9 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
 
     private func setup(_ permission: DesktopPermissionID, automatic: Bool) async -> DesktopPermissionObservation {
         guard !Task.isCancelled else { return .init(.checking, detail: "Setup cancelled.") }
+        if [.directCapture, .automation, .safariJavaScript, .clipboard].contains(permission) {
+            return await setupSupplementalPermission(permission)
+        }
         switch permission {
         case .accessibility:
             if !access.accessibility() { access.requestAccessibility() }
@@ -166,7 +205,7 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
             let current = accessibilityObservation()
             if current.state != .ready { openPrivacy("Accessibility") }
             return current
-        case .screenRecording, .directCapture:
+        case .screenRecording:
             // CGRequestScreenCaptureAccess can return false without registering
             // the app on newer macOS. A real host SCK request owns that prompt.
             let alreadyAllowed = access.screenRecording()
@@ -196,7 +235,6 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
                     return .init(.checking, detail: "Setup changed. Retry Setup Full Disk Access.")
                 }
                 guard !Task.isCancelled else { return .init(.checking, detail: "Setup cancelled.") }
-                if value.state == .notGranted || value.state == .denied { openFullDiskAccess() }
                 return value
             }
             openFullDiskAccess()
@@ -223,6 +261,38 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         return await observe(permission)
     }
 
+    private func setupSupplementalPermission(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation {
+        switch permission {
+        case .directCapture:
+            directCaptureVerified = false
+            let captured = await access.requestDirectCapture()
+            guard !Task.isCancelled else { return .init(.verificationRequired, detail: "Capture check cancelled. Choose Setup to retry.") }
+            guard captured, access.screenRecording() else {
+                openPrivacy("ScreenCapture")
+                return .init(.failed, detail: "Direct capture was not verified. Allow PersonaStack's screen request, including any request to bypass the private window picker. Then choose Setup again. Quit and reopen PersonaStack if macOS requests it.")
+            }
+            directCaptureVerified = true
+            return directCaptureObservation()
+        case .automation:
+            _ = await access.automation(true)
+            guard !Task.isCancelled else { return .init(.verificationRequired, detail: "Automation setup cancelled. Choose Check to read the current grant.") }
+            let current = await automationObservation()
+            if current.state != .ready { openPrivacy("Automation") }
+            return current
+        case .safariJavaScript:
+            verifiedSafariProcess = nil
+            access.openSafari()
+            return .init(.verificationRequired, detail: DesktopBrowserPermission.javascriptInstructions)
+        case .clipboard:
+            if [.notDetermined, .ask].contains(access.clipboardAccess()) { access.requestClipboardAccess() }
+            guard !Task.isCancelled else { return .init(.verificationRequired, detail: "Clipboard setup cancelled. Choose Check to read the access policy.") }
+            let current = clipboardObservation()
+            if !current.state.satisfiesSetup { openPrivacy("Pasteboard") }
+            return current
+        default: return await observe(permission)
+        }
+    }
+
     private func resetForSetup(_ permission: DesktopPermissionID) async -> DesktopPermissionObservation? {
         guard DesktopPermissionReset.arguments(for: permission) != nil else { return nil }
         let result = await access.resetPermission(permission)
@@ -230,7 +300,8 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         // failure prevents confirmation. Never reuse this process's cached grant.
         if result != .notApplicable {
             resetObservations[permission] = Self.resetObservation(permission, confirmed: result == .cleared)
-            if permission == .screenRecording || permission == .directCapture {
+            if permission == .screenRecording {
+                directCaptureVerified = false
                 for id in [DesktopPermissionID.screenRecording, .directCapture] {
                     resetObservations[id] = Self.resetObservation(id, confirmed: result == .cleared)
                 }
@@ -243,7 +314,7 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
             // Its in-process cached answer cannot prove access after a reset.
             switch permission {
             case .accessibility: access.requestAccessibility()
-            case .screenRecording, .directCapture: _ = await access.requestScreenRecording()
+            case .screenRecording: _ = await access.requestScreenRecording()
             case .microphone: _ = await access.requestMicrophone()
             default: break
             }
@@ -286,6 +357,74 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         return .init(.ready, detail: "macOS allows PersonaStack Screen Capture access. No screenshot was taken.",
                      verificationKey: "\(Bundle.main.bundleIdentifier ?? "unpackaged"):\(permission.rawValue):allowed",
                      verified: true)
+    }
+
+    private func directCaptureObservation() -> DesktopPermissionObservation {
+        guard access.screenRecording() else {
+            directCaptureVerified = false
+            return Self.privacyDenialObservation(.directCapture)
+        }
+        guard directCaptureVerified else {
+            return .init(.verificationRequired, detail: "Choose Setup to verify direct screen capture. macOS may separately ask to bypass the private window picker. A 1-pixel screen image is discarded without saving or sending it.")
+        }
+        return .init(.ready, detail: "Direct screen capture worked. No image was saved or sent.", verified: true)
+    }
+
+    private func clipboardObservation() -> DesktopPermissionObservation {
+        switch access.clipboardAccess() {
+        case .notNeeded:
+            return .init(.notNeeded, detail: "This macOS version has no programmatic clipboard permission.")
+        case .allowed:
+            return .init(.ready, detail: "macOS always allows PersonaStack's programmatic clipboard access. No clipboard content was read by this check.", verified: true)
+        case .denied:
+            return .init(.denied, detail: "Choose Always Allow for PersonaStack in Privacy & Security → Pasteboard. Accessibility does not replace this policy.")
+        case .notDetermined, .ask:
+            return .init(.verificationRequired, detail: "Setup requests clipboard access using a text read and discards it. Choose Always Allow in Privacy & Security → Pasteboard for unattended access. If PersonaStack is missing, copy harmless text in another app and choose Setup.")
+        case .unknown:
+            return .init(.verificationRequired, detail: "Clipboard policy could not be read. Review PersonaStack in Privacy & Security → Pasteboard and choose Check.")
+        }
+    }
+
+    private func automationObservation() async -> DesktopPermissionObservation {
+        let status = await access.automation(false)
+        switch status {
+        case noErr:
+            return .init(.ready, detail: "macOS allows PersonaStack to send Apple Events to Safari. Other apps have separate grants.", verificationKey: "safari-automation:allowed", verified: true)
+        case OSStatus(errAEEventNotPermitted):
+            verifiedSafariProcess = nil
+            return .init(.denied, detail: "Enable Safari under PersonaStack in Privacy & Security → Automation. This grant is separate from Accessibility.")
+        case OSStatus(errAEEventWouldRequireUserConsent):
+            verifiedSafariProcess = nil
+            return .init(.notGranted, detail: "Choose Setup to request permission to control Safari with Apple Events. macOS grants access separately for each app.")
+        default:
+            verifiedSafariProcess = nil
+            return .init(.verificationRequired, detail: "Safari Automation access could not be read. Open Safari and choose Setup. A missing or inactive Safari process does not prove permission denial.")
+        }
+    }
+
+    private func safariJavaScriptObservation() async -> DesktopPermissionObservation {
+        let automation = await automationObservation()
+        guard automation.state == .ready else {
+            return .init(.verificationRequired, detail: "Set up Application Automation for Safari first. " + DesktopBrowserPermission.javascriptInstructions)
+        }
+        guard let pid = access.safariProcessIdentifier(), verifiedSafariProcess == pid else {
+            verifiedSafariProcess = nil
+            return .init(.verificationRequired, detail: DesktopBrowserPermission.javascriptInstructions)
+        }
+        return .init(.ready, detail: "Safari allows JavaScript from Apple Events. No page content was read or changed. Choose Check after changing Safari's developer settings.", verificationKey: "safari-javascript:\(pid)", verified: true)
+    }
+
+    private func checkSafariJavaScript() async -> DesktopPermissionObservation {
+        verifiedSafariProcess = nil
+        guard await automationObservation().state == .ready else { return await safariJavaScriptObservation() }
+        guard !Task.isCancelled, let pid = access.safariProcessIdentifier() else { return await safariJavaScriptObservation() }
+        let verified = await access.verifySafariJavaScript()
+        guard !Task.isCancelled, access.safariProcessIdentifier() == pid else {
+            return .init(.verificationRequired, detail: "Safari changed or the check was cancelled. Open a Safari tab and choose Check again.")
+        }
+        guard verified else { return .init(.verificationRequired, detail: DesktopBrowserPermission.javascriptInstructions) }
+        verifiedSafariProcess = pid
+        return await safariJavaScriptObservation()
     }
 
     /// Read OS trust and content-free AX access without exercising input.
@@ -368,7 +507,7 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
             catch { requestFailed = true }
         }
         guard !Task.isCancelled else { return .init(.checking, detail: "Setup cancelled.") }
-        var observed = automatic ? await observeNotifications() : await checkNotifications()
+        var observed = await checkNotifications()
         guard !Task.isCancelled else { return .init(.checking, detail: "Setup cancelled.") }
         if requestFailed && observed.state == .notGranted {
             let current = await access.notificationSettings()
@@ -446,7 +585,6 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
     }
 
     private func openFullDiskAccess() {
-        access.revealApplication()
         openSettings("com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles")
     }
 
@@ -484,11 +622,11 @@ final class DesktopPermissionChecklistSystemAdapter: DesktopPermissionChecklistA
         case .fullDiskAccess:
             return .init(.verificationRequired, detail: "Already enabled in System Settings? Choose Check to verify it. If needed, choose Setup and add PersonaStack.app from Applications with the + button in Full Disk Access settings.")
         case .inputMonitoring:
-            return .init(.notNeeded, detail: "Ordinary mouse and keyboard control does not require Input Monitoring. No locked-control listener is installed.")
+            return .init(.notNeeded, detail: "Mouse and keyboard control and the active local takeover filter use Accessibility. No separate Input Monitoring grant is required.")
         case .camera: return .init(.notNeeded, detail: "PersonaStack does not use camera capture.")
         case .speechRecognition: return .init(.notNeeded, detail: "Voice messages use audio recording. Native speech recognition is not used.")
         case .systemAudio: return .init(.notNeeded, detail: "The current Cua recorder captures screen video without system audio.")
-        case .automation: return .init(.notNeeded, detail: "No target-specific Apple Events integration is configured.")
+        case .automation: return .init(.verificationRequired, detail: "Choose Setup Application Automation to request Safari access.")
         case .removableVolumes, .networkVolumes:
             return .init(.checking, detail: "Mounted volumes have not been inspected. Use PersonaStack's permission checklist to verify selected resources.")
         case .directCapture:

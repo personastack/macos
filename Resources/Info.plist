@@ -28,6 +28,8 @@
   <string>Share your screen when you set up or use PersonaStack Desktop Control.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Record audio attachments when you choose the microphone in persona chat.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Control Safari when an authorized persona uses Desktop Control to select a web form value.</string>
   <key>NSLocalNetworkUsageDescription</key>
   <string>Connect PersonaStack Desktop to your selected PersonaStack services on your local network.</string>
   <key>NSDesktopFolderUsageDescription</key>

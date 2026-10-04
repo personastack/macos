@@ -6,7 +6,7 @@ import PersonaStackCore
 
 @Suite @MainActor
 struct DesktopPermissionRequestFlowTests {
-    @Test(arguments: [DesktopPermissionID.screenRecording, .directCapture])
+    @Test(arguments: [DesktopPermissionID.screenRecording])
     func hostScreenRequestRunsDespiteDeniedPreflightAndReadsApproval(id: DesktopPermissionID) async {
         var granted = false
         var calls: [String] = []
@@ -25,7 +25,7 @@ struct DesktopPermissionRequestFlowTests {
         #expect(calls == ["host-screen-request"])
     }
 
-    @Test(arguments: [DesktopPermissionID.screenRecording, .directCapture])
+    @Test(arguments: [DesktopPermissionID.screenRecording])
     func refusedScreenRequestOpensSettingsWithoutGrantingReady(id: DesktopPermissionID) async {
         var calls: [String] = []
         var access = DesktopPermissionSystemAccess.permissionFixture()
@@ -40,7 +40,7 @@ struct DesktopPermissionRequestFlowTests {
         #expect(calls == ["request", "com.apple.preference.security?Privacy_ScreenCapture"])
     }
 
-    @Test(arguments: [DesktopPermissionID.screenRecording, .directCapture])
+    @Test(arguments: [DesktopPermissionID.screenRecording])
     func existingScreenGrantSkipsRequestsAndOperationHooks(id: DesktopPermissionID) async {
         var access = DesktopPermissionSystemAccess.permissionFixture()
         access.accessibility = { Issue.record("Screen access must not depend on Accessibility"); return false }
@@ -97,7 +97,7 @@ struct DesktopPermissionRequestFlowTests {
         #expect(requests == 1)
     }
 
-    @Test(arguments: [DesktopPermissionID.screenRecording, .directCapture], [false, true])
+    @Test(arguments: [DesktopPermissionID.screenRecording], [false, true])
     func screenGrantIsReadyIndependentlyOfAccessibility(id: DesktopPermissionID, accessibility: Bool) async {
         var access = DesktopPermissionSystemAccess.permissionFixture()
         access.accessibility = { accessibility }
