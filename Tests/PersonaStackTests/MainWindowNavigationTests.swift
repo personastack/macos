@@ -9,6 +9,9 @@ struct MainWindowNavigationTests {
         let webView = HistoryTestWebView()
         let navigation = MainWindowNavigation()
         navigation.bind(to: webView)
+        #expect(navigation.refreshButton.isEnabled)
+        navigation.refreshButton.performClick(nil)
+        #expect(webView.reloadCalls == 1)
         #expect(!navigation.backButton.isEnabled)
         #expect(!navigation.forwardButton.isEnabled)
         navigation.backButton.performClick(nil)
@@ -46,6 +49,7 @@ struct MainWindowNavigationTests {
         #expect(navigation.backButton.isEnabled)
         #expect(navigation.backButton.accessibilityLabel() == "Back")
         #expect(navigation.forwardButton.accessibilityLabel() == "Forward")
+        #expect(navigation.refreshButton.accessibilityLabel() == "Refresh")
 
         let replacement = HistoryTestWebView()
         replacement.setHistory(back: false, forward: true)
@@ -59,6 +63,9 @@ struct MainWindowNavigationTests {
         navigation.forwardButton.performClick(nil)
         #expect(replacement.forwardCalls == 1)
         #expect(first.forwardCalls == 0)
+        navigation.refreshButton.performClick(nil)
+        #expect(replacement.reloadCalls == 1)
+        #expect(first.reloadCalls == 0)
     }
 }
 
@@ -68,6 +75,7 @@ private final class HistoryTestWebView: WKWebView {
     private var forwardAvailable = false
     private(set) var backCalls = 0
     private(set) var forwardCalls = 0
+    private(set) var reloadCalls = 0
 
     override var canGoBack: Bool { backAvailable }
     override var canGoForward: Bool { forwardAvailable }
@@ -90,6 +98,11 @@ private final class HistoryTestWebView: WKWebView {
     override func goForward() -> WKNavigation? {
         forwardCalls += 1
         setHistory(back: true, forward: false)
+        return nil
+    }
+
+    override func reload() -> WKNavigation? {
+        reloadCalls += 1
         return nil
     }
 }

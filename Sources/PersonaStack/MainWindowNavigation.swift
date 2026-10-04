@@ -3,6 +3,7 @@ import WebKit
 
 @MainActor
 final class MainWindowNavigation: NSTitlebarAccessoryViewController {
+    let refreshButton = NSButton()
     let backButton = NSButton()
     let forwardButton = NSButton()
     private weak var webView: WKWebView?
@@ -21,12 +22,13 @@ final class MainWindowNavigation: NSTitlebarAccessoryViewController {
     init() {
         super.init(nibName: nil, bundle: nil)
         layoutAttribute = .left
-        let controls = NSStackView(views: [backButton, forwardButton])
+        let controls = NSStackView(views: [refreshButton, backButton, forwardButton])
         controls.orientation = .horizontal
         controls.spacing = 2
         controls.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 4)
-        controls.frame = NSRect(x: 0, y: 0, width: 62, height: 22)
+        controls.frame = NSRect(x: 0, y: 0, width: 88, height: 22)
         view = controls
+        configure(refreshButton, symbol: "arrow.clockwise", label: "Refresh", action: #selector(refreshPage))
         configure(backButton, symbol: "chevron.left", label: "Back", action: #selector(goBack))
         configure(forwardButton, symbol: "chevron.right", label: "Forward", action: #selector(goForward))
     }
@@ -68,8 +70,13 @@ final class MainWindowNavigation: NSTitlebarAccessoryViewController {
     }
 
     private func updateAvailability() {
+        refreshButton.isEnabled = webView != nil
         backButton.isEnabled = webView?.canGoBack == true
         forwardButton.isEnabled = webView?.canGoForward == true
+    }
+
+    @objc private func refreshPage() {
+        webView?.reload()
     }
 
     @objc private func goBack() {
