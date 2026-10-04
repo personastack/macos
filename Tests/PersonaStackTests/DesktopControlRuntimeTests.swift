@@ -3063,7 +3063,7 @@ func desktopControlAttemptsOperationsWithoutUnlockProof(state: DesktopControlSes
         #expect(observed.type == "result")
         #expect(try runtimeFixtureCalls(root).filter { $0 == "get_accessibility_tree" }.count == 1)
         let failed = await runtime.handleForTesting(gui("desktop_control_application", "launch_app", token: token), connectionID: connection)
-        #expect(failed.type == "failure" && failed.errorCode == "desktop_command_failed")
+        #expect(failed.type == "failure" && failed.errorCode == "desktop_cua_failure_unknown")
         #expect(try runtimeFixtureCalls(root).filter { $0 == "launch_app" }.count == 1)
         let stat = lockedControlFrame("desktop_control_file", target: owner, arguments: .object([
             "control_token": .string(token), "action": .string("stat"), "path": .string(root.path)]))
@@ -3077,7 +3077,7 @@ func desktopControlAttemptsOperationsWithoutUnlockProof(state: DesktopControlSes
         #expect(runtime.readiness == "ready")
         try Data().write(to: root.appendingPathComponent("permission-failure"))
         let failedWithRecoveryError = await runtime.handleForTesting(gui("desktop_control_application", "launch_app", token: token), connectionID: connection)
-        #expect(failedWithRecoveryError.errorCode == "desktop_command_failed")
+        #expect(failedWithRecoveryError.errorCode == "desktop_cua_failure_unknown")
         #expect(runtime.readiness == "permission_required")
         #expect(try runtimeFixtureCalls(root).filter { $0 == "launch_app" }.count == 2)
         let calls = try runtimeFixtureCalls(root)

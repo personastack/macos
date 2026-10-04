@@ -1971,7 +1971,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             return Self.failure(for: frame, code: "locked_control_cleanup_pending",
                                 message: "The desktop lease ended, but the Mac has not confirmed relock and privacy restoration.")
         }
-        if Self.requiresCua(frame.operation), response.type == "failure", response.errorCode == "desktop_command_failed" {
+        if Self.requiresCua(frame.operation), response.type == "failure",
+           ["desktop_command_failed", "desktop_cua_failure_unknown"].contains(response.errorCode ?? "") {
             let recoveredReadiness = await readinessAfterGuiFailure(generation: commandGeneration)
             guard commandGeneration == lifecycleGeneration else { return response }
             readiness = recoveredReadiness

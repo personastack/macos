@@ -714,14 +714,19 @@ struct DesktopControlCommandExecutorTests {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("desktop-control-cua-error-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: directory) }
+        let toolCalls = directory.appendingPathComponent("tool-calls")
         let executable = directory.appendingPathComponent("fake-cua")
         try #"""
         #!/usr/bin/python3
         import json,sys
+        from pathlib import Path
         for line in sys.stdin:
             request=json.loads(line)
             if request.get("method")=="notifications/initialized": continue
-            result={"isError":True,"content":[{"type":"text","text":"permission denied"}]} if request.get("method")=="tools/call" else {}
+            if request.get("method")=="tools/call":
+                with Path(r"\#(toolCalls.path)").open("a") as output: output.write(request["params"]["name"] + "\n")
+                result={"isError":True,"content":[{"type":"text","text":"private launch diagnostic"}],"structuredContent":{"error":"LAUNCH_CALLBACK_TIMEOUT","message":"private /Users/example path","launch_state":{"process_running":False,"window_ready":False}}}
+            else: result={}
             print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}),flush=True)
         """#.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
@@ -737,12 +742,19 @@ struct DesktopControlCommandExecutorTests {
             await executor.close()
             return
         }
-        let observe = command("desktop_control_observe", owner, requestID: "observe-cua-error",
-                              arguments: .object(["control_token": .string(token), "tool": .string("get_desktop_state"),
-                                                  "arguments": .object([:])]))
-        let response = await executor.handle(observe, proxy: proxy)
+        let launch = command("desktop_control_application", owner, requestID: "launch-cua-error",
+                             arguments: .object(["control_token": .string(token), "tool": .string("launch_app"),
+                                                 "arguments": .object(["bundle_id": .string("com.apple.Safari")])]))
+        let response = await executor.handle(launch, proxy: proxy)
         #expect(response.type == "failure")
-        #expect(response.errorCode == "desktop_command_failed")
+        #expect(response.errorCode == "LAUNCH_CALLBACK_TIMEOUT")
+        #expect(response.errorMessage?.contains("app or URL may already have opened") == true)
+        #expect(response.errorMessage?.contains("If the intended target is Safari and it is absent") == true)
+        #expect(response.errorMessage?.contains("private") == false)
+        #expect(response.errorMessage?.contains("/Users") == false)
+        #expect(response.errorMessage?.contains("process_running") == false)
+        #expect(response.errorMessage?.contains("window_ready") == false)
+        #expect(try String(contentsOf: toolCalls, encoding: .utf8) == "launch_app\n")
         await proxy.stop()
         #expect(await executor.close())
     }

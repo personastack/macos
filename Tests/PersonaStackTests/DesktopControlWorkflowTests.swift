@@ -145,9 +145,55 @@ private actor SuspendedReadiness {
     #expect(failure.message.contains("browser_prepare"))
     #expect(!failure.message.contains("private-content"))
     let unknown = DesktopCuaFailure.from(["structuredContent": ["refusal": ["code": "private-content"]]], tool: "click")
-    #expect(unknown.code == "desktop_command_failed")
+    #expect(unknown.code == "desktop_cua_failure_unknown")
     #expect(unknown.message.contains("partly completed"))
     #expect(!unknown.message.contains("private-content"))
+}
+
+@Test func cuaFailuresMapReviewedStructuredReasonLocationsToFixedMessages() {
+    let cases: [(result: [String: Any], tool: String, code: String, message: String)] = [
+        (["structuredContent": ["code": "invalid_arguments", "detail": "/private/input"]],
+         "click", "invalid_arguments", "required fields and valid ranges"),
+        (["structuredContent": ["code": "window_target_not_found", "pid": 451]],
+         "click", "window_target_not_found", "Discover the current applications and windows"),
+        (["structuredContent": ["code": "permission_denied", "message": "private policy detail"]],
+         "click", "permission_denied", "current authorization or policy"),
+        (["structuredContent": ["error": "LAUNCH_CALLBACK_TIMEOUT", "path": "/private/app",
+                                "launch_state": ["process_running": false, "window_ready": false]]],
+         "launch_app", "LAUNCH_CALLBACK_TIMEOUT", "app or URL may already have opened"),
+        (["structuredContent": ["error": "APP_NOT_INSTALLED", "bundle_id": "private.bundle"]],
+         "launch_app", "APP_NOT_INSTALLED", "could not find an installed macOS app"),
+        (["structuredContent": ["refusal": ["code": "browser_input_incomplete", "message": "private text"]]],
+         "click", "browser_input_incomplete", "Do not repeat the entire input blindly."),
+    ]
+
+    for item in cases {
+        let failure = DesktopCuaFailure.from(item.result, tool: item.tool)
+        #expect(failure.code == item.code)
+        #expect(failure.message.contains(item.message))
+        #expect(!failure.message.contains("/private"))
+        #expect(!failure.message.contains("private text"))
+        #expect(!failure.message.contains("private policy detail"))
+        #expect(!failure.message.contains("window_ready"))
+    }
+
+    let unknown = DesktopCuaFailure.from(
+        ["structuredContent": ["code": "private_unknown_code", "detail": "private detail"]], tool: "click"
+    )
+    #expect(unknown.code == "desktop_cua_failure_unknown")
+    #expect(unknown.message.contains("unrecognized failure"))
+    #expect(unknown.message.contains("may have partly completed"))
+    #expect(!unknown.message.contains("private_unknown_code"))
+    #expect(!unknown.message.contains("private detail"))
+
+    let unrelatedLaunchError = DesktopCuaFailure.from(
+        ["structuredContent": ["error": "NSWORKSPACE_LAUNCH_FAILED", "message": "private launch detail"]],
+        tool: "get_desktop_state"
+    )
+    #expect(unrelatedLaunchError.code == "desktop_cua_failure_unknown")
+    #expect(unrelatedLaunchError.message.contains("unrecognized failure"))
+    #expect(!unrelatedLaunchError.message.contains("launch"))
+    #expect(!unrelatedLaunchError.message.contains("private launch detail"))
 }
 
 @Test @MainActor func expiredCommandCannotAcquireControl() async {
