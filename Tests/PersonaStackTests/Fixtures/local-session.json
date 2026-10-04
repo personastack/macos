@@ -5,8 +5,9 @@
   "harness": "codex",
   "issued_at": "2026-09-16T00:00:00Z",
   "expires_at": "2027-09-16T00:00:00Z",
-  "mcp_url": "https://mcp.personastack.ai/v1/mcp",
-  "bearer_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "mcp_url": "https://mcp.personastack.ai/v1/mcp?connection_id=11111111-1111-4111-8111-111111111111&persona_id=persona-a&workspace_id=ws_11111111111111111111111111111111",
+  "connection_id": "11111111-1111-4111-8111-111111111111",
+  "activity_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "persona_prompt": "Help with the task.",
   "skills": [
     {

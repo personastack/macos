@@ -14,6 +14,7 @@ public enum LocalSessionError: String, Error, LocalizedError, Sendable {
     case invalidRequest = "The local session request is invalid."
     case staleRequest = "The page changed. Start the local session again."
     case unsafeFiles = "PersonaStack cannot safely install the local session files."
+    case missingMCP = "This MCP entry has already been removed."
     case missingHarness = "Install the selected CLI, then try again."
     case outdatedHarness = "Update the selected CLI, then try again."
     case mcpRedirect = "The selected MCP service redirects requests. Enter its final MCP base URL in Server Settings and try again."
@@ -24,6 +25,7 @@ public enum LocalSessionError: String, Error, LocalizedError, Sendable {
 public struct LocalSessionSkillFile: Codable, Equatable, Sendable {
     public let relativePath: String
     public let content: String
+    public init(relativePath: String, content: String) { self.relativePath = relativePath; self.content = content }
     enum CodingKeys: String, CodingKey { case relativePath = "relative_path", content }
 }
 
@@ -45,13 +47,14 @@ public struct LocalSessionBundle: Codable, Sendable {
     public let issuedAt: String
     public let expiresAt: String
     public let mcpURL: String
-    public let bearerToken: String
+    public let connectionID: String
+    public let activityToken: String
     public let personaPrompt: String
     public let skills: [LocalSessionSkill]
     enum CodingKeys: String, CodingKey, CaseIterable {
         case personaID = "persona_id", personaName = "persona_name", workspaceID = "workspace_id"
         case harness, issuedAt = "issued_at", expiresAt = "expires_at", mcpURL = "mcp_url"
-        case bearerToken = "bearer_token", personaPrompt = "persona_prompt", skills
+        case connectionID = "connection_id", activityToken = "activity_token", personaPrompt = "persona_prompt", skills
     }
 
     public static func decode(_ data: Data, appURL: URL, now: Date = Date()) throws -> LocalSessionBundle {
@@ -78,11 +81,12 @@ public struct LocalSessionBundle: Codable, Sendable {
               workspaceID.range(of: "^ws_[0-9a-f]{32}$", options: .regularExpression) != nil,
               personaName.utf8.count <= 1024, !personaName.contains("\0"),
               personaPrompt.utf8.count <= 128 * 1024, !personaPrompt.contains("\0"),
-              bearerToken.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+              UUID(uuidString: connectionID)?.uuidString.lowercased() == connectionID,
+              activityToken.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
               let issued = Self.date(issuedAt), let expires = Self.date(expiresAt),
               abs(expires.timeIntervalSince(issued) - Self.lifetime) < 0.001,
               issued.timeIntervalSince(now) <= 300, expires > now,
-              Self.permitsMCP(mcpURL, appURL: appURL), skills.count <= 32 else { throw LocalSessionError.invalidBundle }
+              Self.permitsMCP(mcpURL, appURL: appURL), Self.hasBinding(mcpURL, connection: connectionID, persona: personaID, workspace: workspaceID), skills.count <= 32 else { throw LocalSessionError.invalidBundle }
         var identities = Set<String>()
         var bytes = 0
         var count = 0
@@ -99,8 +103,21 @@ public struct LocalSessionBundle: Codable, Sendable {
 
     public static func permitsMCP(_ endpoint: String, appURL: URL) -> Bool {
         guard let configuration = try? DesktopEnvironmentConfigurationStore.shared.environment(for: appURL),
-              let endpointURL = URL(string: endpoint) else { return false }
+              var components = URLComponents(string: endpoint) else { return false }
+        if components.queryItems != nil {
+            guard let items = components.queryItems, items.count == 3,
+                  Set(items.map(\.name)) == ["persona_id", "workspace_id", "connection_id"],
+                  items.allSatisfy({ $0.value != nil }) else { return false }
+            components.query = nil
+        }
+        guard let endpointURL = components.url else { return false }
         return configuration.permitsMCP(endpointURL, for: appURL)
+    }
+
+    private static func hasBinding(_ endpoint: String, connection: String, persona: String, workspace: String) -> Bool {
+        guard let query = URLComponents(string: endpoint)?.queryItems, query.count == 3 else { return false }
+        let values = Dictionary(uniqueKeysWithValues: query.map { ($0.name, $0.value ?? "") })
+        return values["connection_id"]?.lowercased() == connection.lowercased() && values["persona_id"] == persona && values["workspace_id"] == workspace
     }
 
     private static func date(_ value: String) -> Date? {

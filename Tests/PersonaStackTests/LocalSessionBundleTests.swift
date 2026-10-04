@@ -9,7 +9,8 @@ struct LocalSessionBundleTests {
     func fixture() -> [String: Any] {
         ["persona_id": "persona-a", "persona_name": "Local persona", "workspace_id": "ws_11111111111111111111111111111111",
          "harness": "codex", "issued_at": "2026-09-16T00:00:00Z", "expires_at": "2027-09-16T00:00:00Z",
-         "mcp_url": "https://mcp.personastack.ai/v1/mcp", "bearer_token": String(repeating: "a", count: 64),
+         "connection_id": "11111111-1111-4111-8111-111111111111",
+         "mcp_url": "https://mcp.personastack.ai/v1/mcp?connection_id=11111111-1111-4111-8111-111111111111&persona_id=persona-a&workspace_id=ws_11111111111111111111111111111111", "activity_token": String(repeating: "a", count: 64),
          "persona_prompt": "Help with the task.", "skills": []]
     }
 
@@ -41,7 +42,7 @@ struct LocalSessionBundleTests {
 
     @Test func localSessionRejectsUnknownFieldsAndDestinations() throws {
         for (key, value) in [("command", "touch file"), ("harness", "other"), ("persona_id", "../persona"),
-                             ("workspace_id", "foreign"), ("bearer_token", "secret"),
+                             ("workspace_id", "foreign"), ("activity_token", "secret"),
                              ("mcp_url", "https://foreign.example/v1/mcp"), ("expires_at", "2027-10-01T00:00:00Z")] {
             var body = fixture()
             body[key] = value

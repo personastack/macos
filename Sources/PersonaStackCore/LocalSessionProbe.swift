@@ -13,7 +13,42 @@ public struct LocalSessionHarnessProbe: Sendable {
     }
 }
 
+public struct LocalSessionProfileTarget: Sendable {
+    public let label: String
+    public let source: URL
+    public let installation: LocalSessionHarnessProbe
+    public let directoryExists: Bool
+}
+
 public enum LocalSessionProbe {
+    /// Only the detected profile and existing named shell-profile directories are selectable.
+    /// This reads directory metadata. It never creates profiles or reads their credentials.
+    public static func profiles(_ harness: LocalSessionHarness, current: LocalSessionHarnessProbe,
+                                manager: FileManager = .default) -> [LocalSessionProfileTarget] {
+        let component = harness == .codex ? "codex" : "claude"
+        let named: [(String, URL)] = [("Personal", current.home.appendingPathComponent(".ai/eg/" + component)),
+                                     ("Work", current.home.appendingPathComponent(".ai/epic/" + component))]
+            .filter { _, path in
+                var directory: ObjCBool = false
+                return manager.fileExists(atPath: path.path, isDirectory: &directory) && directory.boolValue
+            }
+        let canonicalCurrent = current.profile.resolvingSymlinksInPath().standardizedFileURL
+        let match = named.first { $0.1.resolvingSymlinksInPath().standardizedFileURL == canonicalCurrent }
+        let candidates = [(match.map { $0.0 + " (current)" } ?? "Current profile", match?.1 ?? current.profile)] + named
+        var seen = Set<String>()
+        return candidates.compactMap { label, source in
+            let profile = source.resolvingSymlinksInPath().standardizedFileURL
+            guard seen.insert(profile.path).inserted else { return nil }
+            var environment = current.environment
+            environment[harness == .codex ? "CODEX_HOME" : "CLAUDE_CONFIG_DIR"] = profile.path
+            let installation = LocalSessionHarnessProbe(executable: current.executable.resolvingSymlinksInPath(),
+                home: current.home, profile: profile, shell: current.shell, environment: environment)
+            var directory: ObjCBool = false
+            let exists = manager.fileExists(atPath: profile.path, isDirectory: &directory) && directory.boolValue
+            return LocalSessionProfileTarget(label: label, source: source.standardizedFileURL, installation: installation, directoryExists: exists)
+        }
+    }
+
     public static func loginShell() throws -> URL {
         guard let record = getpwuid(getuid()), let value = record.pointee.pw_shell else { throw LocalSessionError.missingHarness }
         let path = String(cString: value)
@@ -48,6 +83,8 @@ public enum LocalSessionProbe {
         let help = try run(executable: executable, arguments: ["--help"], environment: environment)
         let pluginHelp = try run(executable: executable, arguments: ["plugin", "--help"], environment: environment)
         let marketplaceHelp = try run(executable: executable, arguments: ["plugin", "marketplace", "--help"], environment: environment)
+        let mcpHelp = try run(executable: executable, arguments: ["mcp", "--help"], environment: environment)
+        guard ["add", "get", "list", "login", "logout", "remove"].allSatisfy({ mcpHelp.contains($0) }) else { throw LocalSessionError.outdatedHarness }
         try validateCapabilities(harness, version: version, help: help, pluginHelp: pluginHelp, marketplaceHelp: marketplaceHelp)
     }
 

@@ -25,6 +25,7 @@ if [ -d "$framework" ]; then
   sign "$framework/Versions/B/Updater.app"
   sign "$framework"
 fi
+sign --identifier ai.personastack.desktop.harness-hook "$bundle/Contents/MacOS/PersonaStackHarnessHook"
 sign --identifier ai.personastack.desktop \
   --entitlements "$root_dir/Resources/Release.entitlements" "$bundle"
 "$root_dir/scripts/verify-app-signature.sh" "$bundle"

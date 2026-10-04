@@ -6,6 +6,7 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .executable(name: "PersonaStack", targets: ["PersonaStack"]),
+        .executable(name: "PersonaStackHarnessHook", targets: ["PersonaStackHarnessHook"]),
         .executable(name: "PersonaStackPolicyCheck", targets: ["PersonaStackPolicyCheck"]),
         .executable(name: "PersonaStackLockedControlInstaller", targets: ["PersonaStackLockedControlInstaller"]),
     ],
@@ -18,6 +19,7 @@ let package = Package(
         .target(name: "PersonaStackCore", dependencies: ["Yams", "LockedControlAudit"]),
         .executableTarget(name: "PersonaStack", dependencies: ["PersonaStackCore", .product(name: "Sparkle", package: "Sparkle")],
                           linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])]),
+        .executableTarget(name: "PersonaStackHarnessHook", dependencies: ["PersonaStackCore"]),
         .executableTarget(name: "PersonaStackPolicyCheck", dependencies: ["PersonaStackCore"]),
         .executableTarget(name: "PersonaStackLockedControlInstaller", dependencies: ["PersonaStackCore"]),
         .testTarget(name: "PersonaStackTests", dependencies: ["PersonaStackCore", "PersonaStack"], resources: [.copy("Fixtures/local-session.json"), .copy("Fixtures/desktop-parity.json")]),

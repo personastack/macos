@@ -19,13 +19,12 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
 
     override init() {
         shutdown = {
-            guard await LocalRunManager.shared.shutdown(waitForRetry: false) else { return false }
             await DesktopControlRuntime.shared.shutdownForQuit()
             return true
         }
         terminate = { $0.terminate(nil) }
-        hasActiveSessions = { LocalRunManager.shared.hasActiveSessions }
-        showCleanupFailure = { LocalRunManager.shared.showQuitRecovery() }
+        hasActiveSessions = { false }
+        showCleanupFailure = {}
         cancelPermissionRestart = { DesktopApplicationRestart.shared.cancelPendingRestart() }
         timeout = .seconds(10)
         moveToMenuBar = Self.hideWindows

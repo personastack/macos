@@ -28,7 +28,7 @@ final class LiveDesktopEnvironmentSettingsLifecycle: DesktopEnvironmentSettingsL
         ChatWindowManager.shared.unregister(view)
         StackWindowManager.shared.unregister(view)
         LocalSessionManager.shared.invalidate(view)
-        LocalRunManager.shared.invalidate(view)
+        DesktopSkillsManager.shared.unregister(view)
         DesktopControlSetupManager.shared.unregister(view)
     }
 
@@ -37,7 +37,6 @@ final class LiveDesktopEnvironmentSettingsLifecycle: DesktopEnvironmentSettingsL
     }
 
     func waitForLocalSessions() async {
-        await LocalRunManager.shared.shutdown()
         guard let previousView else { return }
         await LocalSessionManager.shared.invalidateAndWait(previousView)
     }
@@ -57,7 +56,7 @@ final class LiveDesktopEnvironmentSettingsLifecycle: DesktopEnvironmentSettingsL
             ChatWindowManager.shared.register(previousView, appURL: previousAppURL)
             StackWindowManager.shared.register(previousView, appURL: previousAppURL)
             LocalSessionManager.shared.register(previousView, appURL: previousAppURL)
-            LocalRunManager.shared.register(previousView, appURL: previousAppURL)
+            DesktopSkillsManager.shared.register(previousView, appURL: previousAppURL)
             DesktopControlSetupManager.shared.register(previousView, appURL: previousAppURL)
         }
         DesktopControlRuntime.shared.abortEnvironmentSwitch()

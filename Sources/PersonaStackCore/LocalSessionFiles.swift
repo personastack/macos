@@ -22,23 +22,25 @@ private struct LocalSkillOwnership: Codable, Equatable {
     let digest: String
 }
 
-private struct LocalMCPServer: Encodable {
-    struct Headers: Encodable { let Authorization: String }
-    let type = "http"
-    let url: String
-    let headers: Headers
-}
-
-private struct LocalCodexMCP: Encodable {
-    let mcpServers: [String: LocalMCPServer]
-}
-
-/// Claude plugin manifests use a direct server map rather than Codex's mcpServers wrapper.
-private struct LocalClaudePluginMCP: Encodable {
-    let personastack_local: LocalMCPServer
-}
-
 private struct LocalHarnessPluginOwnership: Codable, Equatable {
+    let format: Int
+    let harness: String
+    let marketplace: String
+    let plugin: String
+    let profile: String
+    let source: String
+    let digest: String
+    let connectionID: String
+    let origin: String
+    let workspaceID: String
+    let personaID: String
+    let personaName: String
+    let mcpURL: String
+    var mcpReady: Bool
+    var hookReady: Bool
+}
+
+private struct LegacyHarnessPluginOwnership: Codable, Equatable {
     let format: Int
     let harness: String
     let marketplace: String
@@ -84,43 +86,31 @@ public struct LocalSessionFiles {
     public typealias CommandRunner = @Sendable (URL, [String], [String: String], Bool) throws -> Void
     typealias CommandOutputReader = @Sendable (URL, [String], [String: String]) throws -> String
 
+    private let helperURL: URL
     private let manager: FileManager
     private let commandRunner: CommandRunner
     private let commandOutputReader: CommandOutputReader
     private let logger = Logger(subsystem: "ai.personastack.desktop", category: "local-session")
-    public init(manager: FileManager = .default) {
+    public init(manager: FileManager = .default, helperURL: URL = Bundle.main.executableURL!.deletingLastPathComponent().appendingPathComponent("PersonaStackHarnessHook")) {
+        self.helperURL = helperURL
         self.manager = manager
         self.commandRunner = Self.run
         self.commandOutputReader = Self.readOutput
     }
     init(manager: FileManager, commandRunner: @escaping CommandRunner) {
+        self.helperURL = URL(fileURLWithPath: "/usr/bin/true")
         self.manager = manager; self.commandRunner = commandRunner; self.commandOutputReader = Self.readOutput
     }
     init(manager: FileManager, commandRunner: @escaping CommandRunner,
-         commandOutputReader: @escaping CommandOutputReader) {
+         commandOutputReader: @escaping CommandOutputReader, helperURL: URL = URL(fileURLWithPath: "/usr/bin/true")) {
+        self.helperURL = helperURL
         self.manager = manager; self.commandRunner = commandRunner; self.commandOutputReader = commandOutputReader
     }
 
     /// Read-only preflight runs before the hosted request can issue a credential.
     public func preflight(_ harnessValue: LocalSessionHarness, probe: LocalSessionHarnessProbe) throws {
-        let root = probe.home.resolvingSymlinksInPath().standardizedFileURL
-        let profile = probe.profile.resolvingSymlinksInPath().standardizedFileURL
-        try requireDirectory(root)
-        try requireDirectory(profile)
-        let harness = harnessValue == .codex ? "codex" : "claude-code"
-        let profileKey = profileHash(profile.path)
-        let marketplace = "personastack-desktop-" + profileKey
-        let plugin = "personastack-local-" + profileKey
-        let pluginRoot = root.appendingPathComponent("Library/Application Support/PersonaStack/LocalHarnessPlugins/" + harness + "/" + profileKey)
-        let activeURL = pluginRoot.appendingPathComponent("active.json")
-        let active = try activeOwnership(at: activeURL, under: pluginRoot, harness: harness, profile: profile.path, marketplace: marketplace, plugin: plugin)
-        let registration = try marketplaceRegistration(harnessValue, executable: probe.executable, environment: probe.environment, marketplace: marketplace,
-                                                       expectedRoot: active.map { URL(fileURLWithPath: $0.source).appendingPathComponent("marketplace") })
-        if active == nil {
-            guard registration == .missing else { throw LocalSessionError.unsafeFiles }
-        } else if registration == .mismatch {
-            throw LocalSessionError.unsafeFiles
-        }
+        try requireDirectory(probe.home.resolvingSymlinksInPath().standardizedFileURL)
+        try requireDirectory(probe.profile.resolvingSymlinksInPath().standardizedFileURL)
     }
 
     /// Writes one private plugin source and installs it through the selected CLI's
@@ -135,10 +125,11 @@ public struct LocalSessionFiles {
         let harness = bundle.harness == .codex ? "codex" : "claude-code"
         let profilePath = profile.resolvingSymlinksInPath().standardizedFileURL.path
         let profileKey = profileHash(profilePath)
-        let marketplaceName = "personastack-desktop-" + profileKey
-        let pluginName = "personastack-local-" + profileKey
+        let connectionKey = bundle.connectionID.lowercased().replacingOccurrences(of: "-", with: "")
+        let marketplaceName = "personastack-desktop-" + connectionKey
+        let pluginName = "personastack-persona-" + connectionKey
         let plugins = try directories(["Library", "Application Support", "PersonaStack", "LocalHarnessPlugins", harness, profileKey], below: root)
-        let activeURL = plugins.appendingPathComponent("active.json")
+        let activeURL = plugins.appendingPathComponent(connectionKey + ".json")
         logger.notice("local session plugin ownership validation started")
         let previous = try activeOwnership(at: activeURL, under: plugins, harness: harness, profile: profilePath, marketplace: marketplaceName, plugin: pluginName)
         logger.notice("local session plugin ownership validation completed")
@@ -161,15 +152,13 @@ public struct LocalSessionFiles {
             let plugin = try directories(["plugins", pluginName], below: marketplace)
             let pluginMetadata = try directories([bundle.harness == .codex ? ".codex-plugin" : ".claude-plugin"], below: plugin)
             try write(JSONEncoder().encode(LocalPluginManifest(name: pluginName, version: "1.0.0", description: "Active PersonaStack local persona context and MCP connection.")), to: pluginMetadata.appendingPathComponent("plugin.json"))
-            let server = LocalMCPServer(url: bundle.mcpURL, headers: .init(Authorization: "Bearer " + bundle.bearerToken))
-            if bundle.harness == .codex {
-                try write(JSONEncoder().encode(LocalCodexMCP(mcpServers: ["personastack_local": server])), to: plugin.appendingPathComponent(".mcp.json"))
-            } else {
-                try write(JSONEncoder().encode(LocalClaudePluginMCP(personastack_local: server)), to: plugin.appendingPathComponent(".mcp.json"))
-            }
-            let skillRoot = try directories(["skills", "personastack"], below: plugin)
-            let skill = "---\nname: personastack\ndescription: Active PersonaStack persona context. Consult this skill before work involving the configured persona and use the PersonaStack MCP server for current persona state.\n---\n\n" + bundle.personaPrompt + "\n"
+            let serverName = Self.serverName(bundle.connectionID)
+            let skillName = "personastack-" + connectionKey
+            let skillRoot = try directories(["skills", skillName], below: plugin)
+            let description = String(data: try JSONEncoder().encode("PersonaStack context for " + bundle.personaName + ". Use this context only when this persona is explicitly requested."), encoding: .utf8)!
+            let skill = "---\nname: " + skillName + "\ndescription: " + description + "\n---\n\nMCP server: `" + serverName + "`.\nWorkspace: `" + bundle.workspaceID + "`.\nPersona: `" + bundle.personaID + "`.\n\n" + bundle.personaPrompt + "\n"
             try write(Data(skill.utf8), to: skillRoot.appendingPathComponent("SKILL.md"))
+            try installHooks(bundle: bundle, plugin: plugin)
             var skillDirectories = [skillRoot]
             for selected in try preparedSkills(bundle: bundle, appURL: appURL, profile: profile) {
                 let destination = try directories(["skills", selected.name], below: plugin)
@@ -186,15 +175,25 @@ public struct LocalSessionFiles {
                 let manifest = LocalClaudeMarketplace(name: marketplaceName, description: "Desktop-managed PersonaStack local harness plugin.", owner: .init(name: "PersonaStack"), plugins: [.init(name: pluginName, source: "./plugins/" + pluginName, version: "1.0.0")])
                 try write(JSONEncoder().encode(manifest), to: metadata.appendingPathComponent("marketplace.json"))
             }
-            let ownership = LocalHarnessPluginOwnership(format: 1, harness: harness, marketplace: marketplaceName, plugin: pluginName,
-                                                        profile: profilePath, source: directory.path, digest: try ownedSourceDigest(directory))
+            var ownership = LocalHarnessPluginOwnership(format: 2, harness: harness, marketplace: marketplaceName, plugin: pluginName,
+                                                        profile: profilePath, source: directory.path, digest: try ownedSourceDigest(directory),
+                                                        connectionID: bundle.connectionID, origin: Self.origin(appURL), workspaceID: bundle.workspaceID,
+                                                        personaID: bundle.personaID, personaName: bundle.personaName, mcpURL: bundle.mcpURL, mcpReady: false, hookReady: false)
             stagedOwnership = ownership
             try write(JSONEncoder().encode(ownership), to: directory.appendingPathComponent(".personastack-plugin-owner.json"))
             try installPlugin(bundle.harness, executable: executable, home: root, profile: profile, marketplace: marketplace,
                               harnessEnvironment: harnessEnvironment, ownership: ownership, previous: previous,
                               willMutate: { pluginManagerMutated = true },
                               marketplaceRegistered: { marketplaceRegistered = true })
-            try replaceActiveOwnership(ownership, at: activeURL)
+            ownership.hookReady = true
+            stagedOwnership = ownership
+            try saveOwnership(ownership, at: activeURL)
+            if bundle.harness == .codex { try commandRunner(executable, ["features", "enable", "hooks"], pluginEnvironment(harness: bundle.harness, home: root, profile: profile, inherited: harnessEnvironment), false) }
+            try configureMCP(bundle, executable: executable, environment: pluginEnvironment(harness: bundle.harness, home: root, profile: profile, inherited: harnessEnvironment), previous: previous)
+            ownership.mcpReady = true
+            stagedOwnership = ownership
+            try saveOwnership(ownership, at: activeURL)
+
             let installed = LocalSessionInstalledFiles(directory: directory, pluginManifest: pluginMetadata.appendingPathComponent("plugin.json"), skillDirectories: skillDirectories)
             // The new plugin is active. A stale owned source can be cleaned on a later Configure.
             if let previous { try? manager.removeItem(at: URL(fileURLWithPath: previous.source)) }
@@ -208,12 +207,264 @@ public struct LocalSessionFiles {
         }
     }
 
+    public struct Connection: Codable, Sendable {
+        public let connectionID: String
+        public let workspaceID: String
+        public let personaID: String
+        public let personaName: String
+        public let profile: String
+        public let mcpURL: String
+        public let legacy: Bool
+        public let mcpReady: Bool
+        public let hookReady: Bool
+        enum CodingKeys: String, CodingKey {
+            case connectionID = "connection_id", workspaceID = "workspace_id", personaID = "persona_id", personaName = "persona_name", profile, mcpURL = "mcp_url", legacy, mcpReady = "mcp_ready", hookReady = "hook_ready"
+        }
+    }
+
+    public static func serverName(_ connectionID: String) -> String {
+        "personastack-" + connectionID.lowercased().replacingOccurrences(of: "-", with: "")
+    }
+
+    private static func origin(_ url: URL) -> String {
+        "\(url.scheme ?? "")://\(url.host ?? ""):\(url.port ?? (url.scheme == "http" ? 80 : 443))"
+    }
+
+    private func connectionRoot(_ harness: LocalSessionHarness, probe: LocalSessionHarnessProbe) -> URL {
+        probe.home.resolvingSymlinksInPath().appendingPathComponent("Library/Application Support/PersonaStack/LocalHarnessPlugins/" + (harness == .codex ? "codex" : "claude-code") + "/" + profileHash(probe.profile.resolvingSymlinksInPath().path))
+    }
+
+    public func connections(_ harness: LocalSessionHarness, probe: LocalSessionHarnessProbe, appURL: URL) throws -> [Connection] {
+        let root = connectionRoot(harness, probe: probe)
+        guard exists(root) else { return [] }
+        try requireOwnedDirectory(root)
+        let names = try manager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        guard names.count <= 256 else { throw LocalSessionError.unsafeFiles }
+        var records: [Connection] = []
+        for path in names where path.pathExtension == "json" && path.lastPathComponent != "active.json" {
+            guard path.deletingPathExtension().lastPathComponent.range(of: "^[0-9a-f]{32}$", options: .regularExpression) != nil else { continue }
+            try requireOwnedFile(path)
+            let value = try JSONDecoder().decode(LocalHarnessPluginOwnership.self, from: Data(contentsOf: path))
+            _ = try activeOwnership(at: path, under: root, harness: harness == .codex ? "codex" : "claude-code", profile: probe.profile.resolvingSymlinksInPath().path, marketplace: value.marketplace, plugin: value.plugin)
+            guard value.origin == Self.origin(appURL) else { continue }
+            records.append(Connection(connectionID: value.connectionID, workspaceID: value.workspaceID, personaID: value.personaID, personaName: value.personaName, profile: value.profile, mcpURL: value.mcpURL, legacy: false, mcpReady: value.mcpReady, hookReady: value.hookReady))
+        }
+        if let (_, owner, url, _) = try legacyConnection(harness, probe: probe, appURL: appURL) {
+            records.append(Connection(connectionID: legacyID(probe.profile), workspaceID: "", personaID: "", personaName: "Previous PersonaStack connection", profile: owner.profile, mcpURL: url, legacy: true, mcpReady: false, hookReady: false))
+        }
+        return records.sorted { $0.personaName < $1.personaName }
+    }
+
+    private struct RemovalProgress: Codable {
+        var mcpRemoved = false
+        var pluginRemoved = false
+        var marketplaceRemoved = false
+    }
+
+    public func remove(_ connectionID: String, harness: LocalSessionHarness, probe: LocalSessionHarnessProbe, appURL: URL) throws {
+        if connectionID.lowercased() == legacyID(probe.profile), let (path, owner, _, _) = try legacyConnection(harness, probe: probe, appURL: appURL) {
+            try removeLegacy(path, owner: owner, harness: harness, probe: probe)
+            return
+        }
+        let (path, owner) = try ownedConnection(connectionID, harness: harness, probe: probe, appURL: appURL)
+        let progressPath = path.deletingPathExtension().appendingPathExtension("remove.json")
+        var progress = RemovalProgress()
+        if exists(progressPath) {
+            try requireOwnedFile(progressPath)
+            progress = try JSONDecoder().decode(RemovalProgress.self, from: Data(contentsOf: progressPath))
+        }
+        func save() throws {
+            if exists(progressPath) { try requireOwnedFile(progressPath) }
+            try JSONEncoder().encode(progress).write(to: progressPath, options: .atomic)
+            try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: progressPath.path)
+        }
+        let environment = pluginEnvironment(harness: harness, home: probe.home, profile: probe.profile, inherited: probe.environment)
+        let marketplace = URL(fileURLWithPath: owner.source).appendingPathComponent("marketplace")
+        let registration = try marketplaceRegistration(harness, executable: probe.executable, environment: environment, marketplace: owner.marketplace, expectedRoot: marketplace)
+        guard registration != .mismatch else { throw LocalSessionError.unsafeFiles }
+        var pluginInstalled = false
+        if registration == .matches && !progress.pluginRemoved {
+            pluginInstalled = try verifyInstalledPlugin(harness, executable: probe.executable, profile: probe.profile, marketplace: marketplace, environment: environment, ownership: owner, allowMissing: true)
+        }
+        if !progress.mcpRemoved {
+            do {
+                try verifyMCP(harness, name: Self.serverName(connectionID), url: owner.mcpURL, executable: probe.executable, environment: environment)
+                try commandRunner(probe.executable, ["mcp", "logout", Self.serverName(connectionID)], environment, false)
+                var remove = ["mcp", "remove", Self.serverName(connectionID)]
+                if harness == .claudeCode { remove += ["--scope", "user"] }
+                try commandRunner(probe.executable, remove, environment, false)
+            } catch LocalSessionError.missingMCP {
+                // A documented missing-entry response proves there is no MCP entry to remove.
+            }
+            progress.mcpRemoved = true
+            try save()
+        }
+        if registration == .matches {
+            if !progress.pluginRemoved && pluginInstalled {
+                let identifier = owner.plugin + "@" + owner.marketplace
+                let removePlugin = harness == .codex ? ["plugin", "remove", identifier] : ["plugin", "uninstall", identifier, "--scope", "user"]
+                try commandRunner(probe.executable, removePlugin, environment, false)
+            }
+            progress.pluginRemoved = true
+            try save()
+            if !progress.marketplaceRemoved {
+                try commandRunner(probe.executable, ["plugin", "marketplace", "remove", owner.marketplace], environment, false)
+                progress.marketplaceRemoved = true
+                try save()
+            }
+        }
+        try manager.removeItem(at: URL(fileURLWithPath: owner.source))
+        try manager.removeItem(at: path)
+        if exists(progressPath) { try manager.removeItem(at: progressPath) }
+    }
+
+    public func check(_ connectionID: String, harness: LocalSessionHarness, probe: LocalSessionHarnessProbe, appURL: URL, reconnect: Bool) throws {
+        let (_, owner) = try ownedConnection(connectionID, harness: harness, probe: probe, appURL: appURL)
+        let environment = pluginEnvironment(harness: harness, home: probe.home, profile: probe.profile, inherited: probe.environment)
+        let marketplace = URL(fileURLWithPath: owner.source).appendingPathComponent("marketplace")
+        guard try marketplaceRegistration(harness, executable: probe.executable, environment: environment, marketplace: owner.marketplace, expectedRoot: marketplace) == .matches else { throw LocalSessionError.unsafeFiles }
+        _ = try verifyInstalledPlugin(harness, executable: probe.executable, profile: probe.profile, marketplace: marketplace, environment: environment, ownership: owner, allowMissing: false)
+        try verifyMCP(harness, name: Self.serverName(connectionID), url: owner.mcpURL, executable: probe.executable, environment: environment)
+        if reconnect { try commandRunner(probe.executable, ["mcp", "login", Self.serverName(connectionID)], environment, false) }
+    }
+
+    public func validateRemoval(_ connectionID: String, harness: LocalSessionHarness, probe: LocalSessionHarnessProbe, appURL: URL) throws {
+        if connectionID.lowercased() == legacyID(probe.profile), try legacyConnection(harness, probe: probe, appURL: appURL) != nil { return }
+        _ = try ownedConnection(connectionID, harness: harness, probe: probe, appURL: appURL)
+    }
+
+    public func legacyCredential(_ connectionID: String, harness: LocalSessionHarness, probe: LocalSessionHarnessProbe, appURL: URL) throws -> HarnessActivityCredential? {
+        guard connectionID.lowercased() == legacyID(probe.profile), let (_, _, _, token) = try legacyConnection(harness, probe: probe, appURL: appURL) else { return nil }
+        return HarnessActivityCredential(connectionID: connectionID.lowercased(), activityToken: token, appURL: appURL, harness: harness, routingEnabled: false)
+    }
+
+    private func legacyID(_ profile: URL) -> String {
+        let hash = profileHash(profile.resolvingSymlinksInPath().path)
+        var chars = Array(hash)
+        chars[12] = "5"
+        chars[16] = Character(String((Int(String(chars[16]), radix: 16)! & 3) | 8, radix: 16))
+        return String(chars[0..<8]) + "-" + String(chars[8..<12]) + "-" + String(chars[12..<16]) + "-" + String(chars[16..<20]) + "-" + String(chars[20..<32])
+    }
+
+    private func legacyConnection(_ harness: LocalSessionHarness, probe: LocalSessionHarnessProbe, appURL: URL) throws -> (URL, LegacyHarnessPluginOwnership, String, String)? {
+        let root = connectionRoot(harness, probe: probe)
+        let path = root.appendingPathComponent("active.json")
+        guard exists(path) else { return nil }
+        try requireOwnedFile(path)
+        let owner = try JSONDecoder().decode(LegacyHarnessPluginOwnership.self, from: Data(contentsOf: path))
+        let key = profileHash(probe.profile.resolvingSymlinksInPath().path)
+        let source = URL(fileURLWithPath: owner.source).standardizedFileURL
+        guard owner.format == 1, owner.harness == (harness == .codex ? "codex" : "claude-code"), owner.profile == probe.profile.resolvingSymlinksInPath().path,
+              owner.marketplace == "personastack-desktop-" + key, owner.plugin == "personastack-local-" + key,
+              source.deletingLastPathComponent() == root else { throw LocalSessionError.unsafeFiles }
+        try requireOwnedDirectory(source)
+        let marker = source.appendingPathComponent(".personastack-plugin-owner.json")
+        try requireOwnedFile(marker)
+        guard try JSONDecoder().decode(LegacyHarnessPluginOwnership.self, from: Data(contentsOf: marker)) == owner,
+              try ownedSourceDigest(source) == owner.digest else { throw LocalSessionError.unsafeFiles }
+        let mcpPath = source.appendingPathComponent("marketplace/plugins/" + owner.plugin + "/.mcp.json")
+        try requireOwnedFile(mcpPath)
+        guard let mcp = try JSONSerialization.jsonObject(with: Data(contentsOf: mcpPath)) as? [String: Any] else { throw LocalSessionError.unsafeFiles }
+        let servers = harness == .codex ? mcp["mcpServers"] as? [String: Any] : mcp
+        guard let server = servers?["personastack_local"] as? [String: Any], let url = server["url"] as? String,
+              let headers = server["headers"] as? [String: String], let authorization = headers["Authorization"], authorization.hasPrefix("Bearer "),
+              LocalSessionBundle.permitsMCP(url, appURL: appURL) else { return nil }
+        let token = String(authorization.dropFirst(7))
+        guard token.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil else { throw LocalSessionError.unsafeFiles }
+        return (path, owner, url, token)
+    }
+
+    private func removeLegacy(_ path: URL, owner: LegacyHarnessPluginOwnership, harness: LocalSessionHarness, probe: LocalSessionHarnessProbe) throws {
+        let environment = pluginEnvironment(harness: harness, home: probe.home, profile: probe.profile, inherited: probe.environment)
+        let marketplace = URL(fileURLWithPath: owner.source).appendingPathComponent("marketplace")
+        let registration = try marketplaceRegistration(harness, executable: probe.executable, environment: environment, marketplace: owner.marketplace, expectedRoot: marketplace)
+        guard registration != .mismatch else { throw LocalSessionError.unsafeFiles }
+        if registration == .matches {
+            let identifier = owner.plugin + "@" + owner.marketplace
+            let remove = harness == .codex ? ["plugin", "remove", identifier] : ["plugin", "uninstall", identifier, "--scope", "user"]
+            // Legacy sources use the same verified owned cache layout and content digest.
+            let adapted = LocalHarnessPluginOwnership(format: 1, harness: owner.harness, marketplace: owner.marketplace, plugin: owner.plugin, profile: owner.profile, source: owner.source, digest: owner.digest, connectionID: legacyID(probe.profile), origin: "", workspaceID: "", personaID: "", personaName: "", mcpURL: "", mcpReady: false, hookReady: false)
+            let installed = try verifyInstalledPlugin(harness, executable: probe.executable, profile: probe.profile, marketplace: marketplace, environment: environment, ownership: adapted, allowMissing: true)
+            if installed { try commandRunner(probe.executable, remove, environment, false) }
+            try commandRunner(probe.executable, ["plugin", "marketplace", "remove", owner.marketplace], environment, false)
+        }
+        try manager.removeItem(at: URL(fileURLWithPath: owner.source))
+        try manager.removeItem(at: path)
+    }
+
+    private func ownedConnection(_ connectionID: String, harness: LocalSessionHarness, probe: LocalSessionHarnessProbe, appURL: URL) throws -> (URL, LocalHarnessPluginOwnership) {
+        guard UUID(uuidString: connectionID) != nil else { throw LocalSessionError.invalidRequest }
+        let root = connectionRoot(harness, probe: probe)
+        let key = connectionID.lowercased().replacingOccurrences(of: "-", with: "")
+        let path = root.appendingPathComponent(key + ".json")
+        guard let owner = try activeOwnership(at: path, under: root, harness: harness == .codex ? "codex" : "claude-code", profile: probe.profile.resolvingSymlinksInPath().path, marketplace: "personastack-desktop-" + key, plugin: "personastack-persona-" + key), owner.origin == Self.origin(appURL), owner.connectionID.lowercased() == connectionID.lowercased() else { throw LocalSessionError.unsafeFiles }
+        return (path, owner)
+    }
+
+    private func configureMCP(_ bundle: LocalSessionBundle, executable: URL, environment: [String: String], previous: LocalHarnessPluginOwnership?) throws {
+        let name = Self.serverName(bundle.connectionID)
+        var exists = false
+        if bundle.harness == .codex {
+            let data = try commandOutputReader(executable, ["mcp", "list", "--json"], environment)
+            guard let records = try JSONSerialization.jsonObject(with: Data(data.utf8)) as? [[String: Any]] else { throw LocalSessionError.unsafeFiles }
+            exists = records.contains { $0["name"] as? String == name }
+            if exists && previous == nil { throw LocalSessionError.unsafeFiles }
+        } else if previous != nil {
+            // A failed previous setup may have installed its plugin before adding MCP.
+            do {
+                try verifyMCP(bundle.harness, name: name, url: bundle.mcpURL, executable: executable, environment: environment)
+                exists = true
+            } catch LocalSessionError.missingMCP { exists = false }
+        }
+        if exists {
+            try verifyMCP(bundle.harness, name: name, url: bundle.mcpURL, executable: executable, environment: environment)
+        } else {
+            let add = bundle.harness == .codex ? ["mcp", "add", name, "--url", bundle.mcpURL] : ["mcp", "add", "--transport", "http", "--scope", "user", name, bundle.mcpURL]
+            try commandRunner(executable, add, environment, false)
+            try verifyMCP(bundle.harness, name: name, url: bundle.mcpURL, executable: executable, environment: environment)
+        }
+        try commandRunner(executable, ["mcp", "login", name], environment, false)
+        try verifyMCP(bundle.harness, name: name, url: bundle.mcpURL, executable: executable, environment: environment)
+    }
+
+    private func verifyMCP(_ harness: LocalSessionHarness, name: String, url: String, executable: URL, environment: [String: String]) throws {
+        let args = ["mcp", "get", name] + (harness == .codex ? ["--json"] : [])
+        let result = try commandOutputReader(executable, args, environment)
+        if harness == .codex {
+            guard let record = try JSONSerialization.jsonObject(with: Data(result.utf8)) as? [String: Any], record["name"] as? String == name,
+                  let transport = record["transport"] as? [String: Any], transport["url"] as? String == url,
+                  transport["type"] as? String == "streamable_http",
+                  transport["bearer_token_env_var"] == nil || transport["bearer_token_env_var"] is NSNull,
+                  Self.emptyHeaderSetting(transport["http_headers"]), Self.emptyHeaderSetting(transport["env_http_headers"]),
+                  transport["http_headers_helper"] == nil || transport["http_headers_helper"] is NSNull || transport["http_headers_helper"] as? String == "" else { throw LocalSessionError.unsafeFiles }
+        } else {
+            let lines = result.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
+            guard lines.contains("URL: " + url), !lines.contains(where: { $0.hasPrefix("Headers:") }) else { throw LocalSessionError.unsafeFiles }
+        }
+    }
+
+    private static func emptyHeaderSetting(_ value: Any?) -> Bool {
+        value == nil || value is NSNull || (value as? [String: Any])?.isEmpty == true
+    }
+
+    private func installHooks(bundle: LocalSessionBundle, plugin: URL) throws {
+        guard manager.isExecutableFile(atPath: helperURL.path) else { throw LocalSessionError.missingHarness }
+        let hookDirectory = try directories(["hooks"], below: plugin)
+        let events = bundle.harness == .codex ? ["UserPromptSubmit", "Stop", "Interrupt", "SessionEnd"] : ["UserPromptSubmit", "Stop", "StopFailure", "SessionEnd"]
+        var hooks: [String: [[String: Any]]] = [:]
+        for event in events {
+            let command = "exec " + LocalSessionLauncher.shellQuote(helperURL.path) + " --connection " + LocalSessionLauncher.shellQuote(bundle.connectionID) + " --event " + event
+            hooks[event] = [["hooks": [["type": "command", "command": command, "timeout": 8]]]]
+        }
+        try write(JSONSerialization.data(withJSONObject: ["hooks": hooks], options: [.sortedKeys]), to: hookDirectory.appendingPathComponent("hooks.json"))
+    }
+
     private func activeOwnership(at activeURL: URL, under root: URL, harness: String, profile: String, marketplace: String, plugin: String) throws -> LocalHarnessPluginOwnership? {
         guard exists(activeURL) else { return nil }
         try requirePrivate(activeURL, directory: false)
         let ownership = try JSONDecoder().decode(LocalHarnessPluginOwnership.self, from: Data(contentsOf: activeURL))
         let source = URL(fileURLWithPath: ownership.source).standardizedFileURL
-        guard ownership.format == 1, ownership.harness == harness, ownership.marketplace == marketplace, ownership.plugin == plugin, ownership.profile == profile,
+        guard ownership.format == 2, ownership.harness == harness, ownership.marketplace == marketplace, ownership.plugin == plugin, ownership.profile == profile,
               source.deletingLastPathComponent() == root, source.lastPathComponent != "active.json" else { throw LocalSessionError.unsafeFiles }
         try requireOwnedDirectory(source)
         let marker = source.appendingPathComponent(".personastack-plugin-owner.json")
@@ -255,6 +506,14 @@ public struct LocalSessionFiles {
             hasher.update(data: Data([0]))
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func saveOwnership(_ ownership: LocalHarnessPluginOwnership, at activeURL: URL) throws {
+        let marker = URL(fileURLWithPath: ownership.source).appendingPathComponent(".personastack-plugin-owner.json")
+        try requireOwnedFile(marker)
+        try JSONEncoder().encode(ownership).write(to: marker, options: .atomic)
+        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: marker.path)
+        try replaceActiveOwnership(ownership, at: activeURL)
     }
 
     private func replaceActiveOwnership(_ ownership: LocalHarnessPluginOwnership, at activeURL: URL) throws {
@@ -299,12 +558,12 @@ public struct LocalSessionFiles {
                 if installed {
                     willMutate()
                     logger.notice("local session previous plugin removal started")
-                    try commandRunner(executable, remove, environment, true)
+                    try commandRunner(executable, remove, environment, false)
                     logger.notice("local session previous plugin removal completed")
                 }
                 willMutate()
                 logger.notice("local session previous marketplace removal started")
-                try commandRunner(executable, ["plugin", "marketplace", "remove", previous.marketplace], environment, true)
+                try commandRunner(executable, ["plugin", "marketplace", "remove", previous.marketplace], environment, false)
                 logger.notice("local session previous marketplace removal completed")
             }
         }
@@ -431,7 +690,7 @@ public struct LocalSessionFiles {
     private func pluginEnvironment(harness: LocalSessionHarness, home: URL, profile: URL, inherited: [String: String]) -> [String: String] {
         var environment = inherited
         environment["HOME"] = home.path
-        environment[harness == .codex ? "CODEX_HOME" : "CLAUDE_CONFIG_DIR"] = profile.path
+        environment[harness == .codex ? "CODEX_HOME" : "CLAUDE_CONFIG_DIR"] = profile.resolvingSymlinksInPath().path
         return environment
     }
 
@@ -448,40 +707,52 @@ public struct LocalSessionFiles {
     }
 
     private static func processOutput(_ executable: URL, arguments: [String], environment: [String: String], allowFailure: Bool) throws -> String {
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = executable
-        process.arguments = arguments
-        process.environment = environment
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        process.standardInput = FileHandle.nullDevice
+        let process = Process(), outputPipe = Pipe(), errorPipe = Pipe()
+        process.executableURL = executable; process.arguments = arguments; process.environment = environment
+        process.standardOutput = outputPipe; process.standardError = errorPipe; process.standardInput = FileHandle.nullDevice
         do { try process.run() } catch { throw LocalSessionError.missingHarness }
-        pipe.fileHandleForWriting.closeFile()
-        let deadline = ProcessInfo.processInfo.systemUptime + 30
-        var output = Data()
-        let reader = pipe.fileHandleForReading
-        defer { reader.closeFile() }
-        let descriptor = reader.fileDescriptor
-        _ = fcntl(descriptor, F_SETFL, O_NONBLOCK)
-        var buffer = [UInt8](repeating: 0, count: 8192)
+        outputPipe.fileHandleForWriting.closeFile(); errorPipe.fileHandleForWriting.closeFile()
+        let outputFD = outputPipe.fileHandleForReading.fileDescriptor, errorFD = errorPipe.fileHandleForReading.fileDescriptor
+        _ = fcntl(outputFD, F_SETFL, O_NONBLOCK); _ = fcntl(errorFD, F_SETFL, O_NONBLOCK)
+        defer { outputPipe.fileHandleForReading.closeFile(); errorPipe.fileHandleForReading.closeFile() }
+        let deadline = ProcessInfo.processInfo.systemUptime + (arguments.prefix(2).elementsEqual(["mcp", "login"]) ? 180 : 30)
+        var output = Data(), errorOutput = Data()
+        func drain(_ descriptor: Int32, into data: inout Data) {
+            var buffer = [UInt8](repeating: 0, count: 8192)
+            while true {
+                let count = Darwin.read(descriptor, &buffer, buffer.count)
+                if count <= 0 { return }
+                data.append(contentsOf: buffer.prefix(count))
+                if data.count > 256 * 1024 { return }
+            }
+        }
         while process.isRunning && ProcessInfo.processInfo.systemUptime < deadline {
-            let count = Darwin.read(descriptor, &buffer, buffer.count)
-            if count > 0 { output.append(contentsOf: buffer.prefix(count)) }
-            if output.count > 256 * 1024 { kill(process.processIdentifier, SIGKILL); break }
-            if count <= 0 { Thread.sleep(forTimeInterval: 0.02) }
+            drain(outputFD, into: &output); drain(errorFD, into: &errorOutput)
+            if output.count > 256 * 1024 || errorOutput.count > 256 * 1024 { break }
+            Thread.sleep(forTimeInterval: 0.02)
         }
         if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-        while true {
-            let count = Darwin.read(descriptor, &buffer, buffer.count)
-            if count <= 0 { break }
-            output.append(contentsOf: buffer.prefix(count))
-            if output.count > 256 * 1024 { throw LocalSessionError.unsafeFiles }
-        }
         process.waitUntilExit()
-        guard allowFailure || process.terminationStatus == 0 else { throw LocalSessionError.unsafeFiles }
-        guard let value = String(data: output, encoding: .utf8) else { throw LocalSessionError.unsafeFiles }
+        drain(outputFD, into: &output); drain(errorFD, into: &errorOutput)
+        guard output.count <= 256 * 1024, errorOutput.count <= 256 * 1024,
+              let value = String(data: output, encoding: .utf8) else { throw LocalSessionError.unsafeFiles }
+        if !allowFailure && process.terminationStatus != 0 {
+            let diagnostic = String(data: errorOutput, encoding: .utf8) ?? ""
+            if documentedMissingMCP(arguments, output: value, error: diagnostic) { throw LocalSessionError.missingMCP }
+            throw LocalSessionError.unsafeFiles
+        }
         return value
+    }
+
+    static func documentedMissingMCP(_ arguments: [String], output: String, error: String) -> Bool {
+        guard arguments.count >= 3, arguments[0] == "mcp", arguments[1] == "get" else { return false }
+        let name = arguments[2]
+        let codex = "Error: No MCP server named '" + name + "' found."
+        let claude = "No MCP server named \"" + name + "\"."
+        return [output, error].contains { diagnostic in
+            let value = diagnostic.trimmingCharacters(in: .whitespacesAndNewlines)
+            return value == codex || value == claude || value.hasPrefix(claude + " Configured servers:")
+        }
     }
 
     private func exists(_ path: URL) -> Bool {

@@ -57,6 +57,11 @@ lipo -create \
   "$arm64_binary" \
   "$x86_64_binary" \
   -output "$bundle_dir/Contents/MacOS/PersonaStack"
+lipo -create \
+  "$(dirname "$arm64_binary")/PersonaStackHarnessHook" \
+  "$(dirname "$x86_64_binary")/PersonaStackHarnessHook" \
+  -output "$bundle_dir/Contents/MacOS/PersonaStackHarnessHook"
+chmod 755 "$bundle_dir/Contents/MacOS/PersonaStackHarnessHook"
 installer_binary="$root_dir/build/PersonaStackLockedControlInstaller"
 lipo -create \
   "$(dirname "$arm64_binary")/PersonaStackLockedControlInstaller" \

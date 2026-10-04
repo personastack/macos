@@ -12,6 +12,7 @@ root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 test -d "$bundle/Contents/MacOS"
 test -x "$bundle/Contents/MacOS/PersonaStack"
+test -x "$bundle/Contents/MacOS/PersonaStackHarnessHook"
 test -s "$bundle/Contents/Resources/AppIcon.icns"
 test -s "$bundle/Contents/Resources/MenuBarIcon.png"
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" = "$version"
@@ -20,6 +21,8 @@ test "$(/usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$plist")" = 'https://raw.
 test "$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$plist" 2>/dev/null || true)" = "$expected_public_key"
 lipo "$bundle/Contents/MacOS/PersonaStack" -verify_arch arm64
 lipo "$bundle/Contents/MacOS/PersonaStack" -verify_arch x86_64
+lipo "$bundle/Contents/MacOS/PersonaStackHarnessHook" -verify_arch arm64
+lipo "$bundle/Contents/MacOS/PersonaStackHarnessHook" -verify_arch x86_64
 test -x "$framework/Versions/B/Autoupdate"
 test -x "$framework/Versions/B/Updater.app/Contents/MacOS/Updater"
 test -x "$framework/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"

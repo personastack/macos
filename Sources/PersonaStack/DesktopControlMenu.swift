@@ -59,6 +59,18 @@ struct DesktopControlMenu: View {
                 openWindow(id: "personastack-main")
             }
         }
+        Menu("Harnesses") {
+            ForEach(LocalSessionHarness.allCases, id: \.rawValue) { harness in
+                Menu(harness.displayName) {
+                    Button("Configure Persona…") { openDesktopFlow(path: "/user/desktop/harnesses", query: ["harness": harness.rawValue, "mode": "configure"]) }
+                    Button("Remove Persona…") { openDesktopFlow(path: "/user/desktop/harnesses", query: ["harness": harness.rawValue, "mode": "remove"]) }
+                }
+            }
+        }
+        Menu("Skills") {
+            Button("Upload to Workspace…") { openDesktopFlow(path: "/user/desktop/skills", query: ["direction": "upload"]) }
+            Button("Download from Workspace…") { openDesktopFlow(path: "/user/desktop/skills", query: ["direction": "download"]) }
+        }
         Divider()
         connectionStatus
         if let activity = presentation.snapshot.activity {
@@ -98,6 +110,11 @@ struct DesktopControlMenu: View {
         Button("Quit PersonaStack") {
             NSApp.terminate(nil)
         }
+    }
+
+    private func openDesktopFlow(path: String, query: [String: String]) {
+        MainWebViewHost.showMainWindow { openWindow(id: "personastack-main") }
+        MainWebViewHost.shared.openDesktopFlow(path: path, query: query)
     }
 
     private var connectionStatus: some View {

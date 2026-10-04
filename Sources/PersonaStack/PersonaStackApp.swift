@@ -175,7 +175,7 @@ final class MainWebViewHost {
         configuration.userContentController.addScriptMessageHandler(ChatWindowManager.shared, contentWorld: .page, name: "personastackChat")
         configuration.userContentController.addScriptMessageHandler(StackWindowManager.shared, contentWorld: .page, name: "personastackStack")
         configuration.userContentController.addScriptMessageHandler(LocalSessionManager.shared, contentWorld: .page, name: "personastackLocalSession")
-        configuration.userContentController.addScriptMessageHandler(LocalRunManager.shared, contentWorld: .page, name: "personastackLocalRun")
+        configuration.userContentController.addScriptMessageHandler(DesktopSkillsManager.shared, contentWorld: .page, name: "personastackSkills")
         configuration.userContentController.addScriptMessageHandler(DesktopControlSetupManager.shared, contentWorld: .page, name: "personastackDesktopControl")
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
@@ -186,7 +186,7 @@ final class MainWebViewHost {
         ChatWindowManager.shared.register(webView, appURL: appURL)
         StackWindowManager.shared.register(webView, appURL: appURL)
         LocalSessionManager.shared.register(webView, appURL: appURL)
-        LocalRunManager.shared.register(webView, appURL: appURL)
+        DesktopSkillsManager.shared.register(webView, appURL: appURL)
         DesktopControlSetupManager.shared.register(webView, appURL: appURL)
 
         let backgroundWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1, height: 1),
@@ -200,6 +200,16 @@ final class MainWebViewHost {
         self.authorizeNotifications = authorizeNotifications
         requestNotificationAuthorizationIfNeeded()
         if loadPage { coordinator.start(appURL) }
+    }
+
+    func openDesktopFlow(path: String, query: [String: String]) {
+        guard ["/user/desktop/harnesses", "/user/desktop/skills"].contains(path),
+              var components = URLComponents(url: coordinator.appURL, resolvingAgainstBaseURL: false) else { return }
+        components.path = path
+        components.queryItems = query.sorted(by: { $0.key < $1.key }).map { URLQueryItem(name: $0.key, value: $0.value) }
+        components.fragment = nil
+        guard let url = components.url else { return }
+        coordinator.start(url)
     }
 
     func attach(to container: NSView) {
@@ -225,13 +235,13 @@ final class MainWebViewHost {
         ChatWindowManager.shared.unregister(webView)
         StackWindowManager.shared.unregister(webView)
         LocalSessionManager.shared.invalidate(webView)
-        LocalRunManager.shared.invalidate(webView)
+        DesktopSkillsManager.shared.unregister(webView)
         DesktopControlSetupManager.shared.unregister(webView)
         coordinator.retire()
         webView.stopLoading()
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
-        for name in ["personastackConcern", "personastackChat", "personastackStack", "personastackLocalSession", "personastackLocalRun", "personastackDesktopControl"] {
+        for name in ["personastackConcern", "personastackChat", "personastackStack", "personastackLocalSession", "personastackSkills", "personastackDesktopControl"] {
             webView.configuration.userContentController.removeScriptMessageHandler(forName: name)
         }
         webView.removeFromSuperview()
@@ -375,6 +385,7 @@ struct PersonaStackWebView: NSViewRepresentable {
 
         private func invalidateDocumentVerification() {
             documentGeneration = UUID()
+            if let webView { DesktopSkillsManager.shared.invalidate(webView) }
             cancelPermissionVerification()
         }
 
@@ -438,7 +449,6 @@ struct PersonaStackWebView: NSViewRepresentable {
                 ChatWindowManager.shared.invalidateSession()
                 StackWindowManager.shared.invalidateSession()
                 LocalSessionManager.shared.invalidateSession()
-                LocalRunManager.shared.invalidateSession()
             }
 
             if navigationAction.targetFrame == nil {
