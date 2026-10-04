@@ -73,6 +73,13 @@ struct PersonaStackApp: App {
         .commands {
             DesktopServerSettingsCommands()
             DesktopUpdateCommands()
+            CommandGroup(replacing: .appTermination) {
+                Button("Close to Menu Bar") {
+                    terminationDelegate.closeToMenuBar(NSApp)
+                }
+                .keyboardShortcut("q", modifiers: [.command])
+                .help("Hide PersonaStack windows and keep Desktop Control running. Quit PersonaStack from its menu bar icon to stop the app.")
+            }
             CommandGroup(after: .toolbar) {
                 Button("Toggle Full Screen") {
                     NSApp.keyWindow?.toggleFullScreen(nil)
@@ -115,108 +122,6 @@ private struct DesktopControlStatusIcon: View {
     }
 }
 
-@MainActor
-final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
-    var reopenMainWindow: (@MainActor () -> Void)?
-    private var shouldRestoreMainWindowAfterUpdate = false
-    private let shutdown: @MainActor () async -> Void
-    private let reply: @MainActor (NSApplication) -> Void
-    private let timeout: Duration
-    private let recordQuitIntent: @MainActor () -> Void
-    private var terminating = false
-    private var replied = false
-    private var timeoutTask: Task<Void, Never>?
-
-    override init() {
-        shutdown = {
-            await LocalRunManager.shared.shutdown()
-            await DesktopControlRuntime.shared.shutdownForQuit()
-        }
-        reply = { $0.reply(toApplicationShouldTerminate: true) }
-        timeout = .seconds(10)
-        recordQuitIntent = {
-            let preferences = UserDefaults.standard
-            preferences.synchronize()
-            DesktopCrashRecoveryPolicy.recordTerminationIntent(
-                isUpdateRelaunch: preferences.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey),
-                preferences: preferences)
-        }
-        super.init()
-    }
-
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        DesktopLoginItemRegistration.enableOnFirstLaunch()
-        DesktopNotificationCoordinator.shared.install()
-        // The authenticated receiver belongs to the app, not Desktop Control
-        // enrollment or the visible main window.
-        _ = MainWebViewHost.shared
-        DesktopUpdater.shared.start()
-        guard UserDefaults.standard.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
-                || CommandLine.arguments.contains(DesktopApplicationRestart.foregroundArgument) else { return }
-        UserDefaults.standard.removeObject(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
-        _ = UserDefaults.standard.synchronize()
-        shouldRestoreMainWindowAfterUpdate = true
-        NSApp.setActivationPolicy(.regular)
-        Task { @MainActor [weak self] in
-            await Task.yield()
-            NSApp.activate(ignoringOtherApps: true)
-            self?.restoreMainWindowAfterUpdateIfNeeded()
-        }
-    }
-
-    func installMainWindowReopener(_ action: @escaping @MainActor () -> Void) {
-        reopenMainWindow = action
-        restoreMainWindowAfterUpdateIfNeeded()
-    }
-
-    private func restoreMainWindowAfterUpdateIfNeeded() {
-        guard shouldRestoreMainWindowAfterUpdate, let reopenMainWindow else { return }
-        shouldRestoreMainWindowAfterUpdate = false
-        reopenMainWindow()
-    }
-
-    init(shutdown: @escaping @MainActor () async -> Void,
-         reply: @escaping @MainActor (NSApplication) -> Void,
-         timeout: Duration) {
-        self.shutdown = shutdown
-        self.reply = reply
-        self.timeout = timeout
-        recordQuitIntent = {}
-        super.init()
-    }
-
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        guard let reopenMainWindow else { return true }
-        reopenMainWindow()
-        return false
-    }
-
-    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if !terminating { DesktopUpdater.shared.applicationWillTerminate() }
-        guard !terminating else { return .terminateLater }
-        recordQuitIntent()
-        terminating = true
-        Task { @MainActor in
-            await shutdown()
-            finish(sender)
-        }
-        timeoutTask = Task { @MainActor in
-            try? await Task.sleep(for: timeout)
-            guard !LocalRunManager.shared.hasActiveSessions else { return }
-            finish(sender)
-        }
-        return .terminateLater
-    }
-
-    private func finish(_ sender: NSApplication) {
-        guard !replied else { return }
-        replied = true
-        timeoutTask?.cancel()
-        timeoutTask = nil
-        reply(sender)
-    }
-}
-
 /// The shell owns the authenticated concern stream for the app lifetime. A
 /// hidden window retains its WebView when the visible window is closed.
 @MainActor
@@ -233,6 +138,7 @@ final class MainWebViewHost {
 
     static func showMainWindow(openWindow: () -> Void) {
         NSApp.setActivationPolicy(.regular)
+        NSApp.unhide(nil)
         if let window = NSApp.windows.first(where: { $0.title == "PersonaStack" }) {
             if window.isMiniaturized { window.deminiaturize(nil) }
             window.makeKeyAndOrderFront(nil)
@@ -244,6 +150,7 @@ final class MainWebViewHost {
 
     static func showServerSettingsWindow(openWindow: () -> Void) {
         NSApp.setActivationPolicy(.regular)
+        NSApp.unhide(nil)
         openWindow()
         NSApp.activate(ignoringOtherApps: true)
     }

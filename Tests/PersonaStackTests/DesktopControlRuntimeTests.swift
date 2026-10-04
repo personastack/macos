@@ -1252,44 +1252,6 @@ private struct SavedDesktopControlCredentialStore: DesktopControlCredentialStori
     _ = try runtime.beginDisconnect()
 }
 
-@Test @MainActor func quitWaitsForCleanupAndRepliesOnlyOnce() async {
-    var cleanupCalls = 0
-    var replies = 0
-    let delegate = PersonaStackTerminationDelegate(
-        shutdown: { cleanupCalls += 1 },
-        reply: { _ in replies += 1 },
-        timeout: .seconds(1))
-    let app = NSApplication.shared
-
-    #expect(delegate.applicationShouldTerminate(app) == .terminateLater)
-    #expect(delegate.applicationShouldTerminate(app) == .terminateLater)
-    try? await Task.sleep(for: .milliseconds(30))
-    #expect(cleanupCalls == 1)
-    #expect(replies == 1)
-}
-
-@Test @MainActor func quitDeadlineRepliesWhenCleanupIsSlow() async {
-    var replies = 0
-    var cleanupContinuation: CheckedContinuation<Void, Never>?
-    let delegate = PersonaStackTerminationDelegate(
-        shutdown: { await withCheckedContinuation { cleanupContinuation = $0 } },
-        reply: { _ in replies += 1 },
-        timeout: .milliseconds(10))
-
-    #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateLater)
-    for _ in 0..<100 where cleanupContinuation == nil {
-        try? await Task.sleep(for: .milliseconds(10))
-    }
-    #expect(cleanupContinuation != nil)
-    for _ in 0..<100 where replies == 0 {
-        try? await Task.sleep(for: .milliseconds(10))
-    }
-    #expect(replies == 1)
-    cleanupContinuation?.resume()
-    try? await Task.sleep(for: .milliseconds(20))
-    #expect(replies == 1)
-}
-
 private actor DesktopControlRelayStateFixture: DesktopControlRelayStateReading {
     let active: Bool
     private var readFails = false

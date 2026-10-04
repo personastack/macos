@@ -36,12 +36,26 @@ final class LocalRunManager: NSObject, WKScriptMessageHandlerWithReply {
         }
         for window in windows.values { window.requestClose() }
     }
-    func shutdown() async {
+    @discardableResult
+    func shutdown(waitForRetry: Bool = true) async -> Bool {
         invalidateSession()
         for window in Array(windows.values) { await window.closeSession() }
         // A failed stop stays visible and retryable. Quit/profile switching cannot
         // silently detach a live local container from its owning window.
-        while !windows.isEmpty { try? await Task.sleep(for: .milliseconds(200)) }
+        if waitForRetry {
+            while !windows.isEmpty { try? await Task.sleep(for: .milliseconds(200)) }
+        }
+        return windows.isEmpty
+    }
+
+    func showQuitRecovery() {
+        for window in windows.values { window.focus() }
+        guard let window = windows.values.first?.window, window.attachedSheet == nil else { return }
+        let alert = NSAlert()
+        alert.messageText = "PersonaStack is waiting for local work to close."
+        alert.informativeText = "Review the local chat window. Retry closing it if cleanup failed, then choose Quit or Restart PersonaStack again. PersonaStack will stay open while local work or credential cleanup is pending."
+        alert.addButton(withTitle: "Keep Open")
+        alert.beginSheetModal(for: window)
     }
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage,

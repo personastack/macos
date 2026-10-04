@@ -296,7 +296,7 @@ final class LocalRunWindow: NSObject, NSWindowDelegate {
     }
     func requestClose() { Task { await closeSession() } }
     func closeSession() async {
-        guard !disposed, await model.close() else { return }
+        guard !disposed, await model.close(), !disposed else { return }
         disposed = true; window.close(); onClose()
     }
 }
