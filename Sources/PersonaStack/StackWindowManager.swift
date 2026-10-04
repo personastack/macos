@@ -51,7 +51,7 @@ final class StackWindowManager: NSObject, WKScriptMessageHandlerWithReply {
             windowKey = key(view, stackID: stackID)
             url = StackWindowCommand.popoutURL(appURL: base, stackID: stackID, view: view)
             transparent = view == .graph
-            kind = view == .stream ? .stackStream : nil
+            kind = view == .stream ? .stackStream : .stackGraph
         case .openPersonaActivity(let personaID):
             windowKey = "persona-activity:\(personaID)"
             url = StackWindowCommand.personaActivityURL(appURL: base, personaID: personaID)
@@ -102,11 +102,12 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         self.url = url
         self.onClose = onClose
         let configuration = WKWebViewConfiguration()
-        if kind != nil { PopoutWindowPresentation.advertise(in: configuration) }
+        if let kind, kind != .stackGraph { PopoutWindowPresentation.advertise(in: configuration) }
         configuration.websiteDataStore = .default()
         configuration.applicationNameForUserAgent = "PersonaStackDesktop/1"
         webView = WKWebView(frame: .zero, configuration: configuration)
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 700),
+        let windowType: NSWindow.Type = kind == .stackGraph ? StackGraphWindow.self : NSWindow.self
+        window = windowType.init(contentRect: NSRect(x: 0, y: 0, width: 900, height: 700),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                           backing: .buffered, defer: false)
         super.init()
@@ -191,4 +192,20 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { dispose() }
+}
+
+/// Borderless graph windows retain keyboard focus and the standard close action.
+@MainActor
+private final class StackGraphWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+
+    override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
+        if !styleMask.contains(.titled), item.action == #selector(performClose(_:)) { return true }
+        return super.validateUserInterfaceItem(item)
+    }
+
+    override func performClose(_ sender: Any?) {
+        if styleMask.contains(.titled) { super.performClose(sender) }
+        else { close() }
+    }
 }

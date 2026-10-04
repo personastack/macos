@@ -54,11 +54,15 @@ struct PopoutWindowPresentationTests {
         let standardTitlebarHeight = standardWindow.frame.height - standardWindow.contentLayoutRect.maxY
         for kind in PopoutWindowKind.allCases {
             let config = WKWebViewConfiguration()
-            PopoutWindowPresentation.advertise(in: config)
-            let script = try #require(config.userContentController.userScripts.first)
-            #expect(script.source == "window.personastackNativeWindowChrome = true;")
-            #expect(script.injectionTime == .atDocumentStart)
-            #expect(script.isForMainFrameOnly)
+            if kind != .stackGraph {
+                PopoutWindowPresentation.advertise(in: config)
+                let script = try #require(config.userContentController.userScripts.first)
+                #expect(script.source == "window.personastackNativeWindowChrome = true;")
+                #expect(script.injectionTime == .atDocumentStart)
+                #expect(script.isForMainFrameOnly)
+            } else {
+                #expect(config.userContentController.userScripts.isEmpty)
+            }
             let webView = WKWebView(frame: .zero, configuration: config)
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 650), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
@@ -69,7 +73,7 @@ struct PopoutWindowPresentationTests {
             #expect(window.title == kind.fallbackTitle)
             #expect(window.titleVisibility == .visible)
             #expect(window.appearance?.name == .darkAqua)
-            #expect(window.toolbarStyle == (kind == .chat ? .automatic : .unified))
+            #expect(window.toolbarStyle == (kind.usesTitlebarAccessory ? .automatic : .unified))
             #expect(!window.styleMask.contains(.fullSizeContentView))
             #expect(window.collectionBehavior.contains(.fullScreenPrimary))
             #expect(window.hasShadow)
@@ -81,7 +85,7 @@ struct PopoutWindowPresentationTests {
             window.layoutIfNeeded()
             chrome.pinButton.superview?.layoutSubtreeIfNeeded()
             let chromeHeight = window.frame.height - window.contentLayoutRect.maxY
-            if kind == .chat {
+            if kind.usesTitlebarAccessory {
                 #expect(chromeHeight == standardTitlebarHeight)
                 #expect(window.toolbar == nil)
                 #expect(window.titlebarAccessoryViewControllers.count == 1)
@@ -177,4 +181,67 @@ struct PopoutWindowPresentationTests {
         _ = try await webView.evaluateJavaScript("document.title = 'Retired'")
         #expect(window.title == "Renamed · Live Console")
     }
+    @MainActor @Test func graphHoverAndPinTransitionsKeepNativeGeometryAndInput() throws {
+        _ = NSApplication.shared
+        let preferences = PopoutTestPreferences()
+        let graph = StackPopoutWindow(url: URL(string: "https://example.invalid")!, transparent: true, kind: .stackGraph, loadPage: false, defaults: preferences.defaults) {}
+        defer { graph.dispose() }
+        let chrome = try #require(graph.presentation)
+        let overlay = try #require(chrome.graphOverlay)
+        let minimum = graph.window.minSize
+        #expect(chrome.pinButton.accessibilityLabel() == "Pin graph")
+        #expect(graph.window.titlebarAccessoryViewControllers.count == 1)
+        #expect(overlay.isHidden)
+        for width in [340.0, 390.0, 900.0] {
+            graph.window.setFrame(NSRect(x: 50, y: 100, width: width, height: minimum.height), display: false)
+            let canvas = graph.window.convertToScreen(graph.window.contentLayoutRect)
+            for _ in 0..<3 {
+                chrome.togglePin()
+                graph.window.contentView?.layoutSubtreeIfNeeded()
+                overlay.setPointerInside(false)
+                #expect(graph.window.convertToScreen(graph.window.contentLayoutRect) == canvas)
+                #expect(chrome.pinButton.accessibilityLabel() == "Unpin graph")
+                #expect(chrome.pinButton.accessibilityValue() as? Int == 1)
+                #expect(graph.window.toolbar == nil)
+                #expect(graph.window.standardWindowButton(.closeButton) == nil)
+                #expect(graph.window.collectionBehavior.contains(.fullScreenNone))
+                #expect(chrome.pinButton.isHidden)
+                #expect(overlay.hitTest(NSPoint(x: 10, y: 10)) == nil)
+                overlay.setPointerInside(true)
+                #expect(!chrome.pinButton.isHidden)
+                #expect(chrome.pinButton.frame.size == NSSize(width: 24, height: 24))
+                let buttonPoint = NSPoint(x: chrome.pinButton.frame.midX, y: chrome.pinButton.frame.midY)
+                #expect(overlay.hitTest(buttonPoint) === chrome.pinButton)
+                #expect(overlay.hitTest(NSPoint(x: 10, y: 10)) == nil)
+                chrome.togglePin()
+                #expect(graph.window.convertToScreen(graph.window.contentLayoutRect) == canvas)
+                #expect(graph.window.minSize == minimum)
+                #expect(graph.window.titlebarAccessoryViewControllers.count == 1)
+                #expect(chrome.pinButton.window === graph.window)
+                #expect(!chrome.pinButton.isHidden)
+                #expect(overlay.isHidden)
+                #expect(chrome.pinButton.accessibilityValue() as? Int == 0)
+            }
+        }
+        #expect(preferences.defaults.object(forKey: PopoutGeometryStore.key(.stackGraph)) == nil)
+        chrome.willEnterFullscreen()
+        chrome.togglePin()
+        #expect(graph.window.level == .normal)
+        #expect(!chrome.pinButton.isEnabled)
+        chrome.fullscreenTransitionFailed()
+        #expect(chrome.pinButton.isEnabled)
+        chrome.willExitFullscreen()
+        chrome.togglePin()
+        #expect(graph.window.level == .normal)
+        chrome.didExitFullscreen()
+        chrome.togglePin()
+        #expect(graph.window.level == .floating)
+        graph.dispose()
+        overlay.setPointerInside(true)
+        chrome.togglePin()
+        #expect(overlay.onHover == nil)
+        #expect(overlay.isHidden)
+        #expect(!graph.window.isVisible)
+    }
+
 }
