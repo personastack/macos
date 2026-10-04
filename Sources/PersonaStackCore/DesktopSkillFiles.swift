@@ -2,6 +2,11 @@ import CryptoKit
 import Darwin
 import Foundation
 
+public enum DesktopSkillTransferError: String, Error, LocalizedError, Sendable {
+    case collectionFolderRequired = "Choose a folder containing skills to download a copy or a skill with a different name."
+    public var errorDescription: String? { rawValue }
+}
+
 public struct DesktopSkillBaseline: Codable, Equatable, Sendable {
     public let workspaceID: String
     public let skillID: String
@@ -115,7 +120,9 @@ public struct DesktopSkillFiles: Sendable {
         try directory(root)
         let digest = LocalSessionSkill.digest(files)
         try validate(files, digest: digest)
-        let destination = root.appendingPathComponent(name, isDirectory: true)
+        let selectedSkill = FileManager.default.fileExists(atPath: root.appendingPathComponent("SKILL.md").path)
+        guard !selectedSkill || name == root.lastPathComponent else { throw DesktopSkillTransferError.collectionFolderRequired }
+        let destination = selectedSkill ? root : root.appendingPathComponent(name, isDirectory: true)
         let exists = FileManager.default.fileExists(atPath: destination.path)
         if exists {
             let current = try read(destination, origin: origin)

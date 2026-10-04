@@ -114,4 +114,45 @@ struct DesktopSkillsManagerTests {
         await #expect(throws: LocalSessionError.staleRequest) { try await save(baseline, localID: id, folder: folder, manager: manager, view: view) }
         #expect(try files.read(root.appendingPathComponent("review"), origin: origin).baseline == nil)
     }
+
+    @Test(arguments: [true, false])
+    func downloadReplacesDirectRootOrCollectionChildWithinPickerCapability(directRoot: Bool) async throws {
+        let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let files = DesktopSkillFiles(metadataRoot: root.appendingPathComponent("metadata"))
+        let original = try files.write(root: root, name: "review", files: [.init(relativePath: "SKILL.md", content: "Review"), .init(relativePath: "note.txt", content: "Keep")], expectedDigest: "", overwrite: false, origin: origin)
+        let neighbor = try files.write(root: root, name: "neighbor", files: [.init(relativePath: "SKILL.md", content: "Neighbor")], expectedDigest: "", overwrite: false, origin: origin)
+        let selected = directRoot ? original.directory : root
+        let manager = DesktopSkillsManager(files: files, pickFolder: { _ in selected })
+        let view = WKWebView(); manager.register(view, appURL: origin)
+        let folder = try #require(try await manager.apply(request("choose_folder", ["direction": "download"]), view: view)["folder_id"] as? String)
+        let listed = try await skills(manager, view: view, folder: folder)
+        let preview = try #require(listed.first { $0["name"] as? String == "review" })
+        let id = try #require(preview["local_id"] as? String)
+        let initialDigest = try #require(preview["digest"] as? String)
+        var write = request("write", ["folder_id": folder, "name": "review", "files": [["path": "SKILL.md", "content": "Updated"]], "expected_digest": "stale", "overwrite": true])
+        await #expect(throws: LocalSessionError.staleRequest) { _ = try await manager.apply(write, view: view) }
+        #expect(try files.read(original.directory, origin: origin).digest == initialDigest)
+        write["expected_digest"] = initialDigest
+        let result = try await manager.apply(write, view: view)
+        #expect(result["local_id"] as? String == id)
+        let refreshed = try await skills(manager, view: view, folder: folder)
+        let updated = try #require(refreshed.first { $0["local_id"] as? String == id })
+        let digest = try #require(updated["digest"] as? String)
+        #expect(digest == result["digest"] as? String)
+        let current = try files.read(original.directory, origin: origin)
+        #expect(current.files == [.init(relativePath: "SKILL.md", content: "Updated"), .init(relativePath: "note.txt", content: "Keep")])
+        let baseline = DesktopSkillBaseline(workspaceID: workspace, skillID: "catalog", configID: "config", revision: 2, configVersion: 2, digest: digest)
+        try await save(baseline, localID: id, folder: folder, manager: manager, view: view)
+        #expect(try files.read(original.directory, origin: origin).baseline == baseline)
+        await #expect(throws: LocalSessionError.staleRequest) { _ = try await manager.apply(write, view: view) }
+        if directRoot {
+            write["name"] = "neighbor"; write["expected_digest"] = neighbor.digest
+            await #expect(throws: DesktopSkillTransferError.collectionFolderRequired) { _ = try await manager.apply(write, view: view) }
+            #expect(DesktopSkillsManager.errorMessage(DesktopSkillTransferError.collectionFolderRequired) == "Choose a folder containing skills to download a copy or a skill with a different name.")
+            #expect(!FileManager.default.fileExists(atPath: original.directory.appendingPathComponent("neighbor").path))
+        }
+        #expect(!FileManager.default.fileExists(atPath: original.directory.appendingPathComponent("review").path))
+        #expect(try files.read(neighbor.directory, origin: origin).files == neighbor.files)
+        #expect(try files.read(original.directory, origin: origin).digest == digest)
+    }
 }

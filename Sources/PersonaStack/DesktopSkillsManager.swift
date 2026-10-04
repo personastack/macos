@@ -40,8 +40,12 @@ final class DesktopSkillsManager: NSObject, WKScriptMessageHandlerWithReply {
               let body = message.body as? [String: Any] else { replyHandler(nil, LocalSessionError.invalidRequest.rawValue); return }
         Task {
             do { replyHandler(try await apply(body, page: page), nil) }
-            catch { replyHandler(nil, (error as? LocalSessionError ?? .unsafeFiles).rawValue) }
+            catch { replyHandler(nil, Self.errorMessage(error)) }
         }
+    }
+
+    static func errorMessage(_ error: Error) -> String {
+        (error as? DesktopSkillTransferError)?.rawValue ?? (error as? LocalSessionError ?? .unsafeFiles).rawValue
     }
 
     func apply(_ body: [String: Any], view: WKWebView) async throws -> [String: Any] {

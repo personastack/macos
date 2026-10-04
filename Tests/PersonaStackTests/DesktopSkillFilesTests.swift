@@ -39,6 +39,50 @@ struct DesktopSkillFilesTests {
         #expect(replaced.digest == first.digest)
     }
 
+    @Test(arguments: [true, false])
+    func replacementTargetsSelectedSkillOrCollectionChildWithoutNestedArtifacts(directRoot: Bool) throws {
+        let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let files = DesktopSkillFiles(metadataRoot: root.appendingPathComponent("metadata"))
+        let original = try files.write(root: root, name: "review", files: artifacts, expectedDigest: "", overwrite: false, origin: origin)
+        let selected = directRoot ? original.directory : root
+        let incoming = [LocalSessionSkillFile(relativePath: "SKILL.md", content: "Updated skill")]
+        #expect(throws: LocalSessionError.staleRequest) {
+            try files.write(root: selected, name: "review", files: incoming, expectedDigest: "stale", overwrite: true, origin: origin)
+        }
+        #expect(throws: LocalSessionError.unsafeFiles) {
+            try files.write(root: selected, name: "review", files: incoming, expectedDigest: original.digest, overwrite: false, origin: origin)
+        }
+        #expect(try files.read(original.directory, origin: origin).files == original.files)
+        let result = try files.write(root: selected, name: "review", files: incoming, expectedDigest: original.digest, overwrite: true, origin: origin)
+        #expect(result.directory == original.directory)
+        #expect(result.files.contains(incoming[0]))
+        #expect(result.files.contains(artifacts[1]))
+        #expect(!FileManager.default.fileExists(atPath: original.directory.appendingPathComponent("review").path))
+        #expect(throws: LocalSessionError.staleRequest) {
+            try files.write(root: selected, name: "review", files: artifacts, expectedDigest: original.digest, overwrite: true, origin: origin)
+        }
+        #expect(try files.read(original.directory, origin: origin).digest == result.digest)
+    }
+
+    @Test func directSkillCapabilityRejectsOtherNamesWithoutChangingSiblings() throws {
+        let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let files = DesktopSkillFiles(metadataRoot: root.appendingPathComponent("metadata"))
+        let original = try files.write(root: root, name: "review", files: artifacts, expectedDigest: "", overwrite: false, origin: origin)
+        let sibling = try files.write(root: root, name: "neighbor", files: artifacts, expectedDigest: "", overwrite: false, origin: origin)
+        for name in ["review-copy", "neighbor"] {
+            #expect(throws: DesktopSkillTransferError.collectionFolderRequired) {
+                try files.write(root: original.directory, name: name, files: [.init(relativePath: "SKILL.md", content: "Forbidden")], expectedDigest: "", overwrite: true, origin: origin)
+            }
+            #expect(!FileManager.default.fileExists(atPath: original.directory.appendingPathComponent(name).path))
+        }
+        #expect(try files.read(original.directory, origin: origin).files == original.files)
+        #expect(try files.read(sibling.directory, origin: origin).files == sibling.files)
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("review-copy").path))
+        // Granting the collection explicitly permits creating the copy under that root.
+        let copy = try files.write(root: root, name: "review-copy", files: artifacts, expectedDigest: "", overwrite: false, origin: origin)
+        #expect(copy.directory.deletingLastPathComponent() == (try DesktopSkillFiles.canonicalDirectory(root)))
+    }
+
     @Test func downloadPreservesUnrelatedDestinationFiles() throws {
         let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
         let files = DesktopSkillFiles(metadataRoot: root.appendingPathComponent("metadata"))
