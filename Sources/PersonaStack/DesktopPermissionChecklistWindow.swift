@@ -11,6 +11,14 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     private var activationObserver: NSObjectProtocol?
     private var permissionSelection: (id: UUID, permission: DesktopPermissionID, window: NSWindow)?
     private var isRefreshingLockedControlEvidence = false
+    let perception: DesktopPerceptionSetupController
+    private var perceptionTask: Task<Void, Never>?
+    var onInstallPerception: (() async -> Void)?
+    let browserConsent: DesktopBrowserProfileConsentController
+    let resumesPermissionSetup: Bool
+    var setupActionTitle: String { resumesPermissionSetup ? "Resume setup" : "Continue" }
+    private let canStartSetup: () -> Bool
+    private let supportsFullControl: () -> Bool
     private let applicationURL: URL
     private let showApplicationInFinder: (URL) -> Void
     private let lockedControlVerifier: DesktopLockedControlSetupVerifier
@@ -21,24 +29,38 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     var onPresent: (() -> Void)?
 
     init(coordinator: DesktopPermissionChecklistCoordinator,
+         browserConsent: DesktopBrowserProfileConsentController = .shared,
+         perception: DesktopPerceptionSetupController = .init(),
+         canStartSetup: @escaping () -> Bool = { DesktopControlRuntime.shared.permissionSetupAvailable },
+         supportsFullControl: @escaping () -> Bool = { if #available(macOS 15, *) { true } else { false } },
+         resumesPermissionSetup: Bool = DesktopApplicationRestart.resumesPermissionSetup,
          applicationURL: URL = Bundle.main.bundleURL,
          showApplicationInFinder: @escaping (URL) -> Void = {
              NSWorkspace.shared.activateFileViewerSelecting([$0])
          },
          lockedControlVerifier: DesktopLockedControlSetupVerifier = .shared,
-         authorizeFullControl: @escaping @MainActor (DesktopLockedControlSetupVerifier) -> Bool = DesktopPermissionChecklistWindow.confirmFullControl,
+         authorizeFullControl: @escaping @MainActor (DesktopLockedControlSetupVerifier) -> Bool = { _ in true },
          restartApplication: @escaping @MainActor () throws -> Void = { try DesktopApplicationRestart.request() }) {
+        self.resumesPermissionSetup = resumesPermissionSetup
         self.coordinator = coordinator
+        self.browserConsent = browserConsent
+        self.perception = perception
+        self.canStartSetup = canStartSetup
+        self.supportsFullControl = supportsFullControl
         self.applicationURL = applicationURL
         self.showApplicationInFinder = showApplicationInFinder
         self.lockedControlVerifier = lockedControlVerifier
         self.authorizeFullControl = authorizeFullControl
         self.restartApplication = restartApplication
         super.init()
+        coordinator.onReady = { [weak self] in Task { @MainActor in await self?.finish() } }
         activationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
-        ) { [weak coordinator] _ in
-            Task { @MainActor in await coordinator?.refresh() }
+        ) { [weak coordinator, weak browserConsent] _ in
+            Task { @MainActor in
+                browserConsent?.refresh()
+                await coordinator?.refresh()
+            }
         }
     }
 
@@ -66,7 +88,9 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     }
 
     func restart() {
-        guard coordinator.canRestart else { return }
+        guard coordinator.canRestart, !isRefreshingLockedControlEvidence,
+              !lockedControlVerifier.isChecking, !perception.isWorking else { return }
+        guard setupIsAvailable() else { return }
         do {
             try restartApplication()
             cancel()
@@ -75,56 +99,77 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
         }
     }
 
-    func finish() async {
-        guard coordinator.canFinish, !isRefreshingLockedControlEvidence else { return }
+    /// Continue is the affirmative local consent. Verification cannot create
+    /// that consent during presentation, activation, or background polling.
+    func continueSetup() async {
+        guard coordinator.isVisible, !coordinator.hasStarted, !coordinator.isFinishing,
+              !isRefreshingLockedControlEvidence else { return }
+        guard setupIsAvailable() else { return }
+        guard supportsFullControl() else {
+            coordinator.reportSetupPrerequisite("Unattended control requires macOS 15 or later for the full CUA toolset. Chat remains available.")
+            return
+        }
         let generation = coordinator.operationGeneration
         isRefreshingLockedControlEvidence = true
         defer { isRefreshingLockedControlEvidence = false }
-        // Read the installed candidate at the explicit Finish action. Cached
-        // absence from an earlier background check must not skip consent.
         let readiness = await lockedControlVerifier.refresh().readiness
-        guard isCurrentFinishAttempt(generation) else { return }
-        switch readiness {
-        case .absent, .mismatch:
-            coordinator.reportSetupPrerequisite("Locked-screen control is included in the main PersonaStack installer. Reinstall PersonaStack using Install PersonaStack.pkg, then retry Finish Setup. " + lockedControlVerifier.snapshot.detail)
+        guard !Task.isCancelled, coordinator.isVisible, coordinator.operationGeneration == generation else { return }
+        guard readiness == .ready else {
+            coordinator.reportSetupPrerequisite("Reinstall PersonaStack using Install PersonaStack.pkg to set up locked-screen control. " + lockedControlVerifier.snapshot.detail)
             return
-        case .unsupported:
-            coordinator.reportSetupPrerequisite(lockedControlVerifier.snapshot.detail)
-            return
-        case .ready:
-            break
         }
-        if !lockedControlVerifier.permitsLockedControl {
-            guard authorizeFullControl(lockedControlVerifier), isCurrentFinishAttempt(generation),
-                  lockedControlVerifier.recordAcknowledgement() else { return }
+        await coordinator.refresh()
+        guard !Task.isCancelled, coordinator.isVisible, coordinator.operationGeneration == generation,
+              setupIsAvailable() else { return }
+        // No suspension between the lease check and consent mutation.
+        guard lockedControlVerifier.permitsLockedControl ||
+                (authorizeFullControl(lockedControlVerifier) && lockedControlVerifier.recordAcknowledgement()) else { return }
+        browserConsent.approveSelection()
+        coordinator.continueSetup()
+    }
+
+    private func setupIsAvailable() -> Bool {
+        guard canStartSetup() else {
+            coordinator.reportSetupPrerequisite("A remote task is using this Mac. Wait for it to finish, then try again.")
+            return false
         }
-        guard isCurrentFinishAttempt(generation) else { return }
+        return true
+    }
+
+    func finish() async {
+        guard coordinator.hasStarted, coordinator.canFinish, lockedControlVerifier.permitsLockedControl else { return }
         if coordinator.isAwaitingFinish { coordinator.finish(); onStopVerification?() }
         else { completeSetup() }
     }
 
-    private func isCurrentFinishAttempt(_ generation: UUID) -> Bool {
-        !Task.isCancelled && coordinator.operationGeneration == generation && coordinator.canFinish
+    func cancelPerception() {
+        perceptionTask?.cancel()
+        perceptionTask = nil
+        Task { await perception.cancel() }
     }
 
-    private static func confirmFullControl(_ verifier: DesktopLockedControlSetupVerifier) -> Bool {
-        guard !verifier.permitsLockedControl else { return true }
-        let alert = NSAlert()
-        alert.messageText = "Allow full Desktop Control after locking?"
-        alert.informativeText = "Your authorized PersonaStack agents will be able to control apps, files, and commands while this Mac is locked. PersonaStack temporarily unlocks the session, conceals the displays, and locks it again when control ends. Local input ends remote control."
-        alert.addButton(withTitle: "Allow Full Control")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return false }
-        return true
+    func installPerception() {
+        guard perceptionTask == nil, coordinator.isVisible, coordinator.hasStarted,
+              coordinator.currentPermission == .visualPerception else { return }
+        let generation = coordinator.operationGeneration
+        perceptionTask = Task { [weak self] in
+            guard let self else { return }
+            await self.onInstallPerception?()
+            guard !Task.isCancelled, self.coordinator.isVisible, self.coordinator.operationGeneration == generation else { return }
+            self.perceptionTask = nil
+            self.coordinator.check(.visualPerception)
+        }
     }
 
     func cancel() {
+        cancelPerception()
         coordinator.cancel()
         onCancel?()
         window?.orderOut(nil)
     }
 
     func windowWillClose(_ notification: Notification) {
+        cancelPerception()
         coordinator.cancel()
         onCancel?()
     }
@@ -149,21 +194,6 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
         let response = await presentPermissionAlert(alert, permission: id)
         let index = picker.indexOfSelectedItem
         return response == .alertFirstButtonReturn && mounts.indices.contains(index) ? mounts[index] : nil
-    }
-
-    func protectedAccessSetupAction() async -> DesktopProtectedAccessSetupAction {
-        let alert = NSAlert()
-        alert.messageText = "Setup Full Disk Access"
-        alert.informativeText = "If PersonaStack is already enabled in System Settings → Privacy & Security → Full Disk Access, choose Check Access. Otherwise, open Settings, click + and select the running PersonaStack.app shown by Show PersonaStack in Finder. Enable its switch. Opening Settings does not add the app or approve access. Return here for an automatic protected-folder check. Quit and reopen PersonaStack if macOS requests it. Check Access authorizes a directory read in Library/Mail, or Library/Messages if Mail is absent. The same check runs automatically whenever you open this window. Entry names are discarded. No file contents are read or changed. A successful check marks this row Ready. Other folders can still have separate access restrictions."
-        alert.icon = NSImage(named: NSImage.applicationIconName)
-        alert.addButton(withTitle: "Check Access")
-        alert.addButton(withTitle: "Open Settings")
-        alert.addButton(withTitle: "Cancel")
-        switch await presentPermissionAlert(alert, permission: .fullDiskAccess) {
-        case .alertFirstButtonReturn: return .check
-        case .alertSecondButtonReturn: return .settings
-        default: return .cancel
-        }
     }
 
     private func presentPermissionAlert(_ alert: NSAlert, permission: DesktopPermissionID) async -> NSApplication.ModalResponse? {
@@ -191,22 +221,23 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     }
 
     private func show() {
+        browserConsent.refresh()
         if !coordinator.isVisible { onPresent?() }
         let value = makeWindowIfNeeded()
         coordinator.open()
         NSApp.activate(ignoringOtherApps: true)
         value.makeKeyAndOrderFront(nil)
-        coordinator.startPresentationVerification()
-        coordinator.startAutomaticSetup()
         Task { await lockedControlVerifier.refresh() }
     }
 
     func makeWindowIfNeeded() -> NSWindow {
         if let window { return window }
         let content = DesktopPermissionChecklistView(coordinator: coordinator,
-            lockedControlVerifier: lockedControlVerifier,
+            lockedControlVerifier: lockedControlVerifier, browserConsent: browserConsent, perception: perception,
+            installPerception: { [weak self] in self?.installPerception() },
+            resumesPermissionSetup: resumesPermissionSetup,
             cancel: { [weak self] in self?.cancel() }, finish: { [weak self] in
-                Task { @MainActor in await self?.finish() }
+                Task { @MainActor in await self?.continueSetup() }
             },
             restart: { [weak self] in self?.restart() },
             revealApplication: { [weak self] in self?.revealCurrentApplication() })
@@ -227,9 +258,13 @@ final class DesktopPermissionChecklistWindow: NSObject, NSWindowDelegate {
     }
 }
 
-private struct DesktopPermissionChecklistView: View {
+struct DesktopPermissionChecklistView: View {
     @ObservedObject var coordinator: DesktopPermissionChecklistCoordinator
     @ObservedObject var lockedControlVerifier: DesktopLockedControlSetupVerifier
+    @ObservedObject var browserConsent: DesktopBrowserProfileConsentController
+    @ObservedObject var perception: DesktopPerceptionSetupController
+    let installPerception: () -> Void
+    let resumesPermissionSetup: Bool
     let cancel: () -> Void
     let finish: () -> Void
     let restart: () -> Void
@@ -237,111 +272,150 @@ private struct DesktopPermissionChecklistView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 12) {
-                Image(nsImage: NSImage(named: NSImage.applicationIconName) ?? NSImage())
-                    .resizable().frame(width: 40, height: 40).accessibilityHidden(true)
-                Text("Allow PersonaStack to work on this Mac")
-                    .font(.title2.weight(.semibold))
-            }
+            Text("Set up unattended remote control").font(.title2.bold())
             ScrollView {
-                LazyVStack(spacing: 0) {
-                    HStack(alignment: .top, spacing: 12) {
-                        Image(systemName: lockedControlVerifier.snapshot.readiness == .ready ? "checkmark.circle.fill" : "exclamationmark.circle")
-                            .foregroundStyle(lockedControlVerifier.snapshot.readiness == .ready ? Color.green : Color.secondary)
-                            .frame(width: 20).accessibilityHidden(true)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Locked-screen control").font(.headline)
-                            Text(lockedControlVerifier.snapshot.detail).font(.caption).foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 16) {
+                    if !coordinator.hasStarted { introduction; browserSelection }
+                    else {
+                        progress
+                        if let id = coordinator.currentPermission,
+                           let row = coordinator.rows.first(where: { $0.id == id }) {
+                            instruction(row)
                         }
-                        Spacer(minLength: 8)
-                        Button("Verify Installation") {
-                            Task { await lockedControlVerifier.refresh() }
-                        }.disabled(lockedControlVerifier.isChecking || coordinator.isFinishing)
-                        if lockedControlVerifier.isChecking { ProgressView().controlSize(.small) }
-                    }.padding(.vertical, 12)
-                    Divider()
-                    ForEach(coordinator.permissionRows) { row in
-                        rowView(row)
-                        Divider()
                     }
-                    Text("Automatic setup").font(.headline)
-                        .frame(maxWidth: .infinity, alignment: .leading).padding(.top, 20)
-                    Text("PersonaStack sets these up when you open this window. macOS may ask for approval. These settings do not block Desktop Control.")
+                    if coordinator.hasStarted, coordinator.currentPermission == .visualPerception {
+                        if let review = perception.review {
+                            DesktopPerceptionInstallReviewView(review: review, isWorking: perception.isWorking,
+                                install: installPerception, cancel: cancel)
+                        }
+                        if let failure = perception.failure { Text(failure).font(.callout).foregroundStyle(.red) }
+                    }
+                    Label(lockedControlVerifier.snapshot.detail,
+                          systemImage: lockedControlVerifier.snapshot.readiness == .ready ? "checkmark.shield" : "exclamationmark.shield")
                         .font(.caption).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 6)
-                    ForEach(coordinator.automaticRows) { row in
-                        rowView(row, automatic: true)
-                        Divider()
+                    if coordinator.hasStarted {
+                        ForEach(coordinator.automaticRows) { row in
+                            Label("\(row.id.title): \(row.state.title)", systemImage: row.isComplete ? "checkmark.circle" : "clock")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                     }
-                }
+                }.frame(maxWidth: .infinity, alignment: .leading)
             }
-            .accessibilityLabel("Desktop Control permissions")
+            .accessibilityLabel("Unattended control setup")
             if !coordinator.completionError.isEmpty {
-                Text(coordinator.completionError).foregroundStyle(.red)
+                Text(coordinator.completionError).font(.callout).foregroundStyle(.red)
             }
             HStack {
-                Button("Cancel", action: cancel).keyboardShortcut(.cancelAction)
+                Button("Cancel setup", action: cancel).buttonStyle(.bordered).keyboardShortcut(.cancelAction)
                 Spacer()
-                if coordinator.isFinishing { ProgressView().controlSize(.small) }
-                Button(coordinator.primaryActionTitle, action: coordinator.requiresAppRestart ? restart : finish)
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(coordinator.requiresAppRestart ? !coordinator.canRestart : !coordinator.canFinish)
-            }
-        }
-        .padding(24)
-    }
-
-    private func rowView(_ row: DesktopPermissionRow, automatic: Bool = false) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: symbol(row.state))
-                .foregroundStyle(row.state == .restartRequired ? Color.yellow : row.isComplete ? Color.green : Color.secondary)
-                .frame(width: 20)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(row.displayTitle).font(.headline)
-                if [.fullDiskAccess, .directCapture, .automation, .safariJavaScript, .clipboard].contains(row.id) {
-                    Text("Optional for setup.").font(.caption).foregroundStyle(.secondary)
-                }
-                Group {
-                    Text(row.state.title).font(.caption.weight(.semibold))
-                    Text(row.observation.detail).font(.caption).foregroundStyle(.secondary)
-                    if [.localNetwork, .notifications, .launchAtLogin, .automation, .directCapture, .safariJavaScript, .clipboard].contains(row.id) && !row.isComplete && row.state != .checking {
-                        Button(row.id == .safariJavaScript ? "Open Safari" : "Open Settings") { coordinator.openSettings(row.id) }
-                            .accessibilityLabel(row.id == .safariJavaScript ? "Open Safari for Safari JavaScript setup" : "Open Settings for \(row.displayTitle)")
-                            .buttonStyle(.link)
-                            .font(.caption)
-                            .disabled(coordinator.isFinishing || coordinator.busyPermission == row.id)
-                    }
-                    if !row.isComplete && (DesktopPermissionReset.arguments(for: row.id) != nil || row.id == .localNetwork) {
-                        Button("Show PersonaStack in Finder", action: revealApplication)
-                            .buttonStyle(.link)
-                            .font(.caption)
-                            .disabled(coordinator.isFinishing)
-                    }
+                if coordinator.isFinishing {
+                    ProgressView().controlSize(.small)
+                    Text("Connecting this Mac…").font(.callout)
+                } else if coordinator.busyPermission != nil || lockedControlVerifier.isChecking || perception.isWorking {
+                    ProgressView().controlSize(.small).accessibilityLabel("Checking setup")
+                } else if coordinator.requiresAppRestart {
+                    Button("Restart PersonaStack", action: restart).buttonStyle(.borderedProminent)
+                        .disabled(!coordinator.canRestart)
+                } else if !coordinator.hasStarted {
+                    Button(resumesPermissionSetup ? "Resume setup" : "Continue", action: finish).buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                        .disabled(coordinator.needsNewSetupRequest)
                 }
             }
-            Spacer(minLength: 8)
-            HStack(spacing: 8) {
-                Button("Check") { coordinator.check(row.id) }
-                    .accessibilityLabel("Check \(row.displayTitle)")
-                Button("Setup") { coordinator.setup(row.id) }
-                    .accessibilityLabel(row.setupTitle)
-            }
-            .disabled(coordinator.isFinishing || coordinator.busyPermission != nil || coordinator.verificationBusyPermission == row.id || (automatic && coordinator.automaticBusyPermission != nil))
-            if coordinator.busyPermission == row.id || coordinator.automaticBusyPermission == row.id || coordinator.verificationBusyPermission == row.id { ProgressView().controlSize(.small) }
-        }
-        .padding(.vertical, 12)
+        }.padding(24)
     }
 
-    private func symbol(_ state: DesktopPermissionState) -> String {
-        switch state {
-        case .ready: "checkmark.circle.fill"
-        case .notNeeded: "minus.circle"
-        case .checking: "clock"
-        case .restricted, .unsupported: "lock.circle"
-        case .restartRequired: "arrow.clockwise.circle"
-        default: "exclamationmark.circle"
+    private var introduction: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if resumesPermissionSetup {
+                Text("PersonaStack restarted. Resume setup to recheck permissions. Complete the new Desktop Control setup request in the app before connecting this Mac.").fontWeight(.medium)
+            }
+            Text("Authorized personas can control apps, use the clipboard and local network, access files, run commands, and record or replay desktop activity when requested. Recording stays off until requested.")
+            if CuaPerceptionCompatibility.supportedArchitecture {
+                Text("Setup may download 426 MB of visual perception components for review. Installing the separately licensed models requires your confirmation.")
+            }
+            Text("Existing browser profiles need your approval. Apple and your browsers may ask for separate permissions.")
+            Text("While this Mac is locked, PersonaStack temporarily unlocks the session, conceals the displays, then locks it again. Local input ends remote control.")
+            Text("Continue allows bounded setup checks: a discarded screen image and clipboard read, a protected-folder check, and a local-network probe. PersonaStack also clicks and types disposable text in its own test window. If Safari has no document, setup opens a blank test tab and leaves it open. Microphone access is requested only when you record audio in chat.")
+                .foregroundStyle(.secondary)
+        }.font(.callout)
+    }
+
+    private var browserSelection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Existing browser access").font(.callout.bold())
+            Text("Isolated browsers remain available without sharing your signed-in profiles. Select a running Chrome or Edge instance to also allow its windows, tabs, and authenticated profiles.")
+                .font(.caption).foregroundStyle(.secondary)
+            if browserConsent.targets.isEmpty {
+                Text("No supported browser windows found. Open Chrome or Edge, then return to setup to select it.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                ForEach(browserConsent.selectionTargets) { target in
+                    Toggle("\(target.browserName) · instance \(target.pid)", isOn: Binding(
+                        get: { browserConsent.selectedIDs.contains(target.id) },
+                        set: { browserConsent.setSelected($0, id: target.id) }))
+                        .toggleStyle(.checkbox)
+                        .accessibilityHint("Approves this running browser instance, including all its authenticated profiles, when you press Continue")
+                }
+            }
+            Text("Continue approves the selected browser instances. CUA may enable their remote-debugging setting and accept their browser connection dialog. It does not approve macOS permission dialogs. Browser restart requires local approval again. PersonaStack restarts retain approval only for the same running browser instances.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private var progress: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(DesktopPermissionStage.allCases) { stage in
+                let done = stage.permissions.allSatisfy { id in coordinator.rows.first(where: { $0.id == id })?.isComplete == true }
+                Label(stage.title, systemImage: done ? "checkmark.circle.fill" : coordinator.currentStage == stage ? "circle.inset.filled" : "circle")
+                    .foregroundStyle(done ? Color.green : coordinator.currentStage == stage ? Color.primary : Color.secondary)
+                    .font(.callout.weight(coordinator.currentStage == stage ? .semibold : .regular))
+                    .accessibilityLabel("\(stage.title), \(done ? "complete" : coordinator.currentStage == stage ? "current step" : "waiting")")
+            }
+        }
+    }
+
+    private func instruction(_ row: DesktopPermissionRow) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(coordinator.currentStage?.title ?? row.id.title).font(.headline)
+            Text(row.state.title).font(.caption.bold())
+                .foregroundStyle(row.state == .failed || row.state == .denied ? Color.red : Color.secondary)
+            if row.id == .directCapture {
+                Text("Apple may ask to bypass the private window picker. This enables unattended screen capture. Setup discards a one-pixel image and does not record audio.").font(.callout)
+            }
+            Text(row.observation.detail).font(.callout)
+            if coordinator.screenRecordingNeedsRestartRecheck {
+                Text("If Screen Recording is enabled in Settings, restart PersonaStack to recheck access. Restarting does not grant permission. Setup will resume with a fresh check.")
+                    .font(.callout)
+            }
+            if coordinator.busyPermission == nil && row.state != .checking && !perception.isWorking {
+                if row.id != .visualPerception {
+                    HStack {
+                        Button(settingsTitle(row.id)) { coordinator.openSettings(row.id) }.buttonStyle(.bordered)
+                        if [.accessibility, .fullDiskAccess].contains(row.id) {
+                            Button("Show PersonaStack in Finder", action: revealApplication).buttonStyle(.bordered)
+                        }
+                    }
+                }
+                if [.failed, .denied, .restricted, .verificationRequired, .unsupported].contains(row.state),
+                   row.id != .visualPerception || perception.review == nil {
+                    Button("Retry") { coordinator.retryCurrentPermission() }.buttonStyle(.borderedProminent)
+                }
+            }
+        }.padding(16).frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func settingsTitle(_ id: DesktopPermissionID) -> String {
+        switch id {
+        case .accessibility: "Open Accessibility Settings"
+        case .screenRecording, .directCapture: "Open Screen Recording Settings"
+        case .fullDiskAccess: "Open Full Disk Access Settings"
+        case .safariJavaScript: "Open Browser"
+        case .automation: "Open Automation Settings"
+        case .clipboard: "Open Clipboard Settings"
+        case .localNetwork: "Open Local Network Settings"
+        case .launchAtLogin: "Open Login Items"
+        default: "Open Settings"
         }
     }
 }

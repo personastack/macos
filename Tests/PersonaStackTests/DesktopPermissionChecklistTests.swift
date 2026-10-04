@@ -180,20 +180,20 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
         model.open()
         await model.refresh()
         #expect(model.rows.first { $0.id == id }?.state == denied.state)
-        #expect(model.canFinish == (id != .accessibility))
+        #expect(model.canFinish == (id == .microphone))
         #expect(fake.requested.isEmpty)
 
         model.setup(id)
         while model.busyPermission != nil { await Task.yield() }
         #expect(model.rows.first { $0.id == id }?.state == denied.state)
-        #expect(model.canFinish == (id != .accessibility))
+        #expect(model.canFinish == (id == .microphone))
 
         fake.values[id] = .init(.ready, detail: "macOS grant observed", verificationKey: "current-owner",
                                 requiresVerification: true)
         await model.refresh()
         #expect(model.rows.first { $0.id == id }?.state == .verificationRequired)
-        #expect(model.canFinish == (id != .accessibility))
-        #expect(fake.requested == (id == .microphone ? [id, id] : [id]))
+        #expect(model.canFinish == (id == .microphone))
+        #expect(fake.requested == [id])
 
         fake.setupValues[id] = .init(.ready, detail: "Operation verified", verificationKey: "current-owner",
                                      requiresVerification: true, verified: true)
@@ -205,8 +205,8 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
         fake.values[id] = denied
         await model.refresh()
         #expect(model.rows.first { $0.id == id }?.state == denied.state)
-        #expect(model.canFinish == (id != .accessibility))
-        #expect(fake.requested == (id == .microphone ? [id, id, id] : [id, id]))
+        #expect(model.canFinish == (id == .microphone))
+        #expect(fake.requested == [id, id])
         model.cancel()
     }
 }
@@ -311,7 +311,7 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     await model.refresh()
     let firstRequest = Task { try await model.waitForFinish() }
     while !model.isAwaitingFinish { await Task.yield() }
-    await window.finish()
+    await window.continueSetup(); await Task.yield()
     try await firstRequest.value
     #expect(model.isFinishing && model.isVisible)
 
@@ -321,7 +321,7 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     #expect(rowsComplete)
     #expect(model.needsNewSetupRequest && !model.canFinish)
     #expect(model.completionError.contains("Desktop Control page to retry"))
-    await window.finish()
+    await window.continueSetup(); await Task.yield()
     #expect(!model.isFinishing && model.isVisible)
 
     let retryRequest = Task { try await model.waitForFinish() }
@@ -343,7 +343,7 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     model.open()
     await model.refresh()
     #expect(model.canFinish && !model.isAwaitingFinish && !model.needsNewSetupRequest)
-    await window.finish()
+    await window.continueSetup(); await Task.yield()
     #expect(!model.isVisible && !model.isFinishing)
 }
 
@@ -387,7 +387,7 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     #expect(DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(.speechRecognition).state == .notNeeded)
 }
 
-@Test @MainActor func permissionChecklistUnlockedEnrollmentKeepsUnavailableFullAccessVisible() async throws {
+@Test @MainActor func permissionChecklistFullAccessFailureBlocksEnrollment() async {
     let fake = PermissionChecklistFake()
     for id in [DesktopPermissionID.lockedScreenControl, .fullDiskAccess] {
         fake.values[id] = DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(id)
@@ -395,17 +395,9 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     let model = DesktopPermissionChecklistCoordinator(adapter: fake)
     model.open()
     await model.refresh()
-    #expect(model.canFinish)
-    for row in model.rows where row.id == .lockedScreenControl || row.id == .fullDiskAccess {
-        #expect(row.state == (row.id == .fullDiskAccess ? .verificationRequired : .unsupported))
-        #expect(!row.isComplete)
-    }
-    let request = Task { try await model.waitForFinish() }
-    while !model.isAwaitingFinish { await Task.yield() }
+    #expect(!model.canFinish)
     model.finish()
-    try await request.value
-    #expect(model.isFinishing)
-    #expect(fake.requested.isEmpty)
+    #expect(!model.isFinishing && fake.requested.isEmpty)
     model.cancel()
 }
 
@@ -417,7 +409,7 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
             let model = DesktopPermissionChecklistCoordinator(adapter: fake)
             model.open()
             await model.refresh()
-            let required = id == .accessibility
+            let required = DesktopPermissionReadiness.requiredPermissions.contains(id)
             #expect(model.canFinish == !required, "Finish policy for \(id) \(state)")
             model.finish()
             #expect(model.isFinishing == !required)
@@ -479,15 +471,15 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
 
         fake.values[id] = .init(.ready, detail: "Changed owner or grant", verificationKey: "owner-grant-B", requiresVerification: true)
         await model.refresh()
-        #expect(model.rows.first { $0.id == id }?.state == (id == .notifications ? .failed : .verificationRequired))
-        #expect(fake.requested == (id == .notifications ? [id, id] : [id]))
+        #expect(model.rows.first { $0.id == id }?.state == .verificationRequired)
+        #expect(fake.requested == [id])
         fake.setupValues[id] = .init(.ready, detail: "Operation verified", verificationKey: "owner-grant-B", requiresVerification: true, verified: true)
         model.setup(id)
         while model.busyPermission != nil { await Task.yield() }
         await model.refresh()
         #expect(model.rows.first { $0.id == id }?.state == .ready)
         #expect(model.rows.first { $0.id == id }?.observation.detail == "Operation verified")
-        #expect(fake.requested == (id == .notifications ? [id, id, id] : [id, id]))
+        #expect(fake.requested == [id, id])
         fake.values[id] = .init(.denied, detail: "Permission revoked")
         await model.refresh()
         #expect(model.rows.first { $0.id == id }?.state == .denied)
@@ -589,8 +581,8 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
 @Test @MainActor func permissionChecklistRequiredLabelsMatchMinimumFinishPolicy() {
     for id in DesktopPermissionID.allCases {
         let row = DesktopPermissionRow(id: id, observation: .init(.ready, detail: "Ready"))
-        #expect(row.isRequiredForUnlockedSetup == (id == .accessibility))
-        #expect(row.displayTitle == id.title + (id == .accessibility ? " (Required)" : ""))
+        #expect(row.isRequiredForUnlockedSetup == DesktopPermissionReadiness.requiredPermissions.contains(id))
+        #expect(row.displayTitle == id.title + (DesktopPermissionReadiness.requiredPermissions.contains(id) ? " (Required)" : ""))
     }
 }
 
@@ -605,7 +597,7 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
         await model.refresh()
     }
     while fake.pendingObservation == nil { await Task.yield() }
-    #expect(model.canFinish)
+    #expect(!model.canFinish)
     fake.values[.accessibility] = .init(.denied, detail: "Grant revoked during refresh")
     var secondStarted = false
     var secondFinished = false
@@ -626,62 +618,35 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     #expect(fake.requested.isEmpty)
 }
 
-@Test @MainActor func permissionChecklistAccessibilityEnablesFinishBeforeOptionalRefreshCompletes() async throws {
+@Test @MainActor func permissionChecklistWaitsForEveryRequiredObservation() async {
     let fake = PermissionChecklistFake()
-    fake.values[.accessibility] = .init(.ready, detail: "Input verified", requiresVerification: true, verified: true)
     fake.suspendedObservation = .screenRecording
     let model = DesktopPermissionChecklistCoordinator(adapter: fake)
-    let window = DesktopPermissionChecklistWindow(coordinator: model,
-        lockedControlVerifier: permissionChecklistReadyLockedControlVerifier(),
-        authorizeFullControl: { _ in true })
-    defer { model.cancel() }
-    // Own this refresh so the assertion waits for its entire resumed loop.
-    // The ordinary polling task cannot enter while this refresh is suspended.
-    let refresh = Task {
-        model.open()
-        await model.refresh()
-    }
+    let refresh = Task { model.open(); await model.refresh() }
     while fake.pendingObservation == nil { await Task.yield() }
-    let enrollment = Task { try await model.waitForFinish() }
-    while !model.isAwaitingFinish { await Task.yield() }
-    #expect(model.canFinish)
-    var overlapStarted = false
-    let overlap = Task {
-        overlapStarted = true
-        await model.refresh()
-    }
-    while !overlapStarted { await Task.yield() }
-    await window.finish()
-    try await enrollment.value
-    #expect(model.isFinishing && model.isVisible)
-    fake.pendingObservation?.resume(returning: .init(.failed, detail: "Optional capture failed"))
-    fake.pendingObservation = nil
+    #expect(!model.canFinish)
+    fake.pendingObservation?.resume(returning: .init(.failed, detail: "Capture failed"))
+    fake.values[.screenRecording] = .init(.failed, detail: "Capture failed")
     await refresh.value
-    await overlap.value
-    // Enrollment keeps this window open. Finish alone must fence subsequent
-    // authorized Local Network and Full Disk Access observations and probes.
-    #expect(model.isFinishing && model.isVisible)
-    #expect(fake.observed == [.accessibility, .screenRecording])
-    #expect(fake.requested.isEmpty)
+    #expect(!model.canFinish && fake.requested.isEmpty)
+    model.cancel()
 }
 
-@Test @MainActor func permissionChecklistFinishCancelsOptionalSetupAndFencesLateResult() async {
+@Test @MainActor func permissionChecklistCannotFinishWhileAnExplicitOperationIsRunning() async {
     let fake = PermissionChecklistFake()
     fake.delaySetup = true
-    fake.values[.microphone] = .init(.denied, detail: "Optional microphone denied")
     let model = DesktopPermissionChecklistCoordinator(adapter: fake)
     model.open()
     await model.refresh()
     model.setup(.microphone)
     while fake.pendingSetup == nil { await Task.yield() }
-    #expect(model.canFinish)
+    #expect(!model.canFinish)
     model.finish()
-    #expect(model.isFinishing && model.busyPermission == nil)
-    fake.pendingSetup?.resume(returning: .init(.ready, detail: "Late microphone success"))
-    fake.pendingSetup = nil
-    for _ in 0..<10 { await Task.yield() }
-    #expect(model.rows.first { $0.id == .microphone }?.state == .denied)
+    #expect(!model.isFinishing)
     model.cancel()
+    fake.pendingSetup?.resume(returning: .init(.ready, detail: "Late success"))
+    await Task.yield()
+    #expect(!model.isVisible)
 }
 
 @Test @MainActor func permissionChecklistGrantChangedBeforeFirstFailurePollCannotAnchorOldDenial() async {
@@ -707,9 +672,8 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     fake.pendingObservation?.resume(returning: .init(.ready, detail: "Optional screen observation"))
     fake.pendingObservation = nil
     await refresh.value
-    #expect(model.rows.first { $0.id == .microphone }?.isComplete == true)
-    #expect(model.rows.first { $0.id == .microphone }?.observation.detail == "New grant recording verified")
-    #expect(fake.requested == [.microphone, .microphone])
+    #expect(model.rows.first { $0.id == .microphone }?.state == .verificationRequired)
+    #expect(fake.requested == [.microphone])
 }
 
 @Test @MainActor func permissionRecoveryRevealsTheRunningCopyWithoutRequestingOrResettingAccess() async {
@@ -757,11 +721,11 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     await model.refresh()
     let finishRequest = Task { try await model.waitForFinish() }
     while !model.isAwaitingFinish { await Task.yield() }
-    await window.finish()
+    await window.continueSetup(); await Task.yield()
     #expect(requests == 1 && refreshes == 1 && model.isAwaitingFinish && !model.isFinishing)
     #expect(!verifier.permitsLockedControl)
     accepted = true
-    await window.finish()
+    await window.continueSetup(); await Task.yield()
     try await finishRequest.value
     #expect(requests == 2 && refreshes == 2 && model.isFinishing)
     window.completeSetup()
@@ -784,17 +748,17 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     let finishRequest = Task { try await model.waitForFinish() }
     while !model.isAwaitingFinish { await Task.yield() }
 
-    await window.finish()
+    await window.continueSetup(); await Task.yield()
     #expect(model.completionError.contains(snapshot.detail))
     if snapshot.readiness != .unsupported {
-        #expect(model.completionError.contains("main PersonaStack installer"))
+        #expect(model.completionError.contains("Install PersonaStack.pkg"))
     }
     #expect(acknowledgements == 0)
     #expect(!verifier.permitsLockedControl)
     #expect(model.isAwaitingFinish && !model.isFinishing && model.canFinish)
 
     current = .ready
-    await window.finish()
+    await window.continueSetup(); await Task.yield()
     try await finishRequest.value
     #expect(acknowledgements == 1)
     #expect(verifier.permitsLockedControl && model.isFinishing)
@@ -815,7 +779,7 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     await model.refresh()
     let previousRequest = Task { try await model.waitForFinish() }
     while !model.isAwaitingFinish { await Task.yield() }
-    let staleFinish = Task { await window.finish() }
+    let staleFinish = Task { await window.continueSetup(); await Task.yield() }
     while pendingInspection == nil { await Task.yield() }
 
     model.cancel()
@@ -842,13 +806,13 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     defer { model.cancel() }
     fake.values[.screenRecording] = .init(.restartRequired, detail: "Optional")
     await model.refresh()
-    #expect(model.primaryActionTitle == "Finish Setup" && model.canFinish && !model.canRestart)
+    #expect(model.primaryActionTitle == "Restart PersonaStack" && !model.canFinish && model.canRestart)
     fake.values[.accessibility] = .init(.restartRequired, detail: "Required")
     await model.refresh()
     #expect(model.primaryActionTitle == "Restart PersonaStack" && model.canRestart && !model.canFinish)
     #expect(DesktopPermissionState.restartRequired.title == "PersonaStack app restart required")
     var restarts = 0
-    let window = DesktopPermissionChecklistWindow(coordinator: model, restartApplication: { restarts += 1 })
+    let window = DesktopPermissionChecklistWindow(coordinator: model, canStartSetup: { true }, restartApplication: { restarts += 1 })
     window.restart()
     window.restart()
     #expect(restarts == 1 && !model.isVisible && !model.isFinishing)
@@ -861,19 +825,19 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     model.open()
     defer { model.cancel() }
     await model.refresh()
-    let window = DesktopPermissionChecklistWindow(coordinator: model, restartApplication: { throw CocoaError(.executableNotLoadable) })
+    let window = DesktopPermissionChecklistWindow(coordinator: model, canStartSetup: { true }, restartApplication: { throw CocoaError(.executableNotLoadable) })
     window.restart()
     #expect(model.isVisible && model.canRestart && !model.canFinish)
     #expect(model.completionError.contains("could not restart"))
     fake.values[.accessibility] = .init(.ready, detail: "Ready")
     await model.refresh()
-    #expect(!model.canRestart && model.primaryActionTitle == "Finish Setup")
+    #expect(!model.canRestart && model.primaryActionTitle == "Continue")
 }
 
 @Test @MainActor func permissionRestartSchedulesBundleRelaunchBeforeNormalQuit() throws {
     var events: [String] = []
     let appURL = URL(fileURLWithPath: "/Applications/PersonaStack Test ' $().app")
-    try DesktopApplicationRestart.request(applicationURL: appURL, processID: 123, installUpdate: { false }, start: { process in
+    try DesktopApplicationRestart().request(applicationURL: appURL, processID: 123, installUpdate: { false }, start: { process in
         events.append("schedule")
         #expect(process.executableURL?.path == "/bin/sh")
         let args = try #require(process.arguments)
@@ -884,7 +848,7 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     #expect(events == ["schedule", "quit"])
     events.removeAll()
     #expect(throws: CocoaError.self) {
-        try DesktopApplicationRestart.request(applicationURL: appURL, installUpdate: { false }, start: { _ in throw CocoaError(.executableNotLoadable) },
+        try DesktopApplicationRestart().request(applicationURL: appURL, installUpdate: { false }, start: { _ in throw CocoaError(.executableNotLoadable) },
                                                terminate: { events.append("quit") })
     }
     #expect(events.isEmpty)
@@ -893,11 +857,11 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
 @Test @MainActor func permissionRestartLetsPendingUpdaterOwnRelaunchExclusively() throws {
     var installs = 0
     let appURL = URL(fileURLWithPath: "/Applications/PersonaStack.app")
-    try DesktopApplicationRestart.request(applicationURL: appURL, installUpdate: { installs += 1; return true },
+    try DesktopApplicationRestart().request(applicationURL: appURL, installUpdate: { installs += 1; return true },
         start: { _ in Issue.record("Scheduled competing relaunch") }, terminate: { Issue.record("Quit outside Sparkle") })
     #expect(installs == 1)
     #expect(throws: CocoaError.self) {
-        try DesktopApplicationRestart.request(applicationURL: appURL, installUpdate: { throw CocoaError(.executableNotLoadable) },
+        try DesktopApplicationRestart().request(applicationURL: appURL, installUpdate: { throw CocoaError(.executableNotLoadable) },
             start: { _ in Issue.record("Scheduled competing relaunch after update error") }, terminate: { Issue.record("Quit after update error") })
     }
 }
@@ -909,7 +873,7 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     model.open()
     await model.refresh()
     fake.suspendedObservation = .microphone
-    model.startPresentationVerification()
+    let staleObservation = Task { await model.refresh() }
     while fake.pendingObservation == nil { await Task.yield() }
     model.cancel()
     model.open()
@@ -925,6 +889,7 @@ private func permissionChecklistReadyLockedControlVerifier() -> DesktopLockedCon
     fake.setupValues[.microphone] = .init(.ready, detail: "Recording verified", verificationKey: "new-grant",
         requiresVerification: true, verified: true)
     await model.refresh()
-    #expect(fake.requested.filter { $0 == .microphone }.count == 1)
-    #expect(model.rows.first { $0.id == .microphone }?.isComplete == true)
+    await staleObservation.value
+    #expect(fake.requested.filter { $0 == .microphone }.isEmpty)
+    #expect(model.rows.first { $0.id == .microphone }?.state == .verificationRequired)
 }

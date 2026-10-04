@@ -14,6 +14,7 @@ struct DesktopCuaFailure: Error {
         // error for launch_app's legacy structured failure envelope.
         let launchError = tool == "launch_app" ? structured?["error"] as? String : nil
         let code = refusal?["code"] as? String ?? structured?["code"] as? String ?? launchError ?? ""
+        if tool == "parse_visual_regions", let failure = perceptionFailure(code) { return failure }
         let message: String
         switch code {
         case "browser_requires_setup", "browser_consent_required":
@@ -65,6 +66,21 @@ struct DesktopCuaFailure: Error {
         default:
             return Self(code: "desktop_cua_failure_unknown",
                         message: "Cua returned an unrecognized failure. Observe the current desktop and target before deciding whether to retry; the action may have partly completed.")
+        }
+        return Self(code: code, message: message)
+    }
+
+    private static func perceptionFailure(_ code: String) -> Self? {
+        let message: String
+        switch code {
+        case "not_installed", "unsupported_platform":
+            message = "The visual perception extension is unavailable. Complete its native setup on a supported Mac, or use accessibility and typed browser targets."
+        case "capture_not_found", "capture_expired", "capture_stale", "capture_generation_mismatch":
+            message = "The capture is missing, expired, or changed. Observe the target again and parse the new capture before acting."
+        case "unsupported_target", "invalid_frame", "artifact_invalid", "incompatible_protocol",
+             "worker_launch_failed", "worker_crashed", "worker_cancelled", "resource_limit_exceeded", "inference_failed", "timeout":
+            message = "Visual perception could not parse this capture. Inspect the component in native setup or use accessibility and typed browser targets."
+        default: return nil
         }
         return Self(code: code, message: message)
     }

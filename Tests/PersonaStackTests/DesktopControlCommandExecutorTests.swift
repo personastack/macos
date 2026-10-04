@@ -725,7 +725,13 @@ struct DesktopControlCommandExecutorTests {
             if request.get("method")=="notifications/initialized": continue
             if request.get("method")=="tools/call":
                 with Path(r"\#(toolCalls.path)").open("a") as output: output.write(request["params"]["name"] + "\n")
-                result={"isError":True,"content":[{"type":"text","text":"private launch diagnostic"}],"structuredContent":{"error":"LAUNCH_CALLBACK_TIMEOUT","message":"private /Users/example path","launch_state":{"process_running":False,"window_ready":False}}}
+                if request["params"]["name"] == "end_session":
+                    arguments = request["params"]["arguments"]
+                    assert set(arguments) == {"session"} and arguments["session"]
+                    result={"structuredContent":{"session":arguments["session"],"active":False}}
+                else:
+                    assert request["params"]["name"] == "launch_app"
+                    result={"isError":True,"content":[{"type":"text","text":"private launch diagnostic"}],"structuredContent":{"error":"LAUNCH_CALLBACK_TIMEOUT","message":"private /Users/example path","launch_state":{"process_running":False,"window_ready":False}}}
             else: result={}
             print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}),flush=True)
         """#.write(to: executable, atomically: true, encoding: .utf8)
@@ -755,8 +761,9 @@ struct DesktopControlCommandExecutorTests {
         #expect(response.errorMessage?.contains("process_running") == false)
         #expect(response.errorMessage?.contains("window_ready") == false)
         #expect(try String(contentsOf: toolCalls, encoding: .utf8) == "launch_app\n")
-        await proxy.stop()
         #expect(await executor.close())
+        #expect(try String(contentsOf: toolCalls, encoding: .utf8) == "launch_app\nend_session\n")
+        await proxy.stop()
     }
 
     @Test

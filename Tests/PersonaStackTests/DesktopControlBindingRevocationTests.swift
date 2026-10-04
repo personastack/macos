@@ -92,10 +92,17 @@ struct DesktopControlBindingRevocationTests {
             if method == "initialize":
                 result = {"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"test-cua","version":"0.29.1"}}
             elif method == "tools/call":
-                marker.write_text("entered")
-                while not release_marker.exists():
-                    time.sleep(0.01)
-                result = {"content":[{"type":"text","text":"observed"}]}
+                name = request["params"]["name"]
+                arguments = request["params"]["arguments"]
+                if name == "end_session":
+                    assert set(arguments) == {"session"} and arguments["session"]
+                    result = {"structuredContent":{"session":arguments["session"],"active":False}}
+                else:
+                    assert name == "get_desktop_state"
+                    marker.write_text("entered")
+                    while not release_marker.exists():
+                        time.sleep(0.01)
+                    result = {"content":[{"type":"text","text":"observed"}]}
             else:
                 result = {}
             print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)

@@ -81,6 +81,8 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
     private var collapsed = false
     private var disposed = false
     private var closePending = false
+    private var documentGeneration = UUID()
+    private let mediaPermission = DesktopMediaCapturePermission.shared
     init(url: URL, loadPage: Bool = true, defaults: UserDefaults = .standard,
          onClose: @escaping () -> Void) {
         self.url = url
@@ -103,6 +105,7 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
                           backing: .buffered, defer: false)
         super.init()
         config.userContentController.addScriptMessageHandler(self, contentWorld: .page, name: "personastackChatWindow")
+        config.userContentController.addScriptMessageHandler(self, contentWorld: .page, name: DesktopMediaCapturePermission.bridgeName)
         window.isReleasedWhenClosed = false
         window.hidesOnDeactivate = false
         window.minSize = NSSize(width: 340, height: 396)
@@ -124,6 +127,9 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
     func dispose() {
         guard !disposed else { return }
         disposed = true
+        mediaPermission.cancel(owner: documentGeneration)
+        webView.setMicrophoneCaptureState(.none)
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: DesktopMediaCapturePermission.bridgeName, contentWorld: .page)
         presentation.invalidate()
         webView.stopLoading()
         webView.navigationDelegate = nil
@@ -163,6 +169,17 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage,
                                replyHandler: @escaping @MainActor @Sendable (Any?, String?) -> Void) {
+        if message.name == DesktopMediaCapturePermission.bridgeName {
+            let owner = documentGeneration
+            mediaPermission.handleMessage(message.body, owner: owner,
+                trusted: DesktopMediaCapturePermission.trusted(origin: message.frameInfo.securityOrigin,
+                                                              frame: message.frameInfo, appURL: url),
+                isCurrent: { [weak self, weak view = message.webView] in
+                    guard let self, let view else { return false }
+                    return !self.disposed && !self.closePending && view === self.webView && self.documentGeneration == owner
+                }, reply: replyHandler)
+            return
+        }
         guard message.webView === webView, ChatWindowManager.trusted(message, base: url),
               let command = ChatWindowCommand.parse(message.body, main: false) else {
             replyHandler(nil, "Invalid chat window request."); return
@@ -224,15 +241,23 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
         return .cancel
     }
 
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        guard webView === self.webView else { return }
+        mediaPermission.cancel(owner: documentGeneration)
+        documentGeneration = UUID()
+    }
+
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { dispose() }
 
     func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin,
                  initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType,
                  decisionHandler: @escaping @MainActor @Sendable (WKPermissionDecision) -> Void) {
-        decisionHandler(DesktopMediaCapturePermission.decide(
-            origin: origin, frame: frame, type: type, appURL: url,
-            activeView: !disposed && !closePending && webView === self.webView
-        ))
+        let owner = documentGeneration
+        mediaPermission.decide(origin: origin, frame: frame, type: type, appURL: url,
+            owner: owner, isCurrent: { [weak self, weak webView] in
+                guard let self, let webView else { return false }
+                return !self.disposed && !self.closePending && webView === self.webView && self.documentGeneration == owner
+            }, completion: decisionHandler)
     }
 
     func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,

@@ -6,6 +6,7 @@ import WebKit
 
 @MainActor
 protocol DesktopControlSetupRuntime: AnyObject {
+    func refreshUnattendedPermissionReadiness() async -> Bool
     var gatewayConnected: Bool { get }
     var paused: Bool { get }
     var nativeExecutorReady: Bool { get }
@@ -450,7 +451,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             guard let request = permissionRequest else {
                 throw DesktopControlPermissionBridgeError.incomplete
             }
-            try requireCompletionReadiness(page: page)
+            try await requireCompletionReadiness(page: page)
             let credentials = credentials ?? FileDesktopControlCredentialStore(appURL: page.appURL)
             guard let installation = try await savedInstallation(credentials: credentials, appURL: page.appURL) else {
                 throw DesktopControlPermissionBridgeError.incomplete
@@ -463,7 +464,9 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             guard state.hasConfig, state.hasActiveConfig else {
                 throw DesktopControlPermissionBridgeError.incomplete
             }
-            try requireCompletionReadiness(page: page)
+            try await requireCompletionReadiness(page: page)
+            try requireCurrentScope(scope, generation: generation, page: page)
+            try requireFinishedPermissions(page: page, generation: generation, request: request)
             permissionPresenter.completeSetup()
         } else {
             permissionPresenter.failSetup(message: message ?? "Desktop Control setup could not finish. Check the app connection and retry.")
@@ -482,8 +485,9 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         }
     }
 
-    private func requireCompletionReadiness(page: Page) throws {
-        guard page.didPrepare, runtime.gatewayConnected, runtime.isCuaReady(), runtime.nativeExecutorReady else {
+    private func requireCompletionReadiness(page: Page) async throws {
+        guard await runtime.refreshUnattendedPermissionReadiness(),
+              page.didPrepare, runtime.gatewayConnected, runtime.isCuaReady(), runtime.nativeExecutorReady else {
             throw DesktopControlPermissionBridgeError.incomplete
         }
     }

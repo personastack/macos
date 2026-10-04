@@ -30,39 +30,32 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
     model.open()
     defer { model.cancel() }
     await model.refresh()
-    #expect(model.permissionRows.map(\.id) == [.accessibility, .screenRecording, .directCapture, .automation, .safariJavaScript, .clipboard, .fullDiskAccess, .microphone])
-    #expect(model.automaticRows.map(\.id) == [.launchAtLogin, .notifications, .automaticUpdates, .awakeDuringRemoteWork])
+    #expect(model.permissionRows.map(\.id) == DesktopPermissionID.setupPermissions.filter { $0 != .localNetwork })
+    #expect(model.automaticRows.map(\.id) == [.launchAtLogin, .automaticUpdates, .awakeDuringRemoteWork, .visualPerception])
     #expect(DesktopPermissionID.screenRecording.title == "Screen Capture")
     fake.values[.localNetwork] = .init(.verificationRequired, detail: "Selected LAN endpoints")
     await model.refresh()
     #expect(model.permissionRows.map(\.id) == DesktopPermissionID.setupPermissions)
-    #expect(model.canFinish)
+    #expect(!model.canFinish)
     #expect(fake.requested.isEmpty)
 }
 
-@Test @MainActor func permissionAutomaticSetupRunsOncePerPresentationAndDoesNotRequestCoreGrants() async {
+@Test @MainActor func permissionAutomaticSetupRequiresContinueAndSkipsNotifications() async {
     let fake = AutomaticPermissionFake()
-    for id in DesktopPermissionID.automaticSetup { fake.values[id] = .init(.notGranted, detail: "Needs setup") }
+    fake.values[.launchAtLogin] = .init(.notGranted, detail: "Needs setup")
+    fake.values[.awakeDuringRemoteWork] = .init(.notGranted, detail: "Needs setup")
     let model = DesktopPermissionChecklistCoordinator(adapter: fake)
     model.open()
-    await model.refresh()
-    #expect(fake.requested.isEmpty)
-    model.startAutomaticSetup()
-    model.startAutomaticSetup()
-    #expect(model.canFinish)
-    while model.automaticBusyPermission != nil { await Task.yield() }
-    #expect(fake.requested == DesktopPermissionID.automaticSetup)
-    #expect(model.automaticRows.first { $0.id == .notifications }?.state == .denied)
-    #expect(model.canFinish)
+    defer { model.cancel() }
     await model.refresh()
     model.startAutomaticSetup()
-    #expect(fake.requested == DesktopPermissionID.automaticSetup)
-    model.cancel()
-    model.open()
+    #expect(fake.requested.isEmpty && !model.canFinish)
+    model.continueSetup()
+    while model.busyPermission != nil { await Task.yield() }
+    #expect(fake.requested == [.launchAtLogin, .awakeDuringRemoteWork])
+    #expect(model.canFinish)
     model.startAutomaticSetup()
-    while model.automaticBusyPermission != nil { await Task.yield() }
-    #expect(fake.requested == DesktopPermissionID.automaticSetup + [.notifications])
-    model.cancel()
+    #expect(fake.requested == [.launchAtLogin, .awakeDuringRemoteWork])
 }
 
 @Test @MainActor func permissionAutomaticSetupCancellationFencesLateResultAndRemainingRequests() async {
@@ -71,7 +64,8 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
     fake.values[.launchAtLogin] = .init(.notGranted, detail: "Not enabled")
     let model = DesktopPermissionChecklistCoordinator(adapter: fake)
     model.open()
-    model.startAutomaticSetup()
+    await model.refresh()
+    model.continueSetup()
     while fake.pending == nil { await Task.yield() }
     model.cancel()
     model.open()
@@ -85,7 +79,7 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
     model.cancel()
 }
 
-@Test @MainActor func permissionNotificationAutomaticSetupReadsBackApprovalAndNeverOpensSettings() async {
+@Test @MainActor func permissionNotificationExplicitSetupReadsBackApproval() async {
     for approved in [true, false] {
         var authorization = UNAuthorizationStatus.notDetermined
         var requests = 0
@@ -96,38 +90,24 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
             authorization = approved ? .authorized : .denied
         }
         let adapter = DesktopPermissionChecklistSystemAdapter(access: access,
-            openSettings: { _ in Issue.record("Automatic setup must not open Settings") })
+            openSettings: { _ in })
         #expect(await adapter.observe(.notifications).state == .notGranted)
         #expect(requests == 0)
-        #expect(await adapter.setupAutomatically(.notifications).state == (approved ? .ready : .denied))
-        #expect(await adapter.setupAutomatically(.notifications).state == (approved ? .ready : .denied))
+        #expect(await adapter.setup(.notifications).state == (approved ? .ready : .denied))
         #expect(requests == 1)
     }
 }
 
-@Test @MainActor func permissionOptionalNotificationPromptDoesNotBlockCoreSetupOrFinishAndLateResultsAreIgnored() async {
+@Test @MainActor func permissionNotificationNeverStartsDuringGuidedSetup() async {
     let fake = AutomaticPermissionFake()
-    fake.suspend = true
-    fake.values[.notifications] = .init(.notGranted, detail: "Approval pending")
+    fake.values[.notifications] = .init(.notGranted, detail: "Not authorized")
     let model = DesktopPermissionChecklistCoordinator(adapter: fake)
     model.open()
+    defer { model.cancel() }
     await model.refresh()
-    model.startAutomaticSetup()
-    while fake.pending == nil { await Task.yield() }
-    #expect(model.automaticBusyPermission == .notifications)
-    fake.suspend = false
-    model.setup(.accessibility)
-    while model.busyPermission != nil { await Task.yield() }
-    #expect(fake.requested == [.notifications, .accessibility])
-    #expect(model.canFinish)
-    model.finish()
-    fake.pending?.resume(returning: .init(.ready, detail: "Late approval"))
-    fake.pending = nil
-    for _ in 0..<3 { await Task.yield() }
-    #expect(model.isFinishing && model.automaticBusyPermission == nil)
-    #expect(model.automaticRows.first { $0.id == .notifications }?.state == .notGranted)
-    #expect(fake.requested == [.notifications, .accessibility])
-    model.cancel()
+    model.continueSetup()
+    #expect(model.canFinish && fake.requested.isEmpty)
+    #expect(!model.automaticRows.contains { $0.id == .notifications })
 }
 
 @Test @MainActor func permissionNotificationAutomaticSetupPreservesDisabledAlertsAndManualSetupRequestsAuthorization() async {
@@ -137,7 +117,7 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
     access.notificationSettings = { (.authorized, .disabled, .disabled) }
     access.requestNotifications = { requests += 1 }
     let adapter = DesktopPermissionChecklistSystemAdapter(access: access, openSettings: { _ in settingsOpened += 1 })
-    #expect(await adapter.setupAutomatically(.notifications).state == .notGranted)
+    #expect(await adapter.observe(.notifications).state == .notGranted)
     #expect(settingsOpened == 0 && requests == 0)
     #expect(await adapter.setup(.notifications).state == .notGranted)
     #expect(settingsOpened == 1 && requests == 1)
@@ -168,8 +148,8 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
         #expect(await adapter.setupAutomatically(.launchAtLogin).state == expected)
         #expect(registrations == 1 && settingsOpened == 0)
         #expect(await adapter.setup(.launchAtLogin).state == expected)
-        #expect(registrations == 2)
-        #expect(settingsOpened == (registeredStatus == .requiresApproval ? 1 : 0))
+        #expect(registrations == 1)
+        #expect(settingsOpened == 0)
     }
 }
 
@@ -194,7 +174,7 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
         #expect(automatic.detail == DesktopLoginItemRegistration.unconfirmedMessage)
         #expect(registrations == 1 && settingsOpened == 0)
         #expect(await adapter.setup(.launchAtLogin).state == .failed)
-        #expect(registrations == 2 && settingsOpened == 1)
+        #expect(registrations == 2 && settingsOpened == 0)
     }
 }
 
@@ -227,7 +207,7 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
     access.unregisterCrashRecoveryAgent = { Issue.record("Must not unregister the fake agent") }
     access.registerLegacyLogin = { Issue.record("Must not restore the legacy login service") }
     let adapter = DesktopPermissionChecklistSystemAdapter(access: access,
-        openSettings: { _ in Issue.record("Automatic setup must not open Settings") })
+        openSettings: { _ in })
     #expect(await adapter.setupAutomatically(.accessibility).state == .notGranted)
     #expect(await adapter.setupAutomatically(.launchAtLogin).state == .failed)
 }
@@ -262,7 +242,7 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
 
     #expect(await adapter.setup(.notifications).state == .failed)
     #expect(openedSettings == ["com.apple.Notifications-Settings.extension?id=ai.personastack.desktop"])
-    #expect(await adapter.setupAutomatically(.notifications).state == .failed)
+    #expect(await adapter.check(.notifications).state == .notGranted)
     #expect(openedSettings == ["com.apple.Notifications-Settings.extension?id=ai.personastack.desktop"])
 }
 
@@ -276,8 +256,10 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
     let adapter = DesktopPermissionChecklistSystemAdapter(access: access)
 
     #expect(await adapter.setup(.launchAtLogin).state == .failed)
-    #expect(openedSettings == 1)
+    #expect(openedSettings == 0)
     #expect(await adapter.setupAutomatically(.launchAtLogin).state == .failed)
+    #expect(openedSettings == 0)
+    adapter.openSettings(.launchAtLogin)
     #expect(openedSettings == 1)
 }
 
@@ -311,7 +293,7 @@ private final class AutomaticPermissionFake: DesktopPermissionChecklistAdapting 
             return .init(.ready, detail: "Current functional proof", verified: true)
         }
     ), access: access)
-    let ids: [DesktopPermissionID] = [.microphone, .fullDiskAccess, .localNetwork, .awakeDuringRemoteWork]
+    let ids: [DesktopPermissionID] = [.fullDiskAccess, .localNetwork, .awakeDuringRemoteWork]
     for id in ids {
         #expect(await adapter.check(id).detail == "Current functional proof")
     }
@@ -380,7 +362,7 @@ func notificationSetupResolvesRequestErrorsThroughFreshAuthorizationAndDelivery(
     let passive = await adapter.observe(.notifications)
     #expect(passive.state == .ready && passive.requiresVerification && !passive.verified)
     #expect(submitted == 0)
-    #expect(await adapter.setupAutomatically(.notifications).state == .failed)
+    #expect(await adapter.check(.notifications).state == .failed)
     #expect(submitted == 1)
     let failed = await adapter.check(.notifications)
     #expect(failed.state == .failed && failed.detail.contains("allowed in Settings"))
@@ -445,44 +427,27 @@ func notificationCheckRechecksAuthorizationAfterDelivery(denied: Bool) async {
     #expect(await DesktopPermissionChecklistSystemAdapter(access: access).check(.launchAtLogin).state == .ready)
 }
 
-@Test @MainActor func permissionLoginSetupReportsWhichRemovalMacOSRefused() async {
-    guard #available(macOS 15, *) else { return }
+@Test @MainActor func permissionLoginSetupDoesNotPurgeExistingRegistration() async {
     var access = DesktopPermissionSystemAccess.permissionFixture()
     access.loginStatus = { .enabled }
-    access.unregisterLoginForSetup = { throw NSError(domain: SMAppServiceErrorDomain, code: kSMErrorInvalidSignature) }
-    var legacy = SMAppService.Status.enabled
-    access.legacyLoginStatus = { legacy }
-    access.unregisterLegacyLoginForSetup = { legacy = .notRegistered }
-    access.registerLogin = { Issue.record("No registration after failed purge") }
-    access.openLoginSettings = { }
-    let result = await DesktopPermissionChecklistSystemAdapter(access: access).setup(.launchAtLogin)
-    #expect(result.state == .failed && result.detail.contains("refused to remove"))
-    #expect(legacy == .notRegistered)
+    access.unregisterLoginForSetup = { Issue.record("Setup must preserve current registration") }
+    access.unregisterLegacyLoginForSetup = { Issue.record("Setup must not reset login registration") }
+    #expect(await DesktopPermissionChecklistSystemAdapter(access: access).setup(.launchAtLogin).state == .ready)
 }
 
-@Test @MainActor func notificationGrantChangeVerifiesOnceAndRevocationRemovesReady() async {
+@Test @MainActor func notificationGrantChangesDoNotSendSetupNotifications() async {
     var authorization = UNAuthorizationStatus.denied
-    var deliveries = 0
     var access = DesktopPermissionSystemAccess.permissionFixture()
     access.notificationSettings = { (authorization, .enabled, .enabled) }
-    access.verifyNotificationDelivery = { deliveries += 1; return true }
-    let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(observe: { id in
-        id == .notifications ? nil : .init(.notNeeded, detail: "Unrelated capability")
-    }), access: access, openSettings: { _ in Issue.record("Automatic approval must not open Settings") })
-    let model = DesktopPermissionChecklistCoordinator(adapter: adapter)
+    access.verifyNotificationDelivery = { Issue.record("Passive grant read must not deliver notifications"); return false }
+    let model = DesktopPermissionChecklistCoordinator(adapter: DesktopPermissionChecklistSystemAdapter(access: access))
     model.open()
     defer { model.cancel() }
     await model.refresh()
-    #expect(model.rows.first { $0.id == .notifications }?.state == .denied && deliveries == 0)
     authorization = .authorized
     await model.refresh()
-    #expect(model.rows.first { $0.id == .notifications }?.isComplete == true && deliveries == 1)
-    for _ in 0..<3 { await model.refresh() }
-    #expect(deliveries == 1)
+    #expect(model.rows.first { $0.id == .notifications }?.state == .verificationRequired)
     authorization = .denied
     await model.refresh()
     #expect(model.rows.first { $0.id == .notifications }?.state == .denied)
-    authorization = .authorized
-    await model.refresh()
-    #expect(model.rows.first { $0.id == .notifications }?.isComplete == true && deliveries == 2)
 }

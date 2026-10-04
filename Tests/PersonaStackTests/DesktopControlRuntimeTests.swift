@@ -321,7 +321,7 @@ private final class SuspendedDesktopControlCredentialStore: DesktopControlCreden
 }
 
 @Test(arguments: ["restart", "prepare"]) @MainActor
-func cuaFinishWaitsForPermissionTeardownBeforeSuccessorStartup(_ stage: String) async throws {
+func cuaCancelWaitsForPermissionTeardownBeforeSuccessorStartup(_ stage: String) async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-cancel-teardown-\(stage)-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
     defer { try? FileManager.default.removeItem(at: root) }
@@ -351,8 +351,8 @@ func cuaFinishWaitsForPermissionTeardownBeforeSuccessorStartup(_ stage: String) 
     #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("daemon-stopping").path))
     // Cancel after daemon shutdown has started. Cleanup must remain responsive
     // and a successor must wait, even though no startup task owns this phase.
-    model.finish()
-    #expect(model.isFinishing)
+    model.cancel()
+    #expect(!model.isVisible && !model.isFinishing)
     let successor = Task { try await runtime.resumeForSetup(generation: runtime.beginResume()) }
     for _ in 0..<10 { await Task.yield() }
     for name in ["daemon-starts", "proxy-starts"] {
@@ -369,7 +369,7 @@ func cuaFinishWaitsForPermissionTeardownBeforeSuccessorStartup(_ stage: String) 
         #expect(starts.split(separator: "\n").count == 2)
         #expect(credentials.readCount == 2)
         for _ in 0..<10 { await Task.yield() }
-        #expect(runtime.isCuaReady() && model.isFinishing)
+        #expect(runtime.isCuaReady() && !model.isVisible && !model.isFinishing)
         model.cancel()
         await runtime.shutdownForQuit()
     } catch { model.cancel(); await runtime.shutdownForQuit(); throw error }
@@ -409,6 +409,7 @@ private struct EmbeddedRuntimeDriverFixture: DesktopControlDriverInstalling {
 /// Only this fixture's socket, generated pixels, and AX text are observed.
 /// It never calls Cua, TCC, or a user's desktop.
 private func makeRuntimeDriverFixture(_ root: URL) throws -> URL {
+    let toolNamesJSON = String(decoding: try JSONEncoder().encode(CuaDriverCompatibility.requiredTools.sorted()), as: UTF8.self)
     let executable = root.appendingPathComponent("driver.py")
     let script = #"""
 #!/usr/bin/python3
@@ -466,7 +467,7 @@ root = os.path.dirname(os.path.realpath(__file__))
 def chunk(kind, data):
     return struct.pack('>I',len(data))+kind+data+struct.pack('>I',zlib.crc32(kind+data)&0xffffffff)
 png = b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',1,1,8,2,0,0,0))+chunk(b'IDAT',zlib.compress(b'\x00\x00\x00\x00'))+chunk(b'IEND',b'')
-names = ['get_desktop_state','get_accessibility_tree','get_window_state','move_cursor','click','type_text','press_key','launch_app','list_apps','list_windows']
+names = \#(toolNamesJSON)
 input_snapshots = 0
 for line in sys.stdin:
     request = json.loads(line)
@@ -485,6 +486,10 @@ for line in sys.stdin:
         if name == 'health_report':
             assert request['params']['arguments'] == {'include':['bundle_identity']}
             result = {'structuredContent':{'schema_version':'1','driver_version':'0.29.1','platform':'darwin','checks':[{'name':'bundle_identity','status':'pass','data':{'bundle_identifier':'ai.personastack.desktop','configured_bundle_identifier':'ai.personastack.desktop','identity_source':'parent_application','parent_process_id':host,'executable_path':os.path.realpath(__file__)}}]}}
+        elif name == 'end_session':
+            arguments = request['params']['arguments']
+            assert set(arguments) == {'session'} and arguments['session']
+            result = {'structuredContent':{'session':arguments['session'],'active':False}}
         elif name == 'check_permissions':
             if os.path.exists(os.path.join(root, 'pause-permissions')):
                 open(os.path.join(root, 'permissions-waiting'), 'w').close()
@@ -1268,6 +1273,8 @@ private actor DesktopControlRelayStateFixture: DesktopControlRelayStateReading {
 
 @MainActor
 private final class DesktopControlSetupRuntimeFixture: DesktopControlSetupRuntime {
+    var unattendedPermissionsReady = true
+    func refreshUnattendedPermissionReadiness() async -> Bool { unattendedPermissionsReady }
     private(set) var attempts = 0
     private(set) var repairAttempts = 0
     private(set) var gatewayConnected = false
@@ -2264,7 +2271,7 @@ private actor SuspendedPermissionStartupInstaller: DesktopControlDriverInstallin
     }
 }
 
-@Test @MainActor func cuaFinishRetiresCancelledInstallerBeforeSuccessorStartup() async throws {
+@Test @MainActor func cuaCancelRetiresCancelledInstallerBeforeSuccessorStartup() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-cancel-installer-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
     defer { try? FileManager.default.removeItem(at: root) }
@@ -2283,8 +2290,8 @@ private actor SuspendedPermissionStartupInstaller: DesktopControlDriverInstallin
         await Task.yield()
     }
     #expect(await installer.isSuspended)
-    model.finish()
-    #expect(model.isFinishing && runtime.readiness == "paused")
+    model.cancel()
+    #expect(!model.isVisible && !model.isFinishing && runtime.readiness == "paused")
     let successor = Task { try await runtime.resumeForSetup(generation: runtime.beginResume()) }
     for _ in 0..<20 { await Task.yield() }
     #expect(await installer.calls == 1)
@@ -2302,7 +2309,7 @@ private actor SuspendedPermissionStartupInstaller: DesktopControlDriverInstallin
 }
 
 @Test(arguments: ["proxy", "daemon"]) @MainActor
-func cuaFinishWaitsForCancelledStartupCleanupBeforeSuccessorUsesDaemon(_ stage: String) async throws {
+func cuaCancelWaitsForCancelledStartupCleanupBeforeSuccessorUsesDaemon(_ stage: String) async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("cua-cancel-\(stage)-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
     defer { try? FileManager.default.removeItem(at: root) }
@@ -2324,7 +2331,7 @@ func cuaFinishWaitsForCancelledStartupCleanupBeforeSuccessorUsesDaemon(_ stage: 
         try await Task.sleep(for: .milliseconds(10))
     }
     #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("\(stage)-starting").path))
-    model.finish()
+    model.cancel()
     let successor = Task { try await runtime.resumeForSetup(generation: runtime.beginResume()) }
     if stage == "daemon" {
         for _ in 0..<100 {
@@ -2340,7 +2347,7 @@ func cuaFinishWaitsForCancelledStartupCleanupBeforeSuccessorUsesDaemon(_ stage: 
     do {
         try await successor.value
         #expect(runtime.isCuaReady() && runtime.readiness == "ready")
-        #expect(model.isFinishing)
+        #expect(!model.isVisible && !model.isFinishing)
         let calls = try runtimeFixtureCalls(root)
         #expect(calls == ["health_report", "check_permissions", "get_accessibility_tree"])
         for _ in 0..<10 { await Task.yield() }
@@ -2383,7 +2390,7 @@ func permissionApprovalDoesNotConfirmOrUseTheRuntimeSession(warm: Bool, first: D
     let hooks = service.adapter.hooks
     service.adapter.hooks.observe = { id in
         if [.accessibility, .screenRecording].contains(id) { return await hooks.observe(id) }
-        return .init(.notNeeded, detail: "Unrelated fixture capability")
+        return .init(.verificationRequired, detail: "Unverified fixture capability")
     }
     let model = service.window.coordinator
     do {
@@ -2391,11 +2398,12 @@ func permissionApprovalDoesNotConfirmOrUseTheRuntimeSession(warm: Bool, first: D
         let original = try? await runtime.cuaPermissionSnapshot().verificationKey
         service.window.onPresent?()
         model.open()
+        await model.refresh()
         model.startPresentationVerification()
         while model.verificationBusyPermission != nil { await Task.yield() }
         #expect(model.rows.first { $0.id == .accessibility }?.state == .ready)
         #expect(model.rows.first { $0.id == .screenRecording }?.state == .ready)
-        #expect(model.canFinish)
+        #expect(!model.canFinish)
         for id in [first, first == .accessibility ? .screenRecording : .accessibility] {
             model.setup(id)
             while model.busyPermission != nil { await Task.yield() }
@@ -2403,7 +2411,7 @@ func permissionApprovalDoesNotConfirmOrUseTheRuntimeSession(warm: Bool, first: D
         }
         let calls = warm ? try runtimeFixtureCalls(root) : []
         #expect(!calls.contains("click") && !calls.contains("type_text"))
-        #expect(model.canFinish && runtime.paused && !runtime.gatewayConnected && !runtime.hasActiveInstallation)
+        #expect(!model.canFinish && runtime.paused && !runtime.gatewayConnected && !runtime.hasActiveInstallation)
         #expect(credentials.readCount == 0 && !runtime.hasPendingRelayReconnectForTesting)
         if warm {
             let current = try await runtime.cuaPermissionSnapshot().verificationKey
@@ -3047,6 +3055,76 @@ func desktopControlAttemptsOperationsWithoutUnlockProof(state: DesktopControlSes
         let paused = await runtime.handleForTesting(gui("desktop_control_application", "launch_app", token: token), connectionID: connection)
         #expect(paused.errorCode == "desktop_paused")
         #expect(try runtimeFixtureCalls(root) == calls)
+        await runtime.shutdownForQuit()
+    } catch { await runtime.shutdownForQuit(); throw error }
+}
+
+@Test(arguments: [DesktopControlSessionLock.State.unlocked, .locked]) @MainActor
+func unattendedPermissionAdmissionRefreshesAndHeartbeatRevokesLease(state: DesktopControlSessionLock.State) async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("permission-admission-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let executable = try makeRuntimeDriverFixture(root)
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: Data(#"{"installation_id":"permission-admission","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://gateway.test/v1/desktop-control/ws"}"#.utf8))
+    let connection = UUID()
+    let owner = DesktopControlTarget(installationID: installation.installationID, workspaceID: "workspace",
+        configID: "config", personaID: "persona", runID: "run", generation: 1, configVersion: 1)
+    let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
+    var granted = false
+    var observations = 0
+    let runtime = DesktopControlRuntime.makeForTesting(installer: EmbeddedRuntimeDriverFixture(executable: executable),
+        credentials: DeniedDesktopControlCredentialStore(), executor: executor, connectionID: connection,
+        installation: installation, connected: true, sessionLockState: state,
+        lockedControlSetupVerifier: DesktopLockedControlSetupVerifier(operations: .init(inspect: { .absent })),
+        unattendedPermissionsReady: false, permissionObservations: {
+            observations += 1
+            return Dictionary(uniqueKeysWithValues: DesktopPermissionReadiness.requiredPermissions.map {
+                ($0, DesktopPermissionObservation(granted ? .ready : .denied, detail: "Injected permission evidence", verified: granted))
+            })
+        }, hostPermissions: { (true, true) })
+    do {
+        await runtime.waitForSessionLockChangeForTesting()
+        try await runtime.prepareCuaPermissions()
+        let callsBefore = try runtimeFixtureCalls(root)
+        let forbiddenPath = root.appendingPathComponent("must-not-exist").path
+        let attemptedOperations: [(String, DesktopControlJSONValue)] = [
+            ("desktop_control_acquire", .object([:])),
+            ("desktop_control_file", .object(["action": .string("write"), "path": .string(forbiddenPath),
+                "content_base64": .string("bm90IGFsbG93ZWQ="), "mode": .string("create")])),
+            ("desktop_control_execute", .object(["command": .string("touch '\(forbiddenPath)'"),
+                "working_directory": .string(root.path)])),
+        ] + CuaToolCatalog.names.sorted().map { tool in
+            ("desktop_control_cua", .object(["tool": .string(tool), "arguments": .object([:])]))
+        }
+        for (operation, arguments) in attemptedOperations {
+            let denied = await runtime.handleForTesting(lockedControlFrame(operation, target: owner,
+                arguments: arguments), connectionID: connection)
+            #expect(denied.errorCode == "permission_required")
+        }
+        #expect(executor.currentLease == nil)
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("must-not-exist").path))
+        #expect(try runtimeFixtureCalls(root) == callsBefore)
+        #expect(observations >= 3)
+        let status = await runtime.handleForTesting(lockedControlFrame("desktop_control_status", target: owner), connectionID: connection)
+        #expect(status.type == "result")
+        let revokeTarget = DesktopControlTarget(installationID: installation.installationID, workspaceID: "workspace",
+            configID: "other-config", personaID: "", runID: "", generation: 0, configVersion: 1)
+        let revoked = await runtime.handleForTesting(lockedControlFrame("desktop_control_revoke_config", target: revokeTarget), connectionID: connection)
+        #expect(revoked.type == "result")
+        let releaseWithoutLease = await runtime.handleForTesting(lockedControlFrame("desktop_control_release", target: owner), connectionID: connection)
+        #expect(releaseWithoutLease.errorCode != "permission_required")
+        granted = true
+        let acquired = await runtime.handleForTesting(lockedControlFrame("desktop_control_acquire", target: owner), connectionID: connection)
+        #expect(acquired.type == "result")
+        #expect(runtime.unattendedPermissionsReady)
+        #expect(executor.currentLease != nil)
+        // A fresh denial observed by heartbeat invalidates the admitted lease.
+        granted = false
+        #expect(await runtime.heartbeatReadinessForTesting() == "permission_required")
+        #expect(executor.currentLease == nil)
+        #expect(!runtime.unattendedPermissionsReady)
+        let deniedAgain = await runtime.handleForTesting(lockedControlFrame("desktop_control_acquire", target: owner), connectionID: connection)
+        #expect(deniedAgain.errorCode == "permission_required")
         await runtime.shutdownForQuit()
     } catch { await runtime.shutdownForQuit(); throw error }
 }

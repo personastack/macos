@@ -45,16 +45,8 @@ public enum CuaDriverCompatibility {
     SOFTWARE.
     """
 
-    /// PersonaStack's reviewed GUI surface. Upstream tools are never exposed automatically.
-    public static let exposedTools: Set<String> = [
-        "bring_to_front", "browser_prepare", "browser_click", "browser_dialog", "browser_download", "browser_navigate",
-        "browser_pointer", "browser_set_input_files", "browser_type", "check_permissions", "click",
-        "clipboard_read", "clipboard_write", "double_click", "drag", "get_accessibility_tree",
-        "get_browser_state", "get_cursor_position", "get_desktop_state", "get_screen_size",
-        "get_window_state", "hotkey", "invoke_menu", "kill_app", "launch_app", "list_apps",
-        "list_windows", "move_cursor", "press_key", "right_click", "scroll", "set_value",
-        "set_window_frame", "type_text", "zoom"
-    ]
+    /// Pinned artifact schemas are the sole catalog authority.
+    public static var exposedTools: Set<String> { CuaToolCatalog.names }
 
     public struct Manifest: Decodable, Equatable, Sendable {
         public let binaryVersion: String
@@ -78,10 +70,7 @@ public enum CuaDriverCompatibility {
         case missingRequiredTools([String])
     }
 
-    public static let requiredTools: Set<String> = [
-        "get_desktop_state", "get_accessibility_tree", "get_window_state", "move_cursor",
-        "click", "type_text", "press_key", "launch_app", "list_apps", "list_windows"
-    ]
+    public static var requiredTools: Set<String> { exposedTools }
 
     public static func processEnvironment(from environment: [String: String]) -> [String: String] {
         environment.filter { inheritedEnvironmentKeys.contains($0.key) }
@@ -94,6 +83,7 @@ public enum CuaDriverCompatibility {
         }
         guard manifest.binaryVersion == version else { throw ValidationError.unsupportedVersion }
         guard manifest.schemaVersion == schemaVersion else { throw ValidationError.unsupportedSchema }
+        guard !requiredTools.isEmpty else { throw ValidationError.malformedManifest }
         let missing = requiredTools.subtracting(toolNames).sorted()
         guard missing.isEmpty else { throw ValidationError.missingRequiredTools(missing) }
     }

@@ -176,7 +176,25 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private var lastSuccessfulConnection: Date?
     private(set) var tools: Set<String> = []
     private(set) var paused = false
-    private(set) var readiness = "unknown"
+    private var driverReadiness = "unknown"
+    private(set) var unattendedPermissionsReady = false
+    private let permissionObservations: @MainActor () async -> [DesktopPermissionID: DesktopPermissionObservation]
+    private(set) var readiness: String {
+        get { driverReadiness == "ready" && !unattendedPermissionsReady ? "permission_required" : driverReadiness }
+        set { driverReadiness = newValue }
+    }
+
+    /// The same nonprompting aggregate governs setup, heartbeat and admission.
+    /// Lock state is deliberately excluded: a qualified locked acquisition must
+    /// not require the screen to have already been unlocked.
+    @discardableResult
+    func refreshUnattendedPermissionReadiness() async -> Bool {
+        let generation = lifecycleGeneration
+        let observations = await permissionObservations()
+        guard generation == lifecycleGeneration, !Task.isCancelled else { return false }
+        unattendedPermissionsReady = DesktopPermissionReadiness(observations: observations).isReady
+        return unattendedPermissionsReady
+    }
 
     private var lockedControlController: DesktopLockedControlRuntimeController? {
         if let lockedControlControllerOverride { return lockedControlControllerOverride }
@@ -397,6 +415,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                  lockedControlController: DesktopLockedControlRuntimeController? = nil,
                  sessionLock: DesktopControlSessionLock = DesktopControlSessionLock(),
                  ownedCuaObservation: (@MainActor () -> DesktopControlOwnedCuaObservation?)? = nil,
+                 permissionObservations: @escaping @MainActor () async -> [DesktopPermissionID: DesktopPermissionObservation] = {
+                     await DesktopPermissionChecklist.shared.readinessObservations()
+                 },
                  hostPermissions: @escaping @MainActor () -> (accessibility: Bool, screenRecording: Bool) = {
                      (DesktopAccessibilityPermission.isGranted(), CGPreflightScreenCaptureAccess())
                  }) {
@@ -411,6 +432,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         self.sessionLock = sessionLock
         self.hostPermissions = hostPermissions
         self.ownedCuaObservation = ownedCuaObservation
+        self.permissionObservations = permissionObservations
         Self.clearObsoleteCredentialErrors(in: preferences)
         installExecutorLeaseObserver(executor)
         lockedControlControllerOverride?.onStateChange = { [weak self] state in
@@ -501,6 +523,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                                lockedControlController: DesktopLockedControlRuntimeController? = nil,
                                ownedCuaObservation: (@MainActor () -> DesktopControlOwnedCuaObservation?)? = nil,
                                allowsAutomaticCuaRecovery: Bool = false,
+                               unattendedPermissionsReady: Bool = true,
+                               permissionObservations: (@MainActor () async -> [DesktopPermissionID: DesktopPermissionObservation])? = nil,
                                hostPermissions: @escaping @MainActor () -> (accessibility: Bool, screenRecording: Bool) = {
                                    (DesktopAccessibilityPermission.isGranted(), CGPreflightScreenCaptureAccess())
                                }) -> DesktopControlRuntime {
@@ -514,6 +538,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                                             lockedControlController: lockedControlController,
                                             sessionLock: testSessionLock,
                                             ownedCuaObservation: ownedCuaObservation,
+                                            permissionObservations: permissionObservations ?? {
+                                                Dictionary(uniqueKeysWithValues: DesktopPermissionReadiness.requiredPermissions.map {
+                                                    ($0, .init(unattendedPermissionsReady ? .ready : .verificationRequired,
+                                                               detail: "Fixture permission evidence", verified: unattendedPermissionsReady))
+                                                })
+                                            },
                                             hostPermissions: hostPermissions)
         if let executor { runtime.executor = executor }
         runtime.proxy = proxy
@@ -521,6 +551,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         runtime.activeInstallation = installation
         runtime.gatewayConnected = connected
         runtime.readiness = readiness
+        runtime.unattendedPermissionsReady = unattendedPermissionsReady
         runtime.paused = paused
         runtime.allowsAutomaticCuaRecovery = allowsAutomaticCuaRecovery
         runtime.executorCleanupInProgress = cleanupInProgress
@@ -1157,6 +1188,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     var hasActiveInstallation: Bool { activeInstallation != nil }
+    var permissionSetupAvailable: Bool {
+        executor.permissionSetupAvailable && !disconnecting && !environmentSwitchPending && !repairInProgress
+            && !executorCleanupInProgress && !executorCleanupFailed
+    }
 
     var sessionRecoveryMessage: String? {
         sessionLock.isAwakeAndActive ? nil : "Desktop Control is unavailable while this Mac is asleep or another login session is active."
@@ -1230,12 +1265,23 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     func prepareCuaPermissions() async throws {
         try Task.checkCancellation()
         guard !disconnecting, !environmentSwitchPending, !repairInProgress else { throw CancellationError() }
+        let preparationExecutor = executor
+        let preparationID = try await preparationExecutor.beginNativeVerification()
+        defer { preparationExecutor.endNativeVerification(preparationID) }
+        try preparationExecutor.requireNativeVerification(preparationID)
         // A cached credential is not an active relay. Retain only existing relay recovery.
         allowsAutomaticCuaRecovery = gateway != nil || pendingGateway != nil || reconnectTask != nil
         let preflightGeneration = lifecycleGeneration
         // Screen lock observations do not gate permission preparation.
         guard sessionLock.isAwakeAndActive else { throw CancellationError() }
         try requireCurrentStartup(preflightGeneration)
+        let needsBrowserGrant = DesktopBrowserProfileConsentController.shared.hasApprovedTargets
+            && cuaService?.allowsExistingBrowserProfiles == false
+        if needsBrowserGrant {
+            if let existing = proxy { await existing.stop(); proxy = nil; tools = [] }
+            guard await stopOwnedCuaService() else { throw DesktopControlOwnedCuaStopError() }
+            try requireCurrentLifecycle(preflightGeneration)
+        }
         let ownedDaemonRunning = isOwnedCuaRunning()
         if let existing = proxy {
             let running = await existing.isProcessRunning()
@@ -1259,6 +1305,119 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let generation = try beginResume()
         guard sessionLock.isAwakeAndActive else { throw CancellationError() }
         try await startPermissionCua(generation: generation, remainPaused: remainPaused)
+        try preparationExecutor.requireNativeVerification(preparationID)
+    }
+
+    var existingBrowserGrantNeedsRestart: Bool { cuaService?.allowsExistingBrowserProfiles == false }
+
+    /// The local owner selected this running instance before this attended check.
+    /// A remote lease cannot interleave with daemon grant changes or the handshake.
+    func verifyExistingBrowserForPermissions(target: DesktopBrowserConsentTarget) async throws {
+        try await prepareCuaPermissions()
+        guard let proxy, let service = cuaService, service.allowsExistingBrowserProfiles else {
+            throw CuaMCPProxyError.permissionsRequired
+        }
+        let generation = lifecycleGeneration
+        let currentExecutor = executor
+        let id = try await currentExecutor.beginNativeVerification()
+        defer { currentExecutor.endNativeVerification(id) }
+        let session = "browser-setup-\(UUID().uuidString)"
+        func requireCurrent() throws {
+            try requireCurrentStartup(generation)
+            try currentExecutor.requireNativeVerification(id)
+            guard self.executor === currentExecutor, self.proxy === proxy, cuaService === service,
+                  sessionLock.isAwakeAndActive,
+                  DesktopBrowserProfileConsentController.shared.approvedTargets.contains(where: { $0.instanceIdentity == target.instanceIdentity }),
+                  DesktopBrowserProfileConsentController.shared.allowed(pid: target.pid, windowID: target.windowID) else {
+                throw CancellationError()
+            }
+        }
+        try requireCurrent()
+        let arguments: [String: Any] = ["session": session, "pid": target.pid, "window_id": target.windowID,
+                                        "strategy": ["kind": "existing_profile"]]
+        var failure: Error?
+        do {
+            let data = try await proxy.callTool(name: "browser_prepare", argumentsJSON: JSONSerialization.data(withJSONObject: arguments), timeout: 60)
+            try requireCurrent()
+            try DesktopBrowserHandshakeValidation.requirePrepared(data, pid: target.pid)
+        } catch { failure = error }
+        // End even a failed handshake. Cancellation must not orphan setup state.
+        let cleanup = try await Task {
+            try await DesktopControlExecution.$deadline.withValue(Date().addingTimeInterval(5)) {
+                try await proxy.callTool(name: "end_session", argumentsJSON: JSONSerialization.data(withJSONObject: ["session": session]), timeout: 5)
+            }
+        }.value
+        try DesktopBrowserHandshakeValidation.requireEnded(cleanup, session: session)
+        if let failure { throw failure }
+        try requireCurrent()
+    }
+
+    func perceptionObservation() -> DesktopPermissionObservation {
+        guard CuaPerceptionCompatibility.supportedArchitecture else {
+            return .init(.notNeeded, detail: "CUA publishes no Intel Mac perception extension. Visual-region parsing is unavailable on this architecture.")
+        }
+        let pointer = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".cua-driver/extensions/cua-perception/active.json")
+        guard let data = Self.perceptionPointerData(pointer),
+              let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              value["id"] as? String == "cua-perception",
+              value["version"] as? String == CuaPerceptionCompatibility.version else {
+            return .init(.notGranted, detail: "Install and verify the pinned visual perception component during setup.")
+        }
+        return .init(.verificationRequired, detail: "The perception component is present. Attended verification is required.",
+                     verificationKey: "perception-\(CuaPerceptionCompatibility.version)")
+    }
+
+    private static func perceptionPointerData(_ url: URL) -> Data? {
+        let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        defer { try? file.close() }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+              info.st_uid == getuid(), info.st_size > 0, info.st_size < 4096 else { return nil }
+        guard let data = try? file.read(upToCount: 4096), data.count < 4096 else { return nil }
+        return data
+    }
+
+    func preparePerceptionForPermissions() async throws -> CuaDriverInstallation {
+        try await prepareCuaPermissions()
+        guard let executable = selectedCuaExecutableURL, isOwnedCuaRunning() else { throw CuaMCPProxyError.notStarted }
+        return CuaDriverInstallation(applicationURL: executable.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent(),
+            executableURL: executable, version: CuaDriverCompatibility.version, toolNames: tools)
+    }
+
+    func verifyPerceptionForPermissions() async throws {
+        guard CuaPerceptionCompatibility.supportedArchitecture else { throw CuaPerceptionError.unsupportedArchitecture }
+        let generation = lifecycleGeneration
+        let currentExecutor = executor
+        let id = try await currentExecutor.beginNativeVerification()
+        defer { currentExecutor.endNativeVerification(id) }
+        let target = DesktopInputPermissionWindow(explanation: "PersonaStack will capture this test window and read its disposable labels. You do not need to click or type.")
+        defer { target.invalidate() }
+        func requireCurrent() throws {
+            try requireCurrentStartup(generation)
+            try currentExecutor.requireNativeVerification(id)
+            guard self.executor === currentExecutor, sessionLock.isAwakeAndActive,
+                  hostPermissions().accessibility, hostPermissions().screenRecording else { throw CancellationError() }
+        }
+        try requireCurrent()
+        // The pinned driver constructs its perception client at daemon startup.
+        if let previous = proxy { await previous.stop(); proxy = nil; tools = [] }
+        guard await stopOwnedCuaService() else { throw DesktopControlOwnedCuaStopError() }
+        try requireCurrent()
+        try await startPermissionCua(generation: generation, remainPaused: paused)
+        try requireCurrent()
+        guard let proxy else { throw CuaMCPProxyError.notStarted }
+        try await withTaskCancellationHandler {
+            try await DesktopPerceptionPermissionVerifier.verify(target: target, call: { name, arguments in
+                if name != "end_session" { try requireCurrent() }
+                return try await proxy.callTool(name: name, argumentsJSON: arguments, timeout: name == "end_session" ? 5 : 30)
+            }, isCurrent: requireCurrent)
+        } onCancel: {
+            Task { @MainActor in target.invalidate() }
+        }
+        try requireCurrent()
     }
 
     /// Read-only. It cannot install a runtime or request an OS permission.
@@ -1395,7 +1554,11 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             }
             return existing
         }
-        let service = CuaEmbeddedService(executableURL: executableURL)
+        let catalog = await CuaPerceptionInstaller().catalogURL
+        try requireCurrentStartup(generation)
+        let service = CuaEmbeddedService(executableURL: executableURL,
+            allowsExistingBrowserProfiles: DesktopBrowserProfileConsentController.shared.hasApprovedTargets,
+            perceptionCatalogURL: CuaPerceptionCompatibility.supportedArchitecture ? catalog : nil)
         cuaService = service
         do {
             try await service.start { try self.requireCurrentStartup(generation) }
@@ -1862,6 +2025,19 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             return Self.failure(for: frame, code: "desktop_connection_stale", message: "The desktop connection changed before this command could run. Retry only after checking whether the previous action completed.")
         }
         let isStatus = frame.operation == "desktop_control_status"
+        let requiresPermissionReadiness = !isStatus && ![
+            "desktop_control_release", "desktop_control_revoke_config", "desktop_control_revoke_binding",
+        ].contains(frame.operation ?? "")
+        if requiresPermissionReadiness {
+            guard await refreshUnattendedPermissionReadiness() else {
+                return Self.failure(for: frame, code: "permission_required",
+                                    message: "Complete unattended-control permissions in PersonaStack on this Mac before starting remote work.")
+            }
+            guard Self.acceptsCommand(connectionID: connectionID, currentConnectionID: gatewayConnectionID,
+                                      disconnecting: disconnecting || environmentSwitchPending) else {
+                return Self.failure(for: frame, code: "desktop_connection_stale")
+            }
+        }
         let isLockedAcquire = frame.operation == "desktop_control_acquire"
             && canPreserveExecutorForLockedControl
         guard isStatus || (!executorCleanupInProgress && !executorCleanupFailed) else {
@@ -2000,6 +2176,16 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     private func heartbeatReadiness() async -> String? {
         guard !Task.isCancelled else { return nil }
+        let permissionsReady = await refreshUnattendedPermissionReadiness()
+        guard !Task.isCancelled else { return nil }
+        if !permissionsReady {
+            if executor.currentLease != nil {
+                lockedControlController?.requestStop()
+                executorCleanupInProgress = true
+                await cleanupExecutor()
+            }
+            return paused ? "paused" : "permission_required"
+        }
         if lastLockedControlVerifierRefresh.map({ now().timeIntervalSince($0) >= 30 }) ?? true {
             lastLockedControlVerifierRefresh = now()
             _ = await lockedControlSetupVerifier.refresh()
@@ -2342,7 +2528,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     static func requiresCua(_ operation: String?) -> Bool {
         switch operation {
         case "desktop_control_observe", "desktop_control_input", "desktop_control_application",
-             "desktop_control_window", "desktop_control_clipboard", "desktop_control_browser":
+             "desktop_control_window", "desktop_control_clipboard", "desktop_control_browser", "desktop_control_cua":
             return true
         default:
             return false

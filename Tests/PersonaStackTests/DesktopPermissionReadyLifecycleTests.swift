@@ -81,9 +81,9 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     #expect(readyRow(service, .microphone)?.state == .denied)
     status = .authorized
     await service.window.coordinator.refresh()
-    #expect(readyRow(service, .microphone)?.isComplete == true && page.tests == 2)
+    #expect(readyRow(service, .microphone)?.state == .verificationRequired && page.tests == 1)
     for _ in 0..<3 { await service.window.coordinator.refresh() }
-    #expect(page.tests == 2)
+    #expect(page.tests == 1)
     input = "input-b"
     #expect(await service.adapter.observe(.microphone).verified == false)
     input = "input-a"
@@ -91,7 +91,7 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     _ = await service.adapter.setup(.microphone)
     document = "document-b"
     #expect(await service.adapter.observe(.microphone).verified == false)
-    #expect(page.tests == 3 && page.cancels == 3)
+    #expect(page.tests == 2 && page.cancels == 2)
 }
 
 @Test @MainActor func microphoneFailedRetryAndCanceledLateReplyCannotRestoreReady() async {
@@ -117,16 +117,15 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     #expect(await service.adapter.observe(.microphone).verified == false)
 }
 
-@Test @MainActor func localNetworkPermissionReopenRefreshesExactEndpointsAndFreshFailureReplacesReady() async {
+@Test @MainActor func localNetworkPermissionReopenIsPassiveAndExplicitFailureReplacesReady() async {
     var requests: [URLRequest] = []
     var fails = false
     var profile = DesktopEnvironmentConfiguration.lan
-    let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { profile }, activationNotificationCenter: NotificationCenter(),
-        requestEndpoint: { request in
+    let service = DesktopPermissionChecklist(access: .permissionFixture(), evidence: nil, selectedProfile: { profile }, activationNotificationCenter: NotificationCenter(),
+        requestLocalNetwork: { .init(.ready, detail: "Fixture LAN", verified: true) }, requestEndpoint: { request in
             requests.append(request)
             #expect(request.httpMethod == "HEAD" && request.httpBody == nil)
             #expect(request.value(forHTTPHeaderField: "Authorization") == nil)
-            #expect(request.cachePolicy == .reloadIgnoringLocalCacheData && request.timeoutInterval == 4)
             if fails { throw URLError(.notConnectedToInternet) }
             return HTTPURLResponse(url: request.url!, statusCode: 401, httpVersion: nil, headerFields: nil)!
         })
@@ -134,34 +133,24 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     await openReadyChecklist(service)
     defer { service.window.cancel() }
     #expect(requests.isEmpty)
-    service.window.coordinator.setup(.localNetwork)
-    while service.window.coordinator.busyPermission != nil { await Task.yield() }
-    #expect(readyRow(service, .localNetwork)?.isComplete == true)
+    #expect(await service.adapter.setup(.localNetwork).verified)
     #expect(requests.map(\.url) == [profile.appURL, profile.gatewayURL, profile.mcpURL])
     service.window.cancel()
     await openReadyChecklist(service)
-    #expect(readyRow(service, .localNetwork)?.isComplete == true && requests.count == 6)
-    for _ in 0..<3 { await service.window.coordinator.refresh() }
-    #expect(requests.count == 6)
+    #expect(readyRow(service, .localNetwork)?.isComplete == true && requests.count == 3)
     fails = true
     service.invalidateAfterActivation()
     await service.window.coordinator.refresh()
-    #expect(readyRow(service, .localNetwork)?.state == .failed && requests.count == 9)
-    service.invalidateAfterActivation()
-    await service.window.coordinator.refresh()
-    #expect(requests.count == 12)
+    #expect(requests.count == 3)
+    #expect(await service.adapter.setup(.localNetwork).state == .failed)
+    #expect(requests.count == 6)
     fails = false
-    service.invalidateAfterActivation()
-    await service.window.coordinator.refresh()
-    #expect(readyRow(service, .localNetwork)?.isComplete == true && requests.count == 15)
-    for _ in 0..<3 { await service.window.coordinator.refresh() }
-    #expect(requests.count == 15)
     profile = .production
-    #expect(await service.adapter.observe(.localNetwork).state == .notNeeded)
-    #expect(await service.adapter.setup(.localNetwork).state == .notNeeded)
+    #expect(await service.adapter.observe(.localNetwork).state == .verificationRequired)
+    #expect(await service.adapter.setup(.localNetwork).state == .ready)
+    #expect(requests.count == 9)
     profile = .lan
     #expect(await service.adapter.observe(.localNetwork).state == .verificationRequired)
-    #expect(requests.count == 15)
 }
 
 @Test @MainActor func localNetworkPermissionPublicEndpointFailureStillAttemptsBothLANServices() async {
@@ -170,7 +159,7 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     access.openPrivacySettings = { _ in Issue.record("Network attempts must not open Settings") }
     let profile = DesktopEnvironmentConfiguration.lan
     let service = DesktopPermissionChecklist(access: access, selectedProfile: { profile },
-        activationNotificationCenter: NotificationCenter(), requestEndpoint: { request in
+        activationNotificationCenter: NotificationCenter(), requestLocalNetwork: { .init(.ready, detail: "Fixture discovery", verified: true) }, requestEndpoint: { request in
             requests.append(request)
             #expect(request.httpMethod == "HEAD" && request.httpBody == nil)
             #expect(request.value(forHTTPHeaderField: "Authorization") == nil)
@@ -189,7 +178,7 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     var access = DesktopPermissionSystemAccess.permissionFixture()
     access.openPrivacySettings = { _ in Issue.record("Canceled setup must not open Settings") }
     let service = DesktopPermissionChecklist(access: access, selectedProfile: { .lan },
-        activationNotificationCenter: NotificationCenter(), requestEndpoint: { _ in
+        activationNotificationCenter: NotificationCenter(), requestLocalNetwork: { .init(.ready, detail: "Fixture discovery", verified: true) }, requestEndpoint: { _ in
             requests += 1
             return try await withCheckedThrowingContinuation { pending = $0 }
         })
@@ -217,7 +206,7 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     var followed = false
     var requests = 0
     let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .lan }, activationNotificationCenter: NotificationCenter(),
-        requestEndpoint: { request in
+        requestLocalNetwork: { .init(.ready, detail: "Fixture discovery", verified: true) }, requestEndpoint: { request in
             requests += 1
             return HTTPURLResponse(url: followed ? URL(string: "https://unselected.example")! : request.url!.appendingPathComponent("/"),
                 statusCode: followed ? 200 : 302, httpVersion: nil, headerFields: ["Location": "https://unselected.example"])!
@@ -235,7 +224,7 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     var pending: CheckedContinuation<HTTPURLResponse, Error>?
     var oldURL: URL?
     let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .lan }, activationNotificationCenter: NotificationCenter(),
-        requestEndpoint: { request in
+        requestLocalNetwork: { .init(.ready, detail: "Fixture discovery", verified: true) }, requestEndpoint: { request in
             calls += 1
             if calls == 4 {
                 oldURL = request.url
@@ -245,7 +234,7 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
         })
     #expect(await service.adapter.setup(.localNetwork).verified)
     service.invalidateAfterActivation()
-    let old = Task { await service.adapter.observe(.localNetwork) }
+    let old = Task { await service.adapter.setup(.localNetwork) }
     while pending == nil { await Task.yield() }
     service.cancelVerification()
     #expect(await service.adapter.setup(.localNetwork).verified)
@@ -255,12 +244,12 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     #expect(calls == 7)
 }
 
-@Test @MainActor func protectedAccessReadyRefreshRetriesDenialOnActivationOnly() async throws {
+@Test @MainActor func protectedAccessReopenIsPassiveAndExplicitCheckDetectsRevocation() async throws {
     let home = try protectedAccessFixture()
     let mail = home.appendingPathComponent("Library/Mail")
     defer { try? FileManager.default.removeItem(at: home) }
     var probes = 0
-    let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .production }, protectedAccessAction: { .check },
+    let service = DesktopPermissionChecklist(access: .permissionFixture(), evidence: nil, selectedProfile: { .production }, protectedAccessAction: { .check },
         verifyProtectedAccess: {
             probes += 1
             try await DesktopFileSystem().verifyProtectedDirectoryAccess(home: home)
@@ -269,26 +258,20 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     await openReadyChecklist(service)
     defer { service.window.cancel() }
     #expect(probes == 0)
-    service.window.coordinator.setup(.fullDiskAccess)
-    while service.window.coordinator.busyPermission != nil { await Task.yield() }
-    #expect(readyRow(service, .fullDiskAccess)?.isComplete == true && probes == 1)
+    #expect(await service.adapter.setup(.fullDiskAccess).verified)
     service.window.completeSetup()
     await openReadyChecklist(service)
-    #expect(readyRow(service, .fullDiskAccess)?.isComplete == true && probes == 2)
+    #expect(readyRow(service, .fullDiskAccess)?.isComplete == true && probes == 1)
     try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: mail.path)
     defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: mail.path) }
     service.invalidateAfterActivation()
     await service.window.coordinator.refresh()
-    #expect(readyRow(service, .fullDiskAccess)?.state == .denied && probes == 3)
-    service.invalidateAfterActivation()
-    for _ in 0..<3 { await service.window.coordinator.refresh() }
-    #expect(probes == 4)
+    #expect(probes == 1)
+    #expect(await service.adapter.check(.fullDiskAccess).state == .denied)
+    #expect(probes == 2)
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: mail.path)
-    service.invalidateAfterActivation()
-    await service.window.coordinator.refresh()
-    #expect(readyRow(service, .fullDiskAccess)?.isComplete == true && probes == 5)
-    for _ in 0..<3 { await service.window.coordinator.refresh() }
-    #expect(probes == 5)
+    #expect(await service.adapter.check(.fullDiskAccess).verified)
+    #expect(probes == 3)
 }
 
 @Test @MainActor func microphonePermissionGrantedDuringSetupRetainsRecordingFailure() async {
@@ -325,7 +308,7 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     var pending: CheckedContinuation<Void, Never>?
     var requests = 0
     let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .lan },
-        activationNotificationCenter: NotificationCenter(), requestEndpoint: { request in
+        activationNotificationCenter: NotificationCenter(), requestLocalNetwork: { .init(.ready, detail: "Fixture discovery", verified: true) }, requestEndpoint: { request in
             requests += 1
             if requests == 1 { await withCheckedContinuation { pending = $0 } }
             return HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
@@ -371,5 +354,5 @@ private func readyRow(_ service: DesktopPermissionChecklist, _ id: DesktopPermis
     await service.window.coordinator.refresh()
     status = .authorized
     await service.window.coordinator.refresh()
-    #expect(page.tests == 2 && readyRow(service, .microphone)?.isComplete == true)
+    #expect(page.tests == 1 && readyRow(service, .microphone)?.state == .verificationRequired)
 }

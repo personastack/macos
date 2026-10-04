@@ -207,3 +207,11 @@ private actor SuspendedReadiness {
     #expect(acquired.type == "result")
     _ = await executor.close()
 }
+
+@Test func cuaPerceptionFailuresKeepFiniteRecoveryWithoutPrivateDetails() {
+    for code in ["not_installed", "unsupported_platform", "capture_expired", "worker_crashed", "artifact_invalid"] {
+        let failure = DesktopCuaFailure.from(["structuredContent": ["code": code, "detail": "/private/user/model", "message": "private capture text"]], tool: "parse_visual_regions")
+        #expect(failure.code == code)
+        #expect(!failure.message.contains("/private") && !failure.message.contains("private capture"))
+    }
+}

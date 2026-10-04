@@ -20,8 +20,30 @@ enum DesktopClipboardPermission {
 
     /// macOS has no separate request API. Explicit Setup can attempt a read
     /// to register its consent alert. Do not retain, display or transmit data.
-    static func request() {
+    private static let probeQueue = DispatchQueue(label: "ai.personastack.clipboard-permission")
+    private static var pendingProbe: Task<Void, Never>?
+
+    static func request() async {
         guard #available(macOS 15.4, *) else { return }
-        _ = NSPasteboard.general.data(forType: .string)
+        if let pendingProbe { await pendingProbe.value; return }
+        let task = Task {
+            await runDiscardedProbe {
+                // Confine this pasteboard and its discarded data to one worker.
+                // The main actor must remain available while macOS asks consent.
+                autoreleasepool { _ = NSPasteboard(name: .general).data(forType: .string) }
+            }
+        }
+        pendingProbe = task
+        await task.value
+        pendingProbe = nil
+    }
+
+    static func runDiscardedProbe(_ read: @escaping @Sendable () -> Void) async {
+        await withCheckedContinuation { continuation in
+            probeQueue.async {
+                read()
+                continuation.resume()
+            }
+        }
     }
 }

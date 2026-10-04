@@ -39,7 +39,7 @@ struct PersonaStackApp: App {
     }()
     init() {
         let foregroundUpdateRelaunch = UserDefaults.standard.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
-            || CommandLine.arguments.contains(DesktopApplicationRestart.foregroundArgument)
+            || DesktopApplicationRestart.resumesPermissionSetup
         guard let configuration = try? LaunchConfiguration.selectedEnvironment(),
               UserDefaults.standard.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(configuration)) else { return }
         if DesktopUpdatePolicy.shouldUseAccessoryActivation(relayEnabled: true,
@@ -126,7 +126,7 @@ private struct DesktopControlStatusIcon: View {
 /// hidden window retains its WebView when the visible window is closed.
 @MainActor
 final class MainWebViewHost {
-    private(set) static var shared = MainWebViewHost(appURL: LaunchConfiguration.selectedURL())
+    private(set) static var shared = MainWebViewHost(appURL: LaunchConfiguration.selectedURL(), resumePermissionSetup: DesktopApplicationRestart.resumesPermissionSetup)
 
     static func replaceSharedHost(with appURL: URL) -> MainWebViewHost {
         let oldHost = shared
@@ -162,7 +162,7 @@ final class MainWebViewHost {
     private let authorizeNotifications: () -> Void
     private var notificationAuthorizationRequested = false
 
-    init(appURL: URL, loadPage: Bool = true,
+    init(appURL: URL, loadPage: Bool = true, resumePermissionSetup: Bool = false,
          requestNotifications: Bool = true,
          authorizeNotifications: @escaping () -> Void = { DesktopNotificationCoordinator.shared.requestAuthorization() },
          coordinator suppliedCoordinator: PersonaStackWebView.Coordinator? = nil) {
@@ -172,6 +172,7 @@ final class MainWebViewHost {
         configuration.websiteDataStore = .default()
         configuration.preferences.isFraudulentWebsiteWarningEnabled = true
         configuration.userContentController.add(coordinator, name: "personastackConcern")
+        configuration.userContentController.addScriptMessageHandler(coordinator, contentWorld: .page, name: DesktopMediaCapturePermission.bridgeName)
         configuration.userContentController.addScriptMessageHandler(ChatWindowManager.shared, contentWorld: .page, name: "personastackChat")
         configuration.userContentController.addScriptMessageHandler(StackWindowManager.shared, contentWorld: .page, name: "personastackStack")
         configuration.userContentController.addScriptMessageHandler(LocalSessionManager.shared, contentWorld: .page, name: "personastackLocalSession")
@@ -199,7 +200,7 @@ final class MainWebViewHost {
         self.requestNotifications = requestNotifications
         self.authorizeNotifications = authorizeNotifications
         requestNotificationAuthorizationIfNeeded()
-        if loadPage { coordinator.start(appURL) }
+        if loadPage { coordinator.start(DesktopApplicationRestart.initialPageURL(appURL, resume: resumePermissionSetup)) }
     }
 
     func openDesktopFlow(path: String, query: [String: String]) {
@@ -305,7 +306,7 @@ struct PersonaStackWebView: NSViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler, WKScriptMessageHandlerWithReply {
         weak var webView: WKWebView?
         let appURL: URL
         let loadRecovery = MainWebViewLoadRecovery()
@@ -316,6 +317,7 @@ struct PersonaStackWebView: NSViewRepresentable {
         private var popupWindows: [ObjectIdentifier: NSWindow] = [:]
         private(set) var isRetired = false
         private(set) var documentGeneration = UUID()
+        private let mediaPermission: DesktopMediaCapturePermission
 
         init(
             appURL: URL,
@@ -332,13 +334,15 @@ struct PersonaStackWebView: NSViewRepresentable {
             cancelPermissionVerification: @escaping () -> Void = {
                 DesktopPermissionChecklist.shared.cancelVerification()
             },
-            concernNotificationsEnabled: @escaping () -> Bool = { DesktopConcernNotificationSettings.isEnabled() }
+            concernNotificationsEnabled: @escaping () -> Bool = { DesktopConcernNotificationSettings.isEnabled() },
+            mediaPermission: DesktopMediaCapturePermission = .shared
         ) {
             self.appURL = appURL
             self.scheduleNotification = scheduleNotification
             self.loadRequest = loadRequest
             self.concernNotificationsEnabled = concernNotificationsEnabled
             self.cancelPermissionVerification = cancelPermissionVerification
+            self.mediaPermission = mediaPermission
             super.init()
             if let notificationCoordinator {
                 configureNotificationCenter(notificationCoordinator)
@@ -384,6 +388,7 @@ struct PersonaStackWebView: NSViewRepresentable {
         }
 
         private func invalidateDocumentVerification() {
+            mediaPermission.cancel(owner: documentGeneration)
             documentGeneration = UUID()
             if let webView { DesktopSkillsManager.shared.invalidate(webView) }
             cancelPermissionVerification()
@@ -527,6 +532,8 @@ struct PersonaStackWebView: NSViewRepresentable {
                 window.close()
             }
             popupWindows.removeAll()
+            webView?.setMicrophoneCaptureState(.none)
+            webView?.configuration.userContentController.removeScriptMessageHandler(forName: DesktopMediaCapturePermission.bridgeName, contentWorld: .page)
             webView?.stopLoading()
             webView?.navigationDelegate = nil
             webView?.uiDelegate = nil
@@ -536,10 +543,25 @@ struct PersonaStackWebView: NSViewRepresentable {
         func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin,
                      initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType,
                      decisionHandler: @escaping @MainActor @Sendable (WKPermissionDecision) -> Void) {
-            decisionHandler(DesktopMediaCapturePermission.decide(
-                origin: origin, frame: frame, type: type, appURL: appURL,
-                activeView: !isRetired && webView === self.webView
-            ))
+            let owner = documentGeneration
+            mediaPermission.decide(origin: origin, frame: frame, type: type, appURL: appURL,
+                owner: owner, isCurrent: { [weak self, weak webView] in
+                    guard let self, let webView else { return false }
+                    return !self.isRetired && webView === self.webView && self.documentGeneration == owner
+                }, completion: decisionHandler)
+        }
+
+        func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage,
+                                   replyHandler: @escaping @MainActor @Sendable (Any?, String?) -> Void) {
+            let owner = documentGeneration
+            mediaPermission.handleMessage(message.body, owner: owner,
+                trusted: message.name == DesktopMediaCapturePermission.bridgeName &&
+                    DesktopMediaCapturePermission.trusted(origin: message.frameInfo.securityOrigin,
+                                                          frame: message.frameInfo, appURL: appURL),
+                isCurrent: { [weak self, weak view = message.webView] in
+                    guard let self, let view else { return false }
+                    return !self.isRetired && view === self.webView && self.documentGeneration == owner
+                }, reply: replyHandler)
         }
 
         func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,

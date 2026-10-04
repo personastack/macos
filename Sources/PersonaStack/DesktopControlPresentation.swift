@@ -11,6 +11,7 @@ enum DesktopControlActivityKind: String, Sendable {
     case window = "Managing a window"
     case clipboard = "Using the clipboard"
     case browser = "Using the browser"
+    case cua = "Using desktop tools"
     case file = "Working with files"
     case shell = "Running a command"
 
@@ -22,6 +23,7 @@ enum DesktopControlActivityKind: String, Sendable {
         case "desktop_control_window": self = .window
         case "desktop_control_clipboard": self = .clipboard
         case "desktop_control_browser": self = .browser
+        case "desktop_control_cua": self = .cua
         case "desktop_control_file": self = .file
         case "desktop_control_execute", "desktop_control_exec_read", "desktop_control_exec_write",
              "desktop_control_exec_status", "desktop_control_exec_cancel": self = .shell

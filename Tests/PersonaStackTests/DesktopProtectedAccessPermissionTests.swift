@@ -199,7 +199,7 @@ struct DesktopProtectedAccessPermissionTests {
                 verifyProtectedAccess: { throw NSError(domain: NSPOSIXErrorDomain, code: Int(code)) },
                 activationNotificationCenter: NotificationCenter())
             let adapter = DesktopPermissionChecklistSystemAdapter(hooks: service.adapter.hooks, access: .permissionFixture(), openSettings: { settings.append($0) })
-            let result = await adapter.setup(.fullDiskAccess)
+            let result = await adapter.check(.fullDiskAccess)
             let denied = code == EPERM || code == EACCES
             let expected: DesktopPermissionState = denied ? .denied : (code == ENOENT ? .verificationRequired : .failed)
             #expect(result.state == expected && !result.verified)
@@ -319,7 +319,7 @@ struct DesktopProtectedAccessPermissionTests {
         #expect(await service.adapter.observe(.fullDiskAccess).verificationKey == nil)
     }
 
-    @Test @MainActor func protectedAccessSettingsReturnAutomaticallyChecksThenBecomesReady() async throws {
+    @Test @MainActor func protectedAccessExplicitCheckAfterSettingsBecomesReady() async throws {
         let home = try protectedAccessFixture()
         defer { try? FileManager.default.removeItem(at: home) }
         var action = DesktopProtectedAccessSetupAction.settings
@@ -345,6 +345,9 @@ struct DesktopProtectedAccessPermissionTests {
         #expect(probes == 0 && protectedAccessRow(model)?.isComplete == false)
         service.invalidateAfterActivation()
         await model.refresh()
+        #expect(probes == 0)
+        model.check(.fullDiskAccess)
+        while model.busyPermission != nil { await Task.yield() }
         #expect(protectedAccessRow(model)?.state == .ready && probes == 1)
         action = .cancel
         model.setup(.fullDiskAccess)
@@ -375,6 +378,9 @@ struct DesktopProtectedAccessPermissionTests {
         denied = true
         service.invalidateAfterActivation()
         await model.refresh()
+        #expect(probes == 1)
+        model.check(.fullDiskAccess)
+        while model.busyPermission != nil { await Task.yield() }
         #expect(protectedAccessRow(model)?.state == .denied && probes == 2)
         #expect(settings.isEmpty)
         model.setup(.fullDiskAccess)
@@ -388,7 +394,7 @@ struct DesktopProtectedAccessPermissionTests {
         #expect(protectedAccessRow(model)?.state == .denied)
     }
 
-    @Test @MainActor func protectedAccessReopenRefreshesReadyAndConsentCancelPreservesIt() async {
+    @Test @MainActor func protectedAccessReopenPreservesReadyWithoutRepeatingProbe() async {
         var action = DesktopProtectedAccessSetupAction.check
         var probes = 0
         let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .production }, protectedAccessAction: { action },
@@ -404,11 +410,11 @@ struct DesktopProtectedAccessPermissionTests {
         service.window.onPresent?()
         model.open()
         await model.refresh()
-        #expect(protectedAccessRow(model)?.state == .ready && probes == 2)
+        #expect(protectedAccessRow(model)?.state == .ready && probes == 1)
         action = .cancel
         model.setup(.fullDiskAccess)
         while model.busyPermission != nil { await Task.yield() }
-        #expect(protectedAccessRow(model)?.isComplete == true && probes == 2)
+        #expect(protectedAccessRow(model)?.isComplete == true && probes == 1)
     }
 }
 
@@ -424,7 +430,7 @@ private func protectedAccessCoordinator(service: DesktopPermissionChecklist,
     }, setup: { id in
         guard id == .fullDiskAccess else { Issue.record("Unexpected setup"); return nil }
         return await hooks.setup(id)
-    }), access: service.adapter.access, openSettings: openSettings)
+    }, verifyAutomatically: hooks.verifyAutomatically), access: service.adapter.access, openSettings: openSettings)
     return DesktopPermissionChecklistCoordinator(adapter: adapter)
 }
 

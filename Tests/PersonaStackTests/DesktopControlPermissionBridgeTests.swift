@@ -39,6 +39,8 @@ private final class PermissionBridgeCredentials: DesktopControlCredentialStoring
 
 @MainActor
 private final class PermissionBridgeRuntime: DesktopControlSetupRuntime {
+    var unattendedPermissionsReady = true
+    func refreshUnattendedPermissionReadiness() async -> Bool { unattendedPermissionsReady }
     var gatewayConnected = false
     var paused = false
     var nativeExecutorReady = true
@@ -546,7 +548,7 @@ func permissionBridgeRemovedConfigurationCannotAttachAfterScopeChangesDuringDisc
     #expect(await fixture.enrollment.calls == ["enroll", "reportReady", "configurationState", "configurationState", "configurationState"])
 }
 
-@Test(arguments: ["gui", "native", "connection"]) @MainActor
+@Test(arguments: ["gui", "native", "connection", "permissions"]) @MainActor
 func permissionBridgeCompletionRechecksReadinessAfterConfigurationReadback(lost: String) async throws {
     let fixture = try PermissionBridgeFixture(allowEnrollment: true)
     defer {
@@ -562,6 +564,7 @@ func permissionBridgeCompletionRechecksReadinessAfterConfigurationReadback(lost:
     switch lost {
     case "gui": fixture.runtime.cuaReady = false
     case "native": fixture.runtime.nativeExecutorReady = false
+    case "permissions": fixture.runtime.unattendedPermissionsReady = false
     default: fixture.runtime.gatewayConnected = false
     }
     await fixture.enrollment.releaseConfigurationReadbacks()
@@ -575,6 +578,7 @@ func permissionBridgeCompletionRechecksReadinessAfterConfigurationReadback(lost:
     fixture.runtime.cuaReady = true
     fixture.runtime.nativeExecutorReady = true
     fixture.runtime.gatewayConnected = true
+    fixture.runtime.unattendedPermissionsReady = true
     let retry = await fixture.send(fixture.permissions("completed"))
     #expect(retry.ok && fixture.presenter.completions == 1)
 }

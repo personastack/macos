@@ -31,10 +31,20 @@ final class DesktopControlCommandExecutor {
         let owner: Owner
         let configVersion: Int64
         let token: String
+        let cuaSession = UUID().uuidString
         let started: ContinuousClock.Instant
         var lastActivity: ContinuousClock.Instant
     }
 
+    private var leaseCuaProxy: (any CuaToolCalling)?
+    private var recordingDirectory: DesktopCuaRecordingDirectory?
+    private var recordingActive = false
+    private var recordingLimitReached = false
+    private var recordingMonitor: Task<Void, Never>?
+    private var existingBrowserTargets: [Int32: UInt32] = [:]
+    private let browserConsent: @MainActor (Int32, UInt32) -> Bool
+    private let safariPageReadAccess: @MainActor (Int32, UInt32) async -> Bool
+    private let browserPageAccess: @MainActor (Int32, UInt32) async -> Bool
     private let files = DesktopFileSystem()
     private let shell = DesktopShellExecutor()
     private let powerAssertion: DesktopControlPowerAssertion
@@ -98,8 +108,20 @@ final class DesktopControlCommandExecutor {
 #endif
 
     init(now: @escaping () -> ContinuousClock.Instant = { .now },
+         browserConsent: @escaping @MainActor (Int32, UInt32) -> Bool = {
+             DesktopBrowserProfileConsentController.shared.allowed(pid: $0, windowID: $1)
+         },
+         browserPageAccess: @escaping @MainActor (Int32, UInt32) async -> Bool = {
+             await DesktopBrowserProfileConsentController.shared.safePageAccess(pid: $0, windowID: $1)
+         },
+         safariPageReadAccess: @escaping @MainActor (Int32, UInt32) async -> Bool = {
+             await DesktopSafariPageAccess.allowed(pid: $0, windowID: $1)
+         },
          powerAssertion: DesktopControlPowerAssertion = .init()) {
         self.now = now
+        self.browserConsent = browserConsent
+        self.browserPageAccess = browserPageAccess
+        self.safariPageReadAccess = safariPageReadAccess
         self.powerAssertion = powerAssertion
         expiryTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
@@ -170,6 +192,8 @@ final class DesktopControlCommandExecutor {
         nativeVerificationID == nil && lease == nil && activeOperations == 0 && !closed && !unavailable
             && !revocationInProgress && !cleanupInProgress && failedCleanupLease == nil && !failedCleanupWithoutLease
     }
+
+    var permissionSetupAvailable: Bool { canBeginNativeVerification }
 
     func requireNativeVerification(_ id: UUID) throws {
         guard nativeVerificationID == id, !nativeVerificationInvalidated, !closed, !unavailable, !revocationInProgress,
@@ -305,18 +329,18 @@ final class DesktopControlCommandExecutor {
         return await clearExpiredLease()
     }
 
-    func handle(_ frame: DesktopControlFrame, proxy: CuaMCPProxy?) async -> DesktopControlFrame {
+    func handle(_ frame: DesktopControlFrame, proxy: (any CuaToolCalling)?) async -> DesktopControlFrame {
         await handle(frame, proxy: proxy, onChunk: nil)
     }
 
-    func handle(_ frame: DesktopControlFrame, proxy: CuaMCPProxy?,
+    func handle(_ frame: DesktopControlFrame, proxy: (any CuaToolCalling)?,
                 onChunk: (@Sendable (DesktopControlFrame) async throws -> Void)?) async -> DesktopControlFrame {
         await DesktopControlExecution.$deadline.withValue(frame.deadlineAt) {
             await execute(frame, proxy: proxy, onChunk: onChunk)
         }
     }
 
-    private func execute(_ frame: DesktopControlFrame, proxy: CuaMCPProxy?,
+    private func execute(_ frame: DesktopControlFrame, proxy: (any CuaToolCalling)?,
                          onChunk: (@Sendable (DesktopControlFrame) async throws -> Void)?) async -> DesktopControlFrame {
         do {
             guard frame.deadlineAt != nil else { throw DesktopControlExecution.Expired() }
@@ -391,7 +415,7 @@ final class DesktopControlCommandExecutor {
                 }
                 result = ["released": true]
             case "desktop_control_observe", "desktop_control_input", "desktop_control_application",
-                 "desktop_control_window", "desktop_control_clipboard", "desktop_control_browser":
+                 "desktop_control_window", "desktop_control_clipboard", "desktop_control_browser", "desktop_control_cua":
                 try requireLease(owner, arguments: frame.arguments)
                 result = try await callCua(frame, proxy: proxy)
             case "desktop_control_file":
@@ -640,6 +664,8 @@ final class DesktopControlCommandExecutor {
         // until callbacks, file handles, and managed processes have drained.
         leaseEpoch &+= 1
         lease = nil
+        recordingMonitor?.cancel()
+        recordingMonitor = nil
         let sleepPreventionReleased = powerAssertion.relinquish()
         await shell.requestStopAll()
         guard await settleOperations() else { unavailable = true; return false }
@@ -654,6 +680,25 @@ final class DesktopControlCommandExecutor {
             unavailable = true
             return false
         }
+        if let proxy = leaseCuaProxy, let closingLease {
+            do {
+                let args = try JSONEncoder().encode(DesktopControlJSONValue.object(["session": .string(closingLease.cuaSession)]))
+                let response = try await DesktopControlExecution.$deadline.withValue(Date().addingTimeInterval(5)) {
+                    try await proxy.callTool(name: "end_session", argumentsJSON: args, timeout: 5)
+                }
+                guard case .object(let envelope) = try JSONDecoder().decode(DesktopControlJSONValue.self, from: response),
+                      case .object(let result)? = envelope["result"], envelope["error"] == nil,
+                      result["isError"] == nil || result["isError"] == .bool(false),
+                      case .object(let confirmation)? = result["structuredContent"],
+                      confirmation["session"] == .string(closingLease.cuaSession),
+                      confirmation["active"] == .bool(false) else { return false }
+                leaseCuaProxy = nil
+            } catch { return false }
+        }
+        recordingDirectory = nil
+        recordingActive = false
+        recordingLimitReached = false
+        existingBrowserTargets.removeAll()
         guard sleepPreventionReleased else { return false }
 #if DEBUG
         if cleanupFailuresForTesting > 0 {
@@ -692,7 +737,7 @@ final class DesktopControlCommandExecutor {
         if !(await clearExpiredLease()) { unavailable = true }
     }
 
-    private func callCua(_ frame: DesktopControlFrame, proxy: CuaMCPProxy?) async throws -> Any {
+    private func callCua(_ frame: DesktopControlFrame, proxy: (any CuaToolCalling)?) async throws -> Any {
         guard let proxy, case .object(let values)? = frame.arguments,
               case .string(let name)? = values["tool"],
               CuaDriverCompatibility.exposedTools.contains(name),
@@ -700,9 +745,51 @@ final class DesktopControlCommandExecutor {
         let allowed = Self.allowedTools(for: frame.operation ?? "")
         guard allowed.contains(name) else { throw CommandError.invalidArguments }
         let preparedArguments = try Self.cuaArguments(name: name, arguments: rawArguments,
-                                                     controlToken: lease?.token ?? "")
-        let encoded = try JSONEncoder().encode(preparedArguments)
-        let response = try await proxy.callTool(name: name, argumentsJSON: encoded)
+                                                     controlToken: lease?.cuaSession ?? "")
+        guard let currentLease = validLease() else { throw CommandError.controlRequired }
+        if name == "page", case .object(let fields) = preparedArguments,
+           case .string(let action)? = fields["action"], ["get_text", "query_dom"].contains(action),
+           fields["cdp_port"] == nil, case .number(let pid)? = fields["pid"],
+           case .number(let window)? = fields["window_id"], pid > 0, pid <= Double(Int32.max),
+           window > 0, window <= Double(UInt32.max) {
+            let safariRead = await safariPageReadAccess(Int32(pid), UInt32(window))
+            guard !closed, !unavailable, !revocationInProgress, !cleanupInProgress,
+                  validLease()?.token == currentLease.token else { throw CommandError.controlRequired }
+            if safariRead {
+                throw DesktopCuaFailure(code: "browser_route_unavailable", message: "The pinned CUA Safari page reader cannot guarantee the requested window. Use desktop observation and input until an exact-target driver is available.")
+            }
+        }
+        try requireBrowserConsent(name: name, arguments: preparedArguments)
+        if name == "page", case .object(let fields) = preparedArguments,
+           case .string(let action)? = fields["action"], DesktopCuaPageAdapter.typingActions.contains(action) {
+            leaseCuaProxy = proxy
+            let result = try await DesktopCuaPageAdapter.type(fields, call: { name, arguments in
+                try await proxy.callTool(name: name, argumentsJSON: arguments, timeout: 60)
+            }, requireCurrent: {
+                guard !self.closed, !self.unavailable, !self.revocationInProgress, !self.cleanupInProgress,
+                      self.validLease()?.token == currentLease.token else { throw CommandError.controlRequired }
+                try self.requireBrowserConsent(name: "page", arguments: preparedArguments)
+            })
+            return try Self.boundedCuaImageResult(result)
+        }
+        if name == "page", case .object(let fields) = preparedArguments,
+           case .number(let pid)? = fields["pid"], case .number(let window)? = fields["window_id"] {
+            guard await browserPageAccess(Int32(pid), UInt32(window)) else {
+                throw DesktopCuaFailure(code: "browser_permission_required", message: "Complete native setup for this browser's Automation and JavaScript permissions before using page tools.")
+            }
+            guard !closed, !unavailable, !revocationInProgress, !cleanupInProgress,
+                  validLease()?.token == currentLease.token else { throw CommandError.controlRequired }
+        }
+        if name == "replay_trajectory" {
+            return try await replayTrajectory(rawArguments, frame: frame, proxy: proxy, token: currentLease.token)
+        }
+        leaseCuaProxy = proxy
+        let effectiveArguments = try prepareCuaResourceArguments(name: name, arguments: preparedArguments)
+        let selectedName = name == "list_sessions" ? "get_session" : name
+        let selectedArguments = name == "list_sessions"
+            ? DesktopControlJSONValue.object(["session": .string(currentLease.cuaSession)]) : effectiveArguments
+        let encoded = try JSONEncoder().encode(selectedArguments)
+        let response = try await proxy.callTool(name: selectedName, argumentsJSON: encoded, timeout: 60)
         guard let object = try JSONSerialization.jsonObject(with: response) as? [String: Any],
               let result = object["result"] as? [String: Any], object["error"] == nil else {
             logger.error("Cua tool response invalid tool=\(name, privacy: .public)")
@@ -712,21 +799,158 @@ final class DesktopControlCommandExecutor {
             logger.error("Cua tool returned an error tool=\(name, privacy: .public)")
             throw DesktopCuaFailure.from(result, tool: name)
         }
+        guard isBindingAuthorized(currentLease.owner) else { throw CommandError.bindingRevoked }
+        guard isConfigVersionAuthorized(Self.scope(currentLease.owner), currentLease.configVersion) else {
+            throw CommandError.configurationRevoked
+        }
+        guard validLease()?.token == currentLease.token else { throw CommandError.controlRequired }
+        if name == "start_recording" { startRecordingMonitor(proxy: proxy, token: currentLease.token) }
+        if name == "stop_recording" || name == "end_session" {
+            recordingActive = false
+            recordingMonitor?.cancel()
+            recordingMonitor = nil
+        }
+        if name == "end_session" { existingBrowserTargets.removeAll() }
+        if name == "browser_prepare", case .object(let fields) = preparedArguments,
+           fields["strategy"] != nil, case .number(let pid)? = fields["pid"],
+           case .number(let window)? = fields["window_id"] {
+            existingBrowserTargets[Int32(pid)] = UInt32(window)
+        }
+        if name == "list_sessions" {
+            let hasCursor: Bool
+            if case .object(let fields) = rawArguments, case .string(let cursor)? = fields["cursor"] {
+                hasCursor = UInt64(cursor.dropFirst(2)) != 0
+            } else { hasCursor = false }
+            let sessions = hasCursor ? [] : [result["structuredContent"]].compactMap { $0 }
+            return ["content": [["type": "text", "text": "\(sessions.count) owned session(s)."]],
+                    "structuredContent": ["sessions": sessions, "next_cursor": NSNull()]]
+        }
+        if name == "get_recording_state", recordingDirectory == nil {
+            return ["content": [["type": "text", "text": "Recording is disabled for this control session."]],
+                    "structuredContent": ["recording": false, "enabled": false, "video_active": false]]
+        }
+        if name == "get_recording_state", recordingLimitReached {
+            var limited = result
+            var state = result["structuredContent"] as? [String: Any] ?? [:]
+            state["last_error"] = "recording_limit_reached"
+            limited["structuredContent"] = state
+            return limited
+        }
         return try Self.boundedCuaImageResult(result)
+    }
+
+    private func requireBrowserConsent(name: String, arguments: DesktopControlJSONValue) throws {
+        guard case .object(let fields) = arguments else { throw CommandError.invalidArguments }
+        if name == "browser_prepare", fields["strategy"] != nil {
+            guard case .number(let pid)? = fields["pid"], case .number(let window)? = fields["window_id"],
+                  browserConsent(Int32(pid), UInt32(window)) else {
+                throw DesktopCuaFailure(code: "browser_consent_required", message: "Select this running browser in PersonaStack's native permissions setup before using its signed-in profiles.")
+            }
+        }
+        if name.hasPrefix("browser_") || name == "get_browser_state" || name == "page" {
+            guard existingBrowserTargets.allSatisfy({ browserConsent($0.key, $0.value) }) else {
+                throw DesktopCuaFailure(code: "browser_consent_revoked", message: "The approved browser instance changed. Complete targeted local browser setup before using its profiles again.")
+            }
+        }
+        if name == "page" {
+            guard case .string(let action)? = fields["action"],
+                  (["get_text", "query_dom"].contains(action) || DesktopCuaPageAdapter.typingActions.contains(action)), fields["cdp_port"] == nil else {
+                throw DesktopCuaFailure(code: "browser_route_unavailable", message: "The pinned CUA legacy page mutation route cannot preserve the approved browser binding. Use the typed browser tools for supported actions.")
+            }
+            guard case .number(let pid)? = fields["pid"], case .number(let window)? = fields["window_id"],
+                  pid > 0, pid <= Double(Int32.max), window > 0, window <= Double(UInt32.max),
+                  browserConsent(Int32(pid), UInt32(window)), existingBrowserTargets[Int32(pid)] == UInt32(window) else {
+                throw DesktopCuaFailure(code: "browser_consent_required", message: "Prepare the exact locally approved browser window before using the compatibility page tools.")
+            }
+        }
+    }
+
+    private func prepareCuaResourceArguments(name: String, arguments: DesktopControlJSONValue) throws -> DesktopControlJSONValue {
+        guard case .object(var fields) = arguments else { throw CommandError.invalidArguments }
+        if name == "start_recording" {
+            guard !recordingActive, case .string(let path)? = fields["output_dir"] else { throw CommandError.invalidArguments }
+            if fields["record_video"] == .bool(true) {
+                guard #available(macOS 15, *) else { throw CommandError.executorUnavailable }
+            }
+            let directory = try DesktopCuaRecordingDirectory(path: path)
+            recordingDirectory = directory
+            recordingLimitReached = false
+            fields["output_dir"] = .string(directory.path)
+        }
+        return .object(fields)
+    }
+
+    private func startRecordingMonitor(proxy: any CuaToolCalling, token: String) {
+        recordingActive = true
+        recordingMonitor?.cancel()
+        recordingMonitor = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(2)) } catch { return }
+                guard let self, self.validLease()?.token == token, self.recordingActive,
+                      let directory = self.recordingDirectory else { return }
+                if await directory.isWithinBudget() { continue }
+                guard !Task.isCancelled, self.validLease()?.token == token else { return }
+                self.recordingLimitReached = true
+                self.activeOperations += 1
+                defer { self.activeOperations -= 1 }
+                guard let session = self.lease?.cuaSession else { return }
+                do {
+                    let data = try await DesktopControlExecution.$deadline.withValue(Date().addingTimeInterval(5)) {
+                        try await proxy.callTool(name: "stop_recording", argumentsJSON: JSONSerialization.data(withJSONObject: ["session": session]), timeout: 5)
+                    }
+                    guard self.lease?.token == token else { return }
+                    guard let envelope = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let result = envelope["result"] as? [String: Any], !Self.isCuaToolError(result) else {
+                        self.unavailable = true
+                        return
+                    }
+                    self.recordingActive = false
+                } catch {
+                    if self.lease?.token == token { self.unavailable = true }
+                }
+                return
+            }
+        }
+    }
+
+    private func replayTrajectory(_ arguments: DesktopControlJSONValue, frame: DesktopControlFrame,
+                                  proxy: any CuaToolCalling, token: String) async throws -> Any {
+        guard case .object(let fields) = arguments, case .string(let path)? = fields["dir"] else { throw CommandError.invalidArguments }
+        let trajectory = try await files.loadCuaTrajectory(path: path)
+        let delay: Int
+        if case .number(let value)? = fields["delay_ms"] { delay = Int(value) } else { delay = 500 }
+        let summary = try await trajectory.run(delayMilliseconds: delay, stopOnError: fields["stop_on_error"] != .bool(false)) { [weak self] name, values in
+            guard let self else { throw CommandError.controlRequired }
+            return try await self.replayAction(name: name, arguments: values, frame: frame, proxy: proxy, token: token)
+        }
+        let data = try JSONEncoder().encode(summary)
+        return ["content": [["type": "text", "text": "Trajectory replay finished. Read the per-turn results before retrying."]],
+                "structuredContent": try JSONSerialization.jsonObject(with: data)]
+    }
+
+    private func replayAction(name: String, arguments: DesktopControlJSONValue, frame: DesktopControlFrame,
+                              proxy: any CuaToolCalling, token: String) async throws -> DesktopControlJSONValue {
+        try DesktopControlExecution.check()
+        guard !closed, !unavailable, !revocationInProgress, !cleanupInProgress,
+              validLease()?.token == token else { throw CommandError.controlRequired }
+        let nested = DesktopControlFrame(type: "command", requestID: frame.requestID, target: frame.target,
+            operation: "desktop_control_cua", arguments: .object(["control_token": .string(token), "tool": .string(name), "arguments": arguments]),
+            deadlineAt: frame.deadlineAt)
+        do {
+            let result = try await callCua(nested, proxy: proxy)
+            return try JSONDecoder().decode(DesktopControlJSONValue.self, from: JSONSerialization.data(withJSONObject: result))
+        } catch let failure as DesktopCuaFailure {
+            return .object(["isError": .bool(true), "content": .array([.object(["type": .string("text"), "text": .string(failure.message)])])])
+        }
     }
 
     static func cuaArguments(name: String, arguments: DesktopControlJSONValue,
                              controlToken: String) throws -> DesktopControlJSONValue {
-        guard name == "get_browser_state" || name.hasPrefix("browser_") else { return arguments }
-        guard !controlToken.isEmpty, case .object(var fields) = arguments else { throw CommandError.invalidArguments }
-        if name == "browser_prepare" {
-            guard fields.count == 1, fields["confirm"] == .bool(true) else { throw CommandError.invalidArguments }
-            return .object(["session": .string(controlToken), "allow_launch": .bool(true),
-                            "profile": .object(["mode": .string("isolated_new")])])
+        do { return try CuaRemoteToolArguments.prepare(name: name, arguments: arguments, session: controlToken) }
+        catch CuaRemoteToolArguments.PolicyError.nativeSetupRequired {
+            throw DesktopCuaFailure(code: "native_setup_required", message: "Install the perception component from PersonaStack’s native setup after reviewing its artifact and licenses. Remote confirmation cannot authorize installation.")
         }
-        if let session = fields["session"], session != .string(controlToken) { throw CommandError.invalidArguments }
-        fields["session"] = .string(controlToken)
-        return .object(fields)
+        catch { throw CommandError.invalidArguments }
     }
 
     static func isCuaToolError(_ result: [String: Any]) -> Bool {
@@ -975,6 +1199,7 @@ final class DesktopControlCommandExecutor {
 
     private static func allowedTools(for operation: String) -> Set<String> {
         switch operation {
+        case "desktop_control_cua": return CuaDriverCompatibility.exposedTools
         case "desktop_control_observe": return ["get_desktop_state", "get_accessibility_tree", "get_window_state", "get_cursor_position", "get_screen_size", "list_apps", "list_windows", "get_browser_state"]
         case "desktop_control_input": return ["move_cursor", "click", "double_click", "right_click", "drag", "scroll", "type_text", "press_key", "hotkey", "set_value", "zoom"]
         case "desktop_control_application": return ["launch_app", "bring_to_front", "kill_app", "list_apps"]

@@ -46,7 +46,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         _ = MainWebViewHost.shared
         DesktopUpdater.shared.start()
         guard UserDefaults.standard.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
-                || CommandLine.arguments.contains(DesktopApplicationRestart.foregroundArgument) else { return }
+                || DesktopApplicationRestart.resumesPermissionSetup else { return }
         UserDefaults.standard.removeObject(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
         _ = UserDefaults.standard.synchronize()
         shouldRestoreMainWindowAfterUpdate = true

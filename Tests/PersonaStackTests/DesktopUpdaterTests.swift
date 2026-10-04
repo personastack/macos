@@ -530,3 +530,24 @@ private func isolatedUpdatePreferences() -> UserDefaults {
     #expect(installs == 1)
     #expect(preferences.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey))
 }
+
+@Test(arguments: ["failure", "skip", "benign"]) @MainActor func permissionRestartUpdaterTerminalOutcomeClearsOnlyPendingResume(_ outcome: String) throws {
+    let suite = "DesktopUpdaterTests-resume-\(UUID().uuidString)"
+    let preferences = try #require(UserDefaults(suiteName: suite))
+    defer { preferences.removePersistentDomain(forName: suite) }
+    let owner = DesktopApplicationRestart(defaults: preferences)
+    var cancellations = 0
+    let updater = DesktopUpdater(updaterFactory: { _, _ in FakeDesktopUpdateClient(preferences: preferences) },
+        preferences: preferences, presentReadyReminder: { _ in }, clearAvailableNotification: { _ in },
+        clearUpdateNotifications: { _ in }, cancelPermissionRestart: { cancellations += 1; owner.cancelPendingRestart() })
+    #expect(updater.retainAutomaticInstallHandler(version: "0.6.0", handler: {}))
+    try owner.request(applicationURL: URL(fileURLWithPath: "/Applications/PersonaStack.app"),
+        installUpdate: { try updater.restartForPermissionRepairIfNeeded() }, start: { _ in Issue.record("Sparkle owns relaunch") })
+    switch outcome {
+    case "failure": updater.handleUpdateFailure(domain: "NetworkError", code: -1009)
+    case "skip": updater.handleSkippedUpdate(version: "0.6.0")
+    default: updater.handleUpdateFailure(domain: "SUSparkleErrorDomain", code: 1001)
+    }
+    #expect(cancellations == (outcome == "benign" ? 0 : 1))
+    #expect(owner.consumeResumeHint() == (outcome == "benign"))
+}

@@ -8,7 +8,21 @@ extension DesktopPermissionSystemAccess {
     /// changing the test runner's or installed application's real TCC grants.
     @MainActor static func permissionFixture() -> Self {
         var access = Self()
-        access.resetPermission = { _ in .notApplicable }
+        access.resetPermission = { _ in Issue.record("Unexpected TCC reset"); return .failed }
+        access.accessibility = { false }
+        access.screenRecording = { false }
+        access.microphone = { .notDetermined }
+        access.requestAccessibility = { Issue.record("Unexpected Accessibility prompt") }
+        access.requestScreenRecording = { Issue.record("Unexpected Screen Recording prompt"); return false }
+        access.requestMicrophone = { Issue.record("Unexpected microphone prompt"); return false }
+        access.loginStatus = { .enabled }
+        access.registerLogin = { Issue.record("Unexpected login registration") }
+        access.legacyLoginStatus = { .notRegistered }
+        access.unregisterLegacyLogin = { Issue.record("Unexpected legacy registration change") }
+        access.unregisterCrashRecoveryAgent = { Issue.record("Unexpected agent registration change") }
+        access.registerLegacyLogin = { Issue.record("Unexpected legacy registration") }
+        access.openLoginSettings = { }
+        access.notificationSettings = { (.denied, .disabled, .disabled) }
         access.openPrivacySettings = { _ in }
         access.revealApplication = { }
         access.requestNotifications = { }
@@ -18,7 +32,12 @@ extension DesktopPermissionSystemAccess {
         access.loginSignatureIsValid = { true }
         access.automation = { _ in -1744 }
         access.safariProcessIdentifier = { nil }
+        access.safariProcessIdentity = { nil }
         access.verifySafariJavaScript = { Issue.record("Unexpected Safari script"); return false }
+        access.selectedBrowserObservation = { .init(.notNeeded, detail: "No selected browsers") }
+        access.selectedBrowserSetup = { .init(.notNeeded, detail: "No selected browsers") }
+        access.selectedBrowserCheck = { .init(.notNeeded, detail: "No selected browsers") }
+        access.openSelectedBrowser = { false }
         access.openSafari = { Issue.record("Unexpected Safari launch") }
         access.requestDirectCapture = { Issue.record("Unexpected capture"); return false }
         access.clipboardAccess = { .ask }
@@ -49,41 +68,14 @@ struct DesktopPermissionResetTests {
         #expect(await DesktopPermissionReset.reset(.accessibility) == .failed)
     }
 
-    @Test(arguments: [DesktopPermissionID.accessibility, .screenRecording, .microphone])
-    func explicitSetupClearsOnlyItsPermissionThenRequiresFreshProcess(permission: DesktopPermissionID) async {
-        var calls: [String] = []
+    @Test(arguments: [DesktopPermissionID.accessibility, .screenRecording])
+    func explicitSetupPreservesExistingGrantWithoutReset(permission: DesktopPermissionID) async {
         var access = DesktopPermissionSystemAccess.permissionFixture()
-        access.resetPermission = { id in
-            #expect(id == permission)
-            calls.append("reset")
-            return .cleared
-        }
-        access.requestAccessibility = { calls.append("request") }
-        access.requestScreenRecording = { calls.append("request"); return true }
-        access.requestMicrophone = { calls.append("request"); return true }
-        access.accessibility = { Issue.record("A reset grant must not be read from the old process"); return true }
-        access.screenRecording = { Issue.record("A reset grant must not be read from the old process"); return true }
-        access.microphone = { Issue.record("A reset grant must not be read from the old process"); return .authorized }
-        let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(
-            observe: { _ in Issue.record("Reset access must not reuse operation proof"); return nil },
-            setup: { _ in Issue.record("Reset access must not start an operation"); return nil },
-            verifyAutomatically: { _ in Issue.record("Reset access must not verify cached grants"); return nil }
-        ), access: access, openSettings: { calls.append($0) })
-        let result = await adapter.setup(permission)
-        #expect(result.state == .restartRequired && !result.verified)
-        #expect(result.detail.contains("Cleared PersonaStack's previous"))
-        #expect(calls.first == "reset")
-        #expect(calls.filter { $0 == "request" }.count == (permission == .fullDiskAccess ? 0 : 1))
-        #expect(calls.last?.contains("Privacy_") == true)
-        let count = calls.count
-        #expect(await adapter.observe(permission).state == .restartRequired)
-        #expect(await adapter.check(permission).state == .restartRequired)
-        #expect(await adapter.setupAutomatically(permission).state == .restartRequired)
-        #expect(await adapter.setup(permission).state == .restartRequired)
-        #expect(calls.count == count + (permission == .fullDiskAccess ? 1 : 0))
-        if permission == .screenRecording {
-            #expect(await adapter.observe(.directCapture).state == .restartRequired)
-        }
+        access.accessibility = { true }
+        access.screenRecording = { true }
+        let adapter = DesktopPermissionChecklistSystemAdapter(access: access)
+        #expect(await adapter.setup(permission).state == .ready)
+        #expect(await adapter.observe(permission).state == .ready)
     }
 
     @Test func passiveReadsAndPresentationNeverResetPermissions() async {
@@ -100,36 +92,6 @@ struct DesktopPermissionResetTests {
             _ = await adapter.observe(permission)
             _ = await adapter.setupAutomatically(permission)
         }
-    }
-
-    @Test func failedResetNeverRequestsAccessOrRunsItsOperation() async {
-        var access = DesktopPermissionSystemAccess.permissionFixture()
-        access.resetPermission = { _ in .failed }
-        access.requestAccessibility = { Issue.record("Failed reset must not request access") }
-        var settings = 0
-        let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(setup: { _ in
-            Issue.record("Failed reset must not run an operation"); return nil
-        }), access: access, openSettings: { _ in settings += 1 })
-        let result = await adapter.setup(.accessibility)
-        #expect(result.state == .failed && !result.detail.contains("Cleared"))
-        #expect(settings == 1)
-        #expect(await adapter.observe(.accessibility).state == .failed)
-    }
-
-    @Test func canceledSuccessfulResetStillInvalidatesCachedGrant() async {
-        var pending: CheckedContinuation<DesktopPermissionResetResult, Never>?
-        var access = DesktopPermissionSystemAccess.permissionFixture()
-        access.resetPermission = { _ in await withCheckedContinuation { pending = $0 } }
-        access.requestAccessibility = { Issue.record("Canceled reset must not request access") }
-        access.accessibility = { Issue.record("Canceled successful reset cannot reuse cached trust"); return true }
-        let adapter = DesktopPermissionChecklistSystemAdapter(access: access,
-            openSettings: { _ in Issue.record("Canceled reset must not open Settings") })
-        let task = Task { await adapter.setup(.accessibility) }
-        while pending == nil { await Task.yield() }
-        task.cancel()
-        pending?.resume(returning: .cleared)
-        #expect(await task.value.state == .checking)
-        #expect(await adapter.observe(.accessibility).state == .restartRequired)
     }
 
     @Test func localNetworkDoesNotInvokeTCCReset() async {
@@ -175,7 +137,7 @@ struct DesktopPermissionResetTests {
     ])
     func localNetworkFailureNamesTheEndpointAndCause(code: URLError.Code, reason: String) async throws {
         let service = DesktopPermissionChecklist(access: .permissionFixture(), selectedProfile: { .lan },
-            activationNotificationCenter: NotificationCenter(), requestEndpoint: { _ in throw URLError(code) })
+            activationNotificationCenter: NotificationCenter(), requestLocalNetwork: { .init(.ready, detail: "Fixture discovery", verified: true) }, requestEndpoint: { _ in throw URLError(code) })
         let result = try #require(await service.adapter.hooks.setup(.localNetwork))
         #expect(result.state == .failed && !result.verified)
         #expect(result.detail.contains(DesktopEnvironmentConfiguration.lan.appURL.host!))

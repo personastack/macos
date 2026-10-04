@@ -35,8 +35,12 @@ extension CuaMCPProxyError: LocalizedError {
     }
 }
 
+public protocol CuaToolCalling: Sendable {
+    func callTool(name: String, argumentsJSON: Data, timeout: Int32) async throws -> Data
+}
+
 /// Owns one Cua stdio MCP proxy process. Only reviewed Cua tool names can be called.
-public actor CuaMCPProxy {
+public actor CuaMCPProxy: CuaToolCalling {
     // A full-resolution 5K screenshot can exceed the relay's 8 MiB frame
     // limit before the desktop app has a chance to compress it.
     private static let maximumLocalResponseBytes = 32 * 1024 * 1024
@@ -97,7 +101,8 @@ public actor CuaMCPProxy {
             throw CuaMCPProxyError.invalidToolCatalog
         }
         let names = Set(tools.compactMap { $0["name"] as? String })
-        guard CuaDriverCompatibility.requiredTools.isSubset(of: names) else {
+        guard !CuaDriverCompatibility.requiredTools.isEmpty,
+              CuaDriverCompatibility.requiredTools.isSubset(of: names) else {
             throw CuaMCPProxyError.invalidToolCatalog
         }
         return names.intersection(CuaDriverCompatibility.exposedTools)
@@ -384,13 +389,17 @@ public final class CuaEmbeddedService {
     public let executableURL: URL
     public let socketURL: URL
     public let directoryURL: URL
+    public let allowsExistingBrowserProfiles: Bool
+    public let perceptionCatalogURL: URL?
     private let process = Process()
     private let lifetime = Pipe()
     private var launched = false
     private var ownsDirectory = false
 
-    public init(executableURL: URL) {
+    public init(executableURL: URL, allowsExistingBrowserProfiles: Bool = false, perceptionCatalogURL: URL? = nil) {
         self.executableURL = executableURL
+        self.allowsExistingBrowserProfiles = allowsExistingBrowserProfiles
+        self.perceptionCatalogURL = perceptionCatalogURL
         directoryURL = URL(fileURLWithPath: "/tmp/ps-cua-\(UUID().uuidString)", isDirectory: true)
         socketURL = directoryURL.appendingPathComponent("control.sock")
     }
@@ -402,8 +411,9 @@ public final class CuaEmbeddedService {
             && CuaSocketIdentity.peerPID(at: socketURL) == process.processIdentifier
     }
 
-    public static func arguments(socketURL: URL, pidFileURL: URL) -> [String] {
+    public static func arguments(socketURL: URL, pidFileURL: URL, allowsExistingBrowserProfiles: Bool = false) -> [String] {
         ["serve", "--embedded", "--parent-liveness-stdio", "--socket", socketURL.path, "--pid-file", pidFileURL.path]
+            + (allowsExistingBrowserProfiles ? ["--grant", "existing-profile"] : [])
     }
 
     public func start(isCurrent: @MainActor () throws -> Void) async throws {
@@ -413,8 +423,12 @@ public final class CuaEmbeddedService {
                                                 attributes: [.posixPermissions: 0o700])
         ownsDirectory = true
         process.executableURL = executableURL
-        process.arguments = Self.arguments(socketURL: socketURL, pidFileURL: directoryURL.appendingPathComponent("daemon.pid"))
+        process.arguments = Self.arguments(socketURL: socketURL, pidFileURL: directoryURL.appendingPathComponent("daemon.pid"),
+                                           allowsExistingBrowserProfiles: allowsExistingBrowserProfiles)
         process.environment = CuaDriverCompatibility.processEnvironment(from: ProcessInfo.processInfo.environment)
+        if let perceptionCatalogURL {
+            process.environment?["CUA_DRIVER_PERCEPTION_CATALOG"] = perceptionCatalogURL.path
+        }
         process.standardInput = lifetime
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice

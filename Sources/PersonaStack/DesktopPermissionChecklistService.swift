@@ -15,7 +15,7 @@ enum DesktopPermissionAutomaticCheckError: Error {
         case .sessionUnavailable:
             .init(.verificationRequired, detail: "Desktop Control is unavailable while this Mac is asleep or another login session is active.")
         case .runtimeStartRequired:
-            .init(.verificationRequired, detail: "Choose Setup Screen Capture to start PersonaStack's desktop runtime. Screen approval is already present; capture still needs the running runtime.")
+            .init(.verificationRequired, detail: "PersonaStack's owned desktop runtime is unavailable. Finish any active task, then choose Retry to verify screen sharing.")
         }
     }
 }
@@ -35,8 +35,13 @@ final class DesktopPermissionChecklist {
     private let verifyVolume: (@MainActor (DesktopVolumePermissionMount) async throws -> Void)?
     private let protectedAccessAction: (@MainActor () async -> DesktopProtectedAccessSetupAction)?
     private let verifyProtectedAccess: @MainActor () async throws -> Void
+    private let verifyDesktopCapabilities: @MainActor () async throws -> Void
+    private let observeVisualPerception: @MainActor () -> DesktopPermissionObservation
+    private let prepareVisualPerception: @MainActor () async throws -> CuaDriverInstallation
+    private let verifyVisualPerception: @MainActor () async throws -> Void
     private let verifyPowerAvailability: () -> Bool
     private let voiceContext: @MainActor () -> DesktopVoicePermissionContext?
+    private let requestLocalNetwork: @MainActor () async -> DesktopPermissionObservation
     private let requestEndpoint: @MainActor (URLRequest) async throws -> HTTPURLResponse
     private var authorizedRefreshKeys: [DesktopPermissionID: String] = [:]
     private var refreshNeeded: Set<DesktopPermissionID> = []
@@ -76,6 +81,7 @@ final class DesktopPermissionChecklist {
 
     /// Closing a presentation cancels operations, not completed capability proof.
     func cancelVerification() {
+        window.cancelPerception()
         verificationGeneration = UUID()
         for id in [DesktopPermissionID.desktopFiles, .documentsFiles, .downloadsFiles] {
             resourceVerificationGenerations[id] = UUID()
@@ -95,6 +101,7 @@ final class DesktopPermissionChecklist {
     }
 
     init(access: DesktopPermissionSystemAccess = .init(),
+         evidence: DesktopPermissionEvidence? = .shared,
          directoryURL: @escaping (FileManager.SearchPathDirectory) -> URL? = {
              FileManager.default.urls(for: $0, in: .userDomainMask).first
          }, verifyDirectory: (@MainActor (URL) async throws -> Void)? = nil,
@@ -106,11 +113,17 @@ final class DesktopPermissionChecklist {
          mountNotificationCenter: NotificationCenter = NSWorkspace.shared.notificationCenter,
          protectedAccessAction: (@MainActor () async -> DesktopProtectedAccessSetupAction)? = nil,
          verifyProtectedAccess: (@MainActor () async throws -> Void)? = nil,
+         verifyDesktopCapabilities: @escaping @MainActor () async throws -> Void = DesktopPermissionChecklist.verifyOwnedDesktopCapabilities,
+         observeVisualPerception: @escaping @MainActor () -> DesktopPermissionObservation = { DesktopControlRuntime.shared.perceptionObservation() },
+         prepareVisualPerception: @escaping @MainActor () async throws -> CuaDriverInstallation = { try await DesktopControlRuntime.shared.preparePerceptionForPermissions() },
+         verifyVisualPerception: @escaping @MainActor () async throws -> Void = { try await DesktopControlRuntime.shared.verifyPerceptionForPermissions() },
          verifyPowerAvailability: @escaping () -> Bool = { DesktopControlPowerAssertion.verifyAvailability() },
          activationNotificationCenter: NotificationCenter = .default,
          voiceContext: @escaping @MainActor () -> DesktopVoicePermissionContext? = DesktopVoicePermissionContext.current,
+         requestLocalNetwork: @escaping @MainActor () async -> DesktopPermissionObservation = { await DesktopLocalNetworkPermission.request() },
          requestEndpoint: (@MainActor (URLRequest) async throws -> HTTPURLResponse)? = nil,
          windowFactory: (@MainActor (DesktopPermissionChecklistCoordinator) -> DesktopPermissionChecklistWindow)? = nil) {
+        self.requestLocalNetwork = requestLocalNetwork
         self.voiceContext = voiceContext
         self.requestEndpoint = requestEndpoint ?? { request in
             let session = Self.makeConnectionSession()
@@ -129,15 +142,21 @@ final class DesktopPermissionChecklist {
         self.chooseVolume = chooseVolume
         self.verifyVolume = verifyVolume
         self.protectedAccessAction = protectedAccessAction
+        self.verifyDesktopCapabilities = verifyDesktopCapabilities
+        self.observeVisualPerception = observeVisualPerception
+        self.prepareVisualPerception = prepareVisualPerception
+        self.verifyVisualPerception = verifyVisualPerception
         self.verifyPowerAvailability = verifyPowerAvailability
         self.verifyProtectedAccess = verifyProtectedAccess ?? {
             let files = DesktopFileSystem()
             try await files.verifyProtectedDirectoryAccess(home: FileManager.default.homeDirectoryForCurrentUser)
         }
-        let adapter = DesktopPermissionChecklistSystemAdapter(access: access)
+        let adapter = DesktopPermissionChecklistSystemAdapter(access: access, evidence: evidence)
         self.adapter = adapter
         let coordinator = DesktopPermissionChecklistCoordinator(adapter: adapter)
+        coordinator.onVerified = { evidence?.record($0) }
         window = windowFactory?(coordinator) ?? DesktopPermissionChecklistWindow(coordinator: coordinator)
+        window.onInstallPerception = { [weak self] in await self?.installPerception() }
         window.onPresent = { [weak self] in self?.preparePresentation() }
         window.onCancel = { [weak self] in self?.cancelVerification() }
         window.onStopVerification = { [weak self] in self?.cancelVerification() }
@@ -152,7 +171,7 @@ final class DesktopPermissionChecklist {
             MainActor.assumeIsolated {
                 self?.invalidateAfterActivation()
             }
-            Task { @MainActor in await self?.window.coordinator.refresh() }
+            Task { @MainActor in await self?.window.coordinator.resumeAfterActivation() }
         }
         for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification, NSWorkspace.didRenameVolumeNotification] {
             mountObservers.append(mountNotificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
@@ -210,6 +229,7 @@ final class DesktopPermissionChecklist {
         synchronizeOwner()
         switch id {
         case .accessibility: return adapter.accessibilityObservation()
+        case .visualPerception: return perceptionObservation()
         case .microphone: return observeMicrophone()
         case .automaticUpdates: return observeUpdates()
         case .lockedScreenControl: return observeLockedControl()
@@ -219,10 +239,9 @@ final class DesktopPermissionChecklist {
             guard profile != nil else { return .init(.notGranted, detail: "Choose trusted App, Gateway, and MCP URLs in Server Settings.") }
             return await observeConnection(id, detail: "Use Setup Messaging Connection to check the selected app endpoint. Enrollment is verified after Finish.")
         case .localNetwork:
-            guard let profile else { return .init(.notGranted, detail: "Configure the selected server environment first.") }
+            guard profile != nil else { return .init(.notGranted, detail: "Configure the selected server environment first.") }
             if #available(macOS 15, *) {
-                if profile == .production { return .init(.notNeeded, detail: "The selected PersonaStack cloud services do not require LAN access.") }
-                return await observeConnection(id, detail: "Use Setup Local Network to connect to the configured services. macOS requests LAN approval when needed.")
+                return await observeConnection(id, detail: "Setup requests Local Network access before unattended work, including cloud-connected Macs.")
             }
             return .init(.notNeeded, detail: "This macOS version has no Local Network privacy approval.")
         case .desktopFiles, .documentsFiles, .downloadsFiles:
@@ -231,9 +250,15 @@ final class DesktopPermissionChecklist {
         case .fullDiskAccess:
             return await observeProtectedAccess()
         case .awakeDuringRemoteWork:
-            return evidence(id, detail: "Use Setup Awake During Remote Work to verify idle sleep prevention. PersonaStack holds it only during a remote task.")
+            return evidence(id, detail: "Setup verifies idle sleep prevention. PersonaStack holds it only during a remote task.")
         default: return nil
         }
+    }
+
+    func readinessObservations() async -> [DesktopPermissionID: DesktopPermissionObservation] {
+        var result: [DesktopPermissionID: DesktopPermissionObservation] = [:]
+        for id in DesktopPermissionReadiness.requiredPermissions { result[id] = await adapter.observe(id) }
+        return result
     }
 
     private func evidence(_ id: DesktopPermissionID, detail: String) -> DesktopPermissionObservation {
@@ -256,7 +281,7 @@ final class DesktopPermissionChecklist {
             return .init(.unsupported, detail: verifier.snapshot.detail)
         }
         guard verifier.permitsLockedControl else {
-            return .init(.notGranted, detail: "Finish Setup to allow full Desktop Control after locking.")
+            return .init(.notGranted, detail: "Choose Continue to allow full Desktop Control after locking.")
         }
         return .init(.ready, detail: "The local control component and authorization policy are installed. Full control after locking is allowed.")
     }
@@ -303,6 +328,8 @@ final class DesktopPermissionChecklist {
         synchronizeOwner()
         switch id {
         case .accessibility: return adapter.accessibilityObservation()
+        case .visualPerception: return await preparePerception()
+        case .directCapture: return await verifyOwnedDesktop()
         case .microphone: return await setupMicrophone()
         case .automaticUpdates:
             DesktopUpdater.shared.start()
@@ -327,6 +354,94 @@ final class DesktopPermissionChecklist {
             _ = await DesktopLockedControlSetupVerifier.shared.refresh()
             return observeLockedControl()
         default: return nil
+        }
+    }
+
+    private func perceptionObservation() -> DesktopPermissionObservation {
+        let current = observeVisualPerception()
+        if current.state == .verificationRequired, let key = current.verificationKey,
+           let proof = explicitObservations[.visualPerception], proof.verificationKey == key {
+            return proof
+        }
+        explicitObservations.removeValue(forKey: .visualPerception)
+        return current
+    }
+
+    private func preparePerception() async -> DesktopPermissionObservation {
+        let generation = verificationGeneration
+        do {
+            let driver = try await prepareVisualPerception()
+            try Task.checkCancellation()
+            guard generation == verificationGeneration else { throw CancellationError() }
+            await window.perception.refresh(driver: driver)
+            try Task.checkCancellation()
+            guard generation == verificationGeneration else { throw CancellationError() }
+            if window.perception.status?.ready == true { return await qualifyPerception(generation: generation) }
+            await window.perception.prepare(driver: driver)
+            try Task.checkCancellation()
+            guard generation == verificationGeneration else { throw CancellationError() }
+            return .init(.verificationRequired, detail: window.perception.failure ?? "Review the visual perception component below, then choose Install.")
+        } catch is CancellationError { return .init(.checking, detail: "Visual perception setup cancelled.") }
+        catch { return .init(.failed, detail: "Visual perception could not be prepared. Choose Retry after the desktop runtime recovers.") }
+    }
+
+    private func installPerception() async {
+        guard window.coordinator.hasStarted, window.coordinator.currentPermission == .visualPerception else { return }
+        let generation = verificationGeneration
+        let installed = await window.perception.confirmInstall()
+        guard !Task.isCancelled, generation == verificationGeneration else { return }
+        guard installed else { return }
+        _ = await qualifyPerception(generation: generation)
+    }
+
+    private func qualifyPerception(generation: UUID) async -> DesktopPermissionObservation {
+        do {
+            try await verifyVisualPerception()
+            try Task.checkCancellation()
+            guard generation == verificationGeneration else { throw CancellationError() }
+            let current = observeVisualPerception()
+            guard let key = current.verificationKey else { throw CuaPerceptionError.invalidArtifact }
+            let result = DesktopPermissionObservation(.ready, detail: "Visual perception is installed and parsed PersonaStack's disposable test image. No image was saved or sent.", verificationKey: key, requiresVerification: true, verified: true)
+            explicitObservations[.visualPerception] = result
+            return result
+        } catch is CancellationError { return .init(.checking, detail: "Visual perception setup cancelled.") }
+        catch {
+            let current = observeVisualPerception()
+            let result = DesktopPermissionObservation(.failed, detail: "Visual perception could not parse the test image. Choose Retry to check the component.", verificationKey: current.verificationKey)
+            explicitObservations[.visualPerception] = result
+            return result
+        }
+    }
+
+    /// The direct-capture stage owns the actual embedded-driver pixel and
+    /// input proof. Host preflight alone cannot qualify unattended control.
+    private func verifyOwnedDesktop() async -> DesktopPermissionObservation {
+        let generation = verificationGeneration
+        do {
+            try await verifyDesktopCapabilities()
+            try Task.checkCancellation()
+            guard generation == verificationGeneration else { throw CancellationError() }
+            return .init(.ready, detail: "PersonaStack verified its owned desktop driver, screen capture, and input in its own test window. Test images and text were discarded.", verified: true)
+        } catch is CancellationError { return .init(.checking, detail: "Desktop verification was cancelled.") }
+        catch let error as DesktopPermissionAutomaticCheckError { return error.observation }
+        catch let error as DesktopInputPermissionVerificationError {
+            return .init(.failed, detail: error.localizedDescription)
+        } catch {
+            return .init(.failed, detail: "PersonaStack could not verify its owned desktop driver, screen capture, and input. Review Accessibility and Screen Recording, then choose Retry. An active remote task must finish before setup can test input.")
+        }
+    }
+
+    static func verifyOwnedDesktopCapabilities() async throws {
+        let runtime = DesktopControlRuntime.shared
+        try await runtime.prepareCuaPermissionsAutomatically()
+        try Task.checkCancellation()
+        try await runtime.verifyCuaCapabilitiesAutomatically()
+        try Task.checkCancellation()
+        let target = DesktopInputPermissionWindow()
+        try await withTaskCancellationHandler {
+            try await runtime.verifyCuaInputForPermissions(target: target)
+        } onCancel: {
+            Task { @MainActor in target.invalidate() }
         }
     }
 
@@ -404,7 +519,7 @@ final class DesktopPermissionChecklist {
         let action: DesktopProtectedAccessSetupAction
         if automatic { action = .check }
         else if let protectedAccessAction { action = await protectedAccessAction() }
-        else { action = await window.protectedAccessSetupAction() }
+        else { action = .check }
         guard protectedAccessIsCurrent(attempt, key: key) else { return protectedAccessChanged() }
         switch action {
         case .cancel:
@@ -416,7 +531,9 @@ final class DesktopPermissionChecklist {
         case .check: break
         }
         refreshNeeded.remove(.fullDiskAccess)
-        return await checkProtectedAccess(attempt: attempt, key: key)
+        let value = await checkProtectedAccess(attempt: attempt, key: key)
+        if !automatic && !Task.isCancelled && value.state != .ready { adapter.openSettings(.fullDiskAccess) }
+        return value
     }
 
     private func observeProtectedAccess() async -> DesktopPermissionObservation {
@@ -426,14 +543,6 @@ final class DesktopPermissionChecklist {
         }
         if explicitObservations[.fullDiskAccess]?.verificationKey != key {
             explicitObservations.removeValue(forKey: .fullDiskAccess)
-        }
-        if refreshNeeded.contains(.fullDiskAccess),
-           protectedAccessAttempt == nil {
-            refreshNeeded.remove(.fullDiskAccess)
-            let attempt = UUID()
-            protectedAccessAttempt = attempt
-            defer { if protectedAccessAttempt == attempt { protectedAccessAttempt = nil } }
-            return await checkProtectedAccess(attempt: attempt, key: key)
         }
         return explicitObservations[.fullDiskAccess] ?? DesktopPermissionChecklistSystemAdapter.unconfiguredObservation(.fullDiskAccess)
     }
@@ -446,12 +555,12 @@ final class DesktopPermissionChecklist {
         } catch {
             let failure = error as NSError
             if failure.domain == NSPOSIXErrorDomain && [Int(EPERM), Int(EACCES)].contains(failure.code) {
-                return protectedAccessResult(.denied, detail: "Protected-folder access was blocked. Enable PersonaStack in Full Disk Access settings. If it is already enabled, quit and reopen PersonaStack, then choose Check Access again. Folder permissions or Mac policy can also block access.", attempt: attempt, key: key)
+                return protectedAccessResult(.denied, detail: "Protected-folder access was blocked. Enable PersonaStack in Full Disk Access settings. If it is already enabled, quit and reopen PersonaStack, then return to setup. Folder permissions or Mac policy can also block access.", attempt: attempt, key: key)
             }
             if failure.domain == NSPOSIXErrorDomain && failure.code == Int(ENOENT) {
                 return protectedAccessResult(.verificationRequired, detail: "No protected Mail or Messages folder is available to check. Full Disk Access could not be verified on this Mac. Review PersonaStack in Full Disk Access settings. This optional check does not block setup.", attempt: attempt, key: key)
             }
-            return protectedAccessResult(.failed, detail: "PersonaStack could not verify protected-folder access. Check that your Library folder and its Mail or Messages folder are available and are not redirected, then retry Check Access. Full Disk Access remains unverified.", attempt: attempt, key: key)
+            return protectedAccessResult(.failed, detail: "PersonaStack could not verify protected-folder access. Check that your Library folder and its Mail or Messages folder are available and are not redirected, then choose Retry. Full Disk Access remains unverified.", attempt: attempt, key: key)
         }
     }
 
@@ -460,7 +569,7 @@ final class DesktopPermissionChecklist {
     }
 
     private func protectedAccessChanged() -> DesktopPermissionObservation {
-        .init(.checking, detail: "Setup changed or was cancelled. Retry Setup Full Disk Access.")
+        .init(.checking, detail: "Setup changed or was cancelled. Choose Retry for Full Disk Access.")
     }
 
     private func protectedAccessResult(_ state: DesktopPermissionState, detail: String,
@@ -488,9 +597,6 @@ final class DesktopPermissionChecklist {
         let key = evidenceKey(id)
         if authorizedRefreshKeys[id] != key { authorizedRefreshKeys.removeValue(forKey: id) }
         if explicitObservations[id]?.verificationKey != key { explicitObservations.removeValue(forKey: id) }
-        if refreshNeeded.contains(id), connectionAttempts[id] == nil {
-            return await setupConnection(id)
-        }
         return evidence(id, detail: detail)
     }
 
@@ -518,7 +624,6 @@ final class DesktopPermissionChecklist {
         }
         guard !Task.isCancelled, let profile else { return .init(.notGranted, detail: "Configure the selected server environment first.") }
         if id == .localNetwork {
-            if profile == .production { return .init(.notNeeded, detail: "The selected PersonaStack cloud services do not require LAN access.") }
             if #unavailable(macOS 15) { return .init(.notNeeded, detail: "This macOS version has no Local Network privacy approval.") }
         }
         let key = evidenceKey(id)
@@ -528,6 +633,17 @@ final class DesktopPermissionChecklist {
         refreshNeeded.remove(id)
         explicitObservations.removeValue(forKey: id)
         defer { if connectionAttempts[id] == attempt { connectionAttempts.removeValue(forKey: id) } }
+        if id == .localNetwork {
+            let privacy = await requestLocalNetwork()
+            guard !Task.isCancelled, generation == verificationGeneration, key == evidenceKey(id), connectionAttempts[id] == attempt else {
+                return .init(.checking, detail: "Setup changed or was cancelled.")
+            }
+            guard privacy.state.satisfiesSetup else {
+                let value = DesktopPermissionObservation(privacy.state, detail: privacy.detail, verificationKey: key)
+                explicitObservations[id] = value
+                return value
+            }
+        }
         let endpoints = id == .localNetwork ? [profile.appURL, profile.gatewayURL, profile.mcpURL] : [profile.appURL]
         var failure: (error: Error, endpoint: URL)?
         let value: DesktopPermissionObservation

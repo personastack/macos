@@ -29,9 +29,11 @@
   <key>NSMicrophoneUsageDescription</key>
   <string>Record audio attachments when you choose the microphone in persona chat.</string>
   <key>NSAppleEventsUsageDescription</key>
-  <string>Control Safari when an authorized persona uses Desktop Control to select a web form value.</string>
+  <string>Allow authorized personas to control Safari and locally approved browsers for desktop and web tasks.</string>
+  <key>NSBonjourServices</key>
+  <array><string>_ps-setup._tcp</string></array>
   <key>NSLocalNetworkUsageDescription</key>
-  <string>Connect PersonaStack Desktop to your selected PersonaStack services on your local network.</string>
+  <string>Verify local-network access during setup so authorized personas can use local resources without an unattended permission prompt.</string>
   <key>NSDesktopFolderUsageDescription</key>
   <string>Access Desktop files when you authorize PersonaStack Desktop Control.</string>
   <key>NSDocumentsFolderUsageDescription</key>

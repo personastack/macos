@@ -49,7 +49,7 @@ private final class PresentationFixture {
                 if self.denyDisk { throw NSError(domain: NSPOSIXErrorDomain, code: Int(EPERM)) }
             }, activationNotificationCenter: NotificationCenter(), voiceContext: {
                 .init(identity: self.document, url: DesktopEnvironmentConfiguration.lan.appURL, page: self.voice)
-            }, requestEndpoint: { request in
+            }, requestLocalNetwork: { .init(.ready, detail: "Fixture discovery", verified: true) }, requestEndpoint: { request in
                 #expect(request.httpMethod == "HEAD" && request.httpBody == nil)
                 #expect(request.cachePolicy == .reloadIgnoringLocalCacheData)
                 #expect(request.value(forHTTPHeaderField: "Authorization") == nil)
@@ -82,89 +82,50 @@ private final class PresentationFixture {
     func row(_ id: DesktopPermissionID) -> DesktopPermissionRow? { service.window.coordinator.rows.first { $0.id == id } }
 }
 
-@Test @MainActor func permissionPresentationColdServiceChecksEveryVisibleRowWithoutSetupClicks() async {
+@Test @MainActor func permissionPresentationNeverRunsCaptureDiskNetworkOrAudioChecks() async {
     let fixture = PresentationFixture()
     fixture.open()
     defer { fixture.close() }
     await fixture.settle()
-    #expect(fixture.service.window.coordinator.permissionRows.filter { ![.directCapture, .automation, .safariJavaScript, .clipboard].contains($0.id) }.allSatisfy { $0.isComplete })
-    #expect(fixture.diskChecks == 1 && fixture.voice.recordings == 1 && fixture.grantRequests.isEmpty)
-    #expect(fixture.requests == [DesktopEnvironmentConfiguration.lan.appURL, DesktopEnvironmentConfiguration.lan.gatewayURL, DesktopEnvironmentConfiguration.lan.mcpURL])
+    #expect(fixture.row(.accessibility)?.isComplete == true)
+    #expect(fixture.row(.screenRecording)?.isComplete == true)
+    #expect(fixture.row(.fullDiskAccess)?.state == .verificationRequired)
+    #expect(fixture.row(.localNetwork)?.state == .verificationRequired)
+    #expect(fixture.diskChecks == 0 && fixture.voice.recordings == 0 && fixture.grantRequests.isEmpty)
+    #expect(fixture.requests.isEmpty)
     for _ in 0..<3 { await fixture.service.window.coordinator.refresh() }
     fixture.service.window.coordinator.startPresentationVerification()
-    #expect(fixture.diskChecks == 1 && fixture.voice.recordings == 1 && fixture.requests.count == 3)
+    #expect(fixture.diskChecks == 0 && fixture.voice.recordings == 0 && fixture.requests.isEmpty)
     fixture.close()
     fixture.document = "document-b"
     fixture.open()
     await fixture.settle()
-    #expect(fixture.service.window.coordinator.permissionRows.filter { ![.directCapture, .automation, .safariJavaScript, .clipboard].contains($0.id) }.allSatisfy { $0.isComplete })
-    #expect(fixture.voice.recordings == 2 && fixture.diskChecks == 2 && fixture.requests.count == 6)
+    #expect(fixture.voice.recordings == 0 && fixture.diskChecks == 0 && fixture.requests.isEmpty)
 }
 
-@Test @MainActor func permissionPresentationDeniedGrantsDoNotPromptButDiskAndNetworkStillCheck() async {
+@Test @MainActor func permissionPresentationDenialAndGrantChangesRemainPassive() async {
     let fixture = PresentationFixture()
     fixture.granted = false
-    fixture.denyDisk = true
-    fixture.denyNetwork = true
     fixture.open()
     defer { fixture.close() }
     await fixture.settle()
     #expect(fixture.row(.accessibility)?.state == .notGranted)
     #expect(fixture.row(.screenRecording)?.state == .notGranted)
-    #expect(fixture.row(.microphone)?.state == .notGranted)
-    #expect(fixture.row(.fullDiskAccess)?.state == .denied)
-    #expect(fixture.row(.localNetwork)?.state == .failed)
-    #expect(fixture.voice.recordings == 0 && fixture.grantRequests.isEmpty)
-    #expect(fixture.diskChecks == 1 && fixture.requests.count == 3)
-    fixture.close()
     fixture.granted = true
-    fixture.denyDisk = false
-    fixture.denyNetwork = false
-    fixture.open()
-    await fixture.settle()
-    #expect(fixture.service.window.coordinator.permissionRows.filter { ![.directCapture, .automation, .safariJavaScript, .clipboard].contains($0.id) }.allSatisfy { $0.isComplete })
+    await fixture.service.window.coordinator.resumeAfterActivation()
+    #expect(fixture.row(.accessibility)?.state == .ready)
+    #expect(fixture.row(.screenRecording)?.state == .ready)
+    #expect(fixture.diskChecks == 0 && fixture.voice.recordings == 0 && fixture.requests.isEmpty)
+    #expect(fixture.grantRequests.isEmpty)
+    #expect(!fixture.service.window.coordinator.canFinish)
 }
 
-@Test @MainActor func permissionPresentationActiveVoiceIsNotInterruptedAndFinishCancelsPendingChecks() async {
+@Test @MainActor func permissionPresentationDoesNotInterruptAnActiveVoiceRecording() async {
     let fixture = PresentationFixture()
     fixture.voice.busy = true
     fixture.open()
-    await fixture.settle()
-    #expect(fixture.row(.microphone)?.state == .verificationRequired)
-    #expect(fixture.voice.recordings == 0 && fixture.service.window.coordinator.canFinish)
-    fixture.close()
-    fixture.voice.busy = false
-    fixture.voice.hold = true
-    fixture.open()
     defer { fixture.close() }
-    while fixture.voice.pending == nil { await Task.yield() }
-    #expect(fixture.service.window.coordinator.canFinish)
-    let requests = fixture.requests.count
-    await fixture.service.window.finish()
-    fixture.voice.pending?(.success(true))
-    for _ in 0..<10 { await Task.yield() }
-    #expect(fixture.requests.count == requests)
-    #expect(fixture.service.window.coordinator.verificationBusyPermission == nil)
-}
-
-@Test @MainActor func permissionPresentationScreenGrantIsReadyWithoutAccessibilityOrRuntime() async {
-    let fixture = PresentationFixture()
-    fixture.accessibilityGranted = false
-    fixture.voice.hold = true
-    fixture.open()
-    defer { fixture.close() }
-    while fixture.voice.pending == nil { await Task.yield() }
-    #expect(fixture.row(.accessibility)?.state == .notGranted)
-    #expect(fixture.row(.screenRecording)?.isComplete == true)
-    #expect(!fixture.service.window.coordinator.canFinish)
-    fixture.accessibilityGranted = true
-    fixture.service.window.coordinator.setup(.accessibility)
-    while fixture.service.window.coordinator.busyPermission != nil { await Task.yield() }
-    #expect(fixture.row(.accessibility)?.isComplete == true)
-    #expect(fixture.row(.screenRecording)?.isComplete == true)
-    #expect(fixture.service.window.coordinator.canFinish)
-    #expect(fixture.grantRequests.isEmpty)
-    fixture.voice.pending?(.success(true))
     await fixture.settle()
-    #expect(fixture.diskChecks == 1 && fixture.voice.recordings == 1 && fixture.requests.count == 3)
+    #expect(fixture.voice.recordings == 0 && fixture.voice.cancels == 0)
+    #expect(!fixture.service.window.coordinator.permissionRows.contains { $0.id == .microphone })
 }

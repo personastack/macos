@@ -67,6 +67,7 @@ final class DesktopUpdater: NSObject, ObservableObject {
     private let clearUpdateNotifications: @MainActor (String) -> Void
     private let runningVersion: @MainActor () -> String?
     private let confirmRestart: @MainActor () -> Bool
+    private let cancelPermissionRestart: @MainActor () -> Void
     private let presentApplicationsInstallInstruction: @MainActor (String) -> Void
     private var updater: (any DesktopUpdateClient)?
     private var userDriver: SPUStandardUserDriver?
@@ -76,7 +77,8 @@ final class DesktopUpdater: NSObject, ObservableObject {
     private var isImmediateInstallRequested = false
 
     private override convenience init() {
-        self.init(updaterFactory: { SparkleUpdateClient(hostBundle: .main, userDriver: $0, delegate: $1) })
+        self.init(updaterFactory: { SparkleUpdateClient(hostBundle: .main, userDriver: $0, delegate: $1) },
+                  cancelPermissionRestart: { DesktopApplicationRestart.shared.cancelPendingRestart() })
     }
 
     init(updaterFactory: @escaping (SPUStandardUserDriver, SPUUpdaterDelegate) -> any DesktopUpdateClient,
@@ -93,7 +95,8 @@ final class DesktopUpdater: NSObject, ObservableObject {
              Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
          },
          confirmRestart: @escaping @MainActor () -> Bool = DesktopUpdater.confirmReadyRestart,
-         presentApplicationsInstallInstruction: @escaping @MainActor (String) -> Void = DesktopUpdater.showApplicationsInstallInstruction) {
+         presentApplicationsInstallInstruction: @escaping @MainActor (String) -> Void = DesktopUpdater.showApplicationsInstallInstruction,
+         cancelPermissionRestart: @escaping @MainActor () -> Void = {}) {
         self.updaterFactory = updaterFactory
         self.preferences = preferences
         self.presentAvailableReminder = presentAvailableReminder
@@ -102,6 +105,7 @@ final class DesktopUpdater: NSObject, ObservableObject {
         self.clearUpdateNotifications = clearUpdateNotifications
         self.runningVersion = runningVersion
         self.confirmRestart = confirmRestart
+        self.cancelPermissionRestart = cancelPermissionRestart
         self.presentApplicationsInstallInstruction = presentApplicationsInstallInstruction
         super.init()
     }
@@ -548,6 +552,7 @@ extension DesktopUpdater: SPUUpdaterDelegate {
         isWaitingForApproval = false
         isInformationalUpdate = false
         guard domain != SUSparkleErrorDomain || code != 1001 else { return }
+        if isImmediateInstallRequested { cancelPermissionRestart() }
         immediateInstallHandler = nil
         isImmediateInstallRequested = false
         statusMessage = "Update couldn't finish. PersonaStack is still available. Try again."
@@ -577,6 +582,7 @@ extension DesktopUpdater: SPUUpdaterDelegate {
 
     func handleSkippedUpdate(version: String) {
         guard offeredVersion == version else { return }
+        if isImmediateInstallRequested { cancelPermissionRestart() }
         isChecking = false
         isAutomaticallyDownloading = false
         isWaitingForApproval = false

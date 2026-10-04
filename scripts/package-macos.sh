@@ -74,6 +74,8 @@ cp "$root_dir/Resources/Info.plist" "$bundle_dir/Contents/Info.plist"
 cp "$root_dir/Resources/AppIcon.icns" "$bundle_dir/Contents/Resources/AppIcon.icns"
 cp "$root_dir/Resources/MenuBarIcon.png" "$bundle_dir/Contents/Resources/MenuBarIcon.png"
 cp "$root_dir/Resources/ReleaseSigningCertificate.der" "$bundle_dir/Contents/Resources/ReleaseSigningCertificate.der"
+ditto "$(dirname "$arm64_binary")/PersonaStackDesktop_PersonaStackCore.bundle" \
+  "$bundle_dir/Contents/Resources/PersonaStackDesktop_PersonaStackCore.bundle"
 cp "$root_dir/Resources/LaunchAgents/ai.personastack.desktop.crash-recovery.plist" \
   "$bundle_dir/Contents/Library/LaunchAgents/ai.personastack.desktop.crash-recovery.plist"
 cp "$root_dir/.build/checkouts/Sparkle/LICENSE" "$bundle_dir/Contents/Resources/Sparkle-LICENSE.txt"

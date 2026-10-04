@@ -28,6 +28,7 @@ public struct SystemCuaProcessRunner: CuaProcessRunning {
     }
 
     public func run(_ executable: URL, arguments: [String]) throws -> CuaProcessResult {
+        try Task.checkCancellation()
         let process = Process()
         let stdout = Pipe()
         let stderr = Pipe()
@@ -52,7 +53,7 @@ public struct SystemCuaProcessRunner: CuaProcessRunning {
         }
 
         let deadline = ProcessInfo.processInfo.systemUptime + timeout
-        while process.isRunning && ProcessInfo.processInfo.systemUptime < deadline {
+        while process.isRunning && !Task.isCancelled && ProcessInfo.processInfo.systemUptime < deadline {
             Thread.sleep(forTimeInterval: 0.02)
         }
         if process.isRunning {
@@ -69,9 +70,11 @@ public struct SystemCuaProcessRunner: CuaProcessRunning {
                 }
             }
             if !process.isRunning { process.waitUntilExit() }
+            if Task.isCancelled { throw CancellationError() }
             throw CuaDriverInstallError.processFailed("Cua validation command timed out")
         }
         process.waitUntilExit()
+        try Task.checkCancellation()
         guard readers.wait(timeout: .now() + 1) == .success else {
             throw CuaDriverInstallError.processFailed("Cua validation output did not close")
         }

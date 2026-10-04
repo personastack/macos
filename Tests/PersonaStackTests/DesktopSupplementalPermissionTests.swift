@@ -99,6 +99,7 @@ struct DesktopSupplementalPermissionTests {
         var access = DesktopPermissionSystemAccess.permissionFixture()
         access.automation = { prompt in #expect(!prompt); return grant }
         access.safariProcessIdentifier = { pid }
+        access.safariProcessIdentity = { pid.map { "safari-javascript:\($0):fixture" } }
         access.openSafari = { opens += 1 }
         access.verifySafariJavaScript = { scripts += 1; return succeeds }
         let adapter = DesktopPermissionChecklistSystemAdapter(access: access)
@@ -106,22 +107,22 @@ struct DesktopSupplementalPermissionTests {
         #expect(await adapter.setupAutomatically(.safariJavaScript).state == .verificationRequired)
         #expect(scripts == 0 && opens == 0)
         let setup = await adapter.setup(.safariJavaScript)
-        #expect(setup.detail.contains("Allow JavaScript from Apple Events") && !setup.verified)
-        #expect(opens == 1 && scripts == 0)
-        #expect(await adapter.check(.safariJavaScript).verified && scripts == 1)
-        #expect(await adapter.observe(.safariJavaScript).verified && scripts == 1)
+        #expect(setup.verified)
+        #expect(opens == 0 && scripts == 1)
+        #expect(await adapter.check(.safariJavaScript).verified && scripts == 2)
+        #expect(await adapter.observe(.safariJavaScript).verified && scripts == 2)
         pid = 13
         #expect(await adapter.observe(.safariJavaScript).verified == false)
-        #expect(await adapter.check(.safariJavaScript).verified && scripts == 2)
+        #expect(await adapter.check(.safariJavaScript).verified && scripts == 3)
         grant = OSStatus(errAEEventNotPermitted)
-        #expect(await adapter.check(.safariJavaScript).verified == false && scripts == 2)
+        #expect(await adapter.check(.safariJavaScript).verified == false && scripts == 3)
         grant = noErr
         #expect(await adapter.observe(.safariJavaScript).verified == false)
-        #expect(await adapter.check(.safariJavaScript).verified && scripts == 3)
+        #expect(await adapter.check(.safariJavaScript).verified && scripts == 4)
         succeeds = false
-        #expect(await adapter.check(.safariJavaScript).verified == false && scripts == 4)
+        #expect(await adapter.check(.safariJavaScript).verified == false && scripts == 5)
         pid = nil
-        #expect(await adapter.check(.safariJavaScript).verified == false && scripts == 4)
+        #expect(await adapter.check(.safariJavaScript).verified == false && scripts == 5)
     }
 
     @Test(arguments: [false, true])
@@ -131,6 +132,7 @@ struct DesktopSupplementalPermissionTests {
         var access = DesktopPermissionSystemAccess.permissionFixture()
         access.automation = { prompt in #expect(!prompt); return noErr }
         access.safariProcessIdentifier = { pid }
+        access.safariProcessIdentity = { pid.map { "safari-javascript:\($0):fixture" } }
         access.verifySafariJavaScript = { await withCheckedContinuation { pending = $0 } }
         let adapter = DesktopPermissionChecklistSystemAdapter(access: access)
         let task = Task { await adapter.check(.safariJavaScript) }
@@ -141,7 +143,7 @@ struct DesktopSupplementalPermissionTests {
         #expect(await adapter.observe(.safariJavaScript).verified == false)
     }
 
-    @Test func supplementalRowsUseExistingChecklistAndDoNotBlockEnrollment() async {
+    @Test func supplementalRowsBlockIncompleteUnattendedEnrollment() async {
         var access = DesktopPermissionSystemAccess.permissionFixture()
         access.accessibility = { true }
         access.screenRecording = { true }
@@ -156,10 +158,10 @@ struct DesktopSupplementalPermissionTests {
         for id in [DesktopPermissionID.directCapture, .automation, .safariJavaScript, .clipboard] {
             let row = coordinator.permissionRows.first { $0.id == id }
             #expect(row != nil && row?.isComplete == false)
-            #expect(row?.isRequiredForUnlockedSetup == false)
+            #expect(row?.isRequiredForUnlockedSetup == true)
             #expect(DesktopPermissionReset.arguments(for: id) == nil)
         }
-        #expect(coordinator.canFinish)
+        #expect(!coordinator.canFinish)
     }
 
     @Test(arguments: [
@@ -208,37 +210,46 @@ struct DesktopSupplementalPermissionTests {
         #expect(await adapter.observe(.clipboard).state == .denied)
     }
 
-    /// Optional local render evidence uses the real native view with fake OS
-    /// observations. The window stays hidden and no permission is requested.
+    /// Opt-in diagnostic artifacts only. Hidden AppKit omits content and these
+    /// bitmaps do not qualify visual acceptance. No permission is requested.
     @Test func supplementalPermissionNativePreview() async throws {
         guard let directory = ProcessInfo.processInfo.environment["CUA_PERMISSION_PREVIEW_DIRECTORY"] else { return }
         _ = NSApplication.shared
         var access = DesktopPermissionSystemAccess.permissionFixture()
-        access.accessibility = { true }
         access.screenRecording = { true }
+        access.requestDirectCapture = { false }
         let adapter = DesktopPermissionChecklistSystemAdapter(hooks: .init(observe: { id in
-            if [.fullDiskAccess, .microphone, .localNetwork].contains(id) {
-                return .init(.verificationRequired, detail: "Choose Setup to allow and verify this capability.")
-            }
-            if DesktopPermissionID.automaticSetup.contains(id) { return .init(.ready, detail: "Configured.") }
-            return nil
-        }), access: access)
+            if id == .directCapture { return nil }
+            return .init(.ready, detail: "Fixture verified", verified: true)
+        }), access: access, evidence: nil)
         let coordinator = DesktopPermissionChecklistCoordinator(adapter: adapter)
-        let owner = DesktopPermissionChecklistWindow(coordinator: coordinator)
+        let verifier = DesktopLockedControlSetupVerifier(operations: .init(inspect: { .ready }))
+        _ = await verifier.refresh()
+        let owner = DesktopPermissionChecklistWindow(coordinator: coordinator,
+            browserConsent: .init(inventory: { [] }), lockedControlVerifier: verifier)
         let window = owner.makeWindowIfNeeded()
-        window.appearance = NSAppearance(named: .darkAqua)
         defer { coordinator.cancel(); window.close() }
         coordinator.open()
         await coordinator.refresh()
         let view = try #require(window.contentView)
-        for size in [NSSize(width: 670, height: 740), NSSize(width: 560, height: 460), NSSize(width: 800, height: 600)] {
-            window.setContentSize(size)
-            view.layoutSubtreeIfNeeded()
-            let bitmap = try #require(view.bitmapImageRepForCachingDisplay(in: view.bounds))
-            view.cacheDisplay(in: view.bounds, to: bitmap)
-            let data = try #require(bitmap.representation(using: .png, properties: [:]))
-            try data.write(to: URL(fileURLWithPath: directory).appendingPathComponent("permissions-\(Int(size.width))x\(Int(size.height)).png"))
-            #expect(view.bounds.size == size && !window.isVisible)
+        for state in ["intro", "capture-recovery"] {
+            if state == "capture-recovery" {
+                coordinator.continueSetup()
+                while coordinator.busyPermission != nil { await Task.yield() }
+            }
+            for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+                window.appearance = NSAppearance(named: appearance)
+                for size in [NSSize(width: 670, height: 740), NSSize(width: 560, height: 460)] {
+                    window.setContentSize(size)
+                    view.layoutSubtreeIfNeeded()
+                    let bitmap = try #require(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+                    view.cacheDisplay(in: view.bounds, to: bitmap)
+                    let data = try #require(bitmap.representation(using: .png, properties: [:]))
+                    let name = "permissions-\(state)-\(appearance.rawValue)-\(Int(size.width))x\(Int(size.height)).png"
+                    try data.write(to: URL(fileURLWithPath: directory).appendingPathComponent(name))
+                    #expect(view.bounds.size == size && !window.isVisible)
+                }
+            }
         }
     }
 }

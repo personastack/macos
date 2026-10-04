@@ -6,6 +6,11 @@ final class DesktopInputPermissionWindow: NSObject, DesktopInputPermissionTarget
     let pid = Darwin.getpid()
     let expectedText = "PersonaStack permission check \(UUID().uuidString)"
     private(set) var clickCount = 0
+    private let explanationText: String
+    init(explanation: String = "Checking automatically. PersonaStack will click the test button and enter disposable text. You do not need to click or type.") {
+        explanationText = explanation
+        super.init()
+    }
     private var active = false
     private var window: NSWindow?
     private let field = makeVerificationField()
@@ -18,8 +23,7 @@ final class DesktopInputPermissionWindow: NSObject, DesktopInputPermissionTarget
         let value = Self.makeVerificationWindow()
         value.isReleasedWhenClosed = false
         value.delegate = self
-        let explanation = NSTextField(wrappingLabelWithString:
-            "Checking automatically. PersonaStack will click the test button and enter disposable text. You do not need to click or type.")
+        let explanation = NSTextField(wrappingLabelWithString: explanationText)
         field.isEditable = true
         field.isSelectable = true
         button.target = self
