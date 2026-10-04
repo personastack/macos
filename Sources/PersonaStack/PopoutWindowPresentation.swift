@@ -280,6 +280,9 @@ final class PopoutWindowPresentation: NSObject, NSToolbarDelegate {
         }
         overlay.isHidden = !pinned
         pinButton.bezelStyle = pinned ? .rounded : .accessoryBarAction
+        pinButton.wantsLayer = true
+        pinButton.layer?.backgroundColor = pinned ? Self.backgroundColor.cgColor : nil
+        pinButton.layer?.cornerRadius = 6
         window.setFrame(window.frameRect(forContentRect: contentRect), display: true)
         overlay.refreshPointerPresence()
         pinButton.isHidden = pinned && !overlay.pointerInside

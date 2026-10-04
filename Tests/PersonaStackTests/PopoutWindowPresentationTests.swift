@@ -210,6 +210,7 @@ struct PopoutWindowPresentationTests {
                 overlay.setPointerInside(true)
                 #expect(!chrome.pinButton.isHidden)
                 #expect(chrome.pinButton.frame.size == NSSize(width: 24, height: 24))
+                #expect(chrome.pinButton.layer?.backgroundColor == PopoutWindowPresentation.backgroundColor.cgColor)
                 let buttonPoint = NSPoint(x: chrome.pinButton.frame.midX, y: chrome.pinButton.frame.midY)
                 #expect(overlay.hitTest(buttonPoint) === chrome.pinButton)
                 #expect(overlay.hitTest(NSPoint(x: 10, y: 10)) == nil)
@@ -219,6 +220,7 @@ struct PopoutWindowPresentationTests {
                 #expect(graph.window.titlebarAccessoryViewControllers.count == 1)
                 #expect(chrome.pinButton.window === graph.window)
                 #expect(!chrome.pinButton.isHidden)
+                #expect(chrome.pinButton.layer?.backgroundColor == nil)
                 #expect(overlay.isHidden)
                 #expect(chrome.pinButton.accessibilityValue() as? Int == 0)
             }
