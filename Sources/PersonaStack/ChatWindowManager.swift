@@ -81,10 +81,23 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
     private var collapsed = false
     private var disposed = false
     private var closePending = false
+    private var hostedCloseRequested = false
+    private var closeTask: Task<Void, Never>?
+    private let waitForCloseDeadline: @MainActor () async throws -> Void
+    private let evaluateHostedClose: ((@escaping @MainActor (Bool) -> Void) -> Void)?
+    private let documentLoading: (@MainActor () -> Bool)?
+    private var isDocumentLoading: Bool { documentLoading?() ?? webView.isLoading }
 
-    init(url: URL, loadPage: Bool = true, defaults: UserDefaults = .standard, onClose: @escaping () -> Void) {
+    init(url: URL, loadPage: Bool = true, defaults: UserDefaults = .standard,
+         waitForCloseDeadline: @escaping @MainActor () async throws -> Void = { try await Task.sleep(for: .seconds(2)) },
+         evaluateHostedClose: ((@escaping @MainActor (Bool) -> Void) -> Void)? = nil,
+         documentLoading: (@MainActor () -> Bool)? = nil,
+         onClose: @escaping () -> Void) {
         self.url = url
         self.onClose = onClose
+        self.waitForCloseDeadline = waitForCloseDeadline
+        self.evaluateHostedClose = evaluateHostedClose
+        self.documentLoading = documentLoading
         let config = WKWebViewConfiguration()
         PopoutWindowPresentation.advertise(in: config)
         // The native title bar owns pinning, including when the hosted page is older.
@@ -116,6 +129,7 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
     }
 
     func focus() {
+        guard !disposed, !closePending else { return }
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
     }
@@ -123,24 +137,49 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
     func dispose() {
         guard !disposed else { return }
         disposed = true
+        closeTask?.cancel()
+        closeTask = nil
         presentation.invalidate()
         webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "personastackChatWindow", contentWorld: .page)
-        window.close()
-        onClose()
+        if !closePending {
+            window.close()
+            onClose()
+        }
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         if disposed { return true }
+        guard !closePending else { return true }
         closePending = true
-        if !webView.isLoading { requestHostedClose() }
-        return false
+        // Retire the native window immediately. Keep its WebView only for
+        // bounded, best-effort hosted cleanup. A late reply must not retire
+        // a replacement chat window for the same persona.
+        onClose()
+        closeTask = Task { [weak self, waitForCloseDeadline] in
+            guard !Task.isCancelled else { return }
+            do { try await waitForCloseDeadline() } catch { return }
+            guard !Task.isCancelled else { return }
+            self?.dispose()
+        }
+        if !isDocumentLoading { requestHostedClose() }
+        return true
     }
 
     private func requestHostedClose() {
-        webView.evaluateJavaScript("typeof window.personastackDesktopClose === 'function' ? (window.personastackDesktopClose(), true) : false") { [weak self] value, _ in
+        guard !disposed, !hostedCloseRequested else { return }
+        hostedCloseRequested = true
+        let completion: @MainActor (Bool) -> Void = { [weak self] invoked in
             guard let self, !self.disposed else { return }
-            if value as? Bool != true && !self.webView.isLoading { self.dispose() }
+            if !invoked && !self.isDocumentLoading { self.dispose() }
+        }
+        if let evaluateHostedClose { evaluateHostedClose(completion) }
+        else {
+            webView.evaluateJavaScript("typeof window.personastackDesktopClose === 'function' ? (window.personastackDesktopClose(), true) : false") { value, _ in
+                completion(value as? Bool == true)
+            }
         }
     }
 
@@ -152,11 +191,17 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { dispose() }
 
     func webView(_ webView: WKWebView, decidePolicyFor response: WKNavigationResponse) async -> WKNavigationResponsePolicy {
-        if response.isForMainFrame, let http = response.response as? HTTPURLResponse, http.statusCode >= 400 {
+        navigationResponsePolicy(isMainFrame: response.isForMainFrame, response: response.response,
+                                 canShowMIMEType: response.canShowMIMEType)
+    }
+
+    func navigationResponsePolicy(isMainFrame: Bool, response: URLResponse,
+                                  canShowMIMEType: Bool) -> WKNavigationResponsePolicy {
+        if isMainFrame, let http = response as? HTTPURLResponse, http.statusCode >= 400 {
             dispose()
             return .cancel
         }
-        return response.canShowMIMEType ? .allow : .cancel
+        return canShowMIMEType ? .allow : .cancel
     }
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage,
@@ -170,9 +215,10 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
     }
 
     func apply(_ command: ChatWindowCommand) {
+        if command == .close { dispose(); return }
+        guard !disposed, !closePending else { return }
         switch command {
         case .minimize: window.miniaturize(nil)
-        case .close: dispose()
         case .collapse: resize(collapsed: true)
         case .expand: resize(collapsed: false)
         case .pin: presentation.togglePin()
@@ -228,7 +274,7 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
                  decisionHandler: @escaping @MainActor @Sendable (WKPermissionDecision) -> Void) {
         decisionHandler(DesktopMediaCapturePermission.decide(
             origin: origin, frame: frame, type: type, appURL: url,
-            activeView: !disposed && webView === self.webView
+            activeView: !disposed && !closePending && webView === self.webView
         ))
     }
 

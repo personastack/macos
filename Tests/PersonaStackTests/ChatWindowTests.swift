@@ -201,48 +201,184 @@ struct ChatWindowTests {
     }
 
     @MainActor
-    @Test func testCmdWCanCloseAnUnbootedDocument() async throws {
+    @Test func testCmdWCanCloseAnUnbootedDocument() {
         _ = NSApplication.shared
-        var closed = false
+        var closes = 0
         let preferences = PopoutTestPreferences()
-        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false, defaults: preferences.defaults) { closed = true }
-        #expect(chat.windowShouldClose(chat.window) == false)
-        for _ in 0..<40 where !closed { try await Task.sleep(for: .milliseconds(50)) }
-        #expect(closed)
-        chat.dispose()
+        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false,
+            defaults: preferences.defaults, evaluateHostedClose: { completion in completion(false) }) { closes += 1 }
+        defer { chat.dispose() }
+        chat.window.performClose(nil)
+        #expect(closes == 1)
+        #expect(chat.windowShouldClose(chat.window))
     }
 
     @MainActor
-    @Test func testNativeCloseWaitsForHostedCloseAuthority() async throws {
+    @Test func testNativeCloseRetiresImmediatelyAndFinishesHostedCleanupBeforeDeadline() async throws {
         _ = NSApplication.shared
         let preferences = PopoutTestPreferences()
-        var closed = false
-        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false, defaults: preferences.defaults) { closed = true }
-        defer { chat.dispose() }
-        chat.webView.navigationDelegate = nil
-        chat.webView.loadHTMLString("""
-            <script>window.closeRequests = 0;
-            window.personastackDesktopClose = () => { window.closeRequests += 1; };</script>
-            """, baseURL: nil)
-        var ready = false
-        for _ in 0..<60 {
-            ready = (try? await chat.webView.evaluateJavaScript("typeof window.personastackDesktopClose === 'function'")) as? Bool == true
-            if ready { break }
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        #expect(ready)
-        #expect(!chat.windowShouldClose(chat.window))
-        var requested = false
-        for _ in 0..<40 {
-            requested = (try? await chat.webView.evaluateJavaScript("window.closeRequests > 0")) as? Bool == true
-            if requested { break }
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        #expect(requested)
-        #expect(!closed)
-        // A failed/unfinished hosted operation sends no close acknowledgment.
-        // Only the existing validated bridge's .close command disposes it.
+        var closes = 0
+        var requests = 0
+        var deadline: CheckedContinuation<Void, Never>?
+        var lateReply: (@MainActor (Bool) -> Void)?
+        var cleanupCancelled = false
+        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false,
+            defaults: preferences.defaults,
+            waitForCloseDeadline: {
+                await withCheckedContinuation { deadline = $0 }
+                cleanupCancelled = Task.isCancelled
+            },
+            evaluateHostedClose: { completion in
+                requests += 1; lateReply = completion; completion(true)
+            }) { closes += 1 }
+        defer { chat.dispose(); deadline?.resume(); deadline = nil }
+        chat.window.performClose(nil)
+        #expect(closes == 1 && !chat.window.isVisible)
+        for _ in 0..<100 where deadline == nil { await Task.yield() }
+        #expect(deadline != nil)
+        #expect(requests == 1 && closes == 1)
+        #expect(chat.webView.navigationDelegate === chat)
+        // The healthy hosted bridge disposes remaining resources and cancels cleanup's deadline.
         chat.apply(.close)
-        #expect(closed)
+        #expect(closes == 1)
+        #expect(chat.webView.navigationDelegate == nil && chat.webView.uiDelegate == nil)
+        deadline?.resume(); deadline = nil
+        lateReply?(false)
+        for _ in 0..<100 where !cleanupCancelled { await Task.yield() }
+        #expect(closes == 1 && cleanupCancelled)
+    }
+
+    @MainActor
+    @Test(arguments: [true, false])
+    func testNativeCloseButtonClosesImmediatelyWithoutHostedAcknowledgement(javaScriptReplies: Bool) async throws {
+        _ = NSApplication.shared
+        let preferences = PopoutTestPreferences()
+        var closes = 0
+        var requests = 0
+        var waits = 0
+        var deadline: CheckedContinuation<Void, Never>?
+        var lateReply: (@MainActor (Bool) -> Void)?
+        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false,
+            defaults: preferences.defaults,
+            waitForCloseDeadline: {
+                waits += 1
+                await withCheckedContinuation { deadline = $0 }
+            }, evaluateHostedClose: { completion in
+                requests += 1; lateReply = completion
+                // true models the real page with a rejected or hung API close.
+                // No reply models an unresponsive WebKit process.
+                if javaScriptReplies { completion(true) }
+            }) { closes += 1 }
+        defer { chat.dispose(); deadline?.resume(); deadline = nil }
+        let nativeClose = ChatWindowCloseObserver(window: chat.window)
+        defer { NotificationCenter.default.removeObserver(nativeClose) }
+        let closeButton = try #require(chat.window.standardWindowButton(.closeButton))
+        closeButton.performClick(nil)
+        // Assert synchronously, before either JavaScript or the cleanup deadline can finish.
+        #expect(closes == 1 && nativeClose.count == 1 && !chat.window.isVisible)
+        #expect(chat.windowShouldClose(chat.window))
+        for _ in 0..<100 where deadline == nil { await Task.yield() }
+        #expect(deadline != nil && waits == 1)
+        #expect(requests == 1 && closes == 1)
+        #expect(chat.webView.navigationDelegate === chat)
+        closeButton.performClick(nil)
+        #expect(requests == 1 && waits == 1)
+        deadline?.resume(); deadline = nil
+        for _ in 0..<100 where chat.webView.navigationDelegate != nil { await Task.yield() }
+        #expect(closes == 1)
+        #expect(chat.webView.navigationDelegate == nil && chat.webView.uiDelegate == nil)
+        #expect(chat.windowShouldClose(chat.window))
+        // An expired page cannot dispose a replacement window through onClose.
+        lateReply?(true)
+        lateReply?(false)
+        chat.apply(.close)
+        #expect(closes == 1 && nativeClose.count == 1)
+    }
+
+    @MainActor
+    @Test(arguments: ["ack", "provisional", "failed", "http", "terminated"])
+    func testClosedChatCanReopenImmediatelyAndLateCleanupCannotRemoveReplacement(callback: String) async throws {
+        _ = NSApplication.shared
+        let preferences = PopoutTestPreferences()
+        let manager = ChatWindowManager(loadPages: false, defaults: preferences.defaults, presentWindows: false)
+        defer { manager.invalidateSession() }
+        let base = try #require(URL(string: "https://example.invalid"))
+        manager.apply(.open("p-1", "account-a"), base: base)
+        let first = try #require(manager.chat(for: "p-1"))
+        first.window.performClose(nil)
+        #expect(manager.chat(for: "p-1") == nil)
+        manager.apply(.open("p-1", "account-a"), base: base)
+        let replacement = try #require(manager.chat(for: "p-1"))
+        #expect(replacement !== first)
+        first.focus()
+        #expect(!first.window.isVisible)
+        first.apply(.pin)
+        #expect(first.window.level == .normal)
+        let error = NSError(domain: NSURLErrorDomain, code: NSURLErrorNotConnectedToInternet)
+        switch callback {
+        case "provisional": first.webView(first.webView, didFailProvisionalNavigation: nil, withError: error)
+        case "failed": first.webView(first.webView, didFail: nil, withError: error)
+        case "http":
+            let response = try #require(HTTPURLResponse(url: base, statusCode: 503,
+                                                        httpVersion: "HTTP/1.1", headerFields: nil))
+            let policy = first.navigationResponsePolicy(isMainFrame: true, response: response, canShowMIMEType: true)
+            #expect(policy == .cancel)
+        case "terminated": first.webViewWebContentProcessDidTerminate(first.webView)
+        default: first.apply(.close)
+        }
+        first.apply(.close)
+        first.dispose()
+        #expect(manager.chat(for: "p-1") === replacement)
+    }
+
+    @MainActor
+    @Test(arguments: [true, false])
+    func testCloseDuringLoadingClosesImmediatelyAndBoundsDeferredCleanup(finishLoading: Bool) async throws {
+        _ = NSApplication.shared
+        let preferences = PopoutTestPreferences()
+        let loading = ChatLoadingState()
+        var closes = 0
+        var requests = 0
+        var deadline: CheckedContinuation<Void, Never>?
+        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false,
+            defaults: preferences.defaults,
+            waitForCloseDeadline: { await withCheckedContinuation { deadline = $0 } },
+            evaluateHostedClose: { completion in requests += 1; completion(true) },
+            documentLoading: { loading.isLoading }) { closes += 1 }
+        defer { chat.dispose(); deadline?.resume(); deadline = nil }
+        let nativeClose = ChatWindowCloseObserver(window: chat.window)
+        defer { NotificationCenter.default.removeObserver(nativeClose) }
+        chat.window.performClose(nil)
+        #expect(closes == 1 && nativeClose.count == 1 && requests == 0)
+        for _ in 0..<100 where deadline == nil { await Task.yield() }
+        #expect(deadline != nil && chat.webView.navigationDelegate === chat)
+        if finishLoading {
+            loading.isLoading = false
+            chat.webView(chat.webView, didFinish: nil)
+            chat.webView(chat.webView, didFinish: nil)
+        }
+        #expect(requests == (finishLoading ? 1 : 0) && closes == 1)
+        deadline?.resume(); deadline = nil
+        for _ in 0..<100 where chat.webView.navigationDelegate != nil { await Task.yield() }
+        #expect(chat.webView.navigationDelegate == nil && chat.webView.uiDelegate == nil)
+        chat.webView(chat.webView, didFinish: nil)
+        #expect(requests == (finishLoading ? 1 : 0))
+        #expect(closes == 1 && nativeClose.count == 1)
     }
 }
+
+@MainActor
+private final class ChatWindowCloseObserver: NSObject {
+    private(set) var count = 0
+
+    init(window: NSWindow) {
+        super.init()
+        NotificationCenter.default.addObserver(self, selector: #selector(didClose(_:)),
+                                               name: NSWindow.willCloseNotification, object: window)
+    }
+
+    @objc private func didClose(_ notification: Notification) { count += 1 }
+}
+
+@MainActor
+private final class ChatLoadingState { var isLoading = true }
