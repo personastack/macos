@@ -81,23 +81,10 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
     private var collapsed = false
     private var disposed = false
     private var closePending = false
-    private var hostedCloseRequested = false
-    private var closeTask: Task<Void, Never>?
-    private let waitForCloseDeadline: @MainActor () async throws -> Void
-    private let evaluateHostedClose: ((@escaping @MainActor (Bool) -> Void) -> Void)?
-    private let documentLoading: (@MainActor () -> Bool)?
-    private var isDocumentLoading: Bool { documentLoading?() ?? webView.isLoading }
-
     init(url: URL, loadPage: Bool = true, defaults: UserDefaults = .standard,
-         waitForCloseDeadline: @escaping @MainActor () async throws -> Void = { try await Task.sleep(for: .seconds(2)) },
-         evaluateHostedClose: ((@escaping @MainActor (Bool) -> Void) -> Void)? = nil,
-         documentLoading: (@MainActor () -> Bool)? = nil,
          onClose: @escaping () -> Void) {
         self.url = url
         self.onClose = onClose
-        self.waitForCloseDeadline = waitForCloseDeadline
-        self.evaluateHostedClose = evaluateHostedClose
-        self.documentLoading = documentLoading
         let config = WKWebViewConfiguration()
         PopoutWindowPresentation.advertise(in: config)
         // The native title bar owns pinning, including when the hosted page is older.
@@ -137,8 +124,6 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
     func dispose() {
         guard !disposed else { return }
         disposed = true
-        closeTask?.cancel()
-        closeTask = nil
         presentation.invalidate()
         webView.stopLoading()
         webView.navigationDelegate = nil
@@ -152,39 +137,11 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         if disposed { return true }
-        guard !closePending else { return true }
         closePending = true
-        // Retire the native window immediately. Keep its WebView only for
-        // bounded, best-effort hosted cleanup. A late reply must not retire
-        // a replacement chat window for the same persona.
+        // Closing a view never asks hosted JavaScript to close shared product state.
+        dispose()
         onClose()
-        closeTask = Task { [weak self, waitForCloseDeadline] in
-            guard !Task.isCancelled else { return }
-            do { try await waitForCloseDeadline() } catch { return }
-            guard !Task.isCancelled else { return }
-            self?.dispose()
-        }
-        if !isDocumentLoading { requestHostedClose() }
         return true
-    }
-
-    private func requestHostedClose() {
-        guard !disposed, !hostedCloseRequested else { return }
-        hostedCloseRequested = true
-        let completion: @MainActor (Bool) -> Void = { [weak self] invoked in
-            guard let self, !self.disposed else { return }
-            if !invoked && !self.isDocumentLoading { self.dispose() }
-        }
-        if let evaluateHostedClose { evaluateHostedClose(completion) }
-        else {
-            webView.evaluateJavaScript("typeof window.personastackDesktopClose === 'function' ? (window.personastackDesktopClose(), true) : false") { value, _ in
-                completion(value as? Bool == true)
-            }
-        }
-    }
-
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        if closePending { requestHostedClose() }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { dispose() }
