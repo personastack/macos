@@ -160,6 +160,7 @@ final class MainWebViewHost {
     private let backgroundWindow: NSWindow
     private let requestNotifications: Bool
     private let authorizeNotifications: () -> Void
+    private let sessionRefresh: DesktopSessionRefresh
     private var notificationAuthorizationRequested = false
 
     init(appURL: URL, loadPage: Bool = true, resumePermissionSetup: Bool = false,
@@ -199,8 +200,18 @@ final class MainWebViewHost {
         self.backgroundWindow = backgroundWindow
         self.requestNotifications = requestNotifications
         self.authorizeNotifications = authorizeNotifications
+        let sessionRefresh = DesktopSessionRefresh(appURL: appURL, currentURL: { [weak webView] in webView?.url },
+            evaluate: { [weak webView] script in
+                guard let webView else { return }
+                _ = try await webView.callAsyncJavaScript(script, arguments: [:], in: nil, contentWorld: .page)
+            })
+        self.sessionRefresh = sessionRefresh
+        coordinator.onDocumentLoaded = { [weak sessionRefresh] in sessionRefresh?.refresh() }
         requestNotificationAuthorizationIfNeeded()
-        if loadPage { coordinator.start(DesktopApplicationRestart.initialPageURL(appURL, resume: resumePermissionSetup)) }
+        if loadPage {
+            sessionRefresh.start()
+            coordinator.start(DesktopApplicationRestart.initialPageURL(appURL, resume: resumePermissionSetup))
+        }
     }
 
     func openDesktopFlow(path: String, query: [String: String]) {
@@ -233,6 +244,7 @@ final class MainWebViewHost {
     }
 
     func retire() {
+        sessionRefresh.stop()
         ChatWindowManager.shared.unregister(webView)
         StackWindowManager.shared.unregister(webView)
         LocalSessionManager.shared.invalidate(webView)
@@ -310,6 +322,7 @@ struct PersonaStackWebView: NSViewRepresentable {
         weak var webView: WKWebView?
         let appURL: URL
         let loadRecovery = MainWebViewLoadRecovery()
+        var onDocumentLoaded: (() -> Void)?
         private let scheduleNotification: (UNNotificationRequest) -> Void
         private let concernNotificationsEnabled: () -> Bool
         private let cancelPermissionVerification: () -> Void
@@ -375,6 +388,7 @@ struct PersonaStackWebView: NSViewRepresentable {
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             guard webView === self.webView, let navigation else { return }
             loadRecovery.navigationSucceeded(navigation)
+            onDocumentLoaded?()
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -518,6 +532,7 @@ struct PersonaStackWebView: NSViewRepresentable {
         func retire() {
             guard !isRetired else { return }
             isRetired = true
+            onDocumentLoaded = nil
             loadRecovery.reset()
             invalidateDocumentVerification()
             for window in popupWindows.values {
