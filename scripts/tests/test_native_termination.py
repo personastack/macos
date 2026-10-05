@@ -36,6 +36,7 @@ import AppKit
 }
 @MainActor final class DesktopApplicationRestart {
     static let foregroundArgument = "probe-relaunch"
+    static let resumesPermissionSetup = false
     static let shared = DesktopApplicationRestart()
     func cancelPendingRestart() {}
 }

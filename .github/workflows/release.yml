@@ -84,7 +84,7 @@ jobs:
           fi
           swift test --disable-xctest --skip-update -j 2 \
             "${test_scheduling[@]}" \
-            --filter '(LocalRun|[Dd]esktop|ChatWindow|Popout|[Nn]avigation|MainWebView|[Pp]ermission|[Pp]rotected|[Vv]olume|[Vv]oice|[Mm]icrophone|[Dd]irectory|[Cc]ua|[Nn]otification|[Cc]oncern|[Kk]eychain|[Cc]redential|[Ll]ogin)'
+            --filter '(LocalRun|LocalSession|[Hh]arness|[Ss]kill|[Dd]esktop|ChatWindow|Popout|[Nn]avigation|MainWebView|[Pp]ermission|[Pp]rotected|[Vv]olume|[Vv]oice|[Mm]icrophone|[Dd]irectory|[Cc]ua|[Nn]otification|[Cc]oncern|[Kk]eychain|[Cc]redential|[Ll]ogin)'
       - name: Build certificate-signed installer
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
