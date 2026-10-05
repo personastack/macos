@@ -308,6 +308,11 @@ struct DesktopPermissionChecklistView: View {
             HStack {
                 Button("Cancel setup", action: cancel).buttonStyle(.bordered).keyboardShortcut(.cancelAction)
                 Spacer()
+                if coordinator.canSkipBrowsers {
+                    Button("Skip", action: coordinator.skipBrowsers).buttonStyle(.bordered)
+                        .help("Continue setup without enabling browser integration.")
+                        .accessibilityHint("Skips optional browser setup and continues to the next step")
+                }
                 if coordinator.isFinishing {
                     ProgressView().controlSize(.small)
                     Text("Connecting this Mac…").font(.callout)
@@ -333,7 +338,7 @@ struct DesktopPermissionChecklistView: View {
             if CuaPerceptionCompatibility.supportedArchitecture {
                 Text("Setup may download 426 MB of visual perception components for review. Installing the separately licensed models requires your confirmation.")
             }
-            Text("Existing browser profiles need your approval. Apple and your browsers may ask for separate permissions.")
+            Text("Browser setup is optional. You can skip it and set it up later. Existing browser profiles need your approval. Apple and your browsers may ask for separate permissions.")
             Text("While this Mac is locked, PersonaStack temporarily unlocks the session, conceals the displays, then locks it again. Local input ends remote control.")
             Text("Continue allows bounded setup checks: a discarded screen image and clipboard read, a protected-folder check, and a local-network probe. PersonaStack also clicks and types disposable text in its own test window. If Safari has no document, setup opens a blank test tab and leaves it open. Microphone access is requested only when you record audio in chat.")
                 .foregroundStyle(.secondary)
@@ -366,10 +371,12 @@ struct DesktopPermissionChecklistView: View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(DesktopPermissionStage.allCases) { stage in
                 let done = stage.permissions.allSatisfy { id in coordinator.rows.first(where: { $0.id == id })?.isComplete == true }
-                Label(stage.title, systemImage: done ? "checkmark.circle.fill" : coordinator.currentStage == stage ? "circle.inset.filled" : "circle")
-                    .foregroundStyle(done ? Color.green : coordinator.currentStage == stage ? Color.primary : Color.secondary)
+                let skipped = stage == .browsers && coordinator.browsersSkipped
+                let title = stage.title + (skipped ? " (Skipped)" : stage == .browsers ? " (Optional)" : "")
+                Label(title, systemImage: skipped ? "arrow.right.circle" : done ? "checkmark.circle.fill" : coordinator.currentStage == stage ? "circle.inset.filled" : "circle")
+                    .foregroundStyle(skipped ? Color.secondary : done ? Color.green : coordinator.currentStage == stage ? Color.primary : Color.secondary)
                     .font(.callout.weight(coordinator.currentStage == stage ? .semibold : .regular))
-                    .accessibilityLabel("\(stage.title), \(done ? "complete" : coordinator.currentStage == stage ? "current step" : "waiting")")
+                    .accessibilityLabel("\(title), \(skipped ? "skipped" : done ? "complete" : coordinator.currentStage == stage ? "current step" : "waiting")")
             }
         }
     }
@@ -377,6 +384,10 @@ struct DesktopPermissionChecklistView: View {
     private func instruction(_ row: DesktopPermissionRow) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(coordinator.currentStage?.title ?? row.id.title).font(.headline)
+            if coordinator.currentStage == .browsers {
+                Text("Optional. Choose Skip to continue without browser integration. You can return to permissions setup later.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
             Text(row.state.title).font(.caption.bold())
                 .foregroundStyle(row.state == .failed || row.state == .denied ? Color.red : Color.secondary)
             if row.id == .directCapture {

@@ -42,6 +42,7 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     @Published private(set) var completionError = ""
     @Published private(set) var needsNewSetupRequest = false
     @Published private(set) var hasStarted = false
+    @Published private(set) var browsersSkipped = false
     @Published private(set) var currentPermission: DesktopPermissionID?
     var onReady: (() -> Void)?
     var onVerified: (([DesktopPermissionID: DesktopPermissionObservation]) -> Void)?
@@ -120,8 +121,28 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
 
     var currentStage: DesktopPermissionStage? {
         DesktopPermissionStage.allCases.first { stage in
-            stage.permissions.contains { id in rows.first { $0.id == id }?.isComplete != true }
+            !(stage == .browsers && browsersSkipped) &&
+                stage.permissions.contains { id in rows.first { $0.id == id }?.isComplete != true }
         }
+    }
+
+    var canSkipBrowsers: Bool {
+        guard hasStarted, isVisible, !isFinishing, !needsNewSetupRequest, currentStage == .browsers else { return false }
+        if let busyPermission, !DesktopPermissionStage.browsers.permissions.contains(busyPermission) { return false }
+        return true
+    }
+
+    func skipBrowsers() {
+        guard canSkipBrowsers else { return }
+        browsersSkipped = true
+        guidedTask?.cancel()
+        guidedTask = nil
+        setupTask?.cancel()
+        setupTask = nil
+        busyPermission = nil
+        for id in DesktopPermissionStage.browsers.permissions { rowRevisions[id] = UUID() }
+        completionError = ""
+        advanceGuidedSetup()
     }
 
     /// The window records installed locked-control consent before this call.
@@ -142,6 +163,9 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     /// current step may run a bounded check; the periodic poll stays passive.
     func resumeAfterActivation() async {
         let expected = generation
+        // Returning from browser settings can race the first permission check.
+        // Wait for its result before checking the newly enabled setting.
+        if currentPermission == .safariJavaScript { await guidedTask?.value }
         await refresh()
         guard generation == expected, !Task.isCancelled, hasStarted, let id = currentPermission, guidedTask == nil,
               busyPermission == nil, !isFinishing, isVisible,
@@ -152,7 +176,9 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
     private func advanceGuidedSetup() {
         guard hasStarted, isVisible, !isFinishing, !needsNewSetupRequest,
               guidedTask == nil, busyPermission == nil else { return }
-        let ordered = DesktopPermissionReadiness.requiredPermissions
+        let ordered = DesktopPermissionReadiness.guidedPermissions.filter {
+            !browsersSkipped || !DesktopPermissionStage.browsers.permissions.contains($0)
+        }
         guard let id = ordered.first(where: { id in rows.first { $0.id == id }?.isComplete != true }) else {
             currentPermission = nil
             if canFinish, !completionScheduled, let onReady {
@@ -339,6 +365,7 @@ final class DesktopPermissionChecklistCoordinator: ObservableObject {
         guidedTask?.cancel()
         guidedTask = nil
         hasStarted = false
+        browsersSkipped = false
         completionScheduled = false
         currentPermission = nil
         attemptedPermissions.removeAll()

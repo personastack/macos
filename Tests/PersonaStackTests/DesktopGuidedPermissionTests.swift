@@ -65,7 +65,7 @@ private final class GuidedPermissionFixture: DesktopPermissionChecklistAdapting 
 
 @Test @MainActor func guidedPermissionOneContinueAdvancesInOrderAndCompletesOnce() async {
     let fixture = GuidedPermissionFixture()
-    for id in DesktopPermissionReadiness.requiredPermissions { fixture.values[id] = .init(.notGranted, detail: "Needs setup") }
+    for id in DesktopPermissionReadiness.guidedPermissions { fixture.values[id] = .init(.notGranted, detail: "Needs setup") }
     let coordinator = DesktopPermissionChecklistCoordinator(adapter: fixture)
     coordinator.open()
     await coordinator.refresh()
@@ -77,9 +77,112 @@ private final class GuidedPermissionFixture: DesktopPermissionChecklistAdapting 
     coordinator.continueSetup()
     try? await completion.value
     #expect(coordinator.isFinishing && completions == 1)
-    #expect(fixture.requested == DesktopPermissionReadiness.requiredPermissions)
+    #expect(fixture.requested == DesktopPermissionReadiness.guidedPermissions)
     #expect(!fixture.requested.contains(.microphone) && !fixture.requested.contains(.notifications))
     coordinator.cancel()
+}
+
+@Test(arguments: [DesktopPermissionState.denied, .verificationRequired, .unsupported, .checking, .restartRequired])
+func guidedPermissionBrowserAccessDoesNotBlockRuntimeReadiness(state: DesktopPermissionState) {
+    var observations = Dictionary(uniqueKeysWithValues: DesktopPermissionReadiness.requiredPermissions.map {
+        ($0, DesktopPermissionObservation(.ready, detail: "Verified", verified: true))
+    })
+    for id in DesktopPermissionStage.browsers.permissions {
+        observations[id] = .init(state, detail: "Optional browser permission", requiresVerification: true)
+        #expect(!DesktopPermissionReadiness.requiredPermissions.contains(id))
+        #expect(!DesktopPermissionRow(id: id, observation: observations[id]!).isRequiredForUnlockedSetup)
+    }
+    #expect(DesktopPermissionReadiness(observations: observations).isReady)
+}
+
+@Test(arguments: [DesktopPermissionID.automation, .safariJavaScript]) @MainActor
+func guidedPermissionBrowserSkipContinuesWithoutGrantingBrowserAccess(blocked: DesktopPermissionID) async {
+    let fixture = GuidedPermissionFixture()
+    fixture.grantsOnRequest = false
+    fixture.values[blocked] = .init(.denied, detail: "Browser access denied")
+    fixture.values[.clipboard] = .init(.notGranted, detail: "Next required permission")
+    let coordinator = DesktopPermissionChecklistCoordinator(adapter: fixture)
+    coordinator.open()
+    defer { coordinator.cancel() }
+    await coordinator.refresh()
+    coordinator.skipBrowsers()
+    #expect(!coordinator.browsersSkipped && !coordinator.canSkipBrowsers)
+    var completions = 0
+    coordinator.onReady = { completions += 1; coordinator.finish() }
+    coordinator.continueSetup()
+    while coordinator.busyPermission != nil { await Task.yield() }
+    #expect(coordinator.currentStage == .browsers && coordinator.canSkipBrowsers)
+    coordinator.skipBrowsers()
+    while coordinator.busyPermission != nil { await Task.yield() }
+    #expect(coordinator.browsersSkipped && coordinator.currentStage == .clipboard)
+    #expect(fixture.requested == [blocked, .clipboard])
+    #expect(coordinator.rows.first { $0.id == blocked }?.state == .denied)
+    #expect(coordinator.rows.first { $0.id == blocked }?.observation.verified == false)
+    #expect(!coordinator.canFinish && completions == 0)
+    await coordinator.refresh()
+    #expect(fixture.requested == [blocked, .clipboard])
+    fixture.grantsOnRequest = true
+    coordinator.retryCurrentPermission()
+    while coordinator.busyPermission != nil { await Task.yield() }
+    #expect(coordinator.isFinishing && completions == 1)
+    #expect(DesktopPermissionReadiness(rows: coordinator.rows).isReady)
+    coordinator.skipBrowsers()
+    #expect(completions == 1 && !coordinator.canSkipBrowsers)
+    coordinator.cancel()
+    #expect(!coordinator.browsersSkipped)
+}
+
+@Test(arguments: [DesktopPermissionID.automation, .safariJavaScript]) @MainActor
+func guidedPermissionBrowserSkipFencesLateCheckWhileNextPermissionRuns(blocked: DesktopPermissionID) async {
+    let fixture = GuidedPermissionFixture()
+    fixture.values[blocked] = .init(.verificationRequired, detail: "Browser setting not verified")
+    fixture.values[.clipboard] = .init(.notGranted, detail: "Clipboard approval required")
+    fixture.delayed = blocked
+    let coordinator = DesktopPermissionChecklistCoordinator(adapter: fixture)
+    coordinator.open()
+    defer { coordinator.cancel() }
+    await coordinator.refresh()
+    coordinator.continueSetup()
+    while fixture.pending == nil { await Task.yield() }
+    let browserCheck = fixture.pending
+    fixture.pending = nil
+    fixture.delayed = .clipboard
+    coordinator.skipBrowsers()
+    while fixture.pending == nil { await Task.yield() }
+    browserCheck?.resume(returning: .init(.ready, detail: "Late browser result", verified: true))
+    await Task.yield()
+    await coordinator.refresh()
+    #expect(coordinator.currentPermission == .clipboard && coordinator.busyPermission == .clipboard)
+    #expect(coordinator.currentStage == .clipboard && coordinator.browsersSkipped)
+    #expect(coordinator.rows.first { $0.id == blocked }?.state == .verificationRequired)
+    #expect(fixture.checked.isEmpty && fixture.requested == [blocked, .clipboard])
+    fixture.pending?.resume(returning: .init(.ready, detail: "Clipboard verified", verified: true))
+    while coordinator.busyPermission != nil { await Task.yield() }
+    #expect(coordinator.canFinish)
+}
+
+@Test @MainActor func guidedPermissionBrowserSettingsReturnWaitsForPendingCheckAndVerifiesAgain() async {
+    let fixture = GuidedPermissionFixture()
+    fixture.values[.safariJavaScript] = .init(.verificationRequired, detail: "Browser setting not yet enabled")
+    fixture.delayed = .safariJavaScript
+    let coordinator = DesktopPermissionChecklistCoordinator(adapter: fixture)
+    coordinator.open()
+    defer { coordinator.cancel() }
+    await coordinator.refresh()
+    coordinator.continueSetup()
+    while fixture.pending == nil { await Task.yield() }
+    var activationStarted = false
+    let activation = Task {
+        activationStarted = true
+        await coordinator.resumeAfterActivation()
+    }
+    while !activationStarted { await Task.yield() }
+    fixture.pending?.resume(returning: .init(.verificationRequired, detail: "Earlier setting read"))
+    await activation.value
+    while coordinator.busyPermission != nil { await Task.yield() }
+    #expect(fixture.requested == [.safariJavaScript] && fixture.checked == [.safariJavaScript])
+    #expect(coordinator.rows.first { $0.id == .safariJavaScript }?.state == .ready)
+    #expect(coordinator.canFinish)
 }
 
 @Test @MainActor func guidedPermissionValidGrantsNeedNoRequestsAndNoFinishClick() async {

@@ -9,8 +9,8 @@ public enum DesktopPermissionID: String, CaseIterable, Identifiable, Sendable {
 
     public var id: String { rawValue }
 
-    /// Required unattended desktop capabilities. Chat microphone consent is owned
-    /// by the recording action, never by remote-control setup.
+    /// Capabilities offered during guided setup. Browser integration is optional.
+    /// Chat microphone consent is owned by the recording action.
     public static let setupPermissions: [Self] = [.accessibility, .screenRecording, .directCapture, .fullDiskAccess, .automation, .safariJavaScript, .clipboard, .localNetwork]
     public static let automaticSetup: [Self] = [.launchAtLogin, .automaticUpdates, .awakeDuringRemoteWork, .visualPerception]
 
@@ -123,8 +123,11 @@ public enum DesktopPermissionStage: Int, CaseIterable, Identifiable, Sendable {
 /// probes an OS service or treats a setup acknowledgement as a macOS grant.
 public struct DesktopPermissionReadiness: Equatable, Sendable {
     public static let requirementRevision = 3
-    public static let requiredPermissions: [DesktopPermissionID] =
+    public static let guidedPermissions: [DesktopPermissionID] =
         DesktopPermissionID.setupPermissions + [.launchAtLogin, .awakeDuringRemoteWork, .lockedScreenControl, .visualPerception]
+    public static let requiredPermissions = guidedPermissions.filter {
+        !DesktopPermissionStage.browsers.permissions.contains($0)
+    }
     public let missing: [DesktopPermissionID]
     public var isReady: Bool { missing.isEmpty }
 
