@@ -8,6 +8,8 @@ import OSLog
 @MainActor
 protocol DesktopCrashRecoveryProcessRunning: AnyObject {
     func applicationProcessIDs(bundleIdentifier: String) -> [pid_t]
+    func ownsRunningProcess(processID: pid_t) -> Bool
+    func observeApplicationChanges(_ onChange: @escaping @MainActor () -> Void)
     func launchApplication(at bundleURL: URL, arguments: [String],
                            onTermination: @escaping @MainActor (pid_t) -> Void) -> pid_t?
 }
@@ -15,10 +17,23 @@ protocol DesktopCrashRecoveryProcessRunning: AnyObject {
 @MainActor
 private final class SystemDesktopCrashRecoveryProcessRunner: DesktopCrashRecoveryProcessRunning {
     private var children: [pid_t: Process] = [:]
+    private var applicationObservation: NSKeyValueObservation?
 
     func applicationProcessIDs(bundleIdentifier: String) -> [pid_t] {
         NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
             .map(\.processIdentifier)
+    }
+
+    func ownsRunningProcess(processID: pid_t) -> Bool {
+        children[processID]?.isRunning == true
+    }
+
+    func observeApplicationChanges(_ onChange: @escaping @MainActor () -> Void) {
+        // Workspace launch/termination notifications can omit accessory apps.
+        // The observable application list includes their direct user relaunches.
+        applicationObservation = NSWorkspace.shared.observe(\.runningApplications) { _, _ in
+            Task { @MainActor in onChange() }
+        }
     }
 
     func launchApplication(at bundleURL: URL, arguments: [String],
@@ -55,13 +70,11 @@ final class DesktopCrashRecoverySupervisor {
 
     private let preferences: UserDefaults
     private let processRunner: any DesktopCrashRecoveryProcessRunning
-    private let notificationCenter: NotificationCenter
     private let bundleURL: URL
     private let bundleIdentifier: String
     private let loginSessionID: @MainActor () -> String?
     private let shouldRestartForRelay: @MainActor () -> Bool
     private let schedule: (TimeInterval, @escaping @MainActor () -> Void) -> Void
-    private var observers: [NSObjectProtocol] = []
     private var lockedControlHost: DesktopLockedControlSupervisorHost?
     private var applicationPID: pid_t?
     private var generation: UInt64 = 0
@@ -71,7 +84,6 @@ final class DesktopCrashRecoverySupervisor {
 
     init(preferences: UserDefaults = .standard,
          processRunner: any DesktopCrashRecoveryProcessRunning = SystemDesktopCrashRecoveryProcessRunner(),
-         notificationCenter: NotificationCenter = NSWorkspace.shared.notificationCenter,
          bundleURL: URL = Bundle.main.bundleURL,
          bundleIdentifier: String = Bundle.main.bundleIdentifier ?? "ai.personastack.desktop",
          loginSessionID: @escaping @MainActor () -> String? = { DesktopCrashRecoverySupervisor.currentLoginSessionID() },
@@ -83,7 +95,6 @@ final class DesktopCrashRecoverySupervisor {
          }) {
         self.preferences = preferences
         self.processRunner = processRunner
-        self.notificationCenter = notificationCenter
         self.bundleURL = bundleURL
         self.bundleIdentifier = bundleIdentifier
         self.loginSessionID = loginSessionID
@@ -110,8 +121,9 @@ final class DesktopCrashRecoverySupervisor {
                 _ = preferences.synchronize()
             }
         }
-        observeApplicationLaunches()
-        observeApplicationTerminations()
+        processRunner.observeApplicationChanges { [weak self] in
+            self?.reconcileApplicationProcesses()
+        }
 
         if let runningPID = activeApplicationPID() {
             applicationPID = runningPID
@@ -122,7 +134,9 @@ final class DesktopCrashRecoverySupervisor {
     }
 
     func run() -> Never {
-        NSApplication.shared.setActivationPolicy(.prohibited)
+        // NSApplication registers this same-bundle helper with LaunchServices,
+        // even with prohibited activation. After the GUI exits, open then targets
+        // the helper and fails with -600. Keep the supervisor on a headless loop.
         startLockedControlListener()
         start()
         RunLoop.main.run()
@@ -191,30 +205,18 @@ final class DesktopCrashRecoverySupervisor {
         }
     }
 
-    private func observeApplicationLaunches() {
-        let token = notificationCenter.addObserver(forName: NSWorkspace.didLaunchApplicationNotification,
-                                                   object: nil, queue: .main) { [weak self] note in
-            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
-            MainActor.assumeIsolated {
-                guard let self, app.bundleIdentifier == self.bundleIdentifier,
-                      app.processIdentifier != getpid() else { return }
-                self.receiveApplicationLaunch(bundleIdentifier: app.bundleIdentifier,
-                                              processID: app.processIdentifier)
-            }
+    private func reconcileApplicationProcesses() {
+        let pids = processRunner.applicationProcessIDs(bundleIdentifier: bundleIdentifier)
+            .filter { $0 != getpid() }
+        if let applicationPID, pids.contains(applicationPID) { return }
+        // A child may still be starting before it appears in LaunchServices, or
+        // be finishing after unregistering. Its Process callback owns that exit.
+        if let applicationPID, processRunner.ownsRunningProcess(processID: applicationPID) { return }
+        if let pid = pids.first {
+            receiveApplicationLaunch(bundleIdentifier: bundleIdentifier, processID: pid)
+        } else if let applicationPID {
+            receiveApplicationTermination(bundleIdentifier: bundleIdentifier, processID: applicationPID)
         }
-        observers.append(token)
-    }
-
-    private func observeApplicationTerminations() {
-        let token = notificationCenter.addObserver(forName: NSWorkspace.didTerminateApplicationNotification,
-                                                   object: nil, queue: .main) { [weak self] note in
-            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
-            MainActor.assumeIsolated {
-                self?.receiveApplicationTermination(bundleIdentifier: app.bundleIdentifier,
-                                                    processID: app.processIdentifier)
-            }
-        }
-        observers.append(token)
     }
 
     private func activeApplicationPID() -> pid_t? {
