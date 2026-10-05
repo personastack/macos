@@ -1,6 +1,7 @@
 """Check real Mach-O dependency lookup without credentials or launching an app."""
 
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -64,6 +65,20 @@ class SparkleRuntimeTests(unittest.TestCase):
         self.framework.unlink()
         result = self.verify()
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_signing_continuity_fixture_includes_nested_hook(self):
+        script = (SCRIPT.parent / "test-signing-continuity.sh").read_text()
+        function = re.search(r"(?ms)^make_bundle\(\) \{.*?^\}", script)
+        self.assertIsNotNone(function)
+        fixture = self.root / "Signing Fixtures With Spaces"
+        fixture.mkdir(exist_ok=True)
+        subprocess.run(["sh", "-eu", "-c",
+                        'fixture_dir="$1"\n' + function.group(0) + '\nmake_bundle first /usr/bin/true 1.0.0\n',
+                        "fixture", str(fixture)], check=True)
+        for name in ("PersonaStack", "PersonaStackHarnessHook"):
+            executable = fixture / "first.app/Contents/MacOS" / name
+            self.assertEqual(executable.read_bytes(), Path("/usr/bin/true").read_bytes())
+            self.assertTrue(executable.stat().st_mode & 0o111)
 
     def test_missing_executable_is_rejected(self):
         self.executable.unlink()
