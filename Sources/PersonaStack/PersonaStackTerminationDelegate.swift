@@ -4,7 +4,7 @@ import PersonaStackCore
 @MainActor
 final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     var reopenMainWindow: (@MainActor () -> Void)?
-    private var shouldRestoreMainWindowAfterUpdate = false
+    private var shouldRestoreMainWindow = false
     private let shutdown: @MainActor () async -> Bool
     private let terminate: @MainActor (NSApplication) -> Void
     private let hasActiveSessions: @MainActor () -> Bool
@@ -14,6 +14,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     private let recordQuitIntent: @MainActor () -> Void
     private let moveToMenuBar: @MainActor (NSApplication) -> Void
     private let hasMiniaturizedMainWindow: @MainActor () -> Bool
+    private let navigateMainWindow: @MainActor (URL) -> Void
     private enum Phase { case idle, cleaning, admitted }
     private var phase = Phase.idle
     private var timeoutTask: Task<Void, Never>?
@@ -39,12 +40,14 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
                 isUpdateRelaunch: preferences.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey),
                 preferences: preferences)
         }
+        navigateMainWindow = { MainWebViewHost.shared.coordinator.start($0) }
         super.init()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         DesktopLoginItemRegistration.enableOnFirstLaunch()
         DesktopNotificationCoordinator.shared.install()
+        DesktopNotificationCoordinator.shared.installConcernNavigation { [weak self] in self?.openConcern($0) }
         // The authenticated receiver belongs to the app, not Desktop Control
         // enrollment or the visible main window.
         _ = MainWebViewHost.shared
@@ -53,23 +56,29 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
                 || DesktopApplicationRestart.resumesPermissionSetup else { return }
         UserDefaults.standard.removeObject(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
         _ = UserDefaults.standard.synchronize()
-        shouldRestoreMainWindowAfterUpdate = true
+        shouldRestoreMainWindow = true
         NSApp.setActivationPolicy(.regular)
         Task { @MainActor [weak self] in
             await Task.yield()
             NSApp.activate(ignoringOtherApps: true)
-            self?.restoreMainWindowAfterUpdateIfNeeded()
+            self?.restoreMainWindowIfNeeded()
         }
     }
 
     func installMainWindowReopener(_ action: @escaping @MainActor () -> Void) {
         reopenMainWindow = action
-        restoreMainWindowAfterUpdateIfNeeded()
+        restoreMainWindowIfNeeded()
     }
 
-    private func restoreMainWindowAfterUpdateIfNeeded() {
-        guard shouldRestoreMainWindowAfterUpdate, let reopenMainWindow else { return }
-        shouldRestoreMainWindowAfterUpdate = false
+    func openConcern(_ destination: URL) {
+        navigateMainWindow(destination)
+        shouldRestoreMainWindow = true
+        restoreMainWindowIfNeeded()
+    }
+
+    private func restoreMainWindowIfNeeded() {
+        guard shouldRestoreMainWindow, let reopenMainWindow else { return }
+        shouldRestoreMainWindow = false
         reopenMainWindow()
     }
 
@@ -81,6 +90,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
          cancelPermissionRestart: @escaping @MainActor () -> Void = {},
          recordQuitIntent: @escaping @MainActor () -> Void = {},
          moveToMenuBar: @escaping @MainActor (NSApplication) -> Void = PersonaStackTerminationDelegate.hideWindows,
+         navigateMainWindow: @escaping @MainActor (URL) -> Void = { MainWebViewHost.shared.coordinator.start($0) },
          hasMiniaturizedMainWindow: @escaping @MainActor () -> Bool = {
              NSApp.windows.contains { $0.title == "PersonaStack" && $0.isMiniaturized }
          }) {
@@ -93,6 +103,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         self.recordQuitIntent = recordQuitIntent
         self.moveToMenuBar = moveToMenuBar
         self.hasMiniaturizedMainWindow = hasMiniaturizedMainWindow
+        self.navigateMainWindow = navigateMainWindow
         super.init()
     }
 

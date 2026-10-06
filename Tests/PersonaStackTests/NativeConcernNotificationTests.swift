@@ -7,6 +7,42 @@ import PersonaStackCore
 @testable import PersonaStack
 
 struct NativeConcernNotificationTests {
+    @Test @MainActor
+    func clickingCreatedConcernNavigatesAndReopensTheMainWindow() throws {
+        let appURL = try #require(URL(string: "https://my.personastack.ai/user/personas"))
+        var requests: [UNNotificationRequest] = []
+        let receiver = PersonaStackWebView.Coordinator(appURL: appURL,
+            notificationCoordinator: nil, configureNotificationCenter: { _ in },
+            scheduleNotification: { requests.append($0) }, concernNotificationsEnabled: { true })
+        receiver.handleConcernMessage(name: "personastackConcern", isMainFrame: true, host: appURL.host,
+            body: ["version": "2", "event": "created", "concern_id": "specific-concern", "workspace_id": "ws_b"], appURL: appURL)
+        let request = try #require(requests.first)
+        #expect(request.content.body == "A new concern needs attention.")
+        var destinations: [URL] = []
+        var openedWindows = 0
+        let delegate = PersonaStackTerminationDelegate(shutdown: { true }, terminate: { _ in }, timeout: .seconds(1),
+            navigateMainWindow: { destinations.append($0) })
+        let notifications = DesktopNotificationCoordinator()
+        notifications.installConcernNavigation { delegate.openConcern($0) }
+        notifications.handleResponse(requestIdentifier: request.identifier, actionIdentifier: UNNotificationDefaultActionIdentifier,
+            userInfo: request.content.userInfo, appURL: appURL)
+        #expect(destinations.first?.absoluteString == "https://my.personastack.ai/user/concerns?workspace_id=ws_b&concern_id=specific-concern")
+        // A cold click can precede installation of SwiftUI's window opener.
+        #expect(openedWindows == 0)
+        delegate.installMainWindowReopener { openedWindows += 1 }
+        #expect(openedWindows == 1)
+        notifications.handleResponse(requestIdentifier: request.identifier, actionIdentifier: UNNotificationDefaultActionIdentifier,
+            userInfo: request.content.userInfo, appURL: appURL)
+        #expect(openedWindows == 2 && destinations.count == 2)
+        for action in [UNNotificationDismissActionIdentifier, "PERSONASTACK_LATER", "unknown"] {
+            notifications.handleResponse(requestIdentifier: request.identifier, actionIdentifier: action,
+                userInfo: request.content.userInfo, appURL: appURL)
+        }
+        notifications.handleResponse(requestIdentifier: request.identifier, actionIdentifier: UNNotificationDefaultActionIdentifier,
+            userInfo: request.content.userInfo, appURL: try #require(URL(string: "https://my.personastack.lan")))
+        #expect(openedWindows == 2 && destinations.count == 2)
+    }
+
     @MainActor
     @Test
     func createdConcernSchedulesAContentFreeLocalNotification() throws {
@@ -163,7 +199,7 @@ struct NativeConcernNotificationTests {
     #expect(notifications.count == 1)
     created()
     #expect(notifications.count == 2)
-    #expect(notifications.allSatisfy { $0.content.userInfo.isEmpty })
+    #expect(notifications.allSatisfy { $0.content.userInfo.count == 1 && $0.content.userInfo["app_origin"] as? String == "https://my.personastack.ai" })
     // The concern preference does not interfere with update action routing.
     #expect(DesktopNotificationCoordinator.updateAction(requestIdentifier: "personastack-update-ready-1.0.0",
         actionIdentifier: UNNotificationDefaultActionIdentifier) == .restart)

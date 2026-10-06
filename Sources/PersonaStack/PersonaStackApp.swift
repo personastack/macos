@@ -170,6 +170,9 @@ final class MainWebViewHost {
         configuration.websiteDataStore = .default()
         configuration.preferences.isFraudulentWebsiteWarningEnabled = true
         configuration.userContentController.add(coordinator, name: "personastackConcern")
+        configuration.userContentController.addUserScript(WKUserScript(
+            source: "window.personastackConcernNavigation = true;",
+            injectionTime: .atDocumentStart, forMainFrameOnly: true))
         configuration.userContentController.addScriptMessageHandler(coordinator, contentWorld: .page, name: DesktopMediaCapturePermission.bridgeName)
         configuration.userContentController.addScriptMessageHandler(ChatWindowManager.shared, contentWorld: .page, name: "personastackChat")
         configuration.userContentController.addScriptMessageHandler(StackWindowManager.shared, contentWorld: .page, name: "personastackStack")
@@ -425,7 +428,7 @@ struct PersonaStackWebView: NSViewRepresentable {
                   NotificationBridge.isNewConcernEvent(body) else {
                 return
             }
-            postConcernNotification()
+            postConcernNotification(body)
         }
 
     private static func url(for origin: WKSecurityOrigin) -> URL? {
@@ -436,12 +439,14 @@ struct PersonaStackWebView: NSViewRepresentable {
             return parts.url
         }
 
-        private func postConcernNotification() {
+        private func postConcernNotification(_ body: Any) {
+            guard let info = NotificationBridge.notificationInfo(body, appURL: appURL) else { return }
             let content = UNMutableNotificationContent()
             content.title = "PersonaStack"
             content.body = "A new concern needs attention."
             content.sound = .default
-            let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+            content.userInfo = info
+            let request = UNNotificationRequest(identifier: "personastack-concern-\(UUID().uuidString)", content: content, trigger: nil)
             scheduleNotification(request)
         }
 

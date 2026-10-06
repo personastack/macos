@@ -1,4 +1,5 @@
 import Foundation
+import PersonaStackCore
 import UserNotifications
 
 /// Startup and the permission checklist share one pending OS approval request.
@@ -45,13 +46,18 @@ final class DesktopNotificationCoordinator: NSObject, UNUserNotificationCenterDe
         case restart
     }
 
-    private let center = UNUserNotificationCenter.current()
+    private var center: UNUserNotificationCenter { .current() }
     private let authorization = DesktopNotificationAuthorization()
     private let availableCategory = "PERSONASTACK_DESKTOP_UPDATE_AVAILABLE"
     private let readyCategory = "PERSONASTACK_DESKTOP_UPDATE_READY"
+    private var openConcern: (@MainActor (URL) -> Void)?
 
-    private override init() {
+    override init() {
         super.init()
+    }
+
+    func installConcernNavigation(_ action: @escaping @MainActor (URL) -> Void) {
+        openConcern = action
     }
 
     func install() {
@@ -163,12 +169,23 @@ final class DesktopNotificationCoordinator: NSObject, UNUserNotificationCenterDe
     ) async {
         let requestIdentifier = response.notification.request.identifier
         let actionIdentifier = response.actionIdentifier
+        let userInfo = response.notification.request.content.userInfo as? [String: String]
         await MainActor.run {
-            switch Self.updateAction(requestIdentifier: requestIdentifier, actionIdentifier: actionIdentifier) {
-            case .download: DesktopUpdater.shared.downloadLatestUpdate()
-            case .restart: DesktopUpdater.shared.restartToInstall()
-            case nil: break
-            }
+            handleResponse(requestIdentifier: requestIdentifier, actionIdentifier: actionIdentifier,
+                           userInfo: userInfo ?? [:], appURL: MainWebViewHost.shared.coordinator.appURL)
+        }
+    }
+
+    func handleResponse(requestIdentifier: String, actionIdentifier: String,
+                        userInfo: [AnyHashable: Any], appURL: URL) {
+        switch Self.updateAction(requestIdentifier: requestIdentifier, actionIdentifier: actionIdentifier) {
+        case .download: DesktopUpdater.shared.downloadLatestUpdate()
+        case .restart: DesktopUpdater.shared.restartToInstall()
+        case nil:
+            guard requestIdentifier.hasPrefix("personastack-concern-"),
+                  actionIdentifier == UNNotificationDefaultActionIdentifier,
+                  let destination = NotificationBridge.concernDestination(userInfo, appURL: appURL) else { return }
+            openConcern?(destination)
         }
     }
 
