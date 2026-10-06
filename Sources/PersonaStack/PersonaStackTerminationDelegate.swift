@@ -13,6 +13,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     private let timeout: Duration
     private let recordQuitIntent: @MainActor () -> Void
     private let moveToMenuBar: @MainActor (NSApplication) -> Void
+    private let hasMiniaturizedMainWindow: @MainActor () -> Bool
     private enum Phase { case idle, cleaning, admitted }
     private var phase = Phase.idle
     private var timeoutTask: Task<Void, Never>?
@@ -28,6 +29,9 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         cancelPermissionRestart = { DesktopApplicationRestart.shared.cancelPendingRestart() }
         timeout = .seconds(10)
         moveToMenuBar = Self.hideWindows
+        hasMiniaturizedMainWindow = {
+            NSApp.windows.contains { $0.title == "PersonaStack" && $0.isMiniaturized }
+        }
         recordQuitIntent = {
             let preferences = UserDefaults.standard
             preferences.synchronize()
@@ -76,7 +80,10 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
          showCleanupFailure: @escaping @MainActor () -> Void = {},
          cancelPermissionRestart: @escaping @MainActor () -> Void = {},
          recordQuitIntent: @escaping @MainActor () -> Void = {},
-         moveToMenuBar: @escaping @MainActor (NSApplication) -> Void = PersonaStackTerminationDelegate.hideWindows) {
+         moveToMenuBar: @escaping @MainActor (NSApplication) -> Void = PersonaStackTerminationDelegate.hideWindows,
+         hasMiniaturizedMainWindow: @escaping @MainActor () -> Bool = {
+             NSApp.windows.contains { $0.title == "PersonaStack" && $0.isMiniaturized }
+         }) {
         self.shutdown = shutdown
         self.terminate = terminate
         self.timeout = timeout
@@ -85,7 +92,13 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         self.cancelPermissionRestart = cancelPermissionRestart
         self.recordQuitIntent = recordQuitIntent
         self.moveToMenuBar = moveToMenuBar
+        self.hasMiniaturizedMainWindow = hasMiniaturizedMainWindow
         super.init()
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        guard hasMiniaturizedMainWindow(), let reopenMainWindow else { return }
+        reopenMainWindow()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

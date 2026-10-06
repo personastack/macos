@@ -2,6 +2,27 @@ import AppKit
 import Testing
 @testable import PersonaStack
 
+@MainActor
+private final class MiniaturizedMainWindowState {
+    var isMiniaturized = true
+}
+
+@Test @MainActor func appSwitcherActivationRestoresMiniaturizedMainWindow() {
+    let state = MiniaturizedMainWindowState()
+    var reopenCalls = 0
+    let app = NSApplication.shared
+    let delegate = PersonaStackTerminationDelegate(shutdown: { true }, terminate: { _ in }, timeout: .seconds(1),
+        moveToMenuBar: { _ in }, hasMiniaturizedMainWindow: { state.isMiniaturized })
+    delegate.installMainWindowReopener { reopenCalls += 1 }
+
+    delegate.applicationDidBecomeActive(Notification(name: NSApplication.didBecomeActiveNotification, object: app))
+    #expect(reopenCalls == 1)
+
+    state.isMiniaturized = false
+    delegate.applicationDidBecomeActive(Notification(name: NSApplication.didBecomeActiveNotification, object: app))
+    #expect(reopenCalls == 1)
+}
+
 @Test @MainActor func commandQuitPreservesWorkAndReopenUntilExplicitQuit() async {
     let app = NSApplication.shared
     var windowsVisible = true
