@@ -50,6 +50,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private var daemonPID: Int32?
     private var proxy: CuaMCPProxy?
     private var startingProxy: CuaMCPProxy?
+#if DEBUG
+    private var proxyFactoryForTesting: ((CuaDriverInstallation, URL, Int32) -> CuaMCPProxy)?
+    private var beforeCuaPublicationForTesting: (() async -> Void)?
+#endif
     private var cuaStartup: (id: UUID, task: Task<Void, Error>)?
     private var gateway: DesktopControlGatewayConnection?
     private var pendingGateway: DesktopControlGatewayConnection?
@@ -169,7 +173,24 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let exclusion = try await setupExecutor.beginNativeVerification()
         defer { setupExecutor.endNativeVerification(exclusion) }
         try Task.checkCancellation()
-        try await startCua(startPaused: paused, generation: lifecycleGeneration, connectRelay: false)
+        let generation = lifecycleGeneration
+        try await drainCuaStartup(generation: generation)
+        try setupExecutor.requireNativeVerification(exclusion)
+        // Setup exclusion proves that this client owns no remote lease. Refresh
+        // only our idle MCP connection so an independently restarted CUA can be
+        // checked before enrollment, when no relay heartbeat exists to recover it.
+        let previous = proxy
+        proxy = nil
+        daemonPID = nil
+        selectedCuaInstallation = nil
+        tools = []
+        capabilitiesVerified = false
+        if !paused { readiness = "cua_unavailable" }
+        await previous?.stop()
+        try requireCurrentLifecycle(generation)
+        try setupExecutor.requireNativeVerification(exclusion)
+        try Task.checkCancellation()
+        try await startCua(startPaused: paused, generation: generation, connectRelay: false)
     }
 
     @discardableResult
@@ -922,7 +943,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         try await startCua(startPaused: remainPaused, generation: generation)
     }
 
-    private func startCua(startPaused: Bool, generation: UUID, connectRelay: Bool = true) async throws {
+    private func drainCuaStartup(generation: UUID) async throws {
         try requireCurrentLifecycle(generation)
         while let previous = cuaStartup {
             previous.task.cancel()
@@ -930,7 +951,15 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             _ = await previous.task.result
             if cuaStartup?.id == previous.id { cuaStartup = nil }
             try requireCurrentLifecycle(generation)
+            try Task.checkCancellation()
         }
+    }
+
+    private func startCua(startPaused: Bool, generation: UUID, connectRelay: Bool = true) async throws {
+        try requireCurrentLifecycle(generation)
+        guard !connectRelay || !executor.nativeVerificationInProgress else { throw CuaMCPProxyError.serviceRunning }
+        try await drainCuaStartup(generation: generation)
+        guard !connectRelay || !executor.nativeVerificationInProgress else { throw CuaMCPProxyError.serviceRunning }
         let id = UUID()
         let task = Task { @MainActor in
             try await self.connectCua(startPaused: startPaused, generation: generation, connectRelay: connectRelay)
@@ -938,6 +967,14 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         cuaStartup = (id, task)
         defer { if cuaStartup?.id == id { cuaStartup = nil } }
         try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+    }
+
+    private func makeCuaProxy(installation: CuaDriverInstallation, pid: Int32) -> CuaMCPProxy {
+#if DEBUG
+        if let factory = proxyFactoryForTesting { return factory(installation, cuaService.socketURL, pid) }
+#endif
+        return CuaMCPProxy(executableURL: installation.executableURL,
+                           socketURL: cuaService.socketURL, expectedDaemonPID: pid)
     }
 
     private func connectCua(startPaused: Bool, generation: UUID, connectRelay: Bool) async throws {
@@ -950,8 +987,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                 try requireCurrentLifecycle(generation)
                 let pid = try await cuaService.inspectPeer(installation: installation)
                 try requireCurrentLifecycle(generation)
-                let candidate = CuaMCPProxy(executableURL: installation.executableURL,
-                                            socketURL: cuaService.socketURL, expectedDaemonPID: pid)
+                let candidate = makeCuaProxy(installation: installation, pid: pid)
                 startingProxy = candidate
                 do {
                     _ = try await candidate.start()
@@ -959,6 +995,13 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                     try requireCurrentLifecycle(generation)
                     let catalog = try await candidate.listTools()
                     let validatedTools = try await candidate.validateToolCatalog(catalog)
+#if DEBUG
+                    if let barrier = beforeCuaPublicationForTesting {
+                        beforeCuaPublicationForTesting = nil
+                        await barrier()
+                    }
+#endif
+                    try Task.checkCancellation()
                     try requireCurrentLifecycle(generation)
                     selectedCuaInstallation = installation
                     daemonPID = pid
@@ -1141,6 +1184,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                                credentials: any DesktopControlCredentialStoring,
                                executor: DesktopControlCommandExecutor? = nil,
                                proxy: CuaMCPProxy? = nil,
+                               proxyFactory: ((CuaDriverInstallation, URL, Int32) -> CuaMCPProxy)? = nil,
+                               beforeCuaPublication: (() async -> Void)? = nil,
                                connectionID: UUID? = nil,
                                installation: DesktopControlInstallation? = nil,
                                connected: Bool = false,
@@ -1156,6 +1201,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             configurationProvider: configurationProvider, sessionLock: monitor)
         if let executor { runtime.executor = executor }
         runtime.proxy = proxy
+        runtime.proxyFactoryForTesting = proxyFactory
+        runtime.beforeCuaPublicationForTesting = beforeCuaPublication
         runtime.gatewayConnectionID = connectionID
         runtime.activeInstallation = installation
         runtime.gatewayConnected = connected

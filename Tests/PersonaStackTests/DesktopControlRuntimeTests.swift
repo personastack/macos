@@ -1,6 +1,6 @@
 import AppKit
 import Foundation
-import PersonaStackCore
+@testable import PersonaStackCore
 import ServiceManagement
 import Testing
 import WebKit
@@ -793,4 +793,94 @@ private actor StandaloneRuntimeServiceFixture: DesktopControlCuaServicing {
     #expect(await service.setups == 0)
     #expect(await service.permissionRequests == 0)
     #expect(await service.inspections == 0)
+}
+
+private actor RestartedStandaloneServiceFixture: DesktopControlCuaServicing {
+    nonisolated let socketURL = URL(fileURLWithPath: "/fixture/standalone.sock")
+    private var pid: Int32 = 111
+    private(set) var mutations = 0
+    func setPID(_ pid: Int32) { self.pid = pid }
+    func inspectPeer(installation: CuaDriverInstallation) async throws -> Int32 { pid }
+    func setup(installation: CuaDriverInstallation) async throws { mutations += 1 }
+    func requestPermissions(installation: CuaDriverInstallation) async throws { mutations += 1 }
+}
+
+@Test(arguments: ["running", "stopped", "startup"]) @MainActor
+func firstEnrollmentCheckReconnectsOnlyItsIdleClientAfterStandaloneRestart(mode: String) async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("cua-setup-reconnect-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let catalog = CuaDriverCompatibility.requiredTools.sorted().map { name in
+        DesktopControlJSONValue.object(["name": .string(name), "inputSchema": CuaToolCatalog.reviewedSchema(name)!])
+    }
+    let encodedCatalog = try JSONEncoder().encode(catalog).base64EncodedString()
+    for pid in [111, 222] {
+        let script = #"""
+        #!/usr/bin/python3
+        import base64, json, sys
+        for line in sys.stdin:
+            request = json.loads(line)
+            method = request.get("method")
+            if method == "notifications/initialized": continue
+            if method == "initialize":
+                result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.29.1"}}
+            elif method == "tools/list":
+                result = {"tools":json.loads(base64.b64decode("\#(encodedCatalog)"))}
+            elif method == "tools/call" and request["params"]["name"] == "check_permissions":
+                assert request["params"]["arguments"] == {"prompt":False,"probe_direct_capture":False}
+                result = {"structuredContent":{"accessibility":True,"screen_recording":True,
+                    "source":{"attribution":"driver-daemon","bundle_id":"com.trycua.driver","pid":\#(pid)},
+                    "direct_capture_verification":{"source":"permissions_grant","bundle_id":"com.trycua.driver","verified_at":"2026-10-06T12:00:00Z"}}}
+            else:
+                sys.exit(2)
+            print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
+        """#
+        let executable = directory.appendingPathComponent("proxy-\(pid)")
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+    }
+    let installer = StandaloneRuntimeInstallerFixture()
+    let service = RestartedStandaloneServiceFixture()
+    let credentials = PermissionPreparationCredentialStore(installation: nil)
+    var proxies: [CuaMCPProxy] = []
+    var connectedPIDs: [Int32] = []
+    var publicationWaiting = false
+    let runtime = DesktopControlRuntime.makeForTesting(installer: installer, cuaService: service,
+        credentials: credentials, proxyFactory: { installation, socket, pid in
+            #expect(installation.applicationURL.path == "/Applications/CuaDriver.app")
+            #expect(socket == service.socketURL)
+            connectedPIDs.append(pid)
+            let proxy = CuaMCPProxy(executableURL: directory.appendingPathComponent("proxy-\(pid)"))
+            proxies.append(proxy)
+            return proxy
+        }, beforeCuaPublication: mode == "startup" ? {
+            publicationWaiting = true
+            while !Task.isCancelled { await Task.yield() }
+        } : nil, sessionLockState: .unlocked)
+    if mode == "startup" {
+        let prior = Task { await runtime.heartbeatReadinessForTesting() }
+        let deadline = ContinuousClock.now + .seconds(3)
+        while !publicationWaiting, ContinuousClock.now < deadline { await Task.yield() }
+        #expect(publicationWaiting)
+        await service.setPID(222)
+        try await runtime.checkCuaConnectionForSetup()
+        _ = await prior.value
+    } else {
+        try await runtime.checkCuaConnectionForSetup()
+        #expect(runtime.isCuaReady())
+        #expect(connectedPIDs == [111])
+        if mode == "stopped" { await proxies[0].stop() }
+        await service.setPID(222)
+        try await runtime.checkCuaConnectionForSetup()
+    }
+    #expect(runtime.isCuaReady())
+    #expect(connectedPIDs == [111, 222])
+    #expect(await !proxies[0].isProcessRunning())
+    #expect(await proxies[1].isProcessRunning())
+    #expect(await installer.installations == 0)
+    #expect(await service.mutations == 0)
+    #expect(credentials.readCount == 0)
+    #expect(!runtime.gatewayConnected)
+    #expect(!runtime.hasPendingRelayReconnectForTesting)
+    await runtime.shutdownForQuit()
 }
