@@ -1187,7 +1187,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func refreshStatusReadiness(generation: UUID, connectionID: UUID) async -> Bool {
-        guard !executorCleanupInProgress, !executorCleanupFailed, controlSessionIsUsable else { return true }
+        guard !executorCleanupInProgress, !executorCleanupFailed, controlSessionIsUsable,
+              executor.currentLease == nil, !executor.nativeVerificationInProgress else { return true }
+        // Busy status must not queue behind a long CUA action. Heartbeats keep
+        // checking health independently while an owner holds the lease.
         // Diagnostic checks remain available while paused. They never install,
         // prompt, start CUA, or replay remote work.
         _ = await refreshCuaReadiness()

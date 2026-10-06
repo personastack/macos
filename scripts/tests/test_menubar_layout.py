@@ -72,8 +72,11 @@ class MenuBarLayoutTests(unittest.TestCase):
         self.assertNotIn("confirmForegroundSession", controls)
         self.assertNotIn('Button("Confirm This Mac Is Unlocked")', controls)
         self.assertIn("relayEnabled || DesktopControlRuntime.shared.hasPendingEnvironmentSwitch", controls)
-        self.assertIn("Task { await repairCua() }", controls)
-        self.assertIn(".disabled(status.isRepairing || DesktopControlRuntime.shared.isDisconnecting)", controls)
+        self.assertIn("DesktopControlDiagnosticsWindow.shared.present(checkConnection: true)",
+                      block(controls, 'Button("Check CUA Connection")'))
+        self.assertLess(controls.index('Button("Check CUA Connection")'),
+                        controls.index("if relayEnabled ||"))
+        self.assertIn(".disabled(DesktopControlRuntime.shared.isDisconnecting)", controls)
         self.assertIn('Button("Disconnect This Mac…", role: .destructive)', controls)
         self.assertIn("confirmDisconnect()", controls)
         confirmation = block(self.menu, "private func confirmDisconnect()")

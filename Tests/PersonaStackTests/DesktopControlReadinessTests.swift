@@ -279,3 +279,25 @@ private final class CountingDesktopCredentials: DesktopControlCredentialStoring,
 
     func delete() throws {}
 }
+
+@MainActor @Test func desktopBusyStatusDoesNotQueueBehindCUAOrLoseItsLease() async throws {
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: Data(#"{"installation_id":"install-status","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://gateway.test/v1/desktop-control/ws"}"#.utf8))
+    let target = DesktopControlTarget(installationID: installation.installationID, workspaceID: "workspace-a",
+        configID: "config-a", personaID: "persona-a", runID: "run-a", generation: 1)
+    let executor = DesktopControlCommandExecutor()
+    let acquire = DesktopControlFrame(type: "command", requestID: "acquire", target: target,
+        operation: "desktop_control_acquire", arguments: .object([:]), deadlineAt: Date().addingTimeInterval(45))
+    #expect(await executor.handle(acquire, proxy: nil).type == "result")
+    let connectionID = UUID()
+    let runtime = DesktopControlRuntime.makeForTesting(installer: ReadinessInstaller(), credentials: ReadinessCredentials(),
+        executor: executor, connectionID: connectionID, installation: installation, connected: true, readiness: "ready")
+    let status = DesktopControlFrame(type: "command", requestID: "status", target: target,
+        operation: "desktop_control_status", arguments: .object([:]), deadlineAt: Date().addingTimeInterval(45))
+    let response = await runtime.handleForTesting(status, connectionID: connectionID)
+    guard case .object(let values)? = response.result else { Issue.record("Missing busy status"); return }
+    #expect(values["busy"] == .bool(true))
+    #expect(values["gui_readiness"] == .string("ready"))
+    #expect(executor.currentLease != nil)
+    #expect(await runtime.diagnosticReport().lastCuaCheck == nil)
+    #expect(await executor.close())
+}
