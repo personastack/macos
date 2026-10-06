@@ -24,26 +24,10 @@
   <string>14.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
-  <key>NSScreenCaptureUsageDescription</key>
-  <string>Share your screen when you set up or use PersonaStack Desktop Control.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Record audio attachments when you choose the microphone in persona chat.</string>
-  <key>NSAppleEventsUsageDescription</key>
-  <string>Allow authorized personas to control Safari and locally approved browsers for desktop and web tasks.</string>
-  <key>NSBonjourServices</key>
-  <array><string>_ps-setup._tcp</string></array>
   <key>NSLocalNetworkUsageDescription</key>
-  <string>Verify local-network access during setup so authorized personas can use local resources without an unattended permission prompt.</string>
-  <key>NSDesktopFolderUsageDescription</key>
-  <string>Access Desktop files when you authorize PersonaStack Desktop Control.</string>
-  <key>NSDocumentsFolderUsageDescription</key>
-  <string>Access Documents files when you authorize PersonaStack Desktop Control.</string>
-  <key>NSDownloadsFolderUsageDescription</key>
-  <string>Access Downloads files when you authorize PersonaStack Desktop Control.</string>
-  <key>NSRemovableVolumesUsageDescription</key>
-  <string>Access selected removable volumes when you authorize PersonaStack Desktop Control.</string>
-  <key>NSNetworkVolumesUsageDescription</key>
-  <string>Access selected network volumes when you authorize PersonaStack Desktop Control.</string>
+  <string>Connect to your selected PersonaStack server on the local network.</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
   <key>NSAppTransportSecurity</key>

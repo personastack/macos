@@ -22,15 +22,15 @@ extension CuaMCPProxyError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .permissionsRequired:
-            return "Verify Accessibility in PersonaStack's permissions checklist. Screenshot-based control also needs Screen Capture."
+            return "Complete CUA Setup to grant CUA Accessibility and Screen Recording access."
         case .functionalProbeFailed:
-            return "PersonaStack could not verify screen capture and accessibility. Check its permissions checklist and retry."
+            return "CUA could not verify its permissions. Complete CUA Setup and check the connection."
         case .serviceRunning:
-            return "Quit CuaDriver.app, then retry Desktop Control repair. Repair will not terminate the running service or replace its managed files."
+            return "PersonaStack control or setup is busy. Finish setup or stop the PersonaStack control session, then try again."
         case .serviceMismatch:
-            return "PersonaStack could not verify its desktop control service. Retry the permissions setup or repair Desktop Control."
+            return "PersonaStack could not verify a compatible standalone CUA connection. Choose Set Up CUA to check the installation and connection."
         default:
-            return "The local Cua service could not complete its setup check. Retry setup or repair Cua."
+            return "The local CUA connection could not complete this check. Choose Check CUA Connection or Set Up CUA."
         }
     }
 }
@@ -66,8 +66,8 @@ public actor CuaMCPProxy: CuaToolCalling {
         guard !started else { throw CuaMCPProxyError.alreadyStarted }
         try verifyDaemonIdentity()
         process.executableURL = executableURL
-        // The proxy may only connect to the daemon directly hosted by
-        // PersonaStack. Embedded mode forbids standalone-app fallback.
+        // Upstream 0.29.1 calls its no-autolaunch client guard "embedded".
+        // This applies only to the proxy, never the independent daemon or its TCC identity.
         process.arguments = ["mcp"] + (socketURL.map { ["--socket", $0.path, "--embedded"] } ?? [])
         process.environment = Self.allowedChildEnvironment()
         process.standardInput = input
@@ -105,11 +105,20 @@ public actor CuaMCPProxy: CuaToolCalling {
               CuaDriverCompatibility.requiredTools.isSubset(of: names) else {
             throw CuaMCPProxyError.invalidToolCatalog
         }
+        for tool in tools where CuaDriverCompatibility.requiredTools.contains(tool["name"] as? String ?? "") {
+            guard let name = tool["name"] as? String, let rawSchema = tool["inputSchema"],
+                  JSONSerialization.isValidJSONObject(rawSchema),
+                  let schema = try? JSONDecoder().decode(DesktopControlJSONValue.self,
+                    from: JSONSerialization.data(withJSONObject: rawSchema)),
+                  CuaToolCatalog.matchesAdvertisedSchema(name: name, schema: schema) else {
+                throw CuaMCPProxyError.invalidToolCatalog
+            }
+        }
         return names.intersection(CuaDriverCompatibility.exposedTools)
     }
 
     public func callTool(name: String, argumentsJSON: Data, timeout: Int32 = 60) throws -> Data {
-        guard CuaDriverCompatibility.exposedTools.contains(name) else { throw CuaMCPProxyError.invalidToolName }
+        guard CuaDriverCompatibility.requiredTools.contains(name) else { throw CuaMCPProxyError.invalidToolName }
         return try invokeTool(name: name, argumentsJSON: argumentsJSON, timeout: timeout)
     }
 
@@ -172,11 +181,18 @@ public actor CuaMCPProxy: CuaToolCalling {
         let wire = "{\"jsonrpc\":\"2.0\",\"id\":\(id),\"method\":\"\(method)\",\"params\":\(parameters)}\n"
         guard let bytes = wire.data(using: .utf8) else { throw CuaMCPProxyError.invalidArguments }
         let deadline = try DesktopControlExecution.boundedDeadline(timeout: TimeInterval(timeout))
-        do {
-            try writeInput(bytes, deadline: deadline)
-            return try readResponse(id: id, deadline: deadline)
-        }
+        do { try writeInput(bytes, deadline: deadline) }
         catch {
+            // A partial JSON line cannot be safely reused.
+            stop()
+            throw error
+        }
+        do { return try readResponse(id: id, deadline: deadline) }
+        catch CuaMCPProxyError.timeout {
+            // Keep this transport's session authority for end_session cleanup.
+            // The request is not replayed. readResponse discards its late ID.
+            throw CuaMCPProxyError.timeout
+        } catch {
             stop()
             throw error
         }
@@ -378,114 +394,5 @@ public enum CuaSocketIdentity {
         guard Darwin.getsockopt(descriptor, SOL_LOCAL, LOCAL_PEERPID, &pid, &length) == 0,
               length == MemoryLayout<pid_t>.size, pid > 0 else { return nil }
         return pid
-    }
-}
-
-/// Owns one daemon child and a private endpoint. macOS grants belong to the
-/// PersonaStack host that spawns it, never a LaunchServices-started Cua app.
-@MainActor
-public final class CuaEmbeddedService {
-    public let generation = UUID()
-    public let executableURL: URL
-    public let socketURL: URL
-    public let directoryURL: URL
-    public let allowsExistingBrowserProfiles: Bool
-    public let perceptionCatalogURL: URL?
-    private let process = Process()
-    private let lifetime = Pipe()
-    private var launched = false
-    private var ownsDirectory = false
-
-    public init(executableURL: URL, allowsExistingBrowserProfiles: Bool = false, perceptionCatalogURL: URL? = nil) {
-        self.executableURL = executableURL
-        self.allowsExistingBrowserProfiles = allowsExistingBrowserProfiles
-        self.perceptionCatalogURL = perceptionCatalogURL
-        directoryURL = URL(fileURLWithPath: "/tmp/ps-cua-\(UUID().uuidString)", isDirectory: true)
-        socketURL = directoryURL.appendingPathComponent("control.sock")
-    }
-
-    public var processIdentifier: Int32 { process.processIdentifier }
-    public var isRunning: Bool {
-        launched && process.isRunning
-            && CuaSocketIdentity.parentPID(of: process.processIdentifier) == Darwin.getpid()
-            && CuaSocketIdentity.peerPID(at: socketURL) == process.processIdentifier
-    }
-
-    public static func arguments(socketURL: URL, pidFileURL: URL, allowsExistingBrowserProfiles: Bool = false) -> [String] {
-        ["serve", "--embedded", "--parent-liveness-stdio", "--socket", socketURL.path, "--pid-file", pidFileURL.path]
-            + (allowsExistingBrowserProfiles ? ["--grant", "existing-profile"] : [])
-    }
-
-    public func start(isCurrent: @MainActor () throws -> Void) async throws {
-        guard !launched else { throw CuaMCPProxyError.alreadyStarted }
-        try isCurrent()
-        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: false,
-                                                attributes: [.posixPermissions: 0o700])
-        ownsDirectory = true
-        process.executableURL = executableURL
-        process.arguments = Self.arguments(socketURL: socketURL, pidFileURL: directoryURL.appendingPathComponent("daemon.pid"),
-                                           allowsExistingBrowserProfiles: allowsExistingBrowserProfiles)
-        process.environment = CuaDriverCompatibility.processEnvironment(from: ProcessInfo.processInfo.environment)
-        if let perceptionCatalogURL {
-            process.environment?["CUA_DRIVER_PERCEPTION_CATALOG"] = perceptionCatalogURL.path
-        }
-        process.standardInput = lifetime
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-            launched = true
-            let deadline = ContinuousClock.now + .seconds(10)
-            repeat {
-                try isCurrent()
-                guard process.isRunning else { throw CuaMCPProxyError.processExited }
-                guard CuaSocketIdentity.parentPID(of: process.processIdentifier) == Darwin.getpid() else {
-                    throw CuaMCPProxyError.serviceMismatch
-                }
-                if let peerPID = CuaSocketIdentity.peerPID(at: socketURL) {
-                    guard peerPID == process.processIdentifier else { throw CuaMCPProxyError.serviceMismatch }
-                    return
-                }
-                try await Task.sleep(for: .milliseconds(50))
-            } while ContinuousClock.now < deadline
-            throw CuaMCPProxyError.timeout
-        } catch {
-            _ = await stop()
-            throw error
-        }
-    }
-
-    public func stop() async -> Bool {
-        // Cancellation can arrive before or during shutdown. Drain the owned
-        // child in an uncancelled task so every cleanup sleep still yields.
-        await Task { @MainActor in await self.stopProcess() }.value
-    }
-
-    private func stopProcess() async -> Bool {
-        try? lifetime.fileHandleForWriting.close()
-        if launched && process.isRunning {
-            // EOF lets the embedded daemon settle its owned work first.
-            let gracefulDeadline = ContinuousClock.now + .seconds(1)
-            while process.isRunning && ContinuousClock.now < gracefulDeadline {
-                try? await Task.sleep(for: .milliseconds(25))
-            }
-            if process.isRunning { process.terminate() }
-            let terminateDeadline = ContinuousClock.now + .seconds(1)
-            while process.isRunning && ContinuousClock.now < terminateDeadline {
-                try? await Task.sleep(for: .milliseconds(25))
-            }
-            if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
-            let killDeadline = ContinuousClock.now + .milliseconds(500)
-            while process.isRunning && ContinuousClock.now < killDeadline {
-                try? await Task.sleep(for: .milliseconds(25))
-            }
-            guard !process.isRunning else { return false }
-        }
-        if ownsDirectory {
-            do { try FileManager.default.removeItem(at: directoryURL) }
-            catch { return false }
-            ownsDirectory = false
-        }
-        return true
     }
 }

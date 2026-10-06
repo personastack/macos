@@ -6,18 +6,15 @@ import WebKit
 
 @MainActor
 protocol DesktopControlSetupRuntime: AnyObject {
-    func refreshUnattendedPermissionReadiness() async -> Bool
+    func refreshCuaReadiness() async -> Bool
     var gatewayConnected: Bool { get }
     var paused: Bool { get }
-    var nativeExecutorReady: Bool { get }
     func isCuaReady() -> Bool
-    func probeNativeCapabilities(generation: UUID) async throws
     func beginResume() throws -> UUID
     func resume(generation: UUID) async throws
     func resumeForSetup(generation: UUID) async throws
     func finishSetupIfIdle() async throws
     func disconnect() async throws
-    func repair(resumeRelay: Bool, expectedGeneration: UUID?) async throws -> UUID
     func isCurrentLifecycle(_ generation: UUID) -> Bool
     func connect(installation: DesktopControlInstallation, expectedGeneration: UUID?) async
     func savedInstallation(for appURL: URL) async throws -> DesktopControlInstallation?
@@ -60,7 +57,7 @@ enum DesktopControlSetupCommand: Equatable {
 
     case sync(scope: String)
     case state(scope: String)
-    case permissions(scope: String, phase: PermissionPhase, message: String?)
+    case cuaSetup(scope: String, phase: PermissionPhase, message: String?)
     case prepare(scope: String, enrollmentTicket: String)
 
     static func parse(_ body: Any) throws -> DesktopControlSetupCommand {
@@ -76,7 +73,9 @@ enum DesktopControlSetupCommand: Equatable {
         case "state":
             guard Set(object.keys) == ["version", "action", "scope"] else { throw DesktopControlEnrollmentError.invalidRequest }
             return .state(scope: scope)
-        case "permissions":
+        // The deployed hosted page uses permissions until its next release.
+        // Both wire names enter the standalone CUA setup path.
+        case "cua_setup", "permissions":
             guard let phaseValue = object["phase"] as? String,
                   let phase = PermissionPhase(rawValue: phaseValue),
                   !scope.isEmpty || phase == .repair else {
@@ -90,7 +89,7 @@ enum DesktopControlSetupCommand: Equatable {
                   message == nil || (phase == .failed && message!.utf8.count <= 512) else {
                 throw DesktopControlEnrollmentError.invalidRequest
             }
-            return .permissions(scope: scope, phase: phase, message: message)
+            return .cuaSetup(scope: scope, phase: phase, message: message)
         case "prepare":
             guard !scope.isEmpty,
                   Set(object.keys) == ["version", "action", "scope", "enrollment_ticket"],
@@ -109,7 +108,7 @@ enum DesktopControlSetupCommand: Equatable {
         switch self {
         case .sync: "sync"
         case .state: "state"
-        case .permissions: "permissions"
+        case .cuaSetup: "cua_setup"
         case .prepare: "prepare"
         }
     }
@@ -125,18 +124,14 @@ protocol DesktopControlPermissionPresenting: AnyObject {
     func cancel()
 }
 
-extension DesktopPermissionChecklistWindow: DesktopControlPermissionPresenting {
-    var isFinishing: Bool { coordinator.isFinishing }
-}
-
 private enum DesktopControlPermissionBridgeError: LocalizedError {
     case busy, scopeChanged, incomplete
 
     var errorDescription: String? {
         switch self {
-        case .busy: "Desktop Control permission setup is already open."
+        case .busy: "CUA setup is already open."
         case .scopeChanged: "This Desktop Control setup changed. Reopen setup in the current workspace."
-        case .incomplete: "Finish the native permission checklist before connecting this desktop."
+        case .incomplete: "Complete CUA setup before connecting this desktop."
         }
     }
 
@@ -181,9 +176,8 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
     private var cachedPermissionPresenter: (any DesktopControlPermissionPresenting)?
     private var permissionPresenter: any DesktopControlPermissionPresenting {
         if let cachedPermissionPresenter { return cachedPermissionPresenter }
-        let presenter = DesktopPermissionChecklist.shared.window
+        let presenter = CuaSetupWindow.shared
         presenter.onCancel = { [weak self] in
-            DesktopPermissionChecklist.shared.cancelVerification()
             guard let self, let page = self.permissionPage else { return }
             self.cancelPermissions(for: page)
             page.setupScope.synchronize("")
@@ -260,7 +254,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
                 let response = try await apply(command, page: page)
                 replyHandler(response, nil)
             } catch {
-                if case .permissions = command {
+                if case .cuaSetup = command {
                     let code = (error as? DesktopControlPermissionBridgeError)?.code
                         ?? (error is CancellationError ? "setup_cancelled" : "permissions_incomplete")
                     replyHandler(["ok": false, "version": "1", "error_code": code], nil)
@@ -298,15 +292,18 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             return [
                 "ok": true,
                 "operating_system": "macos",
+                "cua_setup_version": "1",
                 "permissions_checklist_version": "1",
                 "installation_id": installation?.installationID as Any? ?? NSNull(),
                 "configuration_in_use": configurationInUse,
                 "cua_ready": runtime.isCuaReady(),
-                "native_executor_ready": runtime.nativeExecutorReady,
+                // Compatibility with the hosted page before its CUA-only release.
+                // This mirrors CUA readiness and does not advertise native file/shell tools.
+                "native_executor_ready": runtime.isCuaReady(),
                 "gateway_connected": runtime.gatewayConnected,
                 "relay_paused": runtime.paused,
             ]
-        case .permissions(let scope, let phase, let message):
+        case .cuaSetup(let scope, let phase, let message):
             if phase != .repair { page.requiresExplicitPermissions = true }
             return try await permissions(scope: scope, phase: phase, message: message, page: page)
         case .prepare(let scope, let ticket):
@@ -347,18 +344,11 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             try await enrollment.attach(ticket: ticket, installation: saved, appURL: page.appURL)
             try requireCurrentScope(scope, generation: generation, page: page)
         }
-        var runtimeGeneration = try runtime.beginResume()
-        do {
-            try await runtime.resumeForSetup(generation: runtimeGeneration)
-        } catch {
-            try requireCurrentScope(scope, generation: generation, page: page)
-            try requireCurrentLifecycle(runtimeGeneration)
-            guard DesktopControlRuntime.shouldForceRepair(after: error) else { throw error }
-            runtimeGeneration = try await runtime.repair(resumeRelay: true, expectedGeneration: runtimeGeneration)
+        let runtimeGeneration = try runtime.beginResume()
+        try await runtime.resumeForSetup(generation: runtimeGeneration)
+        guard await runtime.refreshCuaReadiness() else {
+            throw DesktopControlPermissionBridgeError.incomplete
         }
-        do { try await runtime.probeNativeCapabilities(generation: runtimeGeneration) }
-        catch is CancellationError { throw CancellationError() }
-        catch { throw DesktopControlEnrollmentError.nativeCapabilitiesUnavailable }
         try requireCurrentScope(scope, generation: generation, page: page)
         try requireCurrentLifecycle(runtimeGeneration)
         let installation: DesktopControlInstallation
@@ -403,7 +393,9 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             "operating_system": "macos",
             "installation_id": installation.installationID,
             "cua_ready": runtime.isCuaReady(),
-            "native_executor_ready": runtime.nativeExecutorReady,
+            // Compatibility with the hosted page before its CUA-only release.
+            // This mirrors CUA readiness and does not advertise native file/shell tools.
+            "native_executor_ready": runtime.isCuaReady(),
             "gateway_connected": runtime.gatewayConnected,
             "relay_paused": runtime.paused,
             "suggested_name": Self.suggestedComputerName(),
@@ -411,7 +403,8 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
     }
 
     private static var scopeReply: [String: Any] {
-        ["ok": true, "version": "1", "operating_system": "macos", "permissions_checklist_version": "1"]
+        ["ok": true, "version": "1", "operating_system": "macos",
+         "cua_setup_version": "1", "permissions_checklist_version": "1"]
     }
 
     private func permissions(scope: String, phase: DesktopControlSetupCommand.PermissionPhase,
@@ -423,7 +416,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         if phase == .repair {
             guard permissionPage == nil else { throw DesktopControlPermissionBridgeError.busy }
             permissionPresenter.presentForRepair()
-            return ["ok": true, "version": "1"]
+            return Self.scopeReply
         }
         if phase == .open {
             guard permissionPage == nil else { throw DesktopControlPermissionBridgeError.busy }
@@ -440,7 +433,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
                 }
                 guard permissionPresenter.isFinishing else { throw DesktopControlPermissionBridgeError.incomplete }
                 page.permissionGeneration = generation
-                return ["ok": true, "permissions_checklist_version": "1", "prerequisites_ready": true]
+                return ["ok": true, "cua_setup_version": "1", "permissions_checklist_version": "1", "prerequisites_ready": true]
             } catch {
                 if permissionRequest == request { cancelPermissions(for: page) }
                 throw error
@@ -475,7 +468,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         page.didPrepare = false
         permissionPage = nil
         permissionRequest = nil
-        return ["ok": true, "version": "1"]
+        return Self.scopeReply
     }
 
     private func requireFinishedPermissions(page: Page, generation: UUID, request: UUID? = nil) throws {
@@ -486,8 +479,8 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
     }
 
     private func requireCompletionReadiness(page: Page) async throws {
-        guard await runtime.refreshUnattendedPermissionReadiness(),
-              page.didPrepare, runtime.gatewayConnected, runtime.isCuaReady(), runtime.nativeExecutorReady else {
+        guard await runtime.refreshCuaReadiness(),
+              page.didPrepare, runtime.gatewayConnected, runtime.isCuaReady() else {
             throw DesktopControlPermissionBridgeError.incomplete
         }
     }

@@ -32,82 +32,7 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
     #expect(DesktopControlRuntime.readiness(for: CuaMCPProxyError.functionalProbeFailed) == "cua_unavailable")
     #expect(DesktopControlRuntime.readiness(for: CuaMCPProxyError.processExited) == "cua_unavailable")
     #expect(DesktopControlRuntime.readiness(for: DesktopControlGatewayConnectionError.upgradeRequired) == "upgrade_required")
-    #expect(CuaMCPProxyError.serviceRunning.localizedDescription.contains("Repair will not terminate"))
-    #expect(DesktopControlRuntime.readiness(for: DesktopControlEnrollmentError.rejected) == "cua_unavailable")
-    #expect(!DesktopControlRuntime.shouldForceRepair(after: CuaMCPProxyError.permissionsRequired))
-    #expect(!DesktopControlRuntime.shouldForceRepair(after: CuaMCPProxyError.serviceRunning))
-    #expect(!DesktopControlRuntime.shouldForceRepair(after: CuaMCPProxyError.serviceMismatch))
-    #expect(!DesktopControlRuntime.shouldForceRepair(after: CancellationError()))
-    #expect(!DesktopControlRuntime.shouldForceRepair(after: CuaMCPProxyError.functionalProbeFailed))
-    #expect(!DesktopControlRuntime.shouldForceRepair(after: CuaMCPProxyError.responseTooLarge))
-    #expect(!DesktopControlRuntime.shouldForceRepair(after: CuaMCPProxyError.processExited))
-    #expect(DesktopControlRuntime.shouldForceRepair(after: CuaDriverInstallError.invalidSignature))
-}
 
-@MainActor
-@Test func cuaPermissionProbeSeparatesToolFailureFromDeniedGrants() {
-    #expect(DesktopControlRuntime.permissionProbeFailure(rpcError: false, toolError: true,
-        hasStructured: false, accessibility: false, screenRecording: false) == .functionalProbeFailed)
-    #expect(DesktopControlRuntime.permissionProbeFailure(rpcError: true, toolError: false,
-        hasStructured: false, accessibility: false, screenRecording: false) == .functionalProbeFailed)
-    #expect(DesktopControlRuntime.permissionProbeFailure(rpcError: false, toolError: false,
-        hasStructured: true, accessibility: true, screenRecording: false) == nil)
-    #expect(DesktopControlRuntime.permissionProbeFailure(rpcError: false, toolError: false,
-        hasStructured: true, accessibility: true, screenRecording: true) == nil)
-}
-
-@MainActor
-@Test func cuaHostCreatesPrivateEndpointsInsteadOfTheSharedStandaloneSocket() {
-    let first = CuaEmbeddedService(executableURL: URL(fileURLWithPath: "/fake/cua"))
-    let second = CuaEmbeddedService(executableURL: URL(fileURLWithPath: "/fake/cua"))
-    #expect(first.socketURL != second.socketURL)
-    #expect(first.directoryURL.path.hasPrefix("/tmp/ps-cua-"))
-    #expect(first.socketURL.path.utf8.count < 104)
-    #expect(first.socketURL.lastPathComponent == "control.sock")
-    #expect(first.generation != second.generation)
-}
-
-@MainActor
-@Test func cuaHostIdentityRequiresObservedParentAndReviewedExecutableRatherThanAnAdvisoryLabel() throws {
-    let executable = URL(fileURLWithPath: "/reviewed/CuaDriver.app/Contents/MacOS/cua-driver")
-    let validIdentity: [String: Any] = [
-        "bundle_identifier": "ai.personastack.desktop", "configured_bundle_identifier": "ai.personastack.desktop",
-        "identity_source": "parent_application", "parent_process_id": Int32(1000), "executable_path": executable.path,
-    ]
-    // Pinned provider contract: cua-driver-rs-v0.29.1,
-    // crates/platform-macos/src/tools/health_report.rs (MacosHealthProvider).
-    func report(_ identity: [String: Any], status: String = "pass", platform: String = "darwin",
-                version: String = "0.29.1", schema: String = "1") throws -> Data {
-        try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": 1, "result": ["structuredContent": [
-            "schema_version": schema, "driver_version": version, "platform": platform,
-            "checks": [["name": "bundle_identity", "status": status, "data": identity]],
-        ]]])
-    }
-    #expect(DesktopControlRuntime.validCuaHostIdentity(try report(validIdentity), executableURL: executable, hostPID: 1000))
-    for platform in ["macos", "linux", "win32", ""] {
-        #expect(!DesktopControlRuntime.validCuaHostIdentity(try report(validIdentity, platform: platform), executableURL: executable, hostPID: 1000))
-    }
-    #expect(!DesktopControlRuntime.validCuaHostIdentity(try report(validIdentity, version: "0.29.2"), executableURL: executable, hostPID: 1000))
-    #expect(!DesktopControlRuntime.validCuaHostIdentity(try report(validIdentity, schema: "2"), executableURL: executable, hostPID: 1000))
-    for field in validIdentity.keys {
-        var invalid = validIdentity
-        invalid.removeValue(forKey: field)
-        #expect(!DesktopControlRuntime.validCuaHostIdentity(try report(invalid), executableURL: executable, hostPID: 1000))
-    }
-    var wrongParent = validIdentity
-    wrongParent["parent_process_id"] = 2000
-    #expect(!DesktopControlRuntime.validCuaHostIdentity(try report(wrongParent), executableURL: executable, hostPID: 1000))
-    var wrongApp = validIdentity
-    wrongApp["bundle_identifier"] = "com.trycua.driver"
-    #expect(!DesktopControlRuntime.validCuaHostIdentity(try report(wrongApp), executableURL: executable, hostPID: 1000))
-    for (field, value) in [("configured_bundle_identifier", "com.trycua.driver"),
-                           ("identity_source", "current_process"),
-                           ("executable_path", "/unreviewed/cua-driver")] {
-        var invalid = validIdentity
-        invalid[field] = value
-        #expect(!DesktopControlRuntime.validCuaHostIdentity(try report(invalid), executableURL: executable, hostPID: 1000))
-    }
-    #expect(!DesktopControlRuntime.validCuaHostIdentity(try report(validIdentity, status: "fail"), executableURL: executable, hostPID: 1000))
 }
 
 @MainActor
@@ -149,7 +74,7 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
                                        result: .object(["available": .bool(true), "busy": .bool(false),
                                                         "native_executor_ready": .bool(true)]))
     let degradedGui = DesktopControlRuntime.enrichStatus(response, connected: true, guiReadiness: "permission_required",
-                                                         nativeExecutorReady: true, paused: false, locked: false,
+                                                         paused: false, locked: false,
                                                          sessionUnlocked: true)
     guard case .object(let result)? = degradedGui.result else {
         Issue.record("status result is missing")
@@ -158,11 +83,11 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
     #expect(result["connected"] == .bool(true))
     #expect(result["gui_readiness"] == .string("permission_required"))
     #expect(result["gui_ready"] == .bool(false))
-    #expect(result["native_executor_ready"] == .bool(true))
+    #expect(result["native_executor_ready"] == nil)
     #expect(result["control_available"] == .bool(false))
 
     let paused = DesktopControlRuntime.enrichStatus(response, connected: true, guiReadiness: "ready",
-                                                    nativeExecutorReady: true, paused: true, locked: true,
+                                                    paused: true, locked: true,
                                                     sessionUnlocked: false)
     guard case .object(let pausedResult)? = paused.result else {
         Issue.record("paused status result is missing")
@@ -172,44 +97,6 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
     #expect(pausedResult["locked"] == .bool(true))
     #expect(pausedResult["session_unlocked"] == .bool(false))
     #expect(pausedResult["control_available"] == .bool(false))
-}
-
-@MainActor
-@Test func successfulGuiPermissionProbeRestoresReadyState() {
-    #expect(DesktopControlRuntime.reconciledGuiReadiness(permissionProbeSucceeded: true,
-                                                         failureReadiness: "cua_unavailable") == "ready")
-    #expect(DesktopControlRuntime.reconciledGuiReadiness(permissionProbeSucceeded: false,
-                                                         failureReadiness: "permission_required") == "permission_required")
-}
-
-@MainActor
-@Test func onlyReadyObservationsCanRetryAfterCuaFailure() {
-    #expect(DesktopControlRuntime.shouldRetryGuiObservation(operation: "desktop_control_observe", readiness: "ready"))
-    for operation in ["desktop_control_input", "desktop_control_application", "desktop_control_window",
-                      "desktop_control_clipboard", "desktop_control_browser"] {
-        #expect(!DesktopControlRuntime.shouldRetryGuiObservation(operation: operation, readiness: "ready"))
-    }
-    for readiness in ["permission_required", "cua_unavailable", "locked", "paused"] {
-        #expect(!DesktopControlRuntime.shouldRetryGuiObservation(operation: "desktop_control_observe", readiness: readiness))
-    }
-}
-
-@MainActor
-@Test func degradedGuiHeartbeatRechecksOnlyAnUnlockedUsableCuaService() {
-    for readiness in ["permission_required", "cua_unavailable"] {
-        #expect(DesktopControlRuntime.shouldProbeGuiRecovery(readiness: readiness, paused: false,
-                                                              sessionAvailable: true, cuaReady: true))
-        #expect(!DesktopControlRuntime.shouldProbeGuiRecovery(readiness: readiness, paused: true,
-                                                               sessionAvailable: true, cuaReady: true))
-        #expect(!DesktopControlRuntime.shouldProbeGuiRecovery(readiness: readiness, paused: false,
-                                                               sessionAvailable: false, cuaReady: true))
-        #expect(!DesktopControlRuntime.shouldProbeGuiRecovery(readiness: readiness, paused: false,
-                                                               sessionAvailable: true, cuaReady: false))
-    }
-    for readiness in ["ready", "paused", "locked", "upgrade_required", "unknown"] {
-        #expect(!DesktopControlRuntime.shouldProbeGuiRecovery(readiness: readiness, paused: false,
-                                                               sessionAvailable: true, cuaReady: true))
-    }
 }
 
 @MainActor
@@ -280,7 +167,7 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
     let connectionID = UUID()
     let owner = DesktopControlTarget(installationID: installation.installationID, workspaceID: "workspace-a",
                                      configID: "config-a", personaID: "persona-a", runID: "run-a", generation: 1)
-    let pausedExecutor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
+    let pausedExecutor = DesktopControlCommandExecutor()
     let pausedRuntime = DesktopControlRuntime.makeForTesting(
         installer: ReadinessInstaller(), credentials: ReadinessCredentials(), executor: pausedExecutor,
         connectionID: connectionID, installation: installation, connected: true,
@@ -299,14 +186,14 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
     }
     #expect(pausedValues["connected"] == .bool(true))
     #expect(pausedValues["gui_readiness"] == .string("permission_required"))
-    #expect(pausedValues["native_executor_ready"] == .bool(false))
+    #expect(pausedValues["native_executor_ready"] == nil)
     #expect(pausedValues["paused"] == .bool(true))
     #expect(pausedValues["locked"] == .bool(true))
     #expect(pausedValues["session_unlocked"] == .bool(false))
     #expect(pausedValues["control_available"] == .bool(false))
     await pausedExecutor.close()
 
-    let failedExecutor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
+    let failedExecutor = DesktopControlCommandExecutor()
     #expect(await failedExecutor.close())
     let cleanupRuntime = DesktopControlRuntime.makeForTesting(
         installer: ReadinessInstaller(), credentials: ReadinessCredentials(), executor: failedExecutor,
@@ -322,7 +209,7 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
         Issue.record("cleanup status result is missing")
         return
     }
-    #expect(cleanupValues["native_executor_ready"] == .bool(false))
+    #expect(cleanupValues["native_executor_ready"] == nil)
     #expect(cleanupValues["control_available"] == .bool(false))
 }
 
@@ -331,7 +218,7 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
     let payload = Data(#"{"installation_id":"install-status","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://gateway.test/v1/desktop-control/ws"}"#.utf8)
     let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: payload)
     let connectionID = UUID()
-    let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
+    let executor = DesktopControlCommandExecutor()
     #expect(await executor.close())
     let runtime = DesktopControlRuntime.makeForTesting(
         installer: ReadinessInstaller(), credentials: ReadinessCredentials(), executor: executor,
@@ -350,17 +237,14 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
         return
     }
     #expect(values["available"] == .bool(false))
-    #expect(values["native_executor_ready"] == .bool(false))
+    #expect(values["native_executor_ready"] == nil)
     #expect(values["control_available"] == .bool(false))
 }
 
 private actor ReadinessInstaller: DesktopControlDriverInstalling {
-    func validateOrInstall(
-        repair: Bool,
-        commitManagedInstall: (@MainActor @Sendable (URL, URL, Bool) throws -> Void)?
-    ) async throws -> CuaDriverInstallation {
-        throw CuaDriverInstallError.invalidLayout
-    }
+    func discoverExisting() async throws -> CuaDriverInstallation? { nil }
+    func install() async throws -> CuaDriverInstallation { throw CuaDriverInstallError.invalidLayout }
+
 }
 
 private struct ReadinessCredentials: DesktopControlCredentialStoring {

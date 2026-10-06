@@ -66,8 +66,8 @@ class MenuBarLayoutTests(unittest.TestCase):
         body = block(self.menu, "var body: some View")
         self.assertIn("desktopControlActions", block(body, 'Menu("Desktop Control")'))
         controls = block(self.menu, "private var desktopControlActions")
-        self.assertIn("DesktopPermissionChecklist.shared.window.presentForRepair()",
-                      block(controls, 'Button("Permissions and Setup…")'))
+        self.assertIn("CuaSetupWindow.shared.presentForRepair()",
+                      block(controls, 'Button("Set Up CUA…")'))
         self.assertNotIn("requiresForegroundSessionConfirmation", controls)
         self.assertNotIn("confirmForegroundSession", controls)
         self.assertNotIn('Button("Confirm This Mac Is Unlocked")', controls)

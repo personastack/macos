@@ -4,7 +4,7 @@ import Foundation
 import PersonaStackCore
 import Security
 
-/// Invoked only by the main macOS Installer or an explicit uninstall. No network, app
+/// Retained only for guarded removal of an existing legacy installation. No network, app
 /// credentials, user-controlled arguments, or long-running privileged service.
 final class SystemPolicyInstaller: DesktopLockedControlPolicyInstalling {
     typealias Policy = DesktopLockedControlPolicy
@@ -13,7 +13,7 @@ final class SystemPolicyInstaller: DesktopLockedControlPolicyInstalling {
     init() throws {
         guard getuid() == 0, geteuid() == 0,
               CommandLine.arguments.count == 2,
-              ["--apply", "--remove"].contains(CommandLine.arguments[1]) else { throw InstallError.denied }
+              CommandLine.arguments[1] == "--remove" else { throw InstallError.denied }
         guard AuthorizationCreate(nil, nil, [], &authorization) == errAuthorizationSuccess else {
             throw InstallError.denied
         }
@@ -130,13 +130,8 @@ final class SystemPolicyInstaller: DesktopLockedControlPolicyInstalling {
 
 do {
     let system = try SystemPolicyInstaller()
-    if CommandLine.arguments[1] == "--remove" {
-        try DesktopLockedControlPolicyInstaller.uninstall(using: system)
-        print("PersonaStack locked-control policy removed and verified.")
-    } else {
-        try DesktopLockedControlPolicyInstaller.install(using: system)
-        print("PersonaStack locked-control policy installed and verified.")
-    }
+    try DesktopLockedControlPolicyInstaller.uninstall(using: system)
+    print("PersonaStack locked-control policy removed and verified.")
 } catch {
     // No policy contents, paths from external input, or authorization material.
     let detail: String

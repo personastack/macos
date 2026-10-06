@@ -37,17 +37,6 @@ final class DesktopControlCommandExecutor {
     }
 
     private var leaseCuaProxy: (any CuaToolCalling)?
-    private var recordingDirectory: DesktopCuaRecordingDirectory?
-    private var recordingActive = false
-    private var recordingLimitReached = false
-    private var recordingMonitor: Task<Void, Never>?
-    private var existingBrowserTargets: [Int32: UInt32] = [:]
-    private let browserConsent: @MainActor (Int32, UInt32) -> Bool
-    private let safariPageReadAccess: @MainActor (Int32, UInt32) async -> Bool
-    private let browserPageAccess: @MainActor (Int32, UInt32) async -> Bool
-    private let files = DesktopFileSystem()
-    private let shell = DesktopShellExecutor()
-    private let powerAssertion: DesktopControlPowerAssertion
     private var lease: Lease? { didSet { leaseStateChanged?() } }
     /// Native-only lifecycle signal. This never crosses the WebView bridge.
     var leaseStateChanged: (@MainActor () -> Void)?
@@ -95,6 +84,7 @@ final class DesktopControlCommandExecutor {
     private var revokedBindingGenerations: [BindingScope: Int64] = [:]
     private var closed = false
     private var unavailable = false
+    var needsSessionCleanup: Bool { unavailable && (lease != nil || failedCleanupLease != nil) }
     private var activeRevocations = 0
     private var revocationInProgress: Bool { activeRevocations > 0 }
     private var expiryTask: Task<Void, Never>?
@@ -107,22 +97,8 @@ final class DesktopControlCommandExecutor {
     private var leaseGrantBarrierForTesting: (@Sendable () async -> Void)?
 #endif
 
-    init(now: @escaping () -> ContinuousClock.Instant = { .now },
-         browserConsent: @escaping @MainActor (Int32, UInt32) -> Bool = {
-             DesktopBrowserProfileConsentController.shared.allowed(pid: $0, windowID: $1)
-         },
-         browserPageAccess: @escaping @MainActor (Int32, UInt32) async -> Bool = {
-             await DesktopBrowserProfileConsentController.shared.safePageAccess(pid: $0, windowID: $1)
-         },
-         safariPageReadAccess: @escaping @MainActor (Int32, UInt32) async -> Bool = {
-             await DesktopSafariPageAccess.allowed(pid: $0, windowID: $1)
-         },
-         powerAssertion: DesktopControlPowerAssertion = .init()) {
+    init(now: @escaping () -> ContinuousClock.Instant = { .now }) {
         self.now = now
-        self.browserConsent = browserConsent
-        self.browserPageAccess = browserPageAccess
-        self.safariPageReadAccess = safariPageReadAccess
-        self.powerAssertion = powerAssertion
         expiryTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(5))
@@ -133,12 +109,8 @@ final class DesktopControlCommandExecutor {
     }
 
     func diagnostics() async -> DesktopControlDiagnostics {
-        let shellState = await shell.diagnostics()
-        let handleCount = await files.openHandleCount()
-        return DesktopControlDiagnostics(activeProcesses: shellState.activeProcesses,
-                                         openFileHandles: handleCount,
-                                         bufferedOutputBytes: shellState.bufferedOutputBytes,
-                                         outputGapsTotal: shellState.outputGapsTotal)
+        DesktopControlDiagnostics(activeProcesses: 0, openFileHandles: 0,
+                                  bufferedOutputBytes: 0, outputGapsTotal: 0)
     }
 
     var presentationActivity: DesktopControlActivity? {
@@ -212,78 +184,6 @@ final class DesktopControlCommandExecutor {
     private func invalidateNativeVerification() {
         nativeVerificationInvalidated = true
         invalidateNativeTarget?()
-    }
-
-    func probeNativeCapabilities(isCurrent: @MainActor @Sendable () throws -> Void) async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("personastack-desktop-probe-\(UUID().uuidString)", isDirectory: true)
-        let file = root.appendingPathComponent("read-write.txt")
-        let expected = Data("personastack-filesystem-probe".utf8)
-        do {
-            try await files.makeDirectory(path: root.path)
-            _ = try await files.write(path: file.path, content: expected, mode: .create)
-            let opened = try await files.open(path: file.path)
-            let read = try await files.read(id: opened.id, offset: 0)
-            guard read.content == expected, read.endOfFile else { throw DesktopFileSystemError.invalidPath }
-            try await files.close(id: opened.id)
-            try await files.remove(path: file.path)
-            try await files.remove(path: root.path)
-            try isCurrent()
-        } catch {
-            await files.closeAll()
-            try? await files.remove(path: file.path)
-            try? await files.remove(path: root.path)
-            _ = await shell.closeAll()
-            throw error
-        }
-
-        do {
-            let started = try await shell.start(
-                command: "printf 'personastack-stream-start'; IFS= read -r _personastack_probe_first; printf 'personastack-stream-middle'; IFS= read -r _personastack_probe_second; printf 'personastack-stream-end'",
-                workingDirectory: FileManager.default.temporaryDirectory.path,
-                timeout: 5
-            )
-            let first = Self.output(started)
-            guard started.state == .running, first.contains("personastack-stream-start") else {
-                throw DesktopShellError.invalidCommand
-            }
-            try await shell.write(id: started.executionID, input: .data(Data("continue\n".utf8)))
-            try isCurrent()
-            var combined = first
-            var cursor = started.nextCursor
-            let middleDeadline = ContinuousClock.now + .seconds(3)
-            var middleObserved = false
-            while ContinuousClock.now < middleDeadline {
-                let output = try await shell.read(id: started.executionID, after: cursor, wait: .milliseconds(250))
-                cursor = output.nextCursor
-                combined += Self.output(output)
-                if combined.contains("personastack-stream-middle") {
-                    middleObserved = true
-                    guard output.state == .running else { throw DesktopShellError.invalidCommand }
-                    break
-                }
-            }
-            guard middleObserved else { throw DesktopShellError.invalidCommand }
-            try await shell.write(id: started.executionID, input: .data(Data("finish\n".utf8)))
-            let exitDeadline = ContinuousClock.now + .seconds(3)
-            var finalState = started.state
-            var finalExitCode = started.exitCode
-            while ContinuousClock.now < exitDeadline, finalState == .running {
-                let output = try await shell.read(id: started.executionID, after: cursor, wait: .milliseconds(250))
-                cursor = output.nextCursor
-                combined += Self.output(output)
-                finalState = output.state
-                finalExitCode = output.exitCode
-            }
-            try isCurrent()
-            guard Self.nativeProbeSucceeded(state: finalState, exitCode: finalExitCode, output: combined) else {
-                throw DesktopShellError.invalidCommand
-            }
-            guard await shell.closeAll() else { throw DesktopShellError.cancellationUnconfirmed }
-        } catch {
-            _ = await shell.closeAll()
-            throw error
-        }
     }
 
 #if DEBUG
@@ -372,7 +272,7 @@ final class DesktopControlCommandExecutor {
         guard isStatus || !revocationInProgress else {
             return Self.failure(frame, "desktop_control_revocation_in_progress", "Another Desktop Control configuration is being cleaned up. Retry after it finishes.")
         }
-        guard isStatus || (!closed && !unavailable && nativeVerificationID == nil) else {
+        guard isStatus || (!closed && (!unavailable || frame.operation == "desktop_control_release") && nativeVerificationID == nil) else {
             return Self.failure(frame, "desktop_executor_unavailable", "The desktop control service is paused or recovering.")
         }
         let owner = Owner(installationID: target.installationID, workspaceID: target.workspaceID,
@@ -418,32 +318,8 @@ final class DesktopControlCommandExecutor {
                  "desktop_control_window", "desktop_control_clipboard", "desktop_control_browser", "desktop_control_cua":
                 try requireLease(owner, arguments: frame.arguments)
                 result = try await callCua(frame, proxy: proxy)
-            case "desktop_control_file":
-                try requireLease(owner, arguments: frame.arguments)
-                result = try await fileOperation(frame.arguments)
-            case "desktop_control_execute":
-                try requireLease(owner, arguments: frame.arguments)
-                result = try await shellStart(frame.arguments)
-            case "desktop_control_exec_read":
-                try requireLease(owner, arguments: frame.arguments)
-                result = try await shellRead(frame.arguments)
-            case "desktop_control_exec_write":
-                try requireLease(owner, arguments: frame.arguments)
-                result = try await shellWrite(frame.arguments)
-            case "desktop_control_exec_status":
-                try requireLease(owner, arguments: frame.arguments)
-                result = try await shellStatus(frame.arguments)
-            case "desktop_control_exec_cancel":
-                try requireLease(owner, arguments: frame.arguments)
-                result = try await shellCancel(frame.arguments)
             default:
                 throw CommandError.invalidArguments
-            }
-            guard isBindingAuthorized(owner) else { throw CommandError.bindingRevoked }
-            if needsLease && commandEpoch != leaseEpoch { throw CommandError.controlRequired }
-            if let onChunk {
-                try await forwardShellChunks(result, requestID: requestID, scope: scope,
-                                             configVersion: configVersion, epoch: commandEpoch, onChunk: onChunk)
             }
             guard isConfigVersionAuthorized(scope, configVersion) else { throw CommandError.configurationRevoked }
             guard isBindingAuthorized(owner) else { throw CommandError.bindingRevoked }
@@ -454,65 +330,23 @@ final class DesktopControlCommandExecutor {
         } catch is DesktopControlExecution.Expired {
             return Self.failure(frame, "desktop_command_expired", "The command deadline elapsed before its next operation. Check the current state before retrying; earlier steps may have completed.")
         } catch is CancellationError {
+            if leaseCuaProxy != nil { fenceUncertainSession() }
             return Self.failure(frame, "outcome_unknown", "The command was cancelled. Check the desktop before repeating an action.")
         } catch let error as CuaMCPProxyError where error == .timeout || error == .interrupted || error == .processExited {
+            fenceUncertainSession()
             return Self.failure(frame, "outcome_unknown", "Cua stopped answering after dispatch. Check the desktop before repeating an action.")
         } catch let error as DesktopCuaFailure {
             return Self.failure(frame, error.code, error.message)
         } catch let error as CommandError {
             return Self.failure(frame, error.code, error.localizedDescription)
-        } catch let error as DesktopFileSystemError {
-            return Self.failure(frame, error.desktopControlCode, error.desktopControlMessage)
-        } catch let error as DesktopShellError {
-            return Self.failure(frame, error.desktopControlCode, error.desktopControlMessage)
         } catch {
-            if frame.operation == "desktop_control_file" {
-                let nsError = error as NSError
-                if Self.isPermissionDenied(nsError) {
-                    return Self.failure(frame, "desktop_file_permission_denied",
-                                        "macOS denied this file operation for PersonaStack Desktop. Choose a file or folder your macOS account can access.")
-                }
-                if Self.mayHavePartialWrite(frame.arguments) {
-                    return Self.failure(frame, "desktop_file_write_outcome_unknown",
-                                        "The file may have changed before the write stopped. Read it again before retrying.")
-                }
-                return Self.failure(frame, "desktop_file_operation_failed",
-                                    "PersonaStack Desktop could not complete this file operation.")
-            }
             return Self.failure(frame, "desktop_command_failed", "The desktop command failed.")
         }
     }
 
-    static func isPermissionDenied(_ error: NSError) -> Bool {
-        if error.domain == NSCocoaErrorDomain {
-            return error.code == NSFileReadNoPermissionError || error.code == NSFileWriteNoPermissionError
-        }
-        return error.domain == NSPOSIXErrorDomain && (error.code == Int(EACCES) || error.code == Int(EPERM))
-    }
-
-    static func mayHavePartialWrite(_ arguments: DesktopControlJSONValue?) -> Bool {
-        guard let values = Self.object(arguments), values["action"] as? String == "write" else { return false }
-        if values["offset"] != nil { return true }
-        guard let mode = values["mode"] as? String else { return false }
-        return mode == "append" || mode == "create"
-    }
-
-    private func forwardShellChunks(_ result: Any, requestID: String, scope: ConfigScope, configVersion: Int64, epoch: UInt64,
-                                    onChunk: @Sendable (DesktopControlFrame) async throws -> Void) async throws {
-        guard let value = result as? [String: Any],
-              value["execution_id"] is String,
-              let chunks = value["chunks"] as? [[String: Any]] else { return }
-        for (index, chunk) in chunks.enumerated() {
-            guard epoch == leaseEpoch else { throw CommandError.controlRequired }
-            guard isConfigVersionAuthorized(scope, configVersion) else { throw CommandError.configurationRevoked }
-            guard let channel = chunk["stream"] as? String,
-                  channel == "stdout" || channel == "stderr",
-                  let encoded = chunk["data_base64"] as? String,
-                  let data = Data(base64Encoded: encoded), !data.isEmpty else { continue }
-            let frame = DesktopControlFrame(type: "result_chunk", requestID: requestID, streamID: requestID,
-                                            sequence: UInt64(index + 1), streamChannel: channel, streamData: data)
-            try await onChunk(frame)
-        }
+    private func fenceUncertainSession() {
+        unavailable = true
+        cleanupFailureMayRestoreAvailability = true
     }
 
     private func acquire(_ owner: Owner, scope: ConfigScope, configVersion: Int64) async throws -> [String: Any] {
@@ -540,7 +374,6 @@ final class DesktopControlCommandExecutor {
         guard !closed, !unavailable, !revocationInProgress, nativeVerificationID == nil else { throw CommandError.executorUnavailable }
         guard isConfigVersionAuthorized(scope, configVersion) else { throw CommandError.configurationRevoked }
         try DesktopControlExecution.check()
-        guard powerAssertion.acquire() else { throw CommandError.sleepPreventionUnavailable }
         let token = UUID().uuidString.lowercased()
         let now = now()
         lease = Lease(owner: owner, configVersion: configVersion, token: token, started: now, lastActivity: now)
@@ -566,18 +399,18 @@ final class DesktopControlCommandExecutor {
         } == true
         if matches {
             guard await cleanupLeaseAndResources(lease) else {
-                return Self.failure(frame, "desktop_control_revoke_incomplete", "The Mac could not confirm that every command or process stopped.")
+                return Self.failure(frame, "desktop_control_revoke_incomplete", "CUA could not confirm that this PersonaStack session stopped.")
             }
         } else if cleanupMatches {
             // Join the same cleanup used by direct revoke, release, and expiry.
             guard await waitForLeaseCleanup() else {
                 unavailable = true
-                return Self.failure(frame, "desktop_control_revoke_incomplete", "The Mac could not confirm that every command or process stopped.")
+                return Self.failure(frame, "desktop_control_revoke_incomplete", "CUA could not confirm that this PersonaStack session stopped.")
             }
         } else if failedCleanupMatches {
             // A prior cleanup failed. Retry that same lease before acknowledging.
             guard await cleanupLeaseAndResources(failedCleanupLease) else {
-                return Self.failure(frame, "desktop_control_revoke_incomplete", "The Mac could not confirm that every command or process stopped.")
+                return Self.failure(frame, "desktop_control_revoke_incomplete", "CUA could not confirm that this PersonaStack session stopped.")
             }
         }
         return DesktopControlFrame(type: "result", requestID: frame.requestID,
@@ -661,13 +494,9 @@ final class DesktopControlCommandExecutor {
             for waiter in waiters { waiter.resume(returning: succeeded) }
         }
         // Fence the old owner before suspending. New acquisition stays unavailable
-        // until callbacks, file handles, and managed processes have drained.
+        // until admitted CUA calls and the owned session have drained.
         leaseEpoch &+= 1
         lease = nil
-        recordingMonitor?.cancel()
-        recordingMonitor = nil
-        let sleepPreventionReleased = powerAssertion.relinquish()
-        await shell.requestStopAll()
         guard await settleOperations() else { unavailable = true; return false }
 #if DEBUG
         if let cleanupResourceBarrierForTesting {
@@ -675,11 +504,6 @@ final class DesktopControlCommandExecutor {
             await cleanupResourceBarrierForTesting()
         }
 #endif
-        await files.closeAll()
-        guard await shell.closeAll() else {
-            unavailable = true
-            return false
-        }
         if let proxy = leaseCuaProxy, let closingLease {
             do {
                 let args = try JSONEncoder().encode(DesktopControlJSONValue.object(["session": .string(closingLease.cuaSession)]))
@@ -695,11 +519,6 @@ final class DesktopControlCommandExecutor {
                 leaseCuaProxy = nil
             } catch { return false }
         }
-        recordingDirectory = nil
-        recordingActive = false
-        recordingLimitReached = false
-        existingBrowserTargets.removeAll()
-        guard sleepPreventionReleased else { return false }
 #if DEBUG
         if cleanupFailuresForTesting > 0 {
             cleanupFailuresForTesting -= 1
@@ -718,7 +537,7 @@ final class DesktopControlCommandExecutor {
 
     private func settleOperations() async -> Bool {
         // Cua calls have a 60-second bound. Drain admitted operations before
-        // closing their resources, so a queued open/start cannot follow cleanup.
+        // ending their session, so an admitted action cannot follow cleanup.
         let deadline = ContinuousClock.now + .seconds(65)
         while activeOperations > 0, ContinuousClock.now < deadline {
             await Task { try? await Task.sleep(for: .milliseconds(10)) }.value
@@ -727,12 +546,7 @@ final class DesktopControlCommandExecutor {
     }
 
     func expireLeaseIfNeeded() async {
-        guard !closed, !revocationInProgress, let original = lease else { return }
-        let processes = await shell.diagnostics()
-        guard !closed, !revocationInProgress, lease?.token == original.token else { return }
-        if processes.activeProcesses > 0, original.started.duration(to: now()) < .seconds(1800) {
-            lease?.lastActivity = now()
-        }
+        guard !closed, !revocationInProgress, lease != nil else { return }
         guard validLease() == nil else { return }
         if !(await clearExpiredLease()) { unavailable = true }
     }
@@ -747,49 +561,9 @@ final class DesktopControlCommandExecutor {
         let preparedArguments = try Self.cuaArguments(name: name, arguments: rawArguments,
                                                      controlToken: lease?.cuaSession ?? "")
         guard let currentLease = validLease() else { throw CommandError.controlRequired }
-        if name == "page", case .object(let fields) = preparedArguments,
-           case .string(let action)? = fields["action"], ["get_text", "query_dom"].contains(action),
-           fields["cdp_port"] == nil, case .number(let pid)? = fields["pid"],
-           case .number(let window)? = fields["window_id"], pid > 0, pid <= Double(Int32.max),
-           window > 0, window <= Double(UInt32.max) {
-            let safariRead = await safariPageReadAccess(Int32(pid), UInt32(window))
-            guard !closed, !unavailable, !revocationInProgress, !cleanupInProgress,
-                  validLease()?.token == currentLease.token else { throw CommandError.controlRequired }
-            if safariRead {
-                throw DesktopCuaFailure(code: "browser_route_unavailable", message: "The pinned CUA Safari page reader cannot guarantee the requested window. Use desktop observation and input until an exact-target driver is available.")
-            }
-        }
-        try requireBrowserConsent(name: name, arguments: preparedArguments)
-        if name == "page", case .object(let fields) = preparedArguments,
-           case .string(let action)? = fields["action"], DesktopCuaPageAdapter.typingActions.contains(action) {
-            leaseCuaProxy = proxy
-            let result = try await DesktopCuaPageAdapter.type(fields, call: { name, arguments in
-                try await proxy.callTool(name: name, argumentsJSON: arguments, timeout: 60)
-            }, requireCurrent: {
-                guard !self.closed, !self.unavailable, !self.revocationInProgress, !self.cleanupInProgress,
-                      self.validLease()?.token == currentLease.token else { throw CommandError.controlRequired }
-                try self.requireBrowserConsent(name: "page", arguments: preparedArguments)
-            })
-            return try Self.boundedCuaImageResult(result)
-        }
-        if name == "page", case .object(let fields) = preparedArguments,
-           case .number(let pid)? = fields["pid"], case .number(let window)? = fields["window_id"] {
-            guard await browserPageAccess(Int32(pid), UInt32(window)) else {
-                throw DesktopCuaFailure(code: "browser_permission_required", message: "Complete native setup for this browser's Automation and JavaScript permissions before using page tools.")
-            }
-            guard !closed, !unavailable, !revocationInProgress, !cleanupInProgress,
-                  validLease()?.token == currentLease.token else { throw CommandError.controlRequired }
-        }
-        if name == "replay_trajectory" {
-            return try await replayTrajectory(rawArguments, frame: frame, proxy: proxy, token: currentLease.token)
-        }
         leaseCuaProxy = proxy
-        let effectiveArguments = try prepareCuaResourceArguments(name: name, arguments: preparedArguments)
-        let selectedName = name == "list_sessions" ? "get_session" : name
-        let selectedArguments = name == "list_sessions"
-            ? DesktopControlJSONValue.object(["session": .string(currentLease.cuaSession)]) : effectiveArguments
-        let encoded = try JSONEncoder().encode(selectedArguments)
-        let response = try await proxy.callTool(name: selectedName, argumentsJSON: encoded, timeout: 60)
+        let encoded = try JSONEncoder().encode(preparedArguments)
+        let response = try await proxy.callTool(name: name, argumentsJSON: encoded, timeout: 60)
         guard let object = try JSONSerialization.jsonObject(with: response) as? [String: Any],
               let result = object["result"] as? [String: Any], object["error"] == nil else {
             logger.error("Cua tool response invalid tool=\(name, privacy: .public)")
@@ -804,152 +578,12 @@ final class DesktopControlCommandExecutor {
             throw CommandError.configurationRevoked
         }
         guard validLease()?.token == currentLease.token else { throw CommandError.controlRequired }
-        if name == "start_recording" { startRecordingMonitor(proxy: proxy, token: currentLease.token) }
-        if name == "stop_recording" || name == "end_session" {
-            recordingActive = false
-            recordingMonitor?.cancel()
-            recordingMonitor = nil
-        }
-        if name == "end_session" { existingBrowserTargets.removeAll() }
-        if name == "browser_prepare", case .object(let fields) = preparedArguments,
-           fields["strategy"] != nil, case .number(let pid)? = fields["pid"],
-           case .number(let window)? = fields["window_id"] {
-            existingBrowserTargets[Int32(pid)] = UInt32(window)
-        }
-        if name == "list_sessions" {
-            let hasCursor: Bool
-            if case .object(let fields) = rawArguments, case .string(let cursor)? = fields["cursor"] {
-                hasCursor = UInt64(cursor.dropFirst(2)) != 0
-            } else { hasCursor = false }
-            let sessions = hasCursor ? [] : [result["structuredContent"]].compactMap { $0 }
-            return ["content": [["type": "text", "text": "\(sessions.count) owned session(s)."]],
-                    "structuredContent": ["sessions": sessions, "next_cursor": NSNull()]]
-        }
-        if name == "get_recording_state", recordingDirectory == nil {
-            return ["content": [["type": "text", "text": "Recording is disabled for this control session."]],
-                    "structuredContent": ["recording": false, "enabled": false, "video_active": false]]
-        }
-        if name == "get_recording_state", recordingLimitReached {
-            var limited = result
-            var state = result["structuredContent"] as? [String: Any] ?? [:]
-            state["last_error"] = "recording_limit_reached"
-            limited["structuredContent"] = state
-            return limited
-        }
         return try Self.boundedCuaImageResult(result)
-    }
-
-    private func requireBrowserConsent(name: String, arguments: DesktopControlJSONValue) throws {
-        guard case .object(let fields) = arguments else { throw CommandError.invalidArguments }
-        if name == "browser_prepare", fields["strategy"] != nil {
-            guard case .number(let pid)? = fields["pid"], case .number(let window)? = fields["window_id"],
-                  browserConsent(Int32(pid), UInt32(window)) else {
-                throw DesktopCuaFailure(code: "browser_consent_required", message: "Select this running browser in PersonaStack's native permissions setup before using its signed-in profiles.")
-            }
-        }
-        if name.hasPrefix("browser_") || name == "get_browser_state" || name == "page" {
-            guard existingBrowserTargets.allSatisfy({ browserConsent($0.key, $0.value) }) else {
-                throw DesktopCuaFailure(code: "browser_consent_revoked", message: "The approved browser instance changed. Complete targeted local browser setup before using its profiles again.")
-            }
-        }
-        if name == "page" {
-            guard case .string(let action)? = fields["action"],
-                  (["get_text", "query_dom"].contains(action) || DesktopCuaPageAdapter.typingActions.contains(action)), fields["cdp_port"] == nil else {
-                throw DesktopCuaFailure(code: "browser_route_unavailable", message: "The pinned CUA legacy page mutation route cannot preserve the approved browser binding. Use the typed browser tools for supported actions.")
-            }
-            guard case .number(let pid)? = fields["pid"], case .number(let window)? = fields["window_id"],
-                  pid > 0, pid <= Double(Int32.max), window > 0, window <= Double(UInt32.max),
-                  browserConsent(Int32(pid), UInt32(window)), existingBrowserTargets[Int32(pid)] == UInt32(window) else {
-                throw DesktopCuaFailure(code: "browser_consent_required", message: "Prepare the exact locally approved browser window before using the compatibility page tools.")
-            }
-        }
-    }
-
-    private func prepareCuaResourceArguments(name: String, arguments: DesktopControlJSONValue) throws -> DesktopControlJSONValue {
-        guard case .object(var fields) = arguments else { throw CommandError.invalidArguments }
-        if name == "start_recording" {
-            guard !recordingActive, case .string(let path)? = fields["output_dir"] else { throw CommandError.invalidArguments }
-            if fields["record_video"] == .bool(true) {
-                guard #available(macOS 15, *) else { throw CommandError.executorUnavailable }
-            }
-            let directory = try DesktopCuaRecordingDirectory(path: path)
-            recordingDirectory = directory
-            recordingLimitReached = false
-            fields["output_dir"] = .string(directory.path)
-        }
-        return .object(fields)
-    }
-
-    private func startRecordingMonitor(proxy: any CuaToolCalling, token: String) {
-        recordingActive = true
-        recordingMonitor?.cancel()
-        recordingMonitor = Task { @MainActor [weak self] in
-            while !Task.isCancelled {
-                do { try await Task.sleep(for: .seconds(2)) } catch { return }
-                guard let self, self.validLease()?.token == token, self.recordingActive,
-                      let directory = self.recordingDirectory else { return }
-                if await directory.isWithinBudget() { continue }
-                guard !Task.isCancelled, self.validLease()?.token == token else { return }
-                self.recordingLimitReached = true
-                self.activeOperations += 1
-                defer { self.activeOperations -= 1 }
-                guard let session = self.lease?.cuaSession else { return }
-                do {
-                    let data = try await DesktopControlExecution.$deadline.withValue(Date().addingTimeInterval(5)) {
-                        try await proxy.callTool(name: "stop_recording", argumentsJSON: JSONSerialization.data(withJSONObject: ["session": session]), timeout: 5)
-                    }
-                    guard self.lease?.token == token else { return }
-                    guard let envelope = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                          let result = envelope["result"] as? [String: Any], !Self.isCuaToolError(result) else {
-                        self.unavailable = true
-                        return
-                    }
-                    self.recordingActive = false
-                } catch {
-                    if self.lease?.token == token { self.unavailable = true }
-                }
-                return
-            }
-        }
-    }
-
-    private func replayTrajectory(_ arguments: DesktopControlJSONValue, frame: DesktopControlFrame,
-                                  proxy: any CuaToolCalling, token: String) async throws -> Any {
-        guard case .object(let fields) = arguments, case .string(let path)? = fields["dir"] else { throw CommandError.invalidArguments }
-        let trajectory = try await files.loadCuaTrajectory(path: path)
-        let delay: Int
-        if case .number(let value)? = fields["delay_ms"] { delay = Int(value) } else { delay = 500 }
-        let summary = try await trajectory.run(delayMilliseconds: delay, stopOnError: fields["stop_on_error"] != .bool(false)) { [weak self] name, values in
-            guard let self else { throw CommandError.controlRequired }
-            return try await self.replayAction(name: name, arguments: values, frame: frame, proxy: proxy, token: token)
-        }
-        let data = try JSONEncoder().encode(summary)
-        return ["content": [["type": "text", "text": "Trajectory replay finished. Read the per-turn results before retrying."]],
-                "structuredContent": try JSONSerialization.jsonObject(with: data)]
-    }
-
-    private func replayAction(name: String, arguments: DesktopControlJSONValue, frame: DesktopControlFrame,
-                              proxy: any CuaToolCalling, token: String) async throws -> DesktopControlJSONValue {
-        try DesktopControlExecution.check()
-        guard !closed, !unavailable, !revocationInProgress, !cleanupInProgress,
-              validLease()?.token == token else { throw CommandError.controlRequired }
-        let nested = DesktopControlFrame(type: "command", requestID: frame.requestID, target: frame.target,
-            operation: "desktop_control_cua", arguments: .object(["control_token": .string(token), "tool": .string(name), "arguments": arguments]),
-            deadlineAt: frame.deadlineAt)
-        do {
-            let result = try await callCua(nested, proxy: proxy)
-            return try JSONDecoder().decode(DesktopControlJSONValue.self, from: JSONSerialization.data(withJSONObject: result))
-        } catch let failure as DesktopCuaFailure {
-            return .object(["isError": .bool(true), "content": .array([.object(["type": .string("text"), "text": .string(failure.message)])])])
-        }
     }
 
     static func cuaArguments(name: String, arguments: DesktopControlJSONValue,
                              controlToken: String) throws -> DesktopControlJSONValue {
         do { return try CuaRemoteToolArguments.prepare(name: name, arguments: arguments, session: controlToken) }
-        catch CuaRemoteToolArguments.PolicyError.nativeSetupRequired {
-            throw DesktopCuaFailure(code: "native_setup_required", message: "Install the perception component from PersonaStack’s native setup after reviewing its artifact and licenses. Remote confirmation cannot authorize installation.")
-        }
         catch { throw CommandError.invalidArguments }
     }
 
@@ -1041,162 +675,6 @@ final class DesktopControlCommandExecutor {
         return output as Data
     }
 
-    static func nativeProbeSucceeded(state: DesktopProcessState, exitCode: Int32?, output: String) -> Bool {
-        state == .exited && exitCode == 0 && output.contains("personastack-stream-end")
-    }
-
-    private func fileOperation(_ arguments: DesktopControlJSONValue?) async throws -> Any {
-        guard let args = Self.object(arguments), let action = args["action"] as? String else { throw CommandError.invalidArguments }
-        switch action {
-        case "stat":
-            guard let path = args["path"] as? String else { throw CommandError.invalidArguments }
-            return Self.entry(try await files.metadata(path: path))
-        case "list":
-            guard let path = args["path"] as? String else { throw CommandError.invalidArguments }
-            let page = try await files.list(path: path, offset: args["offset"] as? Int ?? 0, limit: args["limit"] as? Int ?? 100)
-            return ["entries": page.entries.map(Self.entry), "next_offset": page.nextOffset as Any? ?? NSNull()]
-        case "search":
-            guard let root = args["root"] as? String else { throw CommandError.invalidArguments }
-            let page = try await files.search(root: root, nameContains: args["name_contains"] as? String,
-                                                 nameGlob: args["name_glob"] as? String,
-                                                 contentContains: args["content_contains"] as? String,
-                                                 limit: args["limit"] as? Int ?? 100,
-                                                 continuation: args["continuation"] as? String)
-            return ["matches": page.matches.map { match in
-                var entry = Self.entry(match.entry)
-                entry["matched_lines"] = match.matchedLines
-                entry["content_scan_truncated"] = match.contentScanTruncated
-                return entry
-            }, "continuation": page.continuation as Any? ?? NSNull(),
-                     "incomplete_content_paths": page.incompleteContentPaths,
-                     "complete": page.isComplete]
-        case "open":
-            guard let path = args["path"] as? String else { throw CommandError.invalidArguments }
-            let opened = try await files.open(path: path)
-            var result = Self.fileContent(opened.firstRead)
-            result["handle"] = opened.id.uuidString
-            result["size"] = opened.size
-            result["modified_at"] = Self.iso8601String(opened.modifiedAt)
-            result["revision"] = opened.revision
-            result["changed_since_open"] = opened.firstRead.changedSinceOpen
-            if Self.supportedImageMIMETypes.contains(Self.mimeType(for: opened.path)),
-               opened.size <= Self.maxImageContentBytes {
-                var imageBytes = opened.firstRead.content
-                var offset = opened.firstRead.nextOffset
-                var changed = opened.firstRead.changedSinceOpen
-                while !opened.firstRead.endOfFile && offset < opened.size {
-                    let page = try await files.read(id: opened.id, offset: offset)
-                    if page.content.isEmpty || page.nextOffset <= offset { break }
-                    imageBytes.append(page.content)
-                    offset = page.nextOffset
-                    changed = changed || page.changedSinceOpen
-                    if page.endOfFile { break }
-                }
-                if !changed, offset >= opened.size, UInt64(imageBytes.count) == opened.size {
-                    result["content"] = [["type": "image", "data": imageBytes.base64EncodedString(),
-                                          "mimeType": Self.mimeType(for: opened.path)]]
-                    result["byte_length"] = imageBytes.count
-                    result["next_offset"] = imageBytes.count
-                    result["end_of_file"] = true
-                    result["encoding"] = "image"
-                    result.removeValue(forKey: "content_base64")
-                    result.removeValue(forKey: "content_text")
-                    result.removeValue(forKey: "line_count")
-                } else {
-                    result["image_content_unavailable"] = changed ? "file_changed_during_read" : "incomplete_read"
-                }
-            }
-            return result
-        case "read":
-            guard let id = Self.uuid(args["handle"]) else { throw CommandError.invalidArguments }
-            let read: DesktopFileRead
-            if let startLine = args["start_line"] as? Int {
-                guard let lineCount = args["line_count"] as? Int, args["offset"] == nil else { throw CommandError.invalidArguments }
-                read = try await files.readLines(id: id, startLine: startLine, lineCount: lineCount,
-                                                length: args["length"] as? Int ?? 256 * 1024)
-            } else {
-                guard args["line_count"] == nil else { throw CommandError.invalidArguments }
-                let offset = try Self.optionalUInt64(args["offset"]) ?? 0
-                read = try await files.read(id: id, offset: offset, length: args["length"] as? Int ?? 256 * 1024)
-            }
-            var result = Self.fileContent(read)
-            result["changed_since_open"] = read.changedSinceOpen
-            return result
-        case "close":
-            guard let id = Self.uuid(args["handle"]) else { throw CommandError.invalidArguments }
-            try await files.close(id: id)
-            return ["closed": true]
-        case "write":
-            guard let path = args["path"] as? String, let content = args["content_base64"] as? String,
-                  let data = Data(base64Encoded: content), let mode = args["mode"] as? String else { throw CommandError.invalidArguments }
-            let writeMode: DesktopFileWriteMode
-            switch mode {
-            case "create": writeMode = .create
-            case "replace": writeMode = .replace
-            case "append": writeMode = .append
-            default: throw CommandError.invalidArguments
-            }
-            return Self.entry(try await files.write(path: path, content: data, mode: writeMode, offset: Self.optionalUInt64(args["offset"])))
-        case "patch":
-            guard let path = args["path"] as? String, let expected = args["expected"] as? String,
-                  let replacement = args["replacement"] as? String else { throw CommandError.invalidArguments }
-            return Self.entry(try await files.patch(path: path, expected: expected, replacement: replacement))
-        case "mkdir":
-            guard let path = args["path"] as? String else { throw CommandError.invalidArguments }
-            try await files.makeDirectory(path: path)
-            return ["created": true]
-        case "move":
-            guard let source = args["source"] as? String, let destination = args["destination"] as? String else { throw CommandError.invalidArguments }
-            try await files.move(source: source, destination: destination)
-            return ["moved": true]
-        case "remove":
-            guard let path = args["path"] as? String else { throw CommandError.invalidArguments }
-            try await files.remove(path: path)
-            return ["removed": true]
-        default:
-            throw CommandError.invalidArguments
-        }
-    }
-
-    private func shellStart(_ arguments: DesktopControlJSONValue?) async throws -> Any {
-        guard let args = Self.object(arguments), let command = args["command"] as? String,
-              let cwd = args["working_directory"] as? String else { throw CommandError.invalidArguments }
-        guard let lease = validLease() else { throw CommandError.controlRequired }
-        let remaining = now().duration(to: lease.started + .seconds(1800))
-        let seconds = Double(remaining.components.seconds) + Double(remaining.components.attoseconds) / 1e18
-        guard seconds >= 1 else { throw CommandError.controlRequired }
-        let process = try await shell.start(command: command, workingDirectory: cwd,
-                                            timeout: min(args["timeout_seconds"] as? Double ?? 300, seconds))
-        return Self.process(process)
-    }
-
-    private func shellRead(_ arguments: DesktopControlJSONValue?) async throws -> Any {
-        guard let args = Self.object(arguments), let id = Self.uuid(args["execution_id"]) else { throw CommandError.invalidArguments }
-        let wait = min(max(args["wait_ms"] as? Int ?? 0, 0), 10_000)
-        return Self.process(try await shell.read(id: id, after: Self.optionalUInt64(args["cursor"]) ?? 0, wait: .milliseconds(wait)))
-    }
-
-    private func shellWrite(_ arguments: DesktopControlJSONValue?) async throws -> Any {
-        guard let args = Self.object(arguments), let id = Self.uuid(args["execution_id"]) else { throw CommandError.invalidArguments }
-        if args["close_stdin"] as? Bool == true { try await shell.write(id: id, input: .close) }
-        else if args["interrupt"] as? Bool == true { try await shell.write(id: id, input: .interrupt) }
-        else if let encoded = args["data_base64"] as? String, let data = Data(base64Encoded: encoded) {
-            try await shell.write(id: id, input: .data(data))
-        } else { throw CommandError.invalidArguments }
-        return ["accepted": true]
-    }
-
-    private func shellStatus(_ arguments: DesktopControlJSONValue?) async throws -> Any {
-        guard let args = Self.object(arguments), let id = Self.uuid(args["execution_id"]) else { throw CommandError.invalidArguments }
-        return Self.process(try await shell.status(id: id))
-    }
-
-    private func shellCancel(_ arguments: DesktopControlJSONValue?) async throws -> Any {
-        guard let args = Self.object(arguments), let id = Self.uuid(args["execution_id"]) else { throw CommandError.invalidArguments }
-        try await shell.cancel(id: id)
-        return ["cancelled": true]
-    }
-
     private static func allowedTools(for operation: String) -> Set<String> {
         switch operation {
         case "desktop_control_cua": return CuaDriverCompatibility.exposedTools
@@ -1210,100 +688,13 @@ final class DesktopControlCommandExecutor {
         }
     }
 
-    private static func object(_ value: DesktopControlJSONValue?) -> [String: Any]? {
-        guard let value, let data = try? JSONEncoder().encode(value) else { return nil }
-        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-    }
-
-    private static func uuid(_ value: Any?) -> UUID? { (value as? String).flatMap(UUID.init(uuidString:)) }
-    private static func optionalUInt64(_ value: Any?) throws -> UInt64? {
-        guard let value else { return nil }
-        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
-              let integer = UInt64(exactly: number.doubleValue), integer <= UInt64(Int64.max) else {
-            throw CommandError.invalidArguments
-        }
-        return integer
-    }
-
-    private static func entry(_ entry: DesktopFileEntry) -> [String: Any] {
-        ["path": entry.path, "name": entry.name, "kind": entry.kind.rawValue, "size": entry.size,
-         "modified_at": entry.modifiedAt.map { ISO8601DateFormatter().string(from: $0) } as Any? ?? NSNull(),
-         "symlink_target": entry.symlinkTarget as Any? ?? NSNull()]
-    }
-
-    private static func fileContent(_ read: DesktopFileRead) -> [String: Any] {
-        let mimeType = Self.mimeType(for: read.path)
-        var result: [String: Any] = [
-            "path": read.path,
-            "byte_offset": read.offset,
-            "byte_length": read.content.count,
-            "next_offset": read.nextOffset,
-            "end_of_file": read.endOfFile,
-            "line_start": NSNull(),
-            "next_line": NSNull(),
-            "truncated": read.truncated,
-            "mime_type": mimeType,
-            "encoding": "base64",
-            "content_base64": read.content.base64EncodedString(),
-        ]
-        if read.offset == 0, read.endOfFile, Self.supportedImageMIMETypes.contains(mimeType) {
-            result["content"] = [["type": "image", "data": read.content.base64EncodedString(), "mimeType": mimeType]]
-        }
-        if !read.content.contains(0), let text = String(data: read.content, encoding: .utf8),
-           text.unicodeScalars.allSatisfy({ scalar in
-               !CharacterSet.controlCharacters.contains(scalar) || scalar == "\n" || scalar == "\r" || scalar == "\t"
-           }) {
-            result["content_text"] = text
-            result["encoding"] = "utf-8"
-            result["line_count"] = text.isEmpty ? 0 : text.reduce(into: 0) { count, character in
-                if character == "\n" { count += 1 }
-            } + (text.hasSuffix("\n") ? 0 : 1)
-            if let lineStart = read.lineStart {
-                result["line_start"] = lineStart
-                result["next_line"] = read.nextLine ?? (lineStart + (result["line_count"] as? Int ?? 0))
-            }
-        } else {
-            result["line_count"] = NSNull()
-        }
-        return result
-    }
-
-    // Base64 adds one third to the source bytes. Keep the complete result below
-    // the shared 8 MiB frame limit after JSON metadata is included.
-    private static let maxImageContentBytes: UInt64 = 5 * 1024 * 1024
-    private static let supportedImageMIMETypes: Set<String> = ["image/png", "image/jpeg", "image/webp"]
-
-    private static func mimeType(for path: String) -> String {
-        UTType(filenameExtension: URL(fileURLWithPath: path).pathExtension)?.preferredMIMEType
-            ?? "application/octet-stream"
-    }
-
-    private static func iso8601String(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
-    }
-
-    private static func process(_ process: DesktopProcessRead) -> [String: Any] {
-        ["execution_id": process.executionID.uuidString, "chunks": process.chunks.map {
-            ["sequence": $0.sequence, "stream": $0.stream.rawValue, "data_base64": $0.data.base64EncodedString()]
-        }, "next_cursor": process.nextCursor, "earliest_cursor": process.earliestCursor,
-         "output_gap": process.outputGap, "state": process.state.rawValue,
-         "exit_code": process.exitCode as Any? ?? NSNull(), "signal": process.signal as Any? ?? NSNull()]
-    }
-
-    private static func output(_ read: DesktopProcessRead) -> String {
-        let data = read.chunks.reduce(into: Data()) { result, chunk in result.append(chunk.data) }
-        return String(decoding: data, as: UTF8.self)
-    }
-
     private static func failure(_ frame: DesktopControlFrame, _ code: String, _ message: String) -> DesktopControlFrame {
         DesktopControlFrame(type: "failure", requestID: frame.requestID, errorCode: code, errorMessage: message)
     }
 }
 
 private enum CommandError: Error, LocalizedError {
-    case invalidArguments, busy, controlRequired, configurationRevoked, bindingRevoked, commandFailed, executorUnavailable, sleepPreventionUnavailable
+    case invalidArguments, busy, controlRequired, configurationRevoked, bindingRevoked, commandFailed, executorUnavailable
     var code: String {
         switch self {
         case .invalidArguments: "invalid_arguments"
@@ -1313,7 +704,6 @@ private enum CommandError: Error, LocalizedError {
         case .bindingRevoked: "desktop_control_binding_revoked"
         case .commandFailed: "desktop_command_failed"
         case .executorUnavailable: "desktop_executor_unavailable"
-        case .sleepPreventionUnavailable: "desktop_executor_unavailable"
         }
     }
     var errorDescription: String? {
@@ -1325,75 +715,6 @@ private enum CommandError: Error, LocalizedError {
         case .bindingRevoked: "This persona no longer has access to this Desktop Control configuration."
         case .commandFailed: "The desktop command failed."
         case .executorUnavailable: "The previous desktop command is still stopping. Retry after the desktop service recovers."
-        case .sleepPreventionUnavailable: "PersonaStack could not keep this Mac awake during remote work. Retry Setup Awake During Remote Work in Permissions and Setup."
-        }
-    }
-}
-
-private extension DesktopFileSystemError {
-    var desktopControlCode: String {
-        switch self {
-        case .permissionDenied: "desktop_file_permission_denied"
-        case .missingHandle: "desktop_file_handle_expired"
-        case .invalidRange: "desktop_file_range_invalid"
-        case .tooManyOpenFiles: "desktop_file_handle_limit"
-        case .patchMismatch: "desktop_file_changed"
-        case .searchIncomplete: "desktop_file_search_incomplete"
-        case .searchContinuationExpired: "desktop_file_search_continuation_expired"
-        case .tooManySearches: "desktop_file_search_limit"
-        case .invalidPath, .notRegularFile, .notDirectory, .contentTooLarge, .destinationExists:
-            "desktop_file_operation_failed"
-        }
-    }
-
-    var desktopControlMessage: String {
-        switch self {
-        case .permissionDenied: "macOS denied this file operation for PersonaStack Desktop. Choose a file or folder your macOS account can access."
-        case .missingHandle: "This file handle expired. Open the file again before reading it."
-        case .invalidRange: "The requested file range is outside the supported limit."
-        case .tooManyOpenFiles: "Too many files are open for this desktop control session. Close a file handle and retry."
-        case .patchMismatch: "The file changed or the expected text did not match. Read the current file before editing it again."
-        case .searchIncomplete: "The file search exceeded its scan limit. Narrow the search to a smaller folder."
-        case .searchContinuationExpired: "This file search continuation expired. Start the search again with a narrower folder or filter."
-        case .tooManySearches: "Too many file searches are still open. Continue or restart an earlier search before starting another."
-        case .invalidPath, .notRegularFile, .notDirectory, .contentTooLarge, .destinationExists:
-            "PersonaStack Desktop could not complete this file operation. Check the path, file type, and operation limits."
-        }
-    }
-}
-
-private extension DesktopShellError {
-    var desktopControlCode: String {
-        switch self {
-        case .permissionDenied: "desktop_process_permission_denied"
-        case .invalidWorkingDirectory: "desktop_process_working_directory_invalid"
-        case .tooManyProcesses: "desktop_process_limit"
-        case .missingExecution: "desktop_process_handle_expired"
-        case .invalidInput: "desktop_process_input_invalid"
-        case .inputOutcomeUnknown: "outcome_unknown"
-        case .cancellationUnconfirmed: "desktop_process_cancel_unconfirmed"
-        case .invalidCommand: "desktop_process_start_failed"
-        }
-    }
-
-    var desktopControlMessage: String {
-        switch self {
-        case .permissionDenied:
-            "macOS denied access to the command working directory or process. Choose a location or command your macOS account can access."
-        case .invalidWorkingDirectory:
-            "The command working directory is missing or is not an accessible directory. Choose an existing directory on the target Mac."
-        case .tooManyProcesses:
-            "The desktop already has the maximum number of managed commands running. Finish or cancel one before starting another."
-        case .missingExecution:
-            "This command session is no longer available. Start a new command and use its current execution ID."
-        case .invalidInput:
-            "The command input is invalid or exceeds the supported size. Send a smaller input chunk."
-        case .inputOutcomeUnknown:
-            "Command input may have been partly delivered. Read process output and inspect its state before sending more input. Do not repeat the entire input blindly."
-        case .cancellationUnconfirmed:
-            "The desktop could not confirm that the command stopped. Check its status before retrying work."
-        case .invalidCommand:
-            "The desktop could not start the command. Check the working directory and try again."
         }
     }
 }

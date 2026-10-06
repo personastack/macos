@@ -1,5 +1,7 @@
 # 2026-09-28 - Exclusive Desktop Control installation
 
+- 2026-10-06: Eric selects CUA-only macOS Desktop Control. PersonaStack installs or reuses the official standalone Cua Driver and forwards authenticated cloud commands. CUA owns its service, local policy, and desktop permissions and survives PersonaStack removal. Remove PersonaStack's desktop permission wizard, native remote filesystem/shell tools, and locked-screen helper. Keep unrelated PersonaStack features. This supersedes prior embedded-driver and native full-control ownership decisions.
+
 - Decision: Eric limits each local installation to one PersonaStack account and one integration configuration at a time across all workspaces. App updates and Disconnect preserve the Keychain installation ID and machine credential. Explicit setup first revokes the local session, then machine-proven API attachment replaces the prior configuration and persona bindings. Disabling a configuration keeps the installation reserved. The installation ID is a locator and never authorizes deletion. The API owns enforcement and account assignment.
 
 # Architecture decisions

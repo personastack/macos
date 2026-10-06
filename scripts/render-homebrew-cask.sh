@@ -35,8 +35,8 @@ cask "personastack" do
               sudo: false,
               must_succeed: true,
             }, {
-              executable: "/Library/Application Support/PersonaStack/LockedControlInstaller",
-              args: ["--remove"],
+              executable: "/bin/sh",
+              args: ["-c", 'if [ -e "/Library/Application Support/PersonaStack/LockedControlInstaller" ]; then exec "/Library/Application Support/PersonaStack/LockedControlInstaller" --remove; elif [ -e "/Library/Security/SecurityAgentPlugins/PersonaStackLockedGrantCandidate.bundle" ]; then echo "Legacy locked-control cleanup requires its signed removal utility." >&2; exit 1; fi'],
               sudo: true,
               must_succeed: true,
             }],

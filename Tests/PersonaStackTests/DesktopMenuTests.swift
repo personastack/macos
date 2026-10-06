@@ -7,7 +7,7 @@ import Testing
         let action = try #require(DesktopMenuRelayAction(
             relayEnabled: relayEnabled, relayPaused: false, hasError: true,
             hasTrustedConfiguration: true, environmentSwitchPending: false))
-        #expect(action.title == "Retry Remote Control")
+        #expect(action.title == "Retry PersonaStack Connection")
         #expect(action.isEnabled)
     }
 
@@ -16,7 +16,7 @@ import Testing
         let action = try #require(DesktopMenuRelayAction(
             relayEnabled: true, relayPaused: paused, hasError: false,
             hasTrustedConfiguration: true, environmentSwitchPending: false))
-        #expect(action.title == (paused ? "Resume Remote Control" : "Pause Remote Control"))
+        #expect(action.title == (paused ? "Resume PersonaStack Control" : "Pause PersonaStack Control"))
         #expect(action.isEnabled)
     }
 
@@ -25,7 +25,7 @@ import Testing
         let action = try #require(DesktopMenuRelayAction(
             relayEnabled: false, relayPaused: false, hasError: false,
             hasTrustedConfiguration: trusted, environmentSwitchPending: false))
-        #expect(action.title == "Start Desktop Control")
+        #expect(action.title == "Connect PersonaStack")
         #expect(action.isEnabled == trusted)
     }
 
@@ -37,7 +37,7 @@ import Testing
         let action = try #require(DesktopMenuRelayAction(
             relayEnabled: true, relayPaused: false, hasError: hasError,
             hasTrustedConfiguration: true, environmentSwitchPending: true))
-        #expect(action.title == (hasError ? "Retry Remote Control" : "Pause Remote Control"))
+        #expect(action.title == (hasError ? "Retry PersonaStack Connection" : "Pause PersonaStack Control"))
         #expect(!action.isEnabled)
     }
 
@@ -45,7 +45,7 @@ import Testing
         let action = try #require(DesktopMenuRelayAction(
             relayEnabled: false, relayPaused: true, hasError: true,
             hasTrustedConfiguration: false, environmentSwitchPending: false))
-        #expect(action.title == "Retry Remote Control")
+        #expect(action.title == "Retry PersonaStack Connection")
         #expect(!action.isEnabled)
     }
 
@@ -54,7 +54,7 @@ import Testing
             relayEnabled: false, relayPaused: false, hasError: false,
             hasTrustedConfiguration: false, environmentSwitchPending: false,
             activelyControlling: true))
-        #expect(action.title == "Stop Control")
+        #expect(action.title == "Stop PersonaStack Control")
         #expect(action.isEnabled)
     }
 
@@ -63,7 +63,7 @@ import Testing
             relayEnabled: true, relayPaused: true, hasError: false,
             hasTrustedConfiguration: true, environmentSwitchPending: false,
             activelyControlling: true, cleanupPending: true))
-        #expect(action.title == "Stopping Control…")
+        #expect(action.title == "Stopping PersonaStack Control…")
         #expect(!action.isEnabled)
     }
 }

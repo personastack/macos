@@ -26,23 +26,13 @@ struct DesktopControlBindingRevocationTests {
 
     @Test
     func revokedBindingClosesOwnedResourcesAndPreservesSharedConfigForOtherPersonas() async throws {
-        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
+        let executor = DesktopControlCommandExecutor()
         let owner = target(3)
-        let token = try await acquire(executor, owner)
-        let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try Data("binding fixture".utf8).write(to: path)
-        defer { try? FileManager.default.removeItem(at: path) }
-        let opened = await executor.handle(frame("desktop_control_file", owner,
-            ["control_token": .string(token), "action": .string("open"), "path": .string(path.path)]), proxy: nil)
-        #expect(opened.type == "result")
-        let started = await executor.handle(frame("desktop_control_execute", owner,
-            ["control_token": .string(token), "command": .string("sleep 30"), "working_directory": .string("/tmp")]), proxy: nil)
-        #expect(started.type == "result")
+        _ = try await acquire(executor, owner)
         let revoke = frame("desktop_control_revoke_binding", target(3, run: ""))
         #expect(DesktopControlGatewayConnection.validCommand(revoke, installationID: "install"))
         #expect(await executor.handle(revoke, proxy: nil).type == "result")
-        #expect(await executor.diagnostics().openFileHandles == 0)
-        #expect(await executor.diagnostics().activeProcesses == 0)
+        #expect(executor.currentLease == nil)
         for generation: Int64 in [1, 3] {
             #expect(await executor.handle(frame("desktop_control_acquire", target(generation)), proxy: nil).errorCode == "desktop_control_binding_revoked")
         }
@@ -52,7 +42,7 @@ struct DesktopControlBindingRevocationTests {
 
     @Test
     func staleRevocationDoesNotTouchNewerBindingLeaseOrLowerRememberedCutoff() async throws {
-        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
+        let executor = DesktopControlCommandExecutor()
         #expect(await executor.handle(frame("desktop_control_revoke_binding", target(4, run: "")), proxy: nil).type == "result")
         let newer = target(5)
         let token = try await acquire(executor, newer)
@@ -71,59 +61,15 @@ struct DesktopControlBindingRevocationTests {
 
     @Test
     func overlappingRevocationRecordsEveryBindingCutoffDuringCleanup() async throws {
-        let marker = FileManager.default.temporaryDirectory.appendingPathComponent("desktop-control-revocation-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: marker) }
-        let releaseMarker = marker.appendingPathExtension("release")
-        let directory = marker.deletingLastPathComponent().appendingPathComponent("proxy-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        defer { try? Data().write(to: releaseMarker) }
-        let executable = directory.appendingPathComponent("fake-cua")
-        let script = #"""
-        #!/usr/bin/python3
-        import json, pathlib, sys, time
-        marker = pathlib.Path("\#(marker.path)")
-        release_marker = pathlib.Path("\#(releaseMarker.path)")
-        for line in sys.stdin:
-            request = json.loads(line)
-            method = request.get("method")
-            if method == "notifications/initialized":
-                continue
-            if method == "initialize":
-                result = {"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"test-cua","version":"0.29.1"}}
-            elif method == "tools/call":
-                name = request["params"]["name"]
-                arguments = request["params"]["arguments"]
-                if name == "end_session":
-                    assert set(arguments) == {"session"} and arguments["session"]
-                    result = {"structuredContent":{"session":arguments["session"],"active":False}}
-                else:
-                    assert name == "get_desktop_state"
-                    marker.write_text("entered")
-                    while not release_marker.exists():
-                        time.sleep(0.01)
-                    result = {"content":[{"type":"text","text":"observed"}]}
-            else:
-                result = {}
-            print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
-        """#
-        try script.write(to: executable, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let proxy = RevocationCuaFixture()
 
-        let proxy = CuaMCPProxy(executableURL: executable)
-        _ = try await proxy.start()
-        defer { Task { await proxy.stop() } }
-
-        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
+        let executor = DesktopControlCommandExecutor()
         let activeOwner = target(1)
         let token = try await acquire(executor, activeOwner)
         let observe = frame("desktop_control_observe", activeOwner,
             ["control_token": .string(token), "tool": .string("get_desktop_state"), "arguments": .object([:])])
         let observeTask = Task { await executor.handle(observe, proxy: proxy) }
-        for _ in 0..<100 where !FileManager.default.fileExists(atPath: marker.path) {
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        #expect(FileManager.default.fileExists(atPath: marker.path))
+        await proxy.waitUntilObserved()
 
         let firstBindingRevoke = frame("desktop_control_revoke_binding", target(1, run: ""))
         let firstBindingRevokeTask = Task { await executor.handle(firstBindingRevoke, proxy: nil) }
@@ -135,7 +81,7 @@ struct DesktopControlBindingRevocationTests {
                 cleanupObserved = true
                 break
             }
-            try await Task.sleep(for: .milliseconds(10))
+            await Task.yield()
         }
         #expect(cleanupObserved)
         let secondBinding = target(7, persona: "second-persona")
@@ -145,7 +91,7 @@ struct DesktopControlBindingRevocationTests {
         let acquireDuringFirstCleanup = await executor.handle(frame("desktop_control_acquire", unaffectedOwner), proxy: nil)
         #expect(acquireDuringFirstCleanup.errorCode == "desktop_control_revocation_in_progress")
 
-        try Data().write(to: releaseMarker)
+        await proxy.completeObservation()
         #expect((await observeTask.value).errorCode == "desktop_control_binding_revoked")
         #expect((await firstBindingRevokeTask.value).type == "result")
         let staleAcquire = await executor.handle(frame("desktop_control_acquire", secondBinding), proxy: nil)
@@ -160,12 +106,11 @@ struct DesktopControlBindingRevocationTests {
         #expect(await executor.handle(frame("desktop_control_release", unaffectedOwner,
             ["control_token": .string(controlToken)]), proxy: nil).type == "result")
         await executor.close()
-        await proxy.stop()
     }
 
     @Test
     func malformedBindingRevocationsAreRejectedAndReservedCapacityIsAvailable() async {
-        let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
+        let executor = DesktopControlCommandExecutor()
         for invalid in [target(0, run: ""), target(1, persona: "", run: ""), target(1), target(1, run: "", version: 0)] {
             let revoke = frame("desktop_control_revoke_binding", invalid)
             #expect(!DesktopControlGatewayConnection.validCommand(revoke, installationID: "install"))
@@ -174,5 +119,35 @@ struct DesktopControlBindingRevocationTests {
         #expect(DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_revoke_binding", activeCount: 31))
         #expect(!DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_revoke_binding", activeCount: 32))
         await executor.close()
+    }
+}
+
+
+private actor RevocationCuaFixture: CuaToolCalling {
+    private var observed = false
+    private var arrival: CheckedContinuation<Void, Never>?
+    private var completion: CheckedContinuation<Void, Never>?
+    func waitUntilObserved() async {
+        if observed { return }
+        await withCheckedContinuation { arrival = $0 }
+    }
+    func completeObservation() { completion?.resume(); completion = nil }
+    func callTool(name: String, argumentsJSON: Data, timeout: Int32) async throws -> Data {
+        if name == "end_session" {
+            let arguments = try JSONDecoder().decode(SessionArguments.self, from: argumentsJSON)
+            #expect(!arguments.session.isEmpty)
+            return try JSONEncoder().encode(SessionEnvelope(result: .init(structuredContent: .init(session: arguments.session, active: false))))
+        }
+        #expect(name == "get_desktop_state")
+        observed = true
+        arrival?.resume(); arrival = nil
+        await withCheckedContinuation { completion = $0 }
+        return Data(#"{"result":{"content":[{"type":"text","text":"observed"}]}}"#.utf8)
+    }
+    private struct SessionArguments: Decodable { let session: String }
+    private struct SessionEnvelope: Encodable { let result: SessionResult }
+    private struct SessionResult: Encodable {
+        let structuredContent: State
+        struct State: Encodable { let session: String; let active: Bool }
     }
 }

@@ -19,7 +19,7 @@ struct CuaDriverInstallerTests {
     func healthyPinnedInstallIsReusedWithoutNetworkOrReplacement() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
-        let installationRoot = root.appendingPathComponent("CuaDriver-\(CuaDriverCompatibility.version)", isDirectory: true)
+        let installationRoot = root.appendingPathComponent("Applications", isDirectory: true)
         let app = installationRoot.appendingPathComponent("CuaDriver.app", isDirectory: true)
         try FileManager.default.createDirectory(at: app.appendingPathComponent("Contents/MacOS", isDirectory: true), withIntermediateDirectories: true)
         let info = try PropertyListSerialization.data(
@@ -30,9 +30,9 @@ struct CuaDriverInstallerTests {
         try Data("fake executable".utf8).write(to: executable)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         let runner = FixedCuaProcessRunner()
-        let installer = CuaDriverInstaller(supportDirectory: root, processRunner: runner, externalApplicationURLs: [])
+        let installer = CuaDriverInstaller(supportDirectory: root, processRunner: runner, externalApplicationURLs: [app])
 
-        let installed = try await installer.validateOrInstall()
+        let installed = try await installer.install()
 
         #expect(installed.version == CuaDriverCompatibility.version)
         #expect(installed.applicationURL == app)
@@ -46,23 +46,15 @@ struct CuaDriverInstallerTests {
         ])
     }
 
-    @Test
-    func repairRefusesToReplaceUnmanagedPath() async throws {
+    @Test func missingDiscoveryDoesNotInstallOrRunCommands() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
-        let install = root.appendingPathComponent("CuaDriver-\(CuaDriverCompatibility.version)", isDirectory: true)
-        try FileManager.default.createDirectory(at: install, withIntermediateDirectories: true)
-        let sentinel = install.appendingPathComponent("user-file")
-        try Data("keep".utf8).write(to: sentinel)
         let runner = FixedCuaProcessRunner()
-        let installer = CuaDriverInstaller(supportDirectory: root, processRunner: runner, externalApplicationURLs: [])
-
-        await #expect(throws: CuaDriverInstallError.invalidLayout) {
-            try await installer.validateOrInstall(repair: true)
-        }
-
-        #expect(try String(contentsOf: sentinel, encoding: .utf8) == "keep")
+        let installer = CuaDriverInstaller(supportDirectory: root, processRunner: runner,
+            externalApplicationURLs: [root.appendingPathComponent("missing/CuaDriver.app")])
+        #expect(try await installer.discoverExisting() == nil)
         #expect(runner.invocations.isEmpty)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: root.path).isEmpty)
     }
 
     @Test
@@ -74,7 +66,7 @@ struct CuaDriverInstallerTests {
         let runner = FixedCuaProcessRunner()
         let installer = CuaDriverInstaller(supportDirectory: root, processRunner: runner, externalApplicationURLs: [application])
 
-        let installed = try await installer.validateOrInstall(repair: true)
+        let installed = try await installer.install()
 
         #expect(installed.applicationURL == application)
         #expect(installed.executableURL == executable)
@@ -102,7 +94,7 @@ struct CuaDriverInstallerTests {
             supportDirectory: root, processRunner: runner, externalApplicationURLs: [outdated, compatible]
         )
 
-        let installed = try await installer.validateOrInstall()
+        let installed = try await installer.install()
 
         #expect(installed.applicationURL == compatible)
         #expect(installed.executableURL == compatibleExecutable)
@@ -121,7 +113,7 @@ struct CuaDriverInstallerTests {
         let runner = FixedCuaProcessRunner(mismatchedChecksumPaths: [changedExecutable.path])
         let installer = CuaDriverInstaller(supportDirectory: root, processRunner: runner,
                                            externalApplicationURLs: [changed, reviewed])
-        let installed = try await installer.validateOrInstall()
+        let installed = try await installer.install()
         #expect(installed.applicationURL == reviewed)
         #expect(runner.driverInvocationPaths.allSatisfy { $0 != changedExecutable.path })
         #expect(try String(contentsOf: changedExecutable, encoding: .utf8) == "untouched external executable")

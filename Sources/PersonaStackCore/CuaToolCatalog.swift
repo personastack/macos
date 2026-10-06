@@ -37,6 +37,12 @@ public enum CuaToolCatalog {
 
     public static var names: Set<String> { Set(manifest?.tools.keys.map { $0 } ?? []) }
 
+    static func reviewedSchema(_ name: String) -> DesktopControlJSONValue? { manifest?.tools[name] }
+
+    public static func matchesAdvertisedSchema(name: String, schema: DesktopControlJSONValue) -> Bool {
+        manifest?.tools[name] == schema
+    }
+
     public static func acceptsSession(_ tool: String) -> Bool {
         guard case .object(let schema)? = manifest?.tools[tool],
               case .object(let properties)? = schema["properties"] else { return false }

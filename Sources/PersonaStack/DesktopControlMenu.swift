@@ -150,14 +150,16 @@ struct DesktopControlMenu: View {
                 .font(.caption)
                 .foregroundStyle(.red)
         }
-        Button("Permissions and Setup…") {
-            DesktopPermissionChecklist.shared.window.presentForRepair()
+        Text(DesktopControlRuntime.shared.isCuaReady() ? "CUA: Ready" : "CUA: Not ready")
+        Text(DesktopControlRuntime.shared.gatewayConnected ? "PersonaStack: Connected" : "PersonaStack: Disconnected")
+        Button("Set Up CUA…") {
+            CuaSetupWindow.shared.presentForRepair()
         }
         Button("Diagnostics…") {
             DesktopControlDiagnosticsWindow.shared.present()
         }
         if relayEnabled || DesktopControlRuntime.shared.hasPendingEnvironmentSwitch {
-            Button(status.isRepairing ? "Repairing Desktop Control…" : "Repair Desktop Control") {
+            Button(status.isRepairing ? "Checking CUA Connection…" : "Check CUA Connection") {
                 Task { await repairCua() }
             }
             .disabled(status.isRepairing || DesktopControlRuntime.shared.isDisconnecting)
@@ -175,8 +177,8 @@ struct DesktopControlMenu: View {
     private var relayStatus: String {
         _ = status.revision
         if !serverSettings.hasTrustedConfiguration { return "Set all three server URLs to enable Desktop Control" }
-        if DesktopControlRuntime.shared.hasPendingEnvironmentSwitch { return "Server change incomplete. Retry Server Settings, repair, or disconnect." }
-        if status.isRepairing { return "Repairing Cua Service…" }
+        if DesktopControlRuntime.shared.hasPendingEnvironmentSwitch { return "Server change incomplete. Retry Server Settings, check the CUA connection, or disconnect." }
+        if status.isRepairing { return "Checking CUA connection…" }
         return presentation.snapshot.message
     }
 
@@ -256,7 +258,7 @@ struct DesktopControlMenu: View {
             return
         } catch {
             guard let generation, runtime.isCurrentLifecycle(generation) else { return }
-            repairError = "Cua service could not be repaired: \(error.localizedDescription)"
+            repairError = "CUA connection needs attention: \(error.localizedDescription)"
         }
         guard let generation, runtime.isCurrentLifecycle(generation) else { return }
         relayPaused = runtime.paused
@@ -282,7 +284,7 @@ struct DesktopControlMenu: View {
     private func confirmDisconnect() {
         let alert = NSAlert()
         alert.messageText = "Disconnect this Mac from PersonaStack?"
-        alert.informativeText = "This revokes the desktop connection for every workspace. It does not uninstall Cua. Managed commands are closed where possible, but detached programs may continue."
+        alert.informativeText = "This revokes the desktop connection for every workspace. CUA remains installed and running. Other CUA clients are not disconnected."
         alert.addButton(withTitle: "Disconnect Desktop Control")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
@@ -328,11 +330,11 @@ struct DesktopMenuRelayAction: Equatable {
           hasTrustedConfiguration: Bool, environmentSwitchPending: Bool,
           activelyControlling: Bool = false, cleanupPending: Bool = false) {
         guard relayEnabled || !environmentSwitchPending || activelyControlling else { return nil }
-        if cleanupPending { title = "Stopping Control…" }
-        else if activelyControlling { title = "Stop Control" }
-        else if hasError { title = "Retry Remote Control" }
-        else if !relayEnabled { title = "Start Desktop Control" }
-        else { title = relayPaused ? "Resume Remote Control" : "Pause Remote Control" }
+        if cleanupPending { title = "Stopping PersonaStack Control…" }
+        else if activelyControlling { title = "Stop PersonaStack Control" }
+        else if hasError { title = "Retry PersonaStack Connection" }
+        else if !relayEnabled { title = "Connect PersonaStack" }
+        else { title = relayPaused ? "Resume PersonaStack Control" : "Pause PersonaStack Control" }
         isEnabled = !cleanupPending && (activelyControlling
             || (!environmentSwitchPending && (relayEnabled || hasTrustedConfiguration)))
     }

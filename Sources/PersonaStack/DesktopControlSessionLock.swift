@@ -60,8 +60,8 @@ final class DesktopControlSessionLock {
     var readiness: String { state == .unknown ? "unknown" : "locked" }
 
     /// The lock key is not a documented API contract. Absence must never be
-    /// interpreted as proof of unlock. Ordinary operations do not require that
-    /// proof. The protected locked-control supervisor still requires OS readback.
+    /// interpreted as proof of unlock. CUA reports whether desktop operations
+    /// are available; this monitor fences sleep and inactive user sessions.
     static func currentSnapshot() -> Snapshot {
         classify(CGSessionCopyCurrentDictionary() as? [String: Any], userID: getuid())
     }

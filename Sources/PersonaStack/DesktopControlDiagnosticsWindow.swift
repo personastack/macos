@@ -103,7 +103,7 @@ struct DesktopControlDiagnosticsView: View {
                 Text(error).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
             }
             HStack {
-                Button(model.isRepairing ? "Repairing…" : "Repair Desktop Control") {
+                Button(model.isRepairing ? "Checking…" : "Check CUA Connection") {
                     Task { await model.repairControl() }
                 }
                 .disabled(model.isRepairing)

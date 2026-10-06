@@ -42,7 +42,7 @@ class PackageAppcastTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "darwin", "requires macOS package tools")
 class DesktopInstallerTests(unittest.TestCase):
-    def test_unsigned_main_package_has_only_app_in_applications_and_no_policy_scripts(self):
+    def test_main_package_has_only_app_and_guarded_legacy_migration(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             app = root / "PersonaStack.app"
@@ -55,8 +55,8 @@ class DesktopInstallerTests(unittest.TestCase):
             binary.chmod(0o755)
             output = root / "Install PersonaStack.pkg"
             env = {key: value for key, value in os.environ.items() if not key.startswith("PERSONASTACK_")}
-            env["PERSONASTACK_INCLUDE_LOCKED_CONTROL"] = "0"
-            result = subprocess.run([str(ROOT / "scripts/package-desktop-installer.sh"), str(app), str(root / "unused-tool"), str(output)],
+            env["PERSONASTACK_SIGN_INSTALLER"] = "0"
+            result = subprocess.run([str(ROOT / "scripts/package-desktop-installer.sh"), str(app), str(output)],
                                     env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             expanded = root / "expanded"
@@ -70,16 +70,23 @@ class DesktopInstallerTests(unittest.TestCase):
             self.assertEqual(len(packages), 1)
             package = ET.parse(packages[0]).getroot()
             self.assertEqual(package.get("identifier"), "ai.personastack.desktop")
-            self.assertIsNone(package.find("scripts"))
+            self.assertIsNotNone(package.find("scripts/preinstall"))
+            preinstalls = list(expanded.glob("**/Scripts/preinstall"))
+            self.assertEqual(len(preinstalls), 1)
+            preinstall = preinstalls[0].read_text()
+            self.assertNotIn("__CERT_SHA1__", preinstall)
+            self.assertIn('"$helper" --remove', preinstall)
+            self.assertNotIn("CuaDriver", preinstall)
+            self.assertNotIn("com.trycua", preinstall)
             self.assertFalse(list(package.find("relocate")), ET.tostring(package, encoding="unicode"))
             self.assertTrue(list(expanded.glob("**/Payload/Applications/PersonaStack.app/Contents/MacOS/PersonaStack")))
             self.assertFalse(list(expanded.glob("**/Library/Security/**")))
-            result = subprocess.run([str(ROOT / "scripts/package-desktop-installer.sh"), str(app), str(root / "unused-tool"), str(output)],
+            result = subprocess.run([str(ROOT / "scripts/package-desktop-installer.sh"), str(app), str(output)],
                                     env=env, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Refusing to replace", result.stderr)
 
-    def test_missing_signing_identity_fails_before_packaging_privileged_payload(self):
+    def test_missing_signing_identity_fails_before_release_packaging(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             app = root / "PersonaStack.app"
@@ -88,8 +95,93 @@ class DesktopInstallerTests(unittest.TestCase):
                 plistlib.dump({"CFBundleShortVersionString": "1.2.3"}, file)
             env = {key: value for key, value in os.environ.items() if not key.startswith("PERSONASTACK_")}
             output = root / "Install PersonaStack.pkg"
-            result = subprocess.run([str(ROOT / "scripts/package-desktop-installer.sh"), str(app), "/missing/policy-tool", str(output)],
+            result = subprocess.run([str(ROOT / "scripts/package-desktop-installer.sh"), str(app), str(output)],
                                     env=env, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Developer ID Installer identity is required", result.stderr)
             self.assertFalse(output.exists())
+
+
+class StandaloneCUAPackagingTests(unittest.TestCase):
+    def test_new_payload_does_not_build_or_install_locked_control(self):
+        for name in ("package-macos.sh", "package-desktop-installer.sh"):
+            script = (ROOT / "scripts" / name).read_text()
+            self.assertNotIn("package-locked-control.sh", script)
+            self.assertNotIn("Experiments/LockedSessionCandidate", script)
+            self.assertNotIn("PERSONASTACK_INCLUDE_LOCKED_CONTROL", script)
+        script = (ROOT / "scripts/package-macos.sh").read_text()
+        self.assertNotIn("/PersonaStackLockedControlInstaller", script)
+
+    def test_cask_preserves_cua_and_conditionally_cleans_legacy_policy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive = root / "PersonaStack-1.2.3-developerid.dmg"
+            archive.write_bytes(b"fixture")
+            cask = root / "personastack.rb"
+            subprocess.run([str(ROOT / "scripts/render-homebrew-cask.sh"), "1.2.3", str(archive), str(cask)], check=True)
+            source = cask.read_text()
+            self.assertNotIn("CuaDriver", source)
+            self.assertNotIn("com.trycua", source)
+            self.assertIn('if [ -e "/Library/Application Support/PersonaStack/LockedControlInstaller" ]', source)
+            self.assertIn('exec "/Library/Application Support/PersonaStack/LockedControlInstaller" --remove', source)
+            self.assertIn('Legacy locked-control cleanup requires its signed removal utility.', source)
+            self.assertIn('must_succeed: true', source)
+
+
+class LegacyUpgradeTests(unittest.TestCase):
+    def run_migration(self, root, *, plugin=True, helper=True, helper_status=0, signature_status=0):
+        library = root / "Library"
+        plugin_path = library / "Security/SecurityAgentPlugins/PersonaStackLockedGrantCandidate.bundle"
+        helper_path = library / "Application Support/PersonaStack/LockedControlInstaller"
+        marker = root / "calls"
+        if plugin:
+            plugin_path.mkdir(parents=True)
+        if helper:
+            helper_path.parent.mkdir(parents=True, exist_ok=True)
+            helper_path.write_text(f'#!/bin/sh\n[ "$1" = --remove ] || exit 9\necho remove >> "{marker}"\nexit {helper_status}\n')
+            helper_path.chmod(0o755)
+        commands = root / "commands"
+        commands.mkdir()
+        for name, body in {
+            "id": "echo 0",
+            "stat": 'if [ "$2" = %u ]; then echo 0; else echo 755; fi',
+            "codesign": f'echo verify >> "{marker}"; exit {signature_status}',
+        }.items():
+            command = commands / name
+            command.write_text("#!/bin/sh\n" + body + "\n")
+            command.chmod(0o755)
+        source = (ROOT / "scripts/desktop-upgrade-preinstall.sh").read_text()
+        source = source.replace("/Library", str(library))
+        for name in ("id", "stat", "codesign"):
+            source = source.replace("/usr/bin/" + name, str(commands / name))
+        script = root / "preinstall"
+        script.write_text(source)
+        result = subprocess.run(["/bin/sh", str(script), "package", "target", "/"], capture_output=True, text=True)
+        calls = marker.read_text().splitlines() if marker.exists() else []
+        return result, calls, plugin_path, helper_path
+
+    def test_fresh_install_has_no_policy_or_cua_action(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result, calls, _, _ = self.run_migration(Path(temp), plugin=False, helper=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(calls, [])
+
+    def test_existing_policy_restores_before_retired_payload_is_removed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result, calls, plugin, helper = self.run_migration(Path(temp))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(calls, ["verify", "remove"])
+            self.assertFalse(plugin.exists())
+            self.assertFalse(helper.exists())
+
+    def test_conflict_signature_failure_and_missing_helper_preserve_payload(self):
+        for options, expected in [({"helper_status": 4}, ["verify", "remove"]),
+                                  ({"signature_status": 4}, ["verify"]),
+                                  ({"helper": False}, [])]:
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as temp:
+                result, calls, plugin, helper = self.run_migration(Path(temp), **options)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(calls, expected)
+                self.assertTrue(plugin.exists())
+                if options.get("helper", True):
+                    self.assertTrue(helper.exists())

@@ -75,7 +75,6 @@ final class DesktopCrashRecoverySupervisor {
     private let loginSessionID: @MainActor () -> String?
     private let shouldRestartForRelay: @MainActor () -> Bool
     private let schedule: (TimeInterval, @escaping @MainActor () -> Void) -> Void
-    private var lockedControlHost: DesktopLockedControlSupervisorHost?
     private var applicationPID: pid_t?
     private var generation: UInt64 = 0
     private var crashAttempts = 0
@@ -137,27 +136,12 @@ final class DesktopCrashRecoverySupervisor {
         // NSApplication registers this same-bundle helper with LaunchServices,
         // even with prohibited activation. After the GUI exits, open then targets
         // the helper and fails with -600. Keep the supervisor on a headless loop.
-        startLockedControlListener()
         start()
         RunLoop.main.run()
         exit(0)
     }
 
-    /// Opens only the authenticated local endpoint. The app's current setup,
-    /// consent, and lease gates must approve an arm request before OS work starts.
-    private func startLockedControlListener() {
-        guard lockedControlHost == nil,
-              let certificateURL = Bundle.main.url(forResource: "ReleaseSigningCertificate", withExtension: "der"),
-              let certificate = try? Data(contentsOf: certificateURL), !certificate.isEmpty else { return }
-        let host = DesktopLockedControlSupervisorHost.production(pinnedReleaseCertificate: certificate)
-        do {
-            try host.start()
-            lockedControlHost = host
-        } catch {
-            Logger(subsystem: "ai.personastack.desktop", category: "desktop-control-supervisor")
-                .error("The authenticated local control listener is unavailable.")
-        }
-    }
+
 
     func receiveApplicationTermination(bundleIdentifier: String?, processID: pid_t) {
         guard bundleIdentifier == self.bundleIdentifier, processID == applicationPID else { return }

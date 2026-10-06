@@ -17,10 +17,7 @@ enum DesktopEntryPoint {
             return
         }
         if DesktopCrashRecoverySupervisor.dispatchSupervisorIfRequested() { return }
-        if CommandLine.arguments.contains("--personastack-permission-diagnostics") {
-            DesktopAccessibilityPermission.printDiagnostics()
-            return
-        }
+
         if !CommandLine.arguments.contains(DesktopCrashRecoverySupervisor.recoveryLaunchArgument) {
             DesktopCrashRecoveryPolicy.resumeAfterExplicitLaunch()
         }
@@ -345,7 +342,7 @@ struct PersonaStackWebView: NSViewRepresentable {
                 webView.load(request)
             },
             cancelPermissionVerification: @escaping () -> Void = {
-                DesktopPermissionChecklist.shared.cancelVerification()
+                CuaSetupWindow.shared.cancel()
             },
             concernNotificationsEnabled: @escaping () -> Bool = { DesktopConcernNotificationSettings.isEnabled() },
             mediaPermission: DesktopMediaCapturePermission = .shared

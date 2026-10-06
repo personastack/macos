@@ -15,8 +15,7 @@ let package = Package(
         .package(url: "https://github.com/sparkle-project/Sparkle.git", exact: "2.10.0"),
     ],
     targets: [
-        .target(name: "LockedControlAudit", publicHeadersPath: "include", linkerSettings: [.linkedFramework("Security"), .linkedFramework("SystemConfiguration"), .linkedLibrary("bsm")]),
-        .target(name: "PersonaStackCore", dependencies: ["Yams", "LockedControlAudit"], resources: [.copy("Resources/cua-tools-0.29.1.json")]),
+        .target(name: "PersonaStackCore", dependencies: ["Yams"], resources: [.copy("Resources/cua-tools-0.29.1.json")]),
         .executableTarget(name: "PersonaStack", dependencies: ["PersonaStackCore", .product(name: "Sparkle", package: "Sparkle")],
                           linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])]),
         .executableTarget(name: "PersonaStackHarnessHook", dependencies: ["PersonaStackCore"]),

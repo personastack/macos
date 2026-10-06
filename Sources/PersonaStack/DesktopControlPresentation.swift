@@ -95,10 +95,10 @@ struct DesktopControlPresentation: Equatable, Sendable {
         } else if ["permission_required", "cua_unavailable", "upgrade_required", "locked"].contains(readiness) {
             state = .needsAttention
             switch readiness {
-            case "permission_required": message = "Desktop permissions need attention"
+            case "permission_required": message = "Complete CUA setup"
             case "upgrade_required": message = "Desktop update required"
             case "locked": message = "Mac is locked"
-            default: message = "Desktop control service needs attention"
+            default: message = "CUA connection needs attention"
             }
         } else if !connected || readiness != "ready" {
             state = .connecting
@@ -159,14 +159,11 @@ struct DesktopControlDiagnosticReport: Sendable {
         Cloud connected: \(connected)
         Last successful connection: \(last)
         GUI ready: \(guiReady)
-        Native executor ready: \(nativeReady)
-        Accessibility permission: \(accessibilityGranted.map(String.init) ?? "Unavailable")
-        Screen Recording permission: \(screenCaptureGranted.map(String.init) ?? "Unavailable")
+        CUA Accessibility permission: \(accessibilityGranted.map(String.init) ?? "Unavailable")
+        CUA Screen Recording permission: \(screenCaptureGranted.map(String.init) ?? "Unavailable")
         Session: \(session.rawValue)
         Launch at Login: \(login.rawValue)
         Reconnect pending: \(reconnectPending)
-        Service recovery in progress: \(serviceRecoveryInProgress)
-        Service recovery attempts: \(max(0, serviceRecoveryAttempts))
         Cleanup pending: \(cleanupPending)
         \(resources)
         """

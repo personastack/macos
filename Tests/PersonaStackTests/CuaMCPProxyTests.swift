@@ -207,9 +207,22 @@ struct CuaMCPProxyTests {
         await proxy.stop()
     }
 
+    @Test func advertisedCatalogRejectsChangedSchemaEvenWithAllNames() async throws {
+        let proxy = CuaMCPProxy(executableURL: URL(fileURLWithPath: "/unused"))
+        let tools = CuaDriverCompatibility.requiredTools.sorted().map { name in
+            DesktopControlJSONValue.object(["name": .string(name), "inputSchema":
+                name == "click" ? .object(["type": .string("object")]) : CuaToolCatalog.reviewedSchema(name)!])
+        }
+        let response = try JSONEncoder().encode(DesktopControlJSONValue.object(["result": .object(["tools": .array(tools)])]))
+        await #expect(throws: CuaMCPProxyError.invalidToolCatalog) { try await proxy.validateToolCatalog(response) }
+    }
+
     @Test
     func initializesListsAndCallsOnlyApprovedTools() async throws {
-        let toolNamesJSON = String(decoding: try JSONEncoder().encode(CuaDriverCompatibility.requiredTools.sorted()), as: UTF8.self)
+        let schemas = CuaDriverCompatibility.requiredTools.sorted().map { name in
+            DesktopControlJSONValue.object(["name": .string(name), "inputSchema": CuaToolCatalog.reviewedSchema(name)!])
+        }
+        let toolsJSON = try JSONEncoder().encode(schemas).base64EncodedString()
         let stoppedMarker = FileManager.default.temporaryDirectory.appendingPathComponent("cua-proxy-stopped-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: stoppedMarker) }
         let script = #"""
@@ -231,8 +244,7 @@ struct CuaMCPProxyTests {
             if method == "initialize":
                 result = {"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"cua","version":"0.29.1","telemetry":__import__("os").environ.get("CUA_DRIVER_RS_TELEMETRY_ENABLED"),"update_check":__import__("os").environ.get("CUA_DRIVER_RS_UPDATE_CHECK"),"argv":sys.argv[1:]}}
             elif method == "tools/list":
-                names = \#(toolNamesJSON)
-                result = {"tools":[{"name":name,"inputSchema":{"type":"object"}} for name in names]}
+                result = {"tools": json.loads(__import__("base64").b64decode("\#(toolsJSON)"))}
             elif method == "tools/call":
                 result = {"content":[{"type":"text","text":request["params"]["name"]}]}
             else:
@@ -253,7 +265,7 @@ struct CuaMCPProxyTests {
             #expect(serverInfo["argv"] as? [String] == ["mcp"])
             let listed = try await proxy.listTools()
             let toolNames = try await proxy.validateToolCatalog(listed)
-            #expect(toolNames == CuaDriverCompatibility.requiredTools)
+            #expect(toolNames == CuaDriverCompatibility.exposedTools)
             let args = Data(#"{"include_screenshots":false}"#.utf8)
             let called = try await proxy.callTool(name: "get_desktop_state", argumentsJSON: args)
             #expect(String(decoding: called, as: UTF8.self).contains("get_desktop_state"))
@@ -373,70 +385,6 @@ struct CuaMCPProxyTests {
             await proxy.stop()
             throw error
         }
-    }
-
-    @Test @MainActor
-    func ownedDaemonKeepsTheHostParentAndPrivateEndpointThenStopsOnLifetimeEOF() async throws {
-        let script = #"""
-        #!/usr/bin/python3
-        import json, os, pathlib, socket, sys
-        path = sys.argv[sys.argv.index("--socket") + 1]
-        listener = socket.socket(socket.AF_UNIX)
-        listener.bind(path)
-        listener.listen(16)
-        pathlib.Path(path).with_name("launch.json").write_text(json.dumps({
-            "argv": sys.argv[1:], "ppid": os.getppid(),
-            "embedded": os.environ.get("CUA_DRIVER_EMBEDDED"),
-            "host": os.environ.get("CUA_DRIVER_HOST_BUNDLE_ID")
-        }))
-        sys.stdin.buffer.read()
-        listener.close()
-        """#
-        let executable = try executableScript(script)
-        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
-        let service = CuaEmbeddedService(executableURL: executable)
-        do {
-            try await service.start(isCurrent: {})
-            #expect(service.isRunning)
-            #expect(CuaSocketIdentity.parentPID(of: service.processIdentifier) == Darwin.getpid())
-            #expect(CuaSocketIdentity.peerPID(at: service.socketURL) == service.processIdentifier)
-            let attributes = try FileManager.default.attributesOfItem(atPath: service.directoryURL.path)
-            #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o700)
-            let launchFile = service.directoryURL.appendingPathComponent("launch.json")
-            let deadline = ContinuousClock.now + .seconds(2)
-            while !FileManager.default.fileExists(atPath: launchFile.path), ContinuousClock.now < deadline {
-                try await Task.sleep(for: .milliseconds(10))
-            }
-            let recorded = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: launchFile)) as? [String: Any])
-            #expect(recorded["ppid"] as? Int32 == Darwin.getpid())
-            #expect(recorded["embedded"] as? String == "1")
-            #expect(recorded["host"] as? String == "ai.personastack.desktop")
-            #expect(recorded["argv"] as? [String] == CuaEmbeddedService.arguments(
-                socketURL: service.socketURL, pidFileURL: service.directoryURL.appendingPathComponent("daemon.pid")))
-            #expect(await service.stop())
-            #expect(!service.isRunning)
-            #expect(!FileManager.default.fileExists(atPath: service.directoryURL.path))
-            #expect(await service.stop())
-        } catch {
-            _ = await service.stop()
-            throw error
-        }
-    }
-
-    @Test @MainActor
-    func cancelledDaemonStartupCannotLeaveTheOwnedChildOrEndpointRunning() async throws {
-        let executable = try executableScript("#!/usr/bin/python3\nimport time\ntime.sleep(20)\n")
-        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
-        let service = CuaEmbeddedService(executableURL: executable)
-        var checks = 0
-        await #expect(throws: CancellationError.self) {
-            try await service.start {
-                checks += 1
-                if checks > 1 { throw CancellationError() }
-            }
-        }
-        #expect(!service.isRunning)
-        #expect(!FileManager.default.fileExists(atPath: service.directoryURL.path))
     }
 
     @Test

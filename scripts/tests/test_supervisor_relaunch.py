@@ -21,12 +21,6 @@ enum DesktopControlPreferenceKeys {
     static func relayEnabled(_ configuration: LaunchConfiguration) -> String { "probe-relay" }
     static func relayPaused(_ configuration: LaunchConfiguration) -> String { "probe-paused" }
 }
-@MainActor final class DesktopLockedControlSupervisorHost {
-    static func production(pinnedReleaseCertificate: Data) -> DesktopLockedControlSupervisorHost {
-        DesktopLockedControlSupervisorHost()
-    }
-    func start() throws { fatalError("The fixture must never start a control listener") }
-}
 '''
 MAIN = r'''
 import AppKit

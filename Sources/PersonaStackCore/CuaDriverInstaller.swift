@@ -135,12 +135,30 @@ private final class BoundedProcessOutput: @unchecked Sendable {
 
 public enum CuaDriverInstallError: Error, Equatable {
     case downloadFailed
+    case installationNotWritable
     case checksumMismatch
     case extractionFailed
     case invalidLayout
     case invalidSignature
     case incompatibleRuntime
     case processFailed(String)
+}
+
+extension CuaDriverInstallError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .installationNotWritable:
+            "CUA must be installed in /Applications for its permission setup. An administrator must install CuaDriver.app there, then choose Check CUA Connection."
+        case .incompatibleRuntime:
+            "The installed CUA version is not compatible with this PersonaStack release. PersonaStack will not replace or downgrade it."
+        case .invalidSignature, .checksumMismatch:
+            "CUA could not be verified against the reviewed signed release. The existing installation was not changed."
+        case .downloadFailed:
+            "CUA could not be downloaded. Check the connection and choose Install CUA again."
+        default:
+            "CUA installation could not complete. Check its installation and try again."
+        }
+    }
 }
 
 public struct CuaDriverInstallation: Equatable, Sendable {
@@ -158,7 +176,7 @@ public struct CuaDriverInstallation: Equatable, Sendable {
 }
 
 /// Reuses a compatible signed Cua Driver app, or installs the pinned release into
-/// PersonaStack-owned Application Support. Unmanaged apps are never modified.
+/// /Applications. CUA’s own permission command requires this upstream path.
 public actor CuaDriverInstaller {
     private let supportDirectory: URL
     private let fileManager: FileManager
@@ -180,26 +198,30 @@ public actor CuaDriverInstaller {
         self.session = session
         self.externalApplicationURLs = externalApplicationURLs ?? [
             URL(fileURLWithPath: "/Applications/CuaDriver.app", isDirectory: true),
-            fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications/CuaDriver.app", isDirectory: true),
         ]
     }
 
-    public func validateOrInstall(
-        repair: Bool = false,
-        commitManagedInstall: (@MainActor @Sendable (URL, URL, Bool) throws -> Void)? = nil
-    ) async throws -> CuaDriverInstallation {
-        let installRoot = supportDirectory.appendingPathComponent("CuaDriver-\(CuaDriverCompatibility.version)", isDirectory: true)
-        let replacingManagedInstall = fileManager.fileExists(atPath: installRoot.path)
-        if fileManager.fileExists(atPath: installRoot.path) {
-            if !repair, let existing = try? validate(at: installRoot) { return existing }
-        }
+    /// Passive discovery never downloads, launches, or replaces an application.
+    public func discoverExisting() throws -> CuaDriverInstallation? {
+        var failure: Error?
         for application in externalApplicationURLs where fileManager.fileExists(atPath: application.path) {
-            if let existing = try? validateExternalApplication(at: application) { return existing }
+            do { return try validateExternalApplication(at: application) }
+            catch { failure = error }
         }
-        if replacingManagedInstall {
-            guard isPersonaStackManaged(installRoot) else { throw CuaDriverInstallError.invalidLayout }
-        }
+        if let failure { throw failure }
+        return nil
+    }
 
+    /// Called only by the user's Install CUA action. CUA is not a PersonaStack resource.
+    public func install() async throws -> CuaDriverInstallation {
+        if let existing = try discoverExisting() { return existing }
+        guard let applicationDestination = externalApplicationURLs.last else { throw CuaDriverInstallError.invalidLayout }
+        let applicationsDirectory = applicationDestination.deletingLastPathComponent()
+        if fileManager.fileExists(atPath: applicationsDirectory.path),
+           !fileManager.isWritableFile(atPath: applicationsDirectory.path) {
+            throw CuaDriverInstallError.installationNotWritable
+        }
+        try fileManager.createDirectory(at: applicationsDirectory, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
         let staging = supportDirectory.appendingPathComponent(".cua-install-\(UUID().uuidString)", isDirectory: true)
         try fileManager.createDirectory(at: staging, withIntermediateDirectories: false)
@@ -225,32 +247,22 @@ public actor CuaDriverInstaller {
         }
         try verifySignature(application)
         let validated = try validate(applicationURL: application, executableURL: executable)
-        try Self.installLicenseNotice(into: payload)
-        let ownership = InstallOwnership(version: CuaDriverCompatibility.version, archiveSHA256: CuaDriverCompatibility.archiveSHA256)
-        let ownershipData = try JSONEncoder().encode(ownership)
-        try ownershipData.write(to: payload.appendingPathComponent(Self.ownershipFile), options: .atomic)
-        if let commitManagedInstall {
-            try await commitManagedInstall(installRoot, payload, replacingManagedInstall)
-        } else {
-            if replacingManagedInstall { try fileManager.removeItem(at: installRoot) }
-            try fileManager.moveItem(at: payload, to: installRoot)
+        // The extracted app remains byte-for-byte signed. Keep its license beside it.
+        let license = applicationsDirectory.appendingPathComponent("LICENSE-CuaDriver-MIT.txt")
+        if !fileManager.fileExists(atPath: license.path) {
+            try Self.installLicenseNotice(into: applicationsDirectory)
         }
-        return CuaDriverInstallation(
-            applicationURL: installRoot.appendingPathComponent("CuaDriver.app", isDirectory: true),
-            executableURL: installRoot.appendingPathComponent("CuaDriver.app/Contents/MacOS/cua-driver"),
-            version: validated.version,
-            toolNames: validated.toolNames
-        )
-    }
-
-    private func validate(at root: URL) throws -> CuaDriverInstallation {
-        let application = root.appendingPathComponent("CuaDriver.app", isDirectory: true)
-        let executable = application.appendingPathComponent("Contents/MacOS/cua-driver")
-        guard fileManager.fileExists(atPath: application.path), fileManager.isExecutableFile(atPath: executable.path) else {
+        try Task.checkCancellation()
+        // Never overwrite a shared installation, including one created during download.
+        guard !fileManager.fileExists(atPath: applicationDestination.path) else {
             throw CuaDriverInstallError.invalidLayout
         }
-        try verifySignature(application)
-        return try validate(applicationURL: application, executableURL: executable)
+        try fileManager.moveItem(at: application, to: applicationDestination)
+        return CuaDriverInstallation(
+            applicationURL: applicationDestination,
+            executableURL: applicationDestination.appendingPathComponent("Contents/MacOS/cua-driver"),
+            version: validated.version, toolNames: validated.toolNames
+        )
     }
 
     private func validateExternalApplication(at application: URL) throws -> CuaDriverInstallation {
@@ -260,14 +272,6 @@ public actor CuaDriverInstaller {
         }
         try verifySignature(application)
         return try validate(applicationURL: application, executableURL: executable)
-    }
-
-    private func isPersonaStackManaged(_ root: URL) -> Bool {
-        let marker = root.appendingPathComponent(Self.ownershipFile)
-        guard let data = try? Data(contentsOf: marker),
-              let ownership = try? JSONDecoder().decode(InstallOwnership.self, from: data) else { return false }
-        return ownership.version == CuaDriverCompatibility.version
-            && ownership.archiveSHA256 == CuaDriverCompatibility.archiveSHA256
     }
 
     private func validate(applicationURL: URL, executableURL: URL) throws -> CuaDriverInstallation {
@@ -354,16 +358,10 @@ public actor CuaDriverInstaller {
         return data[start...end]
     }
 
-    private static let ownershipFile = ".personastack-cua-install.json"
-
     static func installLicenseNotice(into directory: URL) throws {
         try Data(CuaDriverCompatibility.licenseNotice.utf8).write(
-            to: directory.appendingPathComponent("LICENSE-CuaDriver-MIT.txt"), options: .atomic
+            to: directory.appendingPathComponent("LICENSE-CuaDriver-MIT.txt"), options: .withoutOverwriting
         )
     }
 
-    private struct InstallOwnership: Decodable, Encodable {
-        let version: String
-        let archiveSHA256: String
-    }
 }

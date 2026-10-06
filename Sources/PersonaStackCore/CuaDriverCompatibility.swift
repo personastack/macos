@@ -7,16 +7,12 @@ public enum CuaDriverCompatibility {
     public static let teamIdentifier = "YCK386LBJ7"
     public static let archiveSHA256 = "ee376d59ef37afac29a10c60c71469ac85fdc8844d1884bd317edd8def29055a"
     public static let executableSHA256 = "620ec8d215661050fad8e33a09e06cdd4573b80cef13d2952f5d27d0536ac096"
-    public static let hostBundleIdentifier = "ai.personastack.desktop"
     public static let archiveURL = URL(string: "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.29.1/cua-driver-rs-0.29.1-darwin-universal.tar.gz")!
     public static let managedServiceEnvironment = [
         "CUA_DRIVER_RS_TELEMETRY_ENABLED": "0",
         "CUA_DRIVER_RS_UPDATE_CHECK": "false",
-        "CUA_DRIVER_EMBEDDED": "1",
-        "CUA_DRIVER_HOST_BUNDLE_ID": hostBundleIdentifier,
     ]
-    // PersonaStack owns OS permission requests. Neither the embedded daemon
-    // nor its MCP proxy may prompt during a status refresh.
+    // Status refreshes never request permission. CUA owns its own TCC identity.
     public static let permissionProbeArgumentsJSON = Data(#"{"prompt":false,"probe_direct_capture":false}"#.utf8)
     private static let inheritedEnvironmentKeys: Set<String> = [
         "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
@@ -46,7 +42,10 @@ public enum CuaDriverCompatibility {
     """
 
     /// Pinned artifact schemas are the sole catalog authority.
-    public static var exposedTools: Set<String> { CuaToolCatalog.names }
+    public static var exposedTools: Set<String> {
+        CuaToolCatalog.names.subtracting(["set_config", "install_extension", "install_ffmpeg", "check_permissions",
+            "start_session", "end_session", "escalate_session", "list_sessions"])
+    }
 
     public struct Manifest: Decodable, Equatable, Sendable {
         public let binaryVersion: String
@@ -70,7 +69,7 @@ public enum CuaDriverCompatibility {
         case missingRequiredTools([String])
     }
 
-    public static var requiredTools: Set<String> { exposedTools }
+    public static var requiredTools: Set<String> { CuaToolCatalog.names }
 
     public static func processEnvironment(from environment: [String: String]) -> [String: String] {
         environment.filter { inheritedEnvironmentKeys.contains($0.key) }
@@ -100,29 +99,35 @@ public enum CuaDriverCompatibility {
 public struct CuaDriverPermissionSnapshot: Equatable, Sendable {
     public let accessibility: Bool
     public let screenRecording: Bool
-    public let hostAttributionValid: Bool
+    public let standaloneAttributionValid: Bool
+    public let directCaptureVerified: Bool
     public let verificationKey: String
 
-    public init(accessibility: Bool, screenRecording: Bool, hostAttributionValid: Bool, verificationKey: String = "") {
+    public init(accessibility: Bool, screenRecording: Bool, standaloneAttributionValid: Bool, directCaptureVerified: Bool = false, verificationKey: String = "") {
         self.accessibility = accessibility
         self.screenRecording = screenRecording
-        self.hostAttributionValid = hostAttributionValid
+        self.standaloneAttributionValid = standaloneAttributionValid
+        self.directCaptureVerified = directCaptureVerified
         self.verificationKey = verificationKey
     }
 
-    public static func parse(_ structured: [String: Any], daemonPID: Int32, hostPID: Int32, verificationKey: String = "") throws -> Self {
+    public static func parseStandalone(_ structured: [String: Any], daemonPID: Int32, verificationKey: String = "") throws -> Self {
         guard let accessibility = structured["accessibility"] as? Bool,
               let screenRecording = structured["screen_recording"] as? Bool,
               let source = structured["source"] as? [String: Any] else {
             throw CuaMCPProxyError.functionalProbeFailed
         }
-        let hostValid = source["attribution"] as? String == "host"
-            && source["host_bundle_id"] as? String == CuaDriverCompatibility.hostBundleIdentifier
-            && source["embedded"] as? Bool == true
-            && source["disclaim_env"] as? Bool == false
-            && source["pid"] as? Int32 == daemonPID
-            && source["responsible_ppid"] as? Int32 == hostPID
-        return Self(accessibility: accessibility, screenRecording: screenRecording, hostAttributionValid: hostValid,
+        let hostValid = source["attribution"] as? String == "driver-daemon"
+            && source["bundle_id"] as? String == CuaDriverCompatibility.bundleIdentifier
+            && source["embedded"] as? Bool != true
+            && (source["pid"] as? NSNumber)?.int32Value == daemonPID
+        let verification = structured["direct_capture_verification"] as? [String: Any]
+        let captureVerified = verification?["bundle_id"] as? String == CuaDriverCompatibility.bundleIdentifier
+            && verification?["source"] as? String == "permissions_grant"
+            && !(verification?["verified_at"] as? String ?? "").isEmpty
+            && (structured["direct_capture_verification_error"] == nil || structured["direct_capture_verification_error"] is NSNull)
+            && structured["screen_recording_capturable"] as? Bool != false
+        return Self(accessibility: accessibility, screenRecording: screenRecording, standaloneAttributionValid: hostValid, directCaptureVerified: captureVerified,
                     verificationKey: verificationKey)
     }
 }

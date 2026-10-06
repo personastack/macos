@@ -94,45 +94,13 @@ private actor SuspendedReadiness {
     #expect(monitor.state == .unknown)
 }
 
-@Test func expiredNativeFileCommandHasNoSideEffects() async throws {
-    let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
-    let files = DesktopFileSystem()
-    await #expect(throws: DesktopControlExecution.Expired.self) {
-        try await DesktopControlExecution.$deadline.withValue(.distantPast) {
-            try await files.makeDirectory(path: path)
-        }
-    }
-    #expect(!FileManager.default.fileExists(atPath: path))
-}
-
-@Test func expiredNativeShellCommandDoesNotStartAProcess() async throws {
-    let shell = DesktopShellExecutor()
-    await #expect(throws: DesktopControlExecution.Expired.self) {
-        try await DesktopControlExecution.$deadline.withValue(.distantPast) {
-            _ = try await shell.start(command: "exit 0", workingDirectory: "/tmp")
-        }
-    }
-    #expect(await shell.diagnostics().activeProcesses == 0)
-}
-
-@Test @MainActor func browserPreparationUsesOnlyAnIsolatedHostOwnedProfile() throws {
+@Test @MainActor func browserPreparationForwardsUpstreamArgumentsWithLeaseSession() throws {
     let prepared = try DesktopControlCommandExecutor.cuaArguments(name: "browser_prepare",
-        arguments: .object(["confirm": .bool(true)]), controlToken: "owned-session")
+        arguments: .object(["allow_launch": .bool(true), "profile": .object(["mode": .string("isolated_new")])]), controlToken: "owned-session")
     #expect(prepared == .object(["session": .string("owned-session"), "allow_launch": .bool(true),
                                 "profile": .object(["mode": .string("isolated_new")])]))
-    for input in [.object([:]), .object(["confirm": .bool(false)]),
-        .object(["confirm": .bool(true), "pid": .number(123)]),
-        .object(["confirm": .bool(true), "strategy": .object(["kind": .string("existing_profile")])]),
-        .object(["confirm": .bool(true), "session": .string("foreign")])] as [DesktopControlJSONValue] {
-        #expect(throws: (any Error).self) {
-            try DesktopControlCommandExecutor.cuaArguments(name: "browser_prepare", arguments: input, controlToken: "owned-session")
-        }
-    }
-    let observed = try DesktopControlCommandExecutor.cuaArguments(name: "get_browser_state",
-        arguments: .object(["pid": .number(123)]), controlToken: "owned-session")
-    #expect(observed == .object(["pid": .number(123), "session": .string("owned-session")]))
     #expect(throws: (any Error).self) {
-        try DesktopControlCommandExecutor.cuaArguments(name: "browser_navigate",
+        try DesktopControlCommandExecutor.cuaArguments(name: "browser_prepare",
             arguments: .object(["session": .string("foreign")]), controlToken: "owned-session")
     }
 }
@@ -197,7 +165,7 @@ private actor SuspendedReadiness {
 }
 
 @Test @MainActor func expiredCommandCannotAcquireControl() async {
-    let executor = DesktopControlCommandExecutor(powerAssertion: .testFixture())
+    let executor = DesktopControlCommandExecutor()
     let target = DesktopControlTarget(installationID: "i", workspaceID: "w", configID: "c", personaID: "p", runID: "r", generation: 1)
     let response = await executor.handle(DesktopControlFrame(type: "command", requestID: "expired", target: target,
         operation: "desktop_control_acquire", arguments: .object([:]), deadlineAt: .distantPast), proxy: nil)

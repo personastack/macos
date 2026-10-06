@@ -7,7 +7,7 @@ import PersonaStackCore
 struct DesktopControlActivityTests {
     @Test func activityFollowsTheExclusiveLeaseAndClearsOnReleaseExpiryAndStop() async throws {
         var clock = ContinuousClock.now
-        let executor = DesktopControlCommandExecutor(now: { clock }, powerAssertion: .init(create: { 1 }, release: { _ in true }))
+        let executor = DesktopControlCommandExecutor(now: { clock })
         let first = owner("one", label: "A persona")
         let second = owner("two", label: "Another persona")
         let acquired = await executor.handle(command("desktop_control_acquire", first), proxy: nil)
@@ -41,7 +41,7 @@ struct DesktopControlActivityTests {
     }
 
     @Test func missingDisplayMetadataUsesGenericIdentityAndRevocationClearsIt() async {
-        let executor = DesktopControlCommandExecutor(powerAssertion: .init(create: { 1 }, release: { _ in true }))
+        let executor = DesktopControlCommandExecutor()
         let target = owner("one", label: nil)
         _ = await executor.handle(command("desktop_control_acquire", target), proxy: nil)
         #expect(executor.presentationActivity?.ownerLabel == "An authorized persona")

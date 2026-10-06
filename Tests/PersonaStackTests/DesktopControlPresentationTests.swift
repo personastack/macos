@@ -52,7 +52,7 @@ import Testing
         let action = try #require(DesktopMenuRelayAction(relayEnabled: true, relayPaused: false, hasError: true,
                                                        hasTrustedConfiguration: true, environmentSwitchPending: false,
                                                        activelyControlling: state.activity != nil))
-        #expect(action.title == "Stop Control")
+        #expect(action.title == "Stop PersonaStack Control")
         #expect(action.isEnabled)
     }
 

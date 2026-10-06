@@ -62,11 +62,6 @@ lipo -create \
   "$(dirname "$x86_64_binary")/PersonaStackHarnessHook" \
   -output "$bundle_dir/Contents/MacOS/PersonaStackHarnessHook"
 chmod 755 "$bundle_dir/Contents/MacOS/PersonaStackHarnessHook"
-installer_binary="$root_dir/build/PersonaStackLockedControlInstaller"
-lipo -create \
-  "$(dirname "$arm64_binary")/PersonaStackLockedControlInstaller" \
-  "$(dirname "$x86_64_binary")/PersonaStackLockedControlInstaller" \
-  -output "$installer_binary"
 if [ "$configuration" = release ]; then
   : "${PERSONASTACK_INSTALLER_SIGNING_IDENTITY:?Developer ID Installer identity is required for the main installer}"
 fi
@@ -100,7 +95,7 @@ artifact_suffix=developerid
 "$root_dir/scripts/notarize.sh" "$bundle_dir"
 spctl --assess --type execute --verbose=2 "$bundle_dir"
 
-PERSONASTACK_INCLUDE_LOCKED_CONTROL=1 "$root_dir/scripts/package-desktop-installer.sh" "$bundle_dir" "$installer_binary" \
+PERSONASTACK_SIGN_INSTALLER=1 "$root_dir/scripts/package-desktop-installer.sh" "$bundle_dir" \
   "$staging_dir/Install PersonaStack.pkg"
 "$root_dir/scripts/notarize.sh" "$staging_dir/Install PersonaStack.pkg"
 spctl --assess --type install --verbose=2 "$staging_dir/Install PersonaStack.pkg"
