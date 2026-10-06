@@ -203,7 +203,11 @@ actor DesktopControlGatewayConnection {
     // One bounded provider task refreshes these snapshots between heartbeats.
     func heartbeatFrame() -> DesktopControlFrame {
         refreshSnapshot()
-        return DesktopControlFrame(type: "heartbeat", lastHeartbeat: Date(), readiness: readiness,
+        return cachedHeartbeatFrame()
+    }
+
+    private func cachedHeartbeatFrame() -> DesktopControlFrame {
+        DesktopControlFrame(type: "heartbeat", lastHeartbeat: Date(), readiness: readiness,
                                    diagnostics: diagnosticsSupported ? cachedDiagnostics : nil)
     }
 
@@ -216,24 +220,43 @@ actor DesktopControlGatewayConnection {
             guard !Task.isCancelled else { return }
             let diagnostics = await diagnosticsProvider()
             guard !Task.isCancelled, let self else { return }
-            await self.applySnapshot(currentReadiness, diagnostics: diagnostics,
-                                     generation: generation, revision: revision)
+            if let update = await self.applySnapshot(currentReadiness, diagnostics: diagnostics,
+                                                     generation: generation, revision: revision) {
+                await self.sendReadinessUpdate(update)
+            }
         }
     }
 
     private func applySnapshot(_ currentReadiness: String?, diagnostics: DesktopControlDiagnostics,
-                               generation: UUID, revision: UInt64) {
-        guard generation == snapshotGeneration else { return }
+                               generation: UUID, revision: UInt64) -> DesktopControlFrame? {
+        guard generation == snapshotGeneration else { return nil }
         snapshotTask = nil
         cachedDiagnostics = diagnostics
         // An explicit lock/pause/readiness update wins over an older observation.
         if revision == readinessRevision, let currentReadiness,
            ["unknown", "ready", "permission_required", "cua_unavailable", "paused", "locked", "upgrade_required"].contains(currentReadiness) {
+            guard readiness != currentReadiness else { return nil }
             readiness = currentReadiness
+            // Do not wait for the next 15-second presence heartbeat, or start
+            // another probe while publishing this probe's completed result.
+            return cachedHeartbeatFrame()
         }
+        return nil
+    }
+
+    private func sendReadinessUpdate(_ frame: DesktopControlFrame) async {
+        guard connected, frame.readiness == readiness else { return }
+        do { try await send(frame) }
+        catch { await disconnected() }
     }
 
 #if DEBUG
+    func applySnapshotForTesting(_ value: String) -> DesktopControlFrame? {
+        applySnapshot(value, diagnostics: .init(activeProcesses: 0, openFileHandles: 0,
+                                               bufferedOutputBytes: 0, outputGapsTotal: 0),
+                      generation: snapshotGeneration, revision: readinessRevision)
+    }
+
     func waitForSnapshotForTesting() async { await snapshotTask?.value }
     func cachedReadinessForTesting() -> String { readiness }
 #endif

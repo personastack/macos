@@ -128,3 +128,37 @@ import Testing
         #expect(model.repairError == "Service unavailable")
     }
 }
+
+@MainActor @Test func cuaConnectionCheckShowsProgressThenSuccessAndRefreshesReport() async {
+    var finish: CheckedContinuation<Void, Never>?
+    var reads = 0
+    let model = DesktopControlDiagnosticsModel(read: {
+        reads += 1
+        return DesktopControlPresentationTests.report()
+    }, repair: { await withCheckedContinuation { finish = $0 } })
+    let check = Task { await model.repairControl() }
+    for _ in 0..<100 where finish == nil { await Task.yield() }
+    #expect(model.isRepairing)
+    #expect(model.repairMessage == "Checking CUA connection…")
+    await model.repairControl()
+    #expect(reads == 0)
+    finish?.resume()
+    await check.value
+    #expect(!model.isRepairing && model.repairError == nil)
+    #expect(model.repairMessage?.contains("CUA is ready") == true)
+    #expect(reads == 1 && model.report != nil)
+}
+
+@MainActor @Test func desktopClosingDiagnosticsFencesCheckResult() async {
+    var finish: CheckedContinuation<Void, Never>?
+    let model = DesktopControlDiagnosticsModel(read: {
+        Issue.record("A closed check must not refresh the report")
+        return DesktopControlPresentationTests.report()
+    }, repair: { await withCheckedContinuation { finish = $0 } })
+    let check = Task { await model.repairControl() }
+    for _ in 0..<100 where finish == nil { await Task.yield() }
+    model.stop()
+    finish?.resume()
+    await check.value
+    #expect(model.report == nil && model.repairMessage == nil && model.repairError == nil)
+}

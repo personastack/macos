@@ -21,6 +21,16 @@ public enum CuaMCPProxyError: Error, Equatable {
 extension CuaMCPProxyError: LocalizedError {
     public var errorDescription: String? {
         switch self {
+        case .notStarted:
+            return "CUA is not connected. Open Set Up CUA to install or start it, then check again."
+        case .timeout:
+            return "CUA did not respond in time. Check CUA on this Mac, then try the connection again."
+        case .processExited:
+            return "The CUA connection closed unexpectedly. Check the connection again."
+        case .invalidToolCatalog:
+            return "CUA's tools are incompatible with this PersonaStack version. Open Set Up CUA to check the installation."
+        case .invalidResponse, .responseTooLarge:
+            return "CUA returned an invalid response. Check its installation in Set Up CUA."
         case .permissionsRequired:
             return "Complete CUA Setup to grant CUA Accessibility and Screen Recording access."
         case .functionalProbeFailed:

@@ -5,16 +5,23 @@ import Testing
 
 @Suite @MainActor
 struct DesktopDiagnosticsRenderingTests {
-    @Test func diagnosticsRendersAtDefaultAndMinimumSizes() async throws {
-        let model = DesktopControlDiagnosticsModel(read: { DesktopControlPresentationTests.report() }, repair: {})
+    @Test(arguments: [false, true]) func diagnosticsRendersAtDefaultAndMinimumSizes(failed: Bool) async throws {
+        struct Failure: LocalizedError {
+            var errorDescription: String? { "CUA did not respond in time. Check CUA on this Mac, then try the connection again." }
+        }
+        let model = DesktopControlDiagnosticsModel(read: { DesktopControlPresentationTests.report() }, repair: {
+            if failed { throw Failure() }
+        })
         model.start()
         defer { model.stop() }
         for _ in 0..<100 where model.report == nil { await Task.yield() }
         _ = try #require(model.report)
+        await model.repairControl()
         for size in [NSSize(width: 580, height: 590), NSSize(width: 440, height: 400)] {
             let host = NSHostingView(rootView: DesktopControlDiagnosticsView(model: model)
                 .environment(\.colorScheme, .light)
                 .background(Color(nsColor: .windowBackgroundColor)))
+            host.sizingOptions = []
             let window = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.titled],
                                   backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
@@ -32,7 +39,7 @@ struct DesktopDiagnosticsRenderingTests {
             #expect(bitmap.pixelsWide > 0 && bitmap.pixelsHigh > 0)
             if let directory = ProcessInfo.processInfo.environment["PERSONASTACK_NATIVE_RENDER_DIR"] {
                 let data = try #require(bitmap.representation(using: .png, properties: [:]))
-                try data.write(to: URL(fileURLWithPath: directory).appendingPathComponent("desktop-diagnostics-\(Int(size.width)).png"))
+                try data.write(to: URL(fileURLWithPath: directory).appendingPathComponent("desktop-diagnostics-\(failed ? "failure" : "success")-\(Int(size.width)).png"))
             }
             window.close()
         }

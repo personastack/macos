@@ -185,7 +185,9 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
         return
     }
     #expect(pausedValues["connected"] == .bool(true))
-    #expect(pausedValues["gui_readiness"] == .string("permission_required"))
+    #expect(pausedValues["gui_readiness"] == .string("cua_unavailable"))
+    #expect(!pausedRuntime.isCuaReady())
+    #expect(await pausedRuntime.diagnosticReport().cuaCheckFailure?.contains("not connected") == true)
     #expect(pausedValues["native_executor_ready"] == nil)
     #expect(pausedValues["paused"] == .bool(true))
     #expect(pausedValues["locked"] == .bool(true))

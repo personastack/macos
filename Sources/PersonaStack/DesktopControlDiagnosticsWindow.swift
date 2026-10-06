@@ -6,6 +6,7 @@ final class DesktopControlDiagnosticsModel: ObservableObject {
     @Published private(set) var report: DesktopControlDiagnosticReport?
     @Published private(set) var isRepairing = false
     @Published private(set) var repairError: String?
+    @Published private(set) var repairMessage: String?
     private let read: @MainActor () async -> DesktopControlDiagnosticReport
     private let repair: @MainActor () async throws -> Void
     private var refreshTask: Task<Void, Never>?
@@ -14,7 +15,7 @@ final class DesktopControlDiagnosticsModel: ObservableObject {
     init(read: @escaping @MainActor () async -> DesktopControlDiagnosticReport = {
         await DesktopControlRuntime.shared.diagnosticReport()
     }, repair: @escaping @MainActor () async throws -> Void = {
-        _ = try await DesktopControlRuntime.shared.repair()
+        try await DesktopControlRuntime.shared.checkCuaConnectionForSetup()
     }) {
         self.read = read
         self.repair = repair
@@ -41,17 +42,32 @@ final class DesktopControlDiagnosticsModel: ObservableObject {
         refreshTask = nil
         report = nil
         repairError = nil
+        repairMessage = nil
     }
 
     func repairControl() async {
         guard !isRepairing else { return }
         isRepairing = true
         repairError = nil
+        repairMessage = "Checking CUA connection…"
         let current = generation
         defer { isRepairing = false }
-        do { try await repair() }
-        catch is CancellationError { return }
-        catch { if generation == current { repairError = error.localizedDescription } }
+        do {
+            try await repair()
+            guard generation == current else { return }
+            repairMessage = "CUA is ready. PersonaStack cloud status is shown below."
+        } catch is CancellationError {
+            if generation == current { repairMessage = "Check canceled. Try again when setup has finished." }
+        } catch {
+            if generation == current {
+                repairMessage = nil
+                repairError = error.localizedDescription
+            }
+        }
+        guard generation == current else { return }
+        let next = await read()
+        guard generation == current else { return }
+        report = next
     }
 }
 
@@ -61,22 +77,25 @@ final class DesktopControlDiagnosticsWindow: NSObject, NSWindowDelegate {
     private let model = DesktopControlDiagnosticsModel()
     private var window: NSWindow?
 
-    func present() {
+    func present(checkConnection: Bool = false) {
         if window == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 590),
                                   styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
             window.title = "Desktop Control Diagnostics"
             window.isReleasedWhenClosed = false
-            window.contentView = NSHostingView(rootView: DesktopControlDiagnosticsView(model: model))
+            let content = NSHostingView(rootView: DesktopControlDiagnosticsView(model: model))
+            content.sizingOptions = []
+            window.contentView = content
             window.contentMinSize = NSSize(width: 440, height: 400)
             window.setContentSize(NSSize(width: 580, height: 590))
             window.delegate = self
             window.center()
             self.window = window
         }
-        model.start()
+        if window?.isVisible != true { model.start() }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        if checkConnection { Task { await model.repairControl() } }
     }
 
     func windowWillClose(_ notification: Notification) { model.stop() }
@@ -90,6 +109,15 @@ struct DesktopControlDiagnosticsView: View {
             Text("Desktop Control Diagnostics").font(.title2.bold())
             Text("Connection and service details for troubleshooting.")
                 .foregroundStyle(.secondary)
+            if let message = model.repairMessage {
+                HStack {
+                    if model.isRepairing { ProgressView().controlSize(.small) }
+                    Text(message).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            if let error = model.repairError {
+                Text(error).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+            }
             ScrollView {
                 if let report = model.report {
                     Text(report.text).font(.system(.body, design: .monospaced))
@@ -99,21 +127,13 @@ struct DesktopControlDiagnosticsView: View {
                     ProgressView("Reading status…").frame(maxWidth: .infinity)
                 }
             }
-            if let error = model.repairError {
-                Text(error).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
-            }
-            HStack {
-                Button(model.isRepairing ? "Checking…" : "Check CUA Connection") {
-                    Task { await model.repairControl() }
+            ViewThatFits(in: .horizontal) {
+                HStack { checkButton; setupButton; Spacer(); copyButton }
+                    .fixedSize(horizontal: true, vertical: false)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack { checkButton; setupButton }
+                    copyButton
                 }
-                .disabled(model.isRepairing)
-                Spacer()
-                Button("Copy Diagnostics") {
-                    guard let report = model.report else { return }
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(report.text, forType: .string)
-                }
-                .disabled(model.report == nil)
             }
             Text("Copied reports exclude account details, credentials, file paths, and command content.")
                 .font(.caption).foregroundStyle(.secondary)
@@ -121,4 +141,25 @@ struct DesktopControlDiagnosticsView: View {
         .padding(22)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
+
+    private var checkButton: some View {
+        Button("Check CUA Connection") { Task { await model.repairControl() } }
+            .buttonStyle(.borderedProminent)
+            .disabled(model.isRepairing)
+    }
+
+    private var setupButton: some View {
+        Button("Set Up CUA…") { CuaSetupWindow.shared.presentForRepair() }
+            .disabled(model.isRepairing)
+    }
+
+    private var copyButton: some View {
+        Button("Copy Diagnostics") {
+            guard let report = model.report else { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(report.text, forType: .string)
+        }
+        .disabled(model.report == nil)
+    }
+
 }

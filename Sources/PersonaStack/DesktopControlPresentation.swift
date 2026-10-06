@@ -143,6 +143,9 @@ struct DesktopControlDiagnosticReport: Sendable {
     let resources: DesktopControlDiagnostics?
     var accessibilityGranted: Bool? = nil
     var screenCaptureGranted: Bool? = nil
+    var desktopReadiness = "unknown"
+    var lastCuaCheck: Date? = nil
+    var cuaCheckFailure: String? = nil
     var serviceRecoveryAttempts = 0
     var serviceRecoveryInProgress = false
 
@@ -159,6 +162,9 @@ struct DesktopControlDiagnosticReport: Sendable {
         Cloud connected: \(connected)
         Last successful connection: \(last)
         GUI ready: \(guiReady)
+        Desktop readiness: \(desktopReadiness)
+        Last CUA check: \(lastCuaCheck.map { $0.ISO8601Format() } ?? "Not checked")
+        CUA check: \(cuaCheckFailure ?? (guiReady ? "Passed" : "Not ready"))
         CUA Accessibility permission: \(accessibilityGranted.map(String.init) ?? "Unavailable")
         CUA Screen Recording permission: \(screenCaptureGranted.map(String.init) ?? "Unavailable")
         Session: \(session.rawValue)

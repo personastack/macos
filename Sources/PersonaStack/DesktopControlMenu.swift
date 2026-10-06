@@ -6,7 +6,6 @@ import SwiftUI
 
 private final class DesktopControlMenuStatus: ObservableObject {
     @Published var revision = 0
-    @Published var isRepairing = false
     private var refresh: AnyCancellable?
 
     init() {
@@ -158,11 +157,11 @@ struct DesktopControlMenu: View {
         Button("Diagnostics…") {
             DesktopControlDiagnosticsWindow.shared.present()
         }
+        Button("Check CUA Connection") {
+            DesktopControlDiagnosticsWindow.shared.present(checkConnection: true)
+        }
+        .disabled(DesktopControlRuntime.shared.isDisconnecting)
         if relayEnabled || DesktopControlRuntime.shared.hasPendingEnvironmentSwitch {
-            Button(status.isRepairing ? "Checking CUA Connection…" : "Check CUA Connection") {
-                Task { await repairCua() }
-            }
-            .disabled(status.isRepairing || DesktopControlRuntime.shared.isDisconnecting)
             Divider()
             Button("Disconnect This Mac…", role: .destructive) {
                 confirmDisconnect()
@@ -178,7 +177,6 @@ struct DesktopControlMenu: View {
         _ = status.revision
         if !serverSettings.hasTrustedConfiguration { return "Set all three server URLs to enable Desktop Control" }
         if DesktopControlRuntime.shared.hasPendingEnvironmentSwitch { return "Server change incomplete. Retry Server Settings, check the CUA connection, or disconnect." }
-        if status.isRepairing { return "Checking CUA connection…" }
         return presentation.snapshot.message
     }
 
@@ -237,31 +235,6 @@ struct DesktopControlMenu: View {
             relayEnabled = runtime.hasActiveInstallation
             relayPaused = runtime.paused
         }
-    }
-
-    @MainActor
-    private func repairCua() async {
-        guard !status.isRepairing else { return }
-        status.isRepairing = true
-        defer { status.isRepairing = false }
-        loginItemError = ""
-        repairError = ""
-        let runtime = DesktopControlRuntime.shared
-        var generation: UUID?
-        do {
-            let current = try runtime.beginRepair()
-            generation = current
-            try await runtime.repair(generation: current)
-            guard runtime.isCurrentLifecycle(current) else { return }
-            relayError = ""
-        } catch is CancellationError {
-            return
-        } catch {
-            guard let generation, runtime.isCurrentLifecycle(generation) else { return }
-            repairError = "CUA connection needs attention: \(error.localizedDescription)"
-        }
-        guard let generation, runtime.isCurrentLifecycle(generation) else { return }
-        relayPaused = runtime.paused
     }
 
     @MainActor

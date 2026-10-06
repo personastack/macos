@@ -183,3 +183,17 @@ private actor SuspendedReadiness {
         #expect(!failure.message.contains("/private") && !failure.message.contains("private capture"))
     }
 }
+
+@Test func desktopHealthTransitionsProduceImmediateHeartbeatWithoutNewProbe() async throws {
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: Data(#"{"installation_id":"install-1","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://agent-gateway.personastack.ai/v1/desktop-control/ws"}"#.utf8))
+    let connection = DesktopControlGatewayConnection(installation: installation,
+        readinessProvider: { Issue.record("Publishing completed health must not start another probe"); return nil },
+        handler: { frame, _ in frame })
+    for state in ["ready", "cua_unavailable", "permission_required", "ready"] {
+        let update = await connection.applySnapshotForTesting(state)
+        #expect(update?.type == "heartbeat")
+        #expect(update?.readiness == state)
+        #expect(await connection.applySnapshotForTesting(state) == nil)
+    }
+    #expect(await connection.applySnapshotForTesting("untrusted error content") == nil)
+}

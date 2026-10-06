@@ -805,8 +805,8 @@ private actor RestartedStandaloneServiceFixture: DesktopControlCuaServicing {
     func requestPermissions(installation: CuaDriverInstallation) async throws { mutations += 1 }
 }
 
-@Test(arguments: ["running", "stopped", "startup"]) @MainActor
-func firstEnrollmentCheckReconnectsOnlyItsIdleClientAfterStandaloneRestart(mode: String) async throws {
+@Test(arguments: ["running", "stopped", "startup", "heartbeat"]) @MainActor
+func desktopFirstEnrollmentCheckReconnectsOnlyItsIdleClientAfterStandaloneRestart(mode: String) async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("cua-setup-reconnect-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -871,7 +871,18 @@ func firstEnrollmentCheckReconnectsOnlyItsIdleClientAfterStandaloneRestart(mode:
         #expect(connectedPIDs == [111])
         if mode == "stopped" { await proxies[0].stop() }
         await service.setPID(222)
-        try await runtime.checkCuaConnectionForSetup()
+        if mode == "heartbeat" {
+            #expect(await runtime.heartbeatReadinessForTesting() == "cua_unavailable")
+            #expect(!runtime.isCuaReady())
+            let failed = await runtime.diagnosticReport()
+            #expect(failed.lastCuaCheck != nil)
+            #expect(failed.cuaCheckFailure?.contains("compatible standalone CUA") == true)
+            #expect(failed.accessibilityGranted == nil)
+            #expect(await runtime.heartbeatReadinessForTesting() == "ready")
+            #expect(await runtime.diagnosticReport().cuaCheckFailure == nil)
+        } else {
+            try await runtime.checkCuaConnectionForSetup()
+        }
     }
     #expect(runtime.isCuaReady())
     #expect(connectedPIDs == [111, 222])
@@ -879,7 +890,7 @@ func firstEnrollmentCheckReconnectsOnlyItsIdleClientAfterStandaloneRestart(mode:
     #expect(await proxies[1].isProcessRunning())
     #expect(await installer.installations == 0)
     #expect(await service.mutations == 0)
-    #expect(credentials.readCount == 0)
+    #expect(credentials.readCount == (mode == "heartbeat" ? 1 : 0))
     #expect(!runtime.gatewayConnected)
     #expect(!runtime.hasPendingRelayReconnectForTesting)
     await runtime.shutdownForQuit()
