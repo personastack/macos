@@ -162,3 +162,24 @@ import Testing
     await check.value
     #expect(model.report == nil && model.repairMessage == nil && model.repairError == nil)
 }
+
+@MainActor @Test func desktopClosedCheckCannotClearReopenedCheckProgress() async {
+    var pending: [CheckedContinuation<Void, Never>] = []
+    let model = DesktopControlDiagnosticsModel(read: { DesktopControlPresentationTests.report() }, repair: {
+        await withCheckedContinuation { pending.append($0) }
+    })
+    let old = Task { await model.repairControl() }
+    for _ in 0..<100 where pending.count < 1 { await Task.yield() }
+    model.stop()
+    #expect(!model.isRepairing)
+    let current = Task { await model.repairControl() }
+    for _ in 0..<100 where pending.count < 2 { await Task.yield() }
+    pending[0].resume()
+    await old.value
+    #expect(model.isRepairing)
+    #expect(model.repairMessage == "Checking CUA connection…")
+    pending[1].resume()
+    await current.value
+    #expect(!model.isRepairing)
+    #expect(model.repairMessage?.contains("CUA is ready") == true)
+}

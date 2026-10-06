@@ -10,6 +10,7 @@ final class DesktopControlDiagnosticsModel: ObservableObject {
     private let read: @MainActor () async -> DesktopControlDiagnosticReport
     private let repair: @MainActor () async throws -> Void
     private var refreshTask: Task<Void, Never>?
+    private var checkTask: Task<Void, Never>?
     private var generation = UUID()
 
     init(read: @escaping @MainActor () async -> DesktopControlDiagnosticReport = {
@@ -40,9 +41,22 @@ final class DesktopControlDiagnosticsModel: ObservableObject {
         generation = UUID()
         refreshTask?.cancel()
         refreshTask = nil
+        checkTask?.cancel()
+        checkTask = nil
+        isRepairing = false
         report = nil
         repairError = nil
         repairMessage = nil
+    }
+
+    func checkConnection() {
+        guard checkTask == nil, !isRepairing else { return }
+        let current = generation
+        checkTask = Task { [weak self] in
+            guard let self, !Task.isCancelled, self.generation == current else { return }
+            await self.repairControl()
+            if self.generation == current { self.checkTask = nil }
+        }
     }
 
     func repairControl() async {
@@ -51,7 +65,7 @@ final class DesktopControlDiagnosticsModel: ObservableObject {
         repairError = nil
         repairMessage = "Checking CUA connection…"
         let current = generation
-        defer { isRepairing = false }
+        defer { if generation == current { isRepairing = false } }
         do {
             try await repair()
             guard generation == current else { return }
@@ -95,7 +109,7 @@ final class DesktopControlDiagnosticsWindow: NSObject, NSWindowDelegate {
         if window?.isVisible != true { model.start() }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        if checkConnection { Task { await model.repairControl() } }
+        if checkConnection { model.checkConnection() }
     }
 
     func windowWillClose(_ notification: Notification) { model.stop() }
@@ -143,7 +157,7 @@ struct DesktopControlDiagnosticsView: View {
     }
 
     private var checkButton: some View {
-        Button("Check CUA Connection") { Task { await model.repairControl() } }
+        Button("Check CUA Connection") { model.checkConnection() }
             .buttonStyle(.borderedProminent)
             .disabled(model.isRepairing)
     }
