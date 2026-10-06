@@ -11,6 +11,39 @@ final class PopoutTestPreferences {
 }
 
 struct PopoutWindowPresentationTests {
+    @MainActor @Test func stackTitlesClearWindowButtonsOnInitialLayoutAndResize() throws {
+        _ = NSApplication.shared
+        let preferences = PopoutTestPreferences()
+        for kind in [PopoutWindowKind.stackStream, .personaActivity] {
+            let popout = StackPopoutWindow(url: URL(string: "https://example.invalid")!,
+                transparent: false, kind: kind, loadPage: false, defaults: preferences.defaults) {}
+            defer { popout.dispose() }
+            let chrome = try #require(popout.presentation)
+            chrome.updateTitle("PersonaStack.ai · \(kind.fallbackTitle)")
+            for width in [900.0, 340.0, 390.0, 900.0] {
+                popout.window.setFrame(NSRect(x: 50, y: 100, width: width, height: 500), display: false)
+                popout.window.layoutIfNeeded()
+                let frameView = try #require(popout.window.contentView?.superview)
+                frameView.layoutSubtreeIfNeeded()
+                let title = try #require(Self.titleField(in: frameView, text: popout.window.title))
+                let titleRect = title.convert(title.bounds, to: nil)
+                #expect(titleRect.width > 0)
+                for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+                    let button = try #require(popout.window.standardWindowButton(type))
+                    #expect(!button.isHidden)
+                    #expect(button.isEnabled)
+                    #expect(titleRect.minX >= button.convert(button.bounds, to: nil).maxX)
+                }
+                #expect(titleRect.maxX <= chrome.pinButton.convert(chrome.pinButton.bounds, to: nil).minX)
+            }
+        }
+    }
+
+    @MainActor private static func titleField(in view: NSView, text: String) -> NSTextField? {
+        if let field = view as? NSTextField, field.stringValue == text { return field }
+        return view.subviews.lazy.compactMap { titleField(in: $0, text: text) }.first
+    }
+
     @Test func geometryIsBoundedAndSeparatedByKind() {
         let preferences = PopoutTestPreferences()
         let store = PopoutGeometryStore(defaults: preferences.defaults)

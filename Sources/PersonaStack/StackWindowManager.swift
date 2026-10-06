@@ -117,8 +117,10 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         window.backgroundColor = .clear
         window.hasShadow = false
         window.isReleasedWhenClosed = false
+        // AppKit reserves title space from button visibility when the unified
+        // toolbar is installed. Showing the buttons afterward overlaps its title.
         for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
-            window.standardWindowButton(button)?.isHidden = true
+            window.standardWindowButton(button)?.isHidden = kind == nil
         }
         webView.underPageBackgroundColor = .clear
         if transparent {
@@ -134,9 +136,6 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         if let kind {
             window.minSize = NSSize(width: 340, height: 396)
             presentation = PopoutWindowPresentation(window: window, webView: webView, kind: kind, defaults: defaults)
-            for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
-                window.standardWindowButton(button)?.isHidden = false
-            }
         }
         window.delegate = self
         webView.navigationDelegate = self
