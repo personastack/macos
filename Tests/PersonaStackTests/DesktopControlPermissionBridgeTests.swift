@@ -137,6 +137,7 @@ private actor PermissionBridgeEnrollment: DesktopControlSetupEnrollment {
     }
     func setRejectEnrollment(_ value: Bool) { rejectEnrollment = value }
     func suspendRejectedEnrollment() { delayEnrollment = true; rejectEnrollment = true }
+    func suspendSuccessfulEnrollment() { delayEnrollment = true; rejectEnrollment = false }
     func releaseEnrollment() { let pending = pendingEnrollment; pendingEnrollment = nil; pending?.resume() }
     func setConfiguration(hasConfig: Bool, active: Bool) { configuration = .init(hasActiveConfig: active, hasConfig: hasConfig) }
     func hasActiveConfig(installation: DesktopControlInstallation, appURL: URL) async throws -> Bool { try require("hasActiveConfig"); return true }
@@ -944,4 +945,27 @@ func cuaBridgeConfirmedPreparationRecoversWithoutAttachingOrEnrollingAgain(exist
     fixture.runtime.cuaProbeReady = true
     #expect(!(await fixture.send(fixture.prepare)).ok)
     #expect(await fixture.enrollment.calls == ["enroll", "reportReady"])
+}
+
+@Test @MainActor func cuaBridgeLateEnrollmentResponsePreservesCredentialForSameReferenceRecovery() async throws {
+    let fixture = try PermissionBridgeFixture(allowEnrollment: true, automaticTimeout: .milliseconds(100))
+    defer { fixture.cleanup() }
+    fixture.presenter.autoFinish = true
+    #expect(await fixture.send(fixture.permissions("open")).ok)
+    await fixture.enrollment.suspendSuccessfulEnrollment()
+    let pending = Task { await fixture.send(fixture.prepare) }
+    while !(await fixture.enrollment.isEnrollmentPending) { await Task.yield() }
+    let early = await fixture.send(["version": "1", "action": "state", "scope": "workspace-session"])
+    #expect(early.ok && early.installationID == nil)
+    #expect(!(await pending.value).ok)
+    #expect(!(await fixture.send(fixture.prepare)).ok)
+    #expect(await fixture.enrollment.calls == ["enroll"])
+    await fixture.enrollment.releaseEnrollment()
+    for _ in 0..<20 { await Task.yield() }
+    #expect(fixture.credentials.counts.saves == 1)
+    #expect(fixture.runtime.gatewayConnected == false)
+    let recovered = await fixture.send(fixture.prepare)
+    #expect(recovered.ok && recovered.installationID == "permission-fixture")
+    #expect(await fixture.enrollment.calls == ["enroll", "reportReady"])
+    #expect(fixture.credentials.counts.saves == 1 && fixture.runtime.gatewayConnected)
 }

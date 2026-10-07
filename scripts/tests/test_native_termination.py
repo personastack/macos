@@ -26,8 +26,13 @@ import AppKit
 @MainActor final class DesktopNotificationCoordinator {
     static let shared = DesktopNotificationCoordinator()
     func install() {}
+    func installConcernNavigation(_ action: @escaping @MainActor (URL) -> Void) {}
 }
-@MainActor final class MainWebViewHost { static let shared = MainWebViewHost() }
+@MainActor final class MainWebViewHost {
+    static let shared = MainWebViewHost()
+    let coordinator = NavigationProbe()
+}
+@MainActor final class NavigationProbe { func start(_ destination: URL) {} }
 @MainActor final class DesktopUpdater {
     static let shared = DesktopUpdater()
     static let foregroundUpdateRelaunchKey = "probe-update"
