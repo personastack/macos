@@ -38,6 +38,12 @@ actor DesktopControlGatewayConnection {
     private var snapshotTask: Task<Void, Never>?
     private var snapshotGeneration = UUID()
     private var diagnosticsSupported = false
+    private var recoveryProbeID: UUID?
+    private var recoveryProbeTimeout: Task<Void, Never>?
+#if DEBUG
+    var recoveryPingForTesting: (@Sendable (@escaping @Sendable (Bool) -> Void) -> Void)?
+    var recoveryTimeoutForTesting: Duration?
+#endif
 
     init(installation: DesktopControlInstallation,
          session: URLSession? = nil,
@@ -100,7 +106,48 @@ actor DesktopControlGatewayConnection {
         }
     }
 
+    /// A wake can leave URLSession reporting connected for a dead TCP path.
+    /// Probe once without interrupting a healthy lease. A bounded failure enters
+    /// the ordinary disconnect/cleanup/reconnect path.
+    func checkConnectionAfterRecovery() {
+        guard connected, recoveryProbeID == nil else { return }
+        let id = UUID()
+        recoveryProbeID = id
+        var timeout: Duration = .seconds(5)
+#if DEBUG
+        timeout = recoveryTimeoutForTesting ?? timeout
+#endif
+        recoveryProbeTimeout = Task { [weak self] in
+            do { try await Task.sleep(for: timeout) } catch { return }
+            await self?.finishRecoveryProbe(id: id, healthy: false)
+        }
+        let completion: @Sendable (Bool) -> Void = { [weak self] healthy in
+            Task { await self?.finishRecoveryProbe(id: id, healthy: healthy) }
+        }
+#if DEBUG
+        if let recoveryPingForTesting { recoveryPingForTesting(completion); return }
+#endif
+        guard let socket else { completion(false); return }
+        socket.sendPing { completion($0 == nil) }
+    }
+
+    private func finishRecoveryProbe(id: UUID, healthy: Bool) async {
+        guard recoveryProbeID == id, connected else { return }
+        recoveryProbeID = nil
+        recoveryProbeTimeout?.cancel()
+        recoveryProbeTimeout = nil
+        if healthy {
+            // The normal heartbeat refresh publishes current CUA readiness.
+            refreshSnapshot()
+        } else {
+            await disconnected(error: .socketUnavailable)
+        }
+    }
+
     func stop() {
+        recoveryProbeID = nil
+        recoveryProbeTimeout?.cancel()
+        recoveryProbeTimeout = nil
         reader?.cancel()
         heartbeats?.cancel()
         snapshotTask?.cancel()
@@ -251,6 +298,14 @@ actor DesktopControlGatewayConnection {
     }
 
 #if DEBUG
+    func configureRecoveryProbeForTesting(timeout: Duration = .seconds(5),
+        ping: @escaping @Sendable (@escaping @Sendable (Bool) -> Void) -> Void) {
+        connected = true
+        recoveryTimeoutForTesting = timeout
+        recoveryPingForTesting = ping
+    }
+    func hasRecoveryProbeForTesting() -> Bool { recoveryProbeID != nil }
+
     func applySnapshotForTesting(_ value: String) -> DesktopControlFrame? {
         applySnapshot(value, diagnostics: .init(activeProcesses: 0, openFileHandles: 0,
                                                bufferedOutputBytes: 0, outputGapsTotal: 0),

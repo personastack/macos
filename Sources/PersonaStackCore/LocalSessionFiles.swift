@@ -616,7 +616,20 @@ public struct LocalSessionFiles {
         logger.notice("local session plugin identity verified")
         let cache: URL
         if harness == .codex {
-            guard let version = record["version"] as? String, !version.isEmpty else { throw LocalSessionError.unsafeFiles }
+            let version: String
+            if let reportedVersionValue = record["version"] {
+                guard let reportedVersion = reportedVersionValue as? String else { throw LocalSessionError.unsafeFiles }
+                guard !reportedVersion.isEmpty else { throw LocalSessionError.unsafeFiles }
+                version = reportedVersion
+            } else {
+                let manifest = marketplace.appendingPathComponent("plugins/" + ownership.plugin + "/.codex-plugin/plugin.json")
+                let value = try JSONSerialization.jsonObject(with: Data(contentsOf: manifest))
+                guard let plugin = value as? [String: Any], plugin["name"] as? String == ownership.plugin,
+                      let manifestVersion = plugin["version"] as? String, !manifestVersion.isEmpty else {
+                    throw LocalSessionError.unsafeFiles
+                }
+                version = manifestVersion
+            }
             cache = profile.resolvingSymlinksInPath().appendingPathComponent("plugins/cache/" + ownership.marketplace + "/" + ownership.plugin + "/" + version)
         } else {
             guard let path = record["installPath"] as? String else { throw LocalSessionError.unsafeFiles }

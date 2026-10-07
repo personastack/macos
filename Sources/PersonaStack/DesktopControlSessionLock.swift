@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import Network
 
 @MainActor
 final class DesktopControlSessionLock {
@@ -13,10 +14,14 @@ final class DesktopControlSessionLock {
     private var sleeping = false
     private var inactive = false
     var onLifecycleLoss: (() -> Void)?
+    var onRecovery: (() -> Void)?
+    private var networkMonitor: NWPathMonitor?
+    private var networkAvailable = false
 
     init(observeSystem: Bool = true,
          workspaceCenter: NotificationCenter = NSWorkspace.shared.notificationCenter,
          activationCenter: NotificationCenter = .default,
+         observeNetwork: Bool = true,
          snapshotReader: @escaping @MainActor () -> Snapshot = DesktopControlSessionLock.currentSnapshot) {
         self.snapshotReader = snapshotReader
         guard observeSystem else { return }
@@ -35,6 +40,7 @@ final class DesktopControlSessionLock {
         observe(workspaceCenter, NSWorkspace.didWakeNotification) { monitor in
             monitor.sleeping = false
             monitor.reconcile()
+            monitor.onRecovery?()
         }
         observe(workspaceCenter, NSWorkspace.sessionDidResignActiveNotification) { monitor in
             monitor.inactive = true
@@ -44,10 +50,23 @@ final class DesktopControlSessionLock {
         observe(workspaceCenter, NSWorkspace.sessionDidBecomeActiveNotification) { monitor in
             monitor.inactive = false
             monitor.reconcile()
+            monitor.onRecovery?()
+        }
+        observe(workspaceCenter, NSWorkspace.screensDidWakeNotification) { $0.onRecovery?() }
+        if observeNetwork {
+            let monitor = NWPathMonitor()
+            networkMonitor = monitor
+            monitor.pathUpdateHandler = { [weak self] path in
+                let available = path.status == .satisfied
+                Task { @MainActor in self?.receiveNetworkAvailability(available) }
+            }
+            monitor.start(queue: DispatchQueue(label: "ai.personastack.desktop.network-recovery"))
         }
         observe(activationCenter, NSApplication.didBecomeActiveNotification) { $0.reconcile() }
         reconcile()
     }
+
+    deinit { networkMonitor?.cancel() }
 
     private func observe(_ center: NotificationCenter, _ name: Notification.Name,
                          action: @escaping @MainActor (DesktopControlSessionLock) -> Void) {
@@ -107,6 +126,13 @@ final class DesktopControlSessionLock {
             guard !sleeping, !inactive else { return }
         }
         publish(value)
+        if value == .unlocked { onRecovery?() }
+    }
+
+    func receiveNetworkAvailability(_ available: Bool) {
+        let recovered = available && !networkAvailable
+        networkAvailable = available
+        if recovered { onRecovery?() }
     }
 
     private func publish(_ value: State) {

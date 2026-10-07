@@ -66,6 +66,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private var startingProxy: CuaMCPProxy?
 #if DEBUG
     private var proxyFactoryForTesting: ((CuaDriverInstallation, URL, Int32) -> CuaMCPProxy)?
+    private var reconnectAttemptForTesting: (() async throws -> Void)?
     private var beforeCuaPublicationForTesting: (() async -> Void)?
 #endif
     private var cuaStartup: (id: UUID, task: Task<Void, Error>)?
@@ -74,6 +75,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private var gatewayConnectionID: UUID?
     private var gatewayAttemptID = UUID()
     private var reconnectTask: Task<Void, Never>?
+    private var reconnectDelayTask: Task<Void, Error>?
+    private var connectionRecoveryRequested = false
+    private var reconnectLoopID = UUID()
     private var activeInstallation: DesktopControlInstallation?
     private var credentialAuthorizationInProgress = false
     private var executor = DesktopControlCommandExecutor()
@@ -121,6 +125,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             let generation = self.lockGeneration
             self.sessionLockChangeTask = Task { await self.sessionLockChanged(generation) }
         }
+        sessionLock.onRecovery = { [weak self] in self?.requestConnectionRecovery() }
         sessionLock.onLifecycleLoss = { [weak self] in
             guard let self else { return }
             self.capabilitiesVerified = false
@@ -708,46 +713,73 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         beginReconnectLoop(for: installation)
     }
 
+    private func requestConnectionRecovery() {
+        guard reconnectTask != nil, !disconnecting, !environmentSwitchPending else { return }
+        connectionRecoveryRequested = true
+        reconnectDelayTask?.cancel()
+    }
+
     private func beginReconnectLoop(for installation: DesktopControlInstallation) {
         guard !environmentSwitchPending, reconnectTask == nil else { return }
         activeInstallation = installation
+        let loopID = UUID()
+        reconnectLoopID = loopID
         reconnectTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                if !(await self.gateway?.isConnected() ?? false) {
-                    let generation = self.lifecycleGeneration
-                    guard !self.disconnecting else { return }
-                    if !self.setupMayRunUnconfigured {
-                        do {
-                            let hasActiveConfig = try await self.hasActiveConfig(for: installation)
-                            guard generation == self.lifecycleGeneration else { return }
-                            if !hasActiveConfig {
-                                try? await self.stopIdleRelay(expectedLifecycle: generation)
-                                return
-                            }
-                        } catch {
-                            // Keep reconnecting when the authority cannot be read.
-                        }
-                    }
-                    do {
-                        try await self.establishConnection(installation, generation: generation)
-                    } catch {
-                        let failure = error as NSError
-                        self.logger.error("gateway reconnect failed: \(failure.domain, privacy: .public) code \(failure.code, privacy: .public)")
-                        if Self.readiness(for: error) == "upgrade_required" {
-                            self.readiness = "upgrade_required"
-                        }
-                    }
+                if self.connectionRecoveryRequested {
+                    self.connectionRecoveryRequested = false
+                    await self.gateway?.checkConnectionAfterRecovery()
                 }
-                do { try await Task.sleep(for: .seconds(5)) }
-                catch { return }
+                guard !Task.isCancelled, self.reconnectLoopID == loopID else { return }
+                guard await self.reconnectIfNeeded(installation, loopID: loopID) else { return }
+                guard !Task.isCancelled else { return }
+                if self.connectionRecoveryRequested { continue }
+                let delay = Task { try await Task.sleep(for: .seconds(5)) }
+                self.reconnectDelayTask = delay
+                await withTaskCancellationHandler {
+                    _ = try? await delay.value
+                } onCancel: { delay.cancel() }
+                guard self.reconnectLoopID == loopID else { return }
+                self.reconnectDelayTask = nil
             }
         }
+    }
+
+    private func reconnectIfNeeded(_ installation: DesktopControlInstallation, loopID: UUID) async -> Bool {
+        let connected = await gateway?.isConnected() ?? false
+        guard !Task.isCancelled, reconnectLoopID == loopID, !disconnecting else { return false }
+        if connected { return true }
+        let generation = lifecycleGeneration
+        if !setupMayRunUnconfigured {
+            do {
+                let hasActiveConfig = try await hasActiveConfig(for: installation)
+                guard !Task.isCancelled, generation == lifecycleGeneration else { return false }
+                if !hasActiveConfig {
+                    try? await stopIdleRelay(expectedLifecycle: generation)
+                    return false
+                }
+            } catch {
+                // Preserve retries when configuration authority is temporarily unreachable.
+            }
+        }
+        guard !Task.isCancelled, generation == lifecycleGeneration else { return false }
+        do {
+            try await establishConnection(installation, generation: generation)
+        } catch {
+            let failure = error as NSError
+            logger.error("gateway reconnect failed: \(failure.domain, privacy: .public) code \(failure.code, privacy: .public)")
+            if Self.readiness(for: error) == "upgrade_required" { readiness = "upgrade_required" }
+        }
+        return true
     }
 
     private func establishConnection(_ installation: DesktopControlInstallation, generation: UUID) async throws {
         try requireCurrentLifecycle(generation)
         guard !disconnecting, !environmentSwitchPending, !executorCleanupInProgress else { throw CancellationError() }
+#if DEBUG
+        if let reconnectAttemptForTesting { try await reconnectAttemptForTesting(); return }
+#endif
         guard paused || isCuaReady() || readiness != "ready" else { throw CuaMCPProxyError.notStarted }
         let attemptID = UUID()
         gatewayAttemptID = attemptID
@@ -818,6 +850,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         guard gatewayAttemptID == disconnectAttempt, lifecycleGeneration == generation else { return }
         if executorCleanupFailed { readiness = "cua_unavailable" }
         if error == .upgradeRequired { readiness = "upgrade_required" }
+        requestConnectionRecovery()
     }
 
     private func requireCurrentLifecycle(_ generation: UUID) throws {
@@ -1381,6 +1414,15 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         if let sessionLockState { monitor.receive(sessionLockState) }
         return runtime
     }
+    func startReconnectLoopForTesting(installation: DesktopControlInstallation,
+                                      attempt: @escaping () async throws -> Void) {
+        setupMayRunUnconfigured = true
+        reconnectAttemptForTesting = attempt
+        beginReconnectLoop(for: installation)
+    }
+    var reconnectDelayPendingForTesting: Bool { reconnectDelayTask != nil }
+    func requestConnectionRecoveryForTesting() { sessionLock.onRecovery?() }
+
     func handleForTesting(_ frame: DesktopControlFrame, connectionID: UUID) async -> DesktopControlFrame {
         await handle(frame, connectionID: connectionID, onChunk: { _ in })
     }

@@ -944,3 +944,31 @@ func desktopFirstEnrollmentCheckReconnectsOnlyItsIdleClientAfterStandaloneRestar
     #expect(!runtime.hasPendingRelayReconnectForTesting)
     await runtime.shutdownForQuit()
 }
+
+@Test @MainActor func desktopRecoveryInterruptsReconnectDelayAndQuitFencesLaterEvents() async throws {
+    let profile = DesktopEnvironmentConfiguration.production
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: JSONSerialization.data(withJSONObject: [
+        "installation_id": "fixture", "machine_credential": String(repeating: "A", count: 43),
+        "gateway_websocket_url": profile.gatewayWebsocketURL.absoluteString, "environment_origin": profile.appOrigin,
+    ]))
+    let runtime = DesktopControlRuntime.makeForTesting(installer: DesktopControlInstallerFixture(errors: []),
+                                                      credentials: EmptyDesktopControlCredentialStore())
+    var attempts = 0
+    runtime.startReconnectLoopForTesting(installation: installation) { attempts += 1 }
+    for _ in 0..<1000 {
+        if runtime.reconnectDelayPendingForTesting { break }
+        await Task.yield()
+    }
+    #expect(attempts == 1 && runtime.reconnectDelayPendingForTesting)
+    runtime.requestConnectionRecoveryForTesting()
+    runtime.requestConnectionRecoveryForTesting()
+    for _ in 0..<1000 {
+        if attempts == 2 && runtime.reconnectDelayPendingForTesting { break }
+        await Task.yield()
+    }
+    #expect(attempts == 2)
+    await runtime.shutdownForQuit()
+    runtime.requestConnectionRecoveryForTesting()
+    await Task.yield()
+    #expect(attempts == 2 && !runtime.hasPendingRelayReconnectForTesting)
+}

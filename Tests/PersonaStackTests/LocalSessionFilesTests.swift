@@ -17,6 +17,7 @@ final class HarnessFilesFixture: @unchecked Sendable {
     var failPlugin = false
     var failPluginRemoval = false
     var failMCPRead = false
+    var omitCodexPluginVersion = false
     var transportEdits: [String: Any] = [:]
     let source = LocalSessionBundleTests()
     private let ownsRoot: Bool
@@ -141,7 +142,9 @@ final class HarnessFilesFixture: @unchecked Sendable {
                     let parts = identifier.split(separator: "@").map(String.init)
                     let market = marketplaces[parts[1]]!
                     if harness == .codex {
-                        return ["pluginId": identifier, "enabled": true, "version": "1.0.0", "source": ["path": market + "/plugins/" + parts[0]], "marketplaceSource": ["source": market]]
+                        var record: [String: Any] = ["pluginId": identifier, "enabled": true, "source": ["path": market + "/plugins/" + parts[0]], "marketplaceSource": ["source": market]]
+                        if !omitCodexPluginVersion { record["version"] = "1.0.0" }
+                        return record
                     }
                     return ["id": identifier, "enabled": true, "scope": "user", "installPath": profile.appendingPathComponent("plugins/cache/" + parts[1] + "/" + parts[0] + "/1.0.0").path]
                 }
@@ -157,6 +160,17 @@ final class HarnessFilesFixture: @unchecked Sendable {
 }
 
 struct LocalSessionFilesTests {
+    @Test
+    func codexPluginVerificationUsesManifestVersionWhenCLIOmitsIt() throws {
+        let fixture = try HarnessFilesFixture(.codex)
+        fixture.omitCodexPluginVersion = true
+
+        let installed = try fixture.configure(UUID())
+
+        #expect(fixture.installed.count == 1)
+        #expect(FileManager.default.fileExists(atPath: installed.directory.path))
+    }
+
     @Test(arguments: [LocalSessionHarness.codex, .claudeCode])
     func multiplePersonasCoexistAndRemovalPreservesSiblingAndUnrelatedServers(_ harness: LocalSessionHarness) throws {
         let fixture = try HarnessFilesFixture(harness)

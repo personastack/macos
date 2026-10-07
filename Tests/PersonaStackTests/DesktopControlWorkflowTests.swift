@@ -74,7 +74,7 @@ private actor SuspendedReadiness {
     let activation = NotificationCenter()
     var snapshot = DesktopControlSessionLock.Snapshot.unlocked
     let monitor = DesktopControlSessionLock(workspaceCenter: workspace, activationCenter: activation,
-                                           snapshotReader: { snapshot })
+                                           observeNetwork: false, snapshotReader: { snapshot })
     #expect(monitor.state == .unlocked)
     workspace.post(name: NSWorkspace.willSleepNotification, object: nil)
     #expect(monitor.state != .unlocked)
@@ -196,4 +196,39 @@ private actor SuspendedReadiness {
         #expect(await connection.applySnapshotForTesting(state) == nil)
     }
     #expect(await connection.applySnapshotForTesting("untrusted error content") == nil)
+}
+
+@Test @MainActor func desktopRecoveryEventsFireEvenWhenLockStateDoesNotChange() {
+    let workspace = NotificationCenter()
+    let monitor = DesktopControlSessionLock(workspaceCenter: workspace, activationCenter: NotificationCenter(),
+                                           observeNetwork: false, snapshotReader: { .locked })
+    var recoveries = 0
+    monitor.onRecovery = { recoveries += 1 }
+    workspace.post(name: NSWorkspace.willSleepNotification, object: nil)
+    #expect(recoveries == 0)
+    workspace.post(name: NSWorkspace.didWakeNotification, object: nil)
+    #expect(recoveries == 1 && monitor.state == .locked)
+    workspace.post(name: NSWorkspace.screensDidWakeNotification, object: nil)
+    #expect(recoveries == 2)
+    workspace.post(name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
+    #expect(recoveries == 3)
+    monitor.receive(.unlocked)
+    monitor.receive(.unlocked)
+    #expect(recoveries == 5)
+    monitor.receive(.locked)
+    #expect(recoveries == 5 && monitor.isAwakeAndActive)
+}
+
+@Test @MainActor func desktopNetworkRecoveryOnlySignalsUsableTransitions() {
+    let monitor = DesktopControlSessionLock(observeSystem: false)
+    var recoveries = 0
+    monitor.onRecovery = { recoveries += 1 }
+    monitor.receiveNetworkAvailability(false)
+    #expect(recoveries == 0)
+    monitor.receiveNetworkAvailability(true)
+    monitor.receiveNetworkAvailability(true)
+    #expect(recoveries == 1)
+    monitor.receiveNetworkAvailability(false)
+    monitor.receiveNetworkAvailability(true)
+    #expect(recoveries == 2)
 }
