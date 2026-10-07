@@ -51,18 +51,74 @@ struct ChatWindowTests {
 
     @Test func testStrictCommands() {
         #expect(ChatWindowCommand.parse(["version": "1", "action": "open_persona_chat", "persona_id": "p-1", "scope": "s"], main: true) == .open("p-1", "s"))
-        for action in ["minimize", "close", "collapse", "expand", "pin"] {
+        for action in ["minimize", "close", "collapse", "expand", "pin", "open_persona_settings"] {
             #expect(ChatWindowCommand.parse(["version": "1", "action": action], main: false) != nil)
             #expect(ChatWindowCommand.parse(["version": "1", "action": action, "extra": "bad"], main: false) == nil)
             #expect(ChatWindowCommand.parse(["version": "2", "action": action], main: false) == nil)
             #expect(ChatWindowCommand.parse(["version": "1", "action": action], main: true) == nil)
         }
+        #expect(ChatWindowCommand.parse(["version": "1", "action": "open_persona_settings"], main: false) == .settings)
+        #expect(ChatWindowCommand.parse(["version": "1", "action": "open_persona_settings", "persona_id": "other"], main: false) == nil)
+        #expect(ChatWindowCommand.parse(["version": "1", "action": "open_persona_settings", "url": "https://evil.test"], main: false) == nil)
         #expect(ChatWindowCommand.parse(["version": "1", "action": "drag", "dx": 7.0, "dy": -8.0], main: false) == .drag(7, -8))
         #expect(ChatWindowCommand.parse(["version": "1", "action": "drag", "dx": NSNumber(value: 0), "dy": NSNumber(value: 1)], main: false) == .drag(0, 1))
         #expect(ChatWindowCommand.parse(["version": "1", "action": "drag", "dx": Double.infinity, "dy": 0.0], main: false) == nil)
         #expect(ChatWindowCommand.parse(["version": "1", "action": "drag", "dx": true, "dy": 0.0], main: false) == nil)
         #expect(ChatWindowCommand.parse(["version": "1", "action": "sync", "scope": ""], main: true) == .sync(""))
         #expect(ChatWindowCommand.parse(["version": "1", "action": "open_persona_chat", "scope": "", "persona_id": "p"], main: true) == nil)
+    }
+
+    @Test func testSettingsURLUsesOnlyTheBoundChatIdentityAndOrigin() throws {
+        let popout = try #require(URL(string: "https://example.invalid:444/user/personas/chat/desktop-popout?persona_id=p-1#fragment"))
+        #expect(ChatWindowCommand.settingsURL(popoutURL: popout)?.absoluteString == "https://example.invalid:444/user/personas/p-1")
+        for path in ["/other?persona_id=p-1", "/user/personas/chat/desktop-popout", "/user/personas/chat/desktop-popout?persona_id=p-1&persona_id=p-2", "/user/personas/chat/desktop-popout?persona_id=..%2Fevil", "/user/personas/chat/desktop-popout?persona_id=p-1&extra=bad"] {
+            #expect(ChatWindowCommand.settingsURL(popoutURL: URL(string: "https://example.invalid\(path)")!) == nil)
+        }
+    }
+
+    @MainActor
+    @Test func testChatSettingsNavigatesAndReopensMainWindowWithoutCollapsingOrClosingChat() throws {
+        _ = NSApplication.shared
+        let preferences = PopoutTestPreferences()
+        var destinations: [URL] = []
+        var reopens = 0
+        let delegate = PersonaStackTerminationDelegate(shutdown: { true }, terminate: { _ in }, timeout: .seconds(1),
+            navigateMainWindow: { destinations.append($0) })
+        delegate.installMainWindowReopener { reopens += 1 }
+        let manager = ChatWindowManager(loadPages: false, defaults: preferences.defaults, presentWindows: false)
+        manager.navigateMainWindow = { delegate.openMainPage($0) }
+        defer { manager.invalidateSession() }
+        let base = try #require(URL(string: "https://example.invalid:444/user/personas?old=1#old"))
+        manager.apply(.open("p-1", "account-a"), base: base)
+        let chat = try #require(manager.chat(for: "p-1"))
+        let frame = chat.window.frame
+        #expect(chat.webView.configuration.userContentController.userScripts.contains {
+            $0.source == "window.personastackDesktopPersonaSettings = true;" && $0.injectionTime == .atDocumentStart && $0.isForMainFrameOnly
+        })
+        chat.apply(.settings)
+        chat.apply(.settings)
+        #expect(destinations.map(\.absoluteString) == Array(repeating: "https://example.invalid:444/user/personas/p-1", count: 2))
+        #expect(reopens == 2)
+        #expect(manager.chat(for: "p-1") === chat)
+        #expect(chat.window.frame == frame)
+        #expect(!chat.webView.collapsed && !chat.window.isMiniaturized)
+        #expect(chat.window.styleMask.contains(.titled))
+        manager.invalidateSession()
+        chat.apply(.settings)
+        #expect(destinations.count == 2 && reopens == 2)
+    }
+
+    @MainActor
+    @Test func testSettingsNavigationWaitsForMainWindowReopener() throws {
+        var destinations: [URL] = []
+        var reopens = 0
+        let delegate = PersonaStackTerminationDelegate(shutdown: { true }, terminate: { _ in }, timeout: .seconds(1),
+            navigateMainWindow: { destinations.append($0) })
+        let destination = try #require(URL(string: "https://example.invalid/user/personas/p-1"))
+        delegate.openMainPage(destination)
+        #expect(destinations == [destination] && reopens == 0)
+        delegate.installMainWindowReopener { reopens += 1 }
+        #expect(reopens == 1)
     }
 
     @Test func testFixedURLAndOrigin() throws {

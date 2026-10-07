@@ -23,7 +23,7 @@ struct NativeConcernNotificationTests {
         let delegate = PersonaStackTerminationDelegate(shutdown: { true }, terminate: { _ in }, timeout: .seconds(1),
             navigateMainWindow: { destinations.append($0) })
         let notifications = DesktopNotificationCoordinator()
-        notifications.installConcernNavigation { delegate.openConcern($0) }
+        notifications.installConcernNavigation { delegate.openMainPage($0) }
         notifications.handleResponse(requestIdentifier: request.identifier, actionIdentifier: UNNotificationDefaultActionIdentifier,
             userInfo: request.content.userInfo, appURL: appURL)
         #expect(destinations.first?.absoluteString == "https://my.personastack.ai/user/concerns?workspace_id=ws_b&concern_id=specific-concern")

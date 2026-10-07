@@ -11,6 +11,7 @@ final class ChatWindowManager: NSObject, WKScriptMessageHandlerWithReply {
     private let defaults: UserDefaults
     private let presentWindows: Bool
     private let mainViews = NSMapTable<WKWebView, NSURL>.weakToStrongObjects()
+    var navigateMainWindow: (URL) -> Void = { _ in }
 
     init(loadPages: Bool = true, defaults: UserDefaults = .standard, presentWindows: Bool = true) {
         self.loadPages = loadPages
@@ -47,7 +48,8 @@ final class ChatWindowManager: NSObject, WKScriptMessageHandlerWithReply {
             sync(next)
             if let existing = windows[persona] { if presentWindows { existing.focus() } }
             else if let url = ChatWindowCommand.popoutURL(appURL: base, personaID: persona) {
-                let chat = PersonaChatWindow(url: url, loadPage: loadPages, defaults: defaults) { [weak self] in self?.windows.removeValue(forKey: persona) }
+                let chat = PersonaChatWindow(url: url, loadPage: loadPages, defaults: defaults,
+                    navigateMainWindow: { [weak self] in self?.navigateMainWindow($0) }) { [weak self] in self?.windows.removeValue(forKey: persona) }
                 windows[persona] = chat
                 if presentWindows { chat.focus() }
             }
@@ -77,6 +79,7 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
     private(set) var presentation: PopoutWindowPresentation!
     private let url: URL
     private let onClose: () -> Void
+    private let navigateMainWindow: (URL) -> Void
     private var expandedSize = NSSize(width: 440, height: 676)
     private var collapsed = false
     private var disposed = false
@@ -84,11 +87,16 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
     private var documentGeneration = UUID()
     private let mediaPermission = DesktopMediaCapturePermission.shared
     init(url: URL, loadPage: Bool = true, defaults: UserDefaults = .standard,
+         navigateMainWindow: @escaping (URL) -> Void = { _ in },
          onClose: @escaping () -> Void) {
         self.url = url
         self.onClose = onClose
+        self.navigateMainWindow = navigateMainWindow
         let config = WKWebViewConfiguration()
         PopoutWindowPresentation.advertise(in: config)
+        config.userContentController.addUserScript(WKUserScript(
+            source: "window.personastackDesktopPersonaSettings = true;",
+            injectionTime: .atDocumentStart, forMainFrameOnly: true))
         // The native title bar owns pinning, including when the hosted page is older.
         config.userContentController.addUserScript(WKUserScript(source: """
             (() => {
@@ -196,6 +204,10 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
         case .collapse: resize(collapsed: true)
         case .expand: resize(collapsed: false)
         case .pin: presentation.togglePin()
+        case .settings:
+            if let destination = ChatWindowCommand.settingsURL(popoutURL: url) {
+                navigateMainWindow(destination)
+            }
         case .drag(let dx, let dy):
             guard presentation.canCollapse else { return }
             let origin = window.frame.origin

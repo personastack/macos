@@ -5,7 +5,7 @@ import CoreFoundation
 public enum ChatWindowCommand: Equatable, Sendable {
     case sync(String)
     case open(String, String)
-    case minimize, close, collapse, expand, pin
+    case minimize, close, collapse, expand, pin, settings
     case drag(Double, Double)
 
     public static func parse(_ body: Any, main: Bool) -> ChatWindowCommand? {
@@ -33,6 +33,7 @@ public enum ChatWindowCommand: Equatable, Sendable {
         case "collapse": return .collapse
         case "expand": return .expand
         case "pin": return .pin
+        case "open_persona_settings": return .settings
         default: return nil
         }
     }
@@ -47,6 +48,18 @@ public enum ChatWindowCommand: Equatable, Sendable {
         guard validPersonaID(personaID), var parts = URLComponents(url: appURL, resolvingAgainstBaseURL: false) else { return nil }
         parts.path = "/user/personas/chat/desktop-popout"
         parts.queryItems = [URLQueryItem(name: "persona_id", value: personaID)]
+        parts.fragment = nil
+        return parts.url
+    }
+
+    public static func settingsURL(popoutURL: URL) -> URL? {
+        guard var parts = URLComponents(url: popoutURL, resolvingAgainstBaseURL: false),
+              parts.path == "/user/personas/chat/desktop-popout",
+              let items = parts.queryItems, items.count == 1,
+              items[0].name == "persona_id", let persona = items[0].value,
+              validPersonaID(persona) else { return nil }
+        parts.path = "/user/personas/\(persona)"
+        parts.query = nil
         parts.fragment = nil
         return parts.url
     }

@@ -47,7 +47,8 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         DesktopLoginItemRegistration.enableOnFirstLaunch()
         DesktopNotificationCoordinator.shared.install()
-        DesktopNotificationCoordinator.shared.installConcernNavigation { [weak self] in self?.openConcern($0) }
+        DesktopNotificationCoordinator.shared.installConcernNavigation { [weak self] in self?.openMainPage($0) }
+        ChatWindowManager.shared.navigateMainWindow = { [weak self] in self?.openMainPage($0) }
         // The authenticated receiver belongs to the app, not Desktop Control
         // enrollment or the visible main window.
         _ = MainWebViewHost.shared
@@ -70,7 +71,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         restoreMainWindowIfNeeded()
     }
 
-    func openConcern(_ destination: URL) {
+    func openMainPage(_ destination: URL) {
         navigateMainWindow(destination)
         shouldRestoreMainWindow = true
         restoreMainWindowIfNeeded()
