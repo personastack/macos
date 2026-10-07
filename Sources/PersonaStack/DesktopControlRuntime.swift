@@ -194,11 +194,14 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             do { _ = try await cuaService.inspectPeer(installation: installation) }
             catch CuaMCPProxyError.notStarted {
                 try requireCurrentLifecycle(generation)
+                try Task.checkCancellation()
+                if let reason = cuaSetupBlockReason { return .unavailable(installed: true, message: reason) }
                 capabilitiesVerified = false
                 cuaPermissions = nil
                 return .stopped
             }
             try requireCurrentLifecycle(generation)
+            if let reason = cuaSetupBlockReason { return .unavailable(installed: true, message: reason) }
             try await checkCuaConnectionForSetup()
             try requireCurrentLifecycle(generation)
             return .ready
@@ -207,6 +210,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         } catch {
             try requireCurrentLifecycle(generation)
             try Task.checkCancellation()
+            if let reason = cuaSetupBlockReason { return .unavailable(installed: installed, message: reason) }
+            if let blocked = error as? CuaSetupBlockedError {
+                return .unavailable(installed: installed, message: blocked.message)
+            }
             recordCuaFailure(error)
             if (error as? CuaMCPProxyError) == .permissionsRequired, let snapshot = cuaPermissions {
                 return .permissions(snapshot)

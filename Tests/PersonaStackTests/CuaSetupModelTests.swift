@@ -204,6 +204,25 @@ func cuaSetupPassiveRefreshKeepsFailureUntilExplicitSuccessfulCheck() async {
 }
 
 @Test @MainActor
+func cuaSetupReturnedCheckFailureSurvivesPassiveRecovery() async {
+    let fixture = CuaSetupOperationsFixture()
+    let reason = "CUA could not be checked. Check Again to continue."
+    fixture.readiness = .unavailable(installed: true, message: reason)
+    let model = CuaSetupModel(operations: fixture.operations)
+    model.check()
+    await model.waitForOperation()
+    #expect(model.outcome == .failure(reason))
+    fixture.readiness = .ready
+    model.refresh()
+    await model.waitForOperation()
+    #expect(model.ready && model.message == reason && model.feedback == .failure)
+    model.check()
+    await model.waitForOperation()
+    #expect(model.outcome == .none && model.feedback == .success)
+    #expect(fixture.calls == ["observe", "observe", "observe"])
+}
+
+@Test @MainActor
 func cuaSetupFailedPassiveRefreshCannotReplaceLastOperationError() async {
     let fixture = CuaSetupOperationsFixture()
     fixture.permissionError = CuaStandaloneServiceError.permissionTimedOut

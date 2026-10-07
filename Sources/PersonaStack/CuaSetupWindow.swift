@@ -281,6 +281,8 @@ final class CuaSetupModel: ObservableObject {
                     self.outcome = Self.failureOutcome(failure)
                 } else if action == .refresh {
                     self.outcome = previousOutcome
+                } else if case .unavailable(_, let reason) = observed {
+                    self.outcome = .failure(reason)
                 } else {
                     self.outcome = .none
                 }

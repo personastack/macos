@@ -74,6 +74,7 @@ private actor PermissionBridgeEnrollment: DesktopControlSetupEnrollment {
     let allowed: Set<String>
     private var rejectEnrollment = false
     private var failAttachment = false
+    private(set) var attachedTicket: String?
     private var suspendReady = false
     private var pendingReady: CheckedContinuation<Void, Never>?
     var isReadyPending: Bool { pendingReady != nil }
@@ -114,10 +115,11 @@ private actor PermissionBridgeEnrollment: DesktopControlSetupEnrollment {
     func loseAttachmentResponse() { failAttachment = true }
     func attach(ticket: String, installation: DesktopControlInstallation, appURL: URL) async throws {
         try require("attach")
-        if failAttachment { throw URLError(.networkConnectionLost) }
         #expect(ticket == String(repeating: "a", count: 43))
         #expect(installation == self.installation)
         #expect(appURL == DesktopEnvironmentConfiguration.production.appURL)
+        attachedTicket = ticket
+        if failAttachment { throw URLError(.networkConnectionLost) }
     }
     func configurationState(installation: DesktopControlInstallation, appURL: URL) async throws -> DesktopControlConfigurationState {
         try require("configurationState")
@@ -903,7 +905,7 @@ func cuaBridgeConfirmedPreparationRecoversWithoutAttachingOrEnrollingAgain(exist
     #expect(fixture.runtime.calls.filter { $0 == "disconnect" }.count == (existing ? 1 : 0))
 }
 
-@Test @MainActor func cuaBridgeUnknownAttachmentNeverRepeatsMutation() async throws {
+@Test @MainActor func cuaBridgeLostAttachmentResponseRecoversWithoutRepeatingMutation() async throws {
     let fixture = try PermissionBridgeFixture(allowEnrollment: true, allowReplacement: true)
     defer { fixture.cleanup() }
     try fixture.credentials.save(fixture.enrollment.installation)
@@ -913,13 +915,20 @@ func cuaBridgeConfirmedPreparationRecoversWithoutAttachingOrEnrollingAgain(exist
     let first = await fixture.send(fixture.prepare)
     #expect(!first.ok && first.error?.contains("could not be confirmed") == true)
     let retry = await fixture.send(fixture.prepare)
-    #expect(!retry.ok && retry.error?.contains("could not be confirmed") == true)
+    #expect(retry.ok && retry.installationID == "permission-fixture")
+    #expect(fixture.runtime.gatewayConnected)
+    #expect(await fixture.enrollment.attachedTicket == String(repeating: "a", count: 43))
     var otherTicket = fixture.prepare
     otherTicket["enrollment_ticket"] = String(repeating: "b", count: 43)
     #expect(!(await fixture.send(otherTicket)).ok)
-    #expect(await fixture.enrollment.calls == ["attach"])
-    #expect(fixture.runtime.calls == ["disconnect"])
+    #expect(await fixture.enrollment.calls == ["attach", "reportReady"])
+    #expect(fixture.runtime.calls.filter { $0 == "disconnect" }.count == 1)
     #expect(fixture.credentials.counts.saves == 1)
+    // The API-owned save/readback may now confirm this original attachment.
+    await fixture.enrollment.setConfiguration(hasConfig: true, active: true)
+    #expect(await fixture.send(fixture.permissions("completed")).ok)
+    #expect(fixture.presenter.completions == 1)
+    #expect(await fixture.enrollment.calls == ["attach", "reportReady", "configurationState"])
 }
 
 @Test @MainActor func cuaBridgeRecoveryRequiresOriginalReferenceAndCurrentSavedInstallation() async throws {

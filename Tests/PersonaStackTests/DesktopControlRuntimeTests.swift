@@ -740,6 +740,49 @@ private actor StandaloneRuntimeServiceFixture: DesktopControlCuaServicing {
     }
 }
 
+private actor CuaObservationRaceService: DesktopControlCuaServicing {
+    nonisolated let socketURL = URL(fileURLWithPath: "/unused/race.sock")
+    private var pending: CheckedContinuation<Void, Never>?
+    private var entered: CheckedContinuation<Void, Never>?
+    private let stopped: Bool
+    init(stopped: Bool) { self.stopped = stopped }
+    func setup(installation: CuaDriverInstallation) async throws { Issue.record("Unexpected service startup") }
+    func requestPermissions(installation: CuaDriverInstallation) async throws { Issue.record("Unexpected permission request") }
+    func inspectPeer(installation: CuaDriverInstallation) async throws -> Int32 {
+        await withCheckedContinuation { pending = $0; entered?.resume(); entered = nil }
+        if stopped { throw CuaMCPProxyError.notStarted }
+        return 123
+    }
+    func waitForInspection() async {
+        if pending != nil { return }
+        await withCheckedContinuation { entered = $0 }
+    }
+    func finishInspection() { let current = pending; pending = nil; current?.resume() }
+}
+
+@Test(arguments: [false, true]) @MainActor
+func cuaObservationRacePreservesNewerVerificationOwner(stopped: Bool) async throws {
+    let installer = StandaloneRuntimeInstallerFixture()
+    let service = CuaObservationRaceService(stopped: stopped)
+    let executor = DesktopControlCommandExecutor()
+    let runtime = DesktopControlRuntime.makeForTesting(installer: installer, cuaService: service,
+        credentials: EmptyDesktopControlCredentialStore(), executor: executor, readiness: "ready")
+    let observation = Task { try await runtime.observeCuaForSetup() }
+    await service.waitForInspection()
+    let owner = try await executor.beginNativeVerification()
+    defer { executor.endNativeVerification(owner) }
+    await service.finishInspection()
+    let result = try await observation.value
+    if case .unavailable(_, let reason) = result {
+        #expect(reason.contains("Another CUA check or setup"))
+    } else { Issue.record("The newer setup owner must block this observation") }
+    try executor.requireNativeVerification(owner)
+    let report = await runtime.diagnosticReport()
+    #expect(report.desktopReadiness == "ready")
+    #expect(report.lastCuaCheck == nil && report.cuaCheckFailure == nil)
+    #expect(await installer.installations == 0)
+}
+
 @Test @MainActor func standaloneReadinessAndConnectionChecksNeverInstallStartOrPrompt() async throws {
     let installer = StandaloneRuntimeInstallerFixture()
     let service = StandaloneRuntimeServiceFixture()

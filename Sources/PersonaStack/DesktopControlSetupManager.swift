@@ -458,7 +458,11 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             if let saved {
                 try await runtime.disconnect()
                 try requireCurrentScope(scope, generation: generation, page: page)
-                page.preparation = .init(ticket: ticket, generation: generation)
+                // The saved credential is already verified. A lost attachment
+                // response must not force attachment again. Recovery may only
+                // reconnect this same installation; the API setup reference
+                // still decides whether its attachment can be saved.
+                page.preparation = .init(ticket: ticket, generation: generation, installation: saved)
                 try await enrollment.attach(ticket: ticket, installation: saved, appURL: page.appURL)
                 try confirmPreparation(saved, ticket: ticket, scope: scope, generation: generation, page: page)
                 try requireCurrentScope(scope, generation: generation, page: page)
