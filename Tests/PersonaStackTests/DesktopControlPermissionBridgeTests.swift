@@ -871,7 +871,10 @@ func cuaSetupRechecksUpstreamReadinessBeforeEnrollment() async throws {
     fixture.presenter.autoFinish = true
     #expect(await fixture.send(fixture.permissions("open")).ok)
     #expect(await fixture.send(fixture.prepare).ok)
-    try await Task.sleep(for: .milliseconds(150))
+    for _ in 0..<200 {
+        if !fixture.presenter.failures.isEmpty { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
     #expect(!fixture.presenter.isFinishing && fixture.presenter.completions == 0)
     #expect(fixture.presenter.failures.count == 1)
     #expect(fixture.presenter.failures.first?.contains("could not be confirmed") == true)
