@@ -370,8 +370,17 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         } catch {
             guard !Task.isCancelled, isCurrentLifecycle(generation), !environmentSwitchPending,
                   (try? configurationProvider()) == configuration else { return }
-            preferences.set(error.localizedDescription, forKey: DesktopControlPreferenceKeys.relayError(configuration))
+            preferences.set(Self.connectionFailureMessage(error), forKey: DesktopControlPreferenceKeys.relayError(configuration))
         }
+    }
+
+    static func connectionFailureMessage(_ error: Error) -> String {
+        // CUA readiness already owns these failures and their recovery. Saving
+        // a second connection error would keep the menu failed after repair.
+        if error is CuaMCPProxyError || error is CuaDriverInstallError || error is CuaStandaloneServiceError {
+            return ""
+        }
+        return error.localizedDescription
     }
 
     func resume() async throws {

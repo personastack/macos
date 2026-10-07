@@ -5,6 +5,32 @@ import Testing
 @testable import PersonaStack
 
 @Suite struct DesktopControlPresentationTests {
+    @Test @MainActor func cuaRecoveryDoesNotLeaveASecondConnectionFailure() {
+        let failures: [Error] = [CuaMCPProxyError.serviceMismatch, CuaDriverInstallError.invalidSignature,
+                                 CuaStandaloneServiceError.startTimedOut]
+        for failure in failures {
+            let connectionFailure = DesktopControlRuntime.connectionFailureMessage(failure)
+            let failed = DesktopControlPresentation(enabled: true, paused: false, connected: true,
+                readiness: "cua_unavailable", hasError: !connectionFailure.isEmpty)
+            #expect(failed.message == "CUA connection needs attention")
+            let recovered = DesktopControlPresentation(enabled: true, paused: false, connected: true,
+                readiness: "ready", hasError: !connectionFailure.isEmpty)
+            #expect(recovered.state == .ready)
+        }
+    }
+
+    @Test @MainActor func cuaReadinessDoesNotHideConnectionOrCredentialFailures() {
+        let failures: [Error] = [DesktopControlEnrollmentError.credentialAccessRequired,
+                                 URLError(.notConnectedToInternet)]
+        for failure in failures {
+            let connectionFailure = DesktopControlRuntime.connectionFailureMessage(failure)
+            #expect(connectionFailure == failure.localizedDescription)
+            let state = DesktopControlPresentation(enabled: true, paused: false, connected: true,
+                readiness: "ready", hasError: !connectionFailure.isEmpty)
+            #expect(state.state == .needsAttention)
+        }
+    }
+
     @Test @MainActor func unchangedPollingDoesNotInvalidateMenuPresentation() {
         var current = DesktopControlPresentation(enabled: true, paused: false, connected: true, readiness: "ready")
         let store = DesktopControlPresentationStore(snapshotProvider: { current })

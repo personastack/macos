@@ -234,7 +234,7 @@ struct DesktopControlMenu: View {
             return
         } catch {
             guard let generation, runtime.isCurrentLifecycle(generation) else { return }
-            relayError = error.localizedDescription
+            relayError = DesktopControlRuntime.connectionFailureMessage(error)
             relayEnabled = runtime.hasActiveInstallation
             relayPaused = runtime.paused
         }
