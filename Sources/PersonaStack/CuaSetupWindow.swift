@@ -273,36 +273,38 @@ final class CuaSetupModel: ObservableObject {
                 let observed = try await operations.observe()
                 guard self.generation == current else { return }
                 try Task.checkCancellation()
-                self.observation = observed
-                self.activity = .idle
-                self.installStage = nil
-                self.task = nil
-                if let failure {
-                    self.outcome = Self.failureOutcome(failure)
-                } else if action == .refresh {
-                    self.outcome = previousOutcome
-                } else if case .unavailable(_, let reason) = observed {
-                    self.outcome = .failure(reason)
-                } else {
-                    self.outcome = .none
-                }
+                self.accept(observed, action: action, failure: failure, previousOutcome: previousOutcome)
                 if action == .finish, observed == .ready, failure == nil { onReady?() }
             } catch {
                 guard self.generation == current else { return }
-                self.activity = .idle
-                self.installStage = nil
-                self.task = nil
-                let reason = error is CancellationError
-                    ? "CUA check was interrupted. Check again to continue."
-                    : DesktopControlRuntime.cuaSetupFailureMessage(failure ?? error)
-                self.observation = .unavailable(installed: self.installed, message: reason)
-                if action == .refresh, case .failure = previousOutcome {
-                    self.outcome = previousOutcome
-                } else {
-                    self.outcome = .failure(reason)
-                }
+                self.rejectObservation(error, failure: failure, action: action, previousOutcome: previousOutcome)
             }
         }
+    }
+
+    private func accept(_ observed: CuaSetupReadiness, action: Action, failure: Error?, previousOutcome: Outcome) {
+        observation = observed
+        settle()
+        if let failure { outcome = Self.failureOutcome(failure) }
+        else if action == .refresh { outcome = previousOutcome }
+        else if case .unavailable(_, let reason) = observed { outcome = .failure(reason) }
+        else { outcome = .none }
+    }
+
+    private func rejectObservation(_ error: Error, failure: Error?, action: Action, previousOutcome: Outcome) {
+        settle()
+        let reason = error is CancellationError
+            ? "CUA check was interrupted. Check again to continue."
+            : DesktopControlRuntime.cuaSetupFailureMessage(failure ?? error)
+        observation = .unavailable(installed: installed, message: reason)
+        if action == .refresh, case .failure = previousOutcome { outcome = previousOutcome }
+        else { outcome = .failure(reason) }
+    }
+
+    private func settle() {
+        activity = .idle
+        installStage = nil
+        task = nil
     }
 
     private static func failureOutcome(_ error: Error) -> Outcome {
@@ -322,9 +324,7 @@ final class CuaSetupModel: ObservableObject {
 
     private func settleCancellation(generation: UUID) {
         guard self.generation == generation else { return }
-        activity = .idle
-        installStage = nil
-        task = nil
+        settle()
         outcome = .failure("CUA setup was interrupted. Check again to continue.")
     }
     private func showInstallProgress(_ stage: CuaInstallStage, generation: UUID) {
