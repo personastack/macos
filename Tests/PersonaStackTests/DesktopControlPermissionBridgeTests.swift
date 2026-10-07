@@ -829,15 +829,17 @@ func cuaSetupRechecksUpstreamReadinessBeforeEnrollment() async throws {
 @Test @MainActor func cuaBridgeHumanConsentOutlastsAutomaticDeadline() async throws {
     let fixture = try PermissionBridgeFixture(allowEnrollment: true, automaticTimeout: .milliseconds(100))
     defer { fixture.cleanup() }
-    let pending = Task { await fixture.send(fixture.prepare) }
+    let pending = Task { await fixture.send(fixture.permissions("open")) }
     try await fixture.waitForOpen()
     try await Task.sleep(for: .milliseconds(150))
     #expect(fixture.presenter.isWaiting && fixture.presenter.failures.isEmpty)
     #expect(await fixture.enrollment.calls.isEmpty)
     fixture.presenter.finish()
-    #expect(await pending.value.ok)
-    #expect(await fixture.send(fixture.permissions("completed")).ok)
-    #expect(fixture.presenter.completions == 1)
+    #expect(await pending.value.prerequisitesReady)
+    #expect(fixture.presenter.isFinishing)
+    // Automatic cloud completion has separate deadline fixtures. Do not make
+    // this human-wait assertion depend on completing cloud work within 100ms.
+    #expect(await fixture.enrollment.calls.isEmpty)
 }
 
 @Test @MainActor func cuaBridgePendingPrepareExcludesRetryEvenAfterTimeout() async throws {

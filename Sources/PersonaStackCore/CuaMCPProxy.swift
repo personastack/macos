@@ -38,7 +38,7 @@ extension CuaMCPProxyError: LocalizedError {
         case .serviceRunning:
             return "PersonaStack control or setup is busy. Finish setup or stop the PersonaStack control session, then try again."
         case .serviceMismatch:
-            return "PersonaStack could not verify a compatible standalone CUA connection. Choose Set Up CUA to check the installation and connection."
+            return "PersonaStack could not verify a compatible standalone CUA connection. Another CUA copy may still be running. Quit the older cua-driver process in Activity Monitor, then choose Check Again. If this continues, ask an administrator to check the CUA installation."
         default:
             return "The local CUA connection could not complete this check. Choose Check CUA Connection or Set Up CUA."
         }
