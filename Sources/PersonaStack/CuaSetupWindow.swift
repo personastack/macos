@@ -55,9 +55,8 @@ final class CuaSetupWindow: NSObject, DesktopControlPermissionPresenting, NSWind
                 self?.window?.orderOut(nil)
                 self?.model.cancel()
             }))
-            hosting.sizingOptions = []
+            hosting.sizingOptions = [.minSize]
             window.contentView = hosting
-            window.contentMinSize = NSSize(width: 440, height: 400)
             window.center()
             self.window = window
         }
@@ -377,7 +376,7 @@ private struct CuaSetupView: View {
             }
         }
         .padding(24)
-        .frame(minWidth: 392, maxWidth: .infinity, minHeight: 352, maxHeight: .infinity)
+        .frame(minWidth: 440, maxWidth: .infinity, minHeight: 400, maxHeight: .infinity)
     }
 
     private func primaryAction() {
