@@ -7,6 +7,15 @@ import ServiceManagement
 protocol DesktopControlDriverInstalling: Sendable {
     func discoverExisting() async throws -> CuaDriverInstallation?
     func install() async throws -> CuaDriverInstallation
+    func install(progress: CuaInstallProgress) async throws -> CuaDriverInstallation
+}
+
+extension DesktopControlDriverInstalling {
+    func install(progress: CuaInstallProgress) async throws -> CuaDriverInstallation {
+        let installation = try await install()
+        await progress(.installed)
+        return installation
+    }
 }
 
 extension CuaDriverInstaller: DesktopControlDriverInstalling {}
@@ -31,6 +40,11 @@ protocol DesktopControlCuaServicing: Sendable {
     func inspectPeer(installation: CuaDriverInstallation) async throws -> Int32
 }
 extension CuaStandaloneService: DesktopControlCuaServicing {}
+
+struct CuaSetupBlockedError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
 
 @MainActor
 final class DesktopControlRuntime: DesktopControlSetupRuntime {
@@ -120,8 +134,24 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     var hasPendingEnvironmentSwitch: Bool { environmentSwitchPending }
     var isDisconnecting: Bool { disconnecting }
     var permissionSetupAvailable: Bool {
-        executor.permissionSetupAvailable && !disconnecting && !environmentSwitchPending && !repairInProgress
-            && !executorCleanupInProgress && !executorCleanupFailed
+        cuaSetupBlockReason == nil
+    }
+    var cuaSetupBlockReason: String? {
+        if disconnecting { return "PersonaStack is disconnecting this Mac. Wait for it to finish, then check again." }
+        if environmentSwitchPending { return "The server change needs attention. Complete it in Server Settings, then check CUA again." }
+        if executorCleanupFailed { return "Remote control cleanup needs attention. Retry Stop PersonaStack Control before setting up CUA." }
+        if executorCleanupInProgress { return "PersonaStack is stopping remote control. Wait for it to finish, then check again." }
+        if repairInProgress || executor.nativeVerificationInProgress {
+            return "Another CUA check or setup is running. Finish it or cancel it, then check again."
+        }
+        if !executor.permissionSetupAvailable {
+            return "Remote control is active or stopping. Use Stop PersonaStack Control before setting up CUA."
+        }
+        return nil
+    }
+    var cuaSetupMessage: String {
+        cuaSetupBlockReason ?? (isCuaReady() ? CuaSetupReadiness.ready.message : cuaCheckFailure)
+            ?? "CUA needs attention. Choose Set Up CUA to continue."
     }
     private var controlSessionIsUsable: Bool { sessionLock.isAwakeAndActive }
     var sessionRecoveryMessage: String? {
@@ -138,15 +168,78 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         try await installer.discoverExisting() != nil
     }
 
+    /// A setup read may connect our idle client, but never installs, starts CUA, or prompts.
+    func observeCuaForSetup() async throws -> CuaSetupReadiness {
+        let generation = lifecycleGeneration
+        var installed = false
+        do {
+            try Task.checkCancellation()
+            if let reason = cuaSetupBlockReason {
+                return .unavailable(installed: selectedCuaInstallation != nil, message: reason)
+            }
+            let discovered = try await installer.discoverExisting()
+            try requireCurrentLifecycle(generation)
+            try Task.checkCancellation()
+            if let reason = cuaSetupBlockReason {
+                return .unavailable(installed: discovered != nil, message: reason)
+            }
+            guard let installation = discovered else {
+                capabilitiesVerified = false
+                cuaPermissions = nil
+                return .absent
+            }
+            installed = true
+            try requireCurrentLifecycle(generation)
+            if let reason = cuaSetupBlockReason { return .unavailable(installed: true, message: reason) }
+            do { _ = try await cuaService.inspectPeer(installation: installation) }
+            catch CuaMCPProxyError.notStarted {
+                try requireCurrentLifecycle(generation)
+                capabilitiesVerified = false
+                cuaPermissions = nil
+                return .stopped
+            }
+            try requireCurrentLifecycle(generation)
+            try await checkCuaConnectionForSetup()
+            try requireCurrentLifecycle(generation)
+            return .ready
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try requireCurrentLifecycle(generation)
+            try Task.checkCancellation()
+            recordCuaFailure(error)
+            if (error as? CuaMCPProxyError) == .permissionsRequired, let snapshot = cuaPermissions {
+                return .permissions(snapshot)
+            }
+            return .unavailable(installed: installed, message: Self.cuaSetupFailureMessage(error))
+        }
+    }
+
+    static func cuaSetupFailureMessage(_ error: Error) -> String {
+        if let error = error as? CuaDriverInstallError { return error.errorDescription ?? "CUA installation failed. Try again." }
+        if let error = error as? CuaStandaloneServiceError { return error.errorDescription ?? "CUA setup failed. Check again." }
+        if let error = error as? CuaMCPProxyError { return error.errorDescription ?? "CUA could not be checked. Try again." }
+        if let error = error as? CuaSetupBlockedError { return error.message }
+        return "CUA could not complete this step. Check again or open Diagnostics for connection details."
+    }
+
+    private func requireCuaSetupAvailable() throws {
+        if let reason = cuaSetupBlockReason { throw CuaSetupBlockedError(message: reason) }
+    }
+
     /// Explicit local setup owns installation and launch. Passive relay paths never call this.
-    func installCuaForSetup() async throws {
-        guard permissionSetupAvailable else { throw CuaMCPProxyError.serviceRunning }
+    func installCuaForSetup(progress: CuaInstallProgress = { _ in }) async throws {
+        try requireCuaSetupAvailable()
         let setupExecutor = executor
         let exclusion = try await setupExecutor.beginNativeVerification()
         defer { setupExecutor.endNativeVerification(exclusion) }
         try Task.checkCancellation()
         let generation = lifecycleGeneration
-        let installation = try await installer.install()
+        let installation = try await installer.install(progress: progress)
+        try requireCurrentLifecycle(generation)
+        try Task.checkCancellation()
+        try setupExecutor.requireNativeVerification(exclusion)
+        await progress(.starting)
         try requireCurrentLifecycle(generation)
         try Task.checkCancellation()
         try setupExecutor.requireNativeVerification(exclusion)
@@ -156,7 +249,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     func requestCuaPermissionsForSetup() async throws {
-        guard permissionSetupAvailable else { throw CuaMCPProxyError.serviceRunning }
+        try requireCuaSetupAvailable()
         let setupExecutor = executor
         let exclusion = try await setupExecutor.beginNativeVerification()
         defer { setupExecutor.endNativeVerification(exclusion) }
@@ -171,7 +264,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     func checkCuaConnectionForSetup() async throws {
-        guard permissionSetupAvailable else { throw CuaMCPProxyError.serviceRunning }
+        try requireCuaSetupAvailable()
         let setupExecutor = executor
         let exclusion = try await setupExecutor.beginNativeVerification()
         defer { setupExecutor.endNativeVerification(exclusion) }
@@ -188,6 +281,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         selectedCuaInstallation = nil
         tools = []
         capabilitiesVerified = false
+        cuaPermissions = nil
         if !paused { readiness = "cua_unavailable" }
         await previous?.stop()
         try requireCurrentLifecycle(generation)

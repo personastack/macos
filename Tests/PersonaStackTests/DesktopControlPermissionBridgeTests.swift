@@ -73,6 +73,10 @@ private actor PermissionBridgeEnrollment: DesktopControlSetupEnrollment {
     let installation: DesktopControlInstallation
     let allowed: Set<String>
     private var rejectEnrollment = false
+    private var failAttachment = false
+    private var suspendReady = false
+    private var pendingReady: CheckedContinuation<Void, Never>?
+    var isReadyPending: Bool { pendingReady != nil }
     private var delayEnrollment = false
     private var pendingEnrollment: CheckedContinuation<Void, Never>?
     var isEnrollmentPending: Bool { pendingEnrollment != nil }
@@ -96,9 +100,21 @@ private actor PermissionBridgeEnrollment: DesktopControlSetupEnrollment {
         try await commitCredential?(installation)
         return installation
     }
-    func reportReady(installation: DesktopControlInstallation, appURL: URL) async throws { try require("reportReady") }
+    func reportReady(installation: DesktopControlInstallation, appURL: URL) async throws {
+        try require("reportReady")
+        if suspendReady { await withCheckedContinuation { pendingReady = $0 } }
+    }
+    func suspendReadyReport() { suspendReady = true }
+    func releaseReadyReport() {
+        suspendReady = false
+        let pending = pendingReady
+        pendingReady = nil
+        pending?.resume()
+    }
+    func loseAttachmentResponse() { failAttachment = true }
     func attach(ticket: String, installation: DesktopControlInstallation, appURL: URL) async throws {
         try require("attach")
+        if failAttachment { throw URLError(.networkConnectionLost) }
         #expect(ticket == String(repeating: "a", count: 43))
         #expect(installation == self.installation)
         #expect(appURL == DesktopEnvironmentConfiguration.production.appURL)
@@ -155,6 +171,7 @@ private struct PermissionBridgeReply: Sendable {
     let code: String?
     let error: String?
     let setupVersion: String?
+    let recoveryVersion: String?
     let legacySetupVersion: String?
     let legacyExecutorReady: Bool?
     let cuaReady: Bool?
@@ -173,7 +190,7 @@ private struct PermissionBridgeFixture {
     let manager: DesktopControlSetupManager
     let page: DesktopControlSetupManager.Page
 
-    init(allowEnrollment: Bool = false, allowReplacement: Bool = false) throws {
+    init(allowEnrollment: Bool = false, allowReplacement: Bool = false, automaticTimeout: Duration = .seconds(60)) throws {
         let configuration = DesktopEnvironmentConfiguration.production
         let payload = try JSONSerialization.data(withJSONObject: [
             "installation_id": "permission-fixture", "machine_credential": String(repeating: "A", count: 43),
@@ -187,7 +204,7 @@ private struct PermissionBridgeFixture {
         suite = "permission-bridge-\(UUID().uuidString)"
         preferences = try #require(UserDefaults(suiteName: suite))
         manager = DesktopControlSetupManager(runtime: runtime, enrollment: enrollment, credentials: credentials,
-            preferences: preferences, configurationProvider: { configuration }, permissionPresenter: presenter)
+            preferences: preferences, configurationProvider: { configuration }, permissionPresenter: presenter, automaticRequestTimeout: automaticTimeout)
         page = DesktopControlSetupManager.Page(appURL: configuration.appURL)
         page.setupScope.synchronize("workspace-session")
     }
@@ -201,6 +218,7 @@ private struct PermissionBridgeFixture {
                 continuation.resume(returning: .init(ok: response?["ok"] as? Bool == true,
                     code: response?["error_code"] as? String, error: error,
                     setupVersion: response?["cua_setup_version"] as? String,
+                    recoveryVersion: response?["setup_recovery_version"] as? String,
                     legacySetupVersion: response?["permissions_checklist_version"] as? String,
                     legacyExecutorReady: response?["native_executor_ready"] as? Bool,
                     cuaReady: response?["cua_ready"] as? Bool,
@@ -287,7 +305,7 @@ func permissionBridgeRepairRejectsInvalidPageAndPayload(_ reason: String) async 
     let fixture = try PermissionBridgeFixture()
     defer { fixture.cleanup() }
     let response = await fixture.send(["version": "1", "action": "state", "scope": "workspace-session"])
-    #expect(response.ok && response.setupVersion == "1")
+    #expect(response.ok && response.setupVersion == "1" && response.recoveryVersion == "1")
     #expect(response.installationID == nil)
     #expect(fixture.credentials.counts.reads == 1)
     #expect(fixture.credentials.counts.saves == 0)
@@ -300,7 +318,7 @@ func permissionBridgeRepairRejectsInvalidPageAndPayload(_ reason: String) async 
     let fixture = try PermissionBridgeFixture()
     defer { fixture.cleanup() }
     let response = await fixture.send(["version": "1", "action": "sync", "scope": "workspace-session"])
-    #expect(response.ok && response.setupVersion == "1")
+    #expect(response.ok && response.setupVersion == "1" && response.recoveryVersion == "1")
     #expect(fixture.credentials.counts.reads == 0 && fixture.credentials.counts.saves == 0)
     #expect(fixture.runtime.calls.isEmpty && fixture.presenter.opens == 0)
     #expect(await fixture.enrollment.calls.isEmpty)
@@ -691,9 +709,10 @@ func permissionBridgeLateCompletionCannotCloseSameScopeSuccessor(finishSuccessor
     #expect(await fixture.enrollment.calls == ["enroll"])
     #expect(fixture.runtime.calls == ["begin", "resumeForSetup"])
     #expect(fixture.presenter.failures.count == 1 && !fixture.presenter.isFinishing)
-    #expect(fixture.presenter.failures[0].contains("fresh setup reference"))
+    #expect(fixture.presenter.failures[0].contains("Return to PersonaStack"))
     #expect(fixture.presenter.completions == 0)
     await fixture.enrollment.setRejectEnrollment(false)
+    #expect(await fixture.send(["version": "1", "action": "sync", "scope": ""]).ok)
     let refreshed = await fixture.send(["version": "1", "action": "sync", "scope": "workspace-session"])
     #expect(refreshed.ok)
     let retry = await fixture.send(fixture.prepare)
@@ -749,4 +768,180 @@ func cuaSetupRechecksUpstreamReadinessBeforeEnrollment() async throws {
     #expect(await fixture.enrollment.calls.isEmpty)
     #expect(fixture.runtime.calls == ["begin", "resumeForSetup"])
     #expect(fixture.presenter.completions == 0)
+}
+
+@Test @MainActor func cuaBridgeScopeChangeSettlesPendingAutomaticReplyOnce() async throws {
+    let fixture = try PermissionBridgeFixture(allowEnrollment: true)
+    defer { fixture.cleanup() }
+    try fixture.credentials.save(fixture.enrollment.installation)
+    await fixture.enrollment.suspendConfigurationReadbacks()
+    var replies = 0
+    var failed = false
+    fixture.manager.dispatch(["version": "1", "action": "state", "scope": "workspace-session"], page: fixture.page) { value, error in
+        replies += 1
+        failed = value == nil && error != nil
+    }
+    try await fixture.waitForConfigurationReadbacks(1)
+    #expect(await fixture.send(["version": "1", "action": "sync", "scope": "other-workspace"]).ok)
+    #expect(replies == 1 && failed)
+    // Reusing the old string cannot revive its prior generation or reply.
+    #expect(await fixture.send(["version": "1", "action": "sync", "scope": "workspace-session"]).ok)
+    await fixture.enrollment.releaseConfigurationReadbacks()
+    for _ in 0..<20 { await Task.yield() }
+    #expect(replies == 1 && fixture.presenter.completions == 0)
+    #expect(fixture.runtime.calls.isEmpty)
+}
+
+@Test @MainActor func cuaBridgeRetirementSettlesPendingAutomaticReplyBeforeDependencyReturns() async throws {
+    let fixture = try PermissionBridgeFixture(allowEnrollment: true)
+    defer { fixture.cleanup() }
+    try fixture.credentials.save(fixture.enrollment.installation)
+    await fixture.enrollment.suspendConfigurationReadbacks()
+    let pending = Task { await fixture.send(["version": "1", "action": "state", "scope": "workspace-session"]) }
+    try await fixture.waitForConfigurationReadbacks(1)
+    fixture.page.retire()
+    let response = await pending.value
+    #expect(!response.ok && response.error != nil)
+    #expect(await fixture.enrollment.pendingConfigurationCount == 1)
+    await fixture.enrollment.releaseConfigurationReadbacks()
+    #expect(fixture.runtime.calls.isEmpty && fixture.presenter.completions == 0)
+}
+
+@Test @MainActor func cuaBridgeAutomaticTimeoutSettlesReplyAndRejectsLateReadback() async throws {
+    let fixture = try PermissionBridgeFixture(allowEnrollment: true, automaticTimeout: .milliseconds(100))
+    defer { fixture.cleanup() }
+    try fixture.credentials.save(fixture.enrollment.installation)
+    await fixture.enrollment.suspendConfigurationReadbacks()
+    let pending = Task { await fixture.send(["version": "1", "action": "state", "scope": "workspace-session"]) }
+    try await fixture.waitForConfigurationReadbacks(1)
+    let response = await pending.value
+    #expect(!response.ok && response.error?.contains("could not be confirmed") == true)
+    #expect(await fixture.enrollment.pendingConfigurationCount == 1)
+    await fixture.enrollment.releaseConfigurationReadbacks()
+    let retry = await fixture.send(["version": "1", "action": "state", "scope": "workspace-session"])
+    #expect(retry.ok && retry.installationID == "permission-fixture")
+    #expect(fixture.runtime.calls.isEmpty)
+}
+
+@Test @MainActor func cuaBridgeHumanConsentOutlastsAutomaticDeadline() async throws {
+    let fixture = try PermissionBridgeFixture(allowEnrollment: true, automaticTimeout: .milliseconds(100))
+    defer { fixture.cleanup() }
+    let pending = Task { await fixture.send(fixture.prepare) }
+    try await fixture.waitForOpen()
+    try await Task.sleep(for: .milliseconds(150))
+    #expect(fixture.presenter.isWaiting && fixture.presenter.failures.isEmpty)
+    #expect(await fixture.enrollment.calls.isEmpty)
+    fixture.presenter.finish()
+    #expect(await pending.value.ok)
+    #expect(await fixture.send(fixture.permissions("completed")).ok)
+    #expect(fixture.presenter.completions == 1)
+}
+
+@Test @MainActor func cuaBridgePendingPrepareExcludesRetryEvenAfterTimeout() async throws {
+    let fixture = try PermissionBridgeFixture(allowEnrollment: true, automaticTimeout: .milliseconds(100))
+    defer { fixture.cleanup() }
+    fixture.presenter.autoFinish = true
+    #expect(await fixture.send(fixture.permissions("open")).ok)
+    await fixture.enrollment.suspendRejectedEnrollment()
+    let pending = Task { await fixture.send(fixture.prepare) }
+    while !(await fixture.enrollment.isEnrollmentPending) { await Task.yield() }
+    let duplicate = await fixture.send(fixture.prepare)
+    #expect(!duplicate.ok && duplicate.error?.contains("still finishing") == true)
+    #expect(!(await pending.value).ok)
+    let lateRetry = await fixture.send(fixture.prepare)
+    #expect(!lateRetry.ok && lateRetry.error?.contains("still finishing") == true)
+    let repair = await fixture.send(fixture.permissions("repair"))
+    #expect(!repair.ok && repair.code == "setup_busy")
+    #expect(await fixture.enrollment.calls == ["enroll"])
+    #expect(fixture.credentials.counts.saves == 0)
+    await fixture.enrollment.releaseEnrollment()
+    for _ in 0..<20 { await Task.yield() }
+    #expect(fixture.credentials.counts.saves == 0)
+    #expect(fixture.presenter.failures.count == 1)
+}
+
+@Test @MainActor func cuaBridgeMissingHostedCompletionReturnsWindowToConnectionRecovery() async throws {
+    let fixture = try PermissionBridgeFixture(allowEnrollment: true, automaticTimeout: .milliseconds(100))
+    defer { fixture.cleanup() }
+    fixture.presenter.autoFinish = true
+    #expect(await fixture.send(fixture.permissions("open")).ok)
+    #expect(await fixture.send(fixture.prepare).ok)
+    try await Task.sleep(for: .milliseconds(150))
+    #expect(!fixture.presenter.isFinishing && fixture.presenter.completions == 0)
+    #expect(fixture.presenter.failures.count == 1)
+    #expect(fixture.presenter.failures.first?.contains("could not be confirmed") == true)
+    #expect(fixture.credentials.counts.saves == 1)
+    // Authoritative readback survives the presentation timeout.
+    let state = await fixture.send(["version": "1", "action": "state", "scope": "workspace-session"])
+    #expect(state.ok && state.installationID == "permission-fixture")
+    #expect(await fixture.enrollment.calls == ["enroll", "reportReady", "configurationState"])
+}
+
+@Test(arguments: [false, true]) @MainActor
+func cuaBridgeConfirmedPreparationRecoversWithoutAttachingOrEnrollingAgain(existing: Bool) async throws {
+    let fixture = try PermissionBridgeFixture(allowEnrollment: true, allowReplacement: existing,
+                                              automaticTimeout: .milliseconds(100))
+    defer { fixture.cleanup() }
+    if existing { try fixture.credentials.save(fixture.enrollment.installation) }
+    fixture.presenter.autoFinish = true
+    #expect(await fixture.send(fixture.permissions("open")).ok)
+    await fixture.enrollment.suspendReadyReport()
+    let pending = Task { await fixture.send(fixture.prepare) }
+    while !(await fixture.enrollment.isReadyPending) { await Task.yield() }
+    #expect(!(await pending.value).ok)
+    #expect(!fixture.runtime.gatewayConnected)
+    #expect(fixture.credentials.counts.saves == 1)
+    await fixture.enrollment.releaseReadyReport()
+    for _ in 0..<20 { await Task.yield() }
+    let retry = await fixture.send(fixture.prepare)
+    #expect(retry.ok && retry.installationID == "permission-fixture")
+    #expect(fixture.runtime.gatewayConnected)
+    #expect(await fixture.enrollment.calls == [existing ? "attach" : "enroll", "reportReady", "reportReady"])
+    #expect(fixture.credentials.counts.saves == 1)
+    #expect(fixture.presenter.opens == 1)
+    #expect(fixture.runtime.calls.filter { $0 == "disconnect" }.count == (existing ? 1 : 0))
+}
+
+@Test @MainActor func cuaBridgeUnknownAttachmentNeverRepeatsMutation() async throws {
+    let fixture = try PermissionBridgeFixture(allowEnrollment: true, allowReplacement: true)
+    defer { fixture.cleanup() }
+    try fixture.credentials.save(fixture.enrollment.installation)
+    fixture.presenter.autoFinish = true
+    #expect(await fixture.send(fixture.permissions("open")).ok)
+    await fixture.enrollment.loseAttachmentResponse()
+    let first = await fixture.send(fixture.prepare)
+    #expect(!first.ok && first.error?.contains("could not be confirmed") == true)
+    let retry = await fixture.send(fixture.prepare)
+    #expect(!retry.ok && retry.error?.contains("could not be confirmed") == true)
+    var otherTicket = fixture.prepare
+    otherTicket["enrollment_ticket"] = String(repeating: "b", count: 43)
+    #expect(!(await fixture.send(otherTicket)).ok)
+    #expect(await fixture.enrollment.calls == ["attach"])
+    #expect(fixture.runtime.calls == ["disconnect"])
+    #expect(fixture.credentials.counts.saves == 1)
+}
+
+@Test @MainActor func cuaBridgeRecoveryRequiresOriginalReferenceAndCurrentSavedInstallation() async throws {
+    let fixture = try PermissionBridgeFixture(allowEnrollment: true)
+    defer { fixture.cleanup() }
+    fixture.presenter.autoFinish = true
+    #expect(await fixture.send(fixture.permissions("open")).ok)
+    #expect(await fixture.send(fixture.prepare).ok)
+    var otherTicket = fixture.prepare
+    otherTicket["enrollment_ticket"] = String(repeating: "b", count: 43)
+    #expect(!(await fixture.send(otherTicket)).ok)
+    fixture.runtime.cuaProbeReady = false
+    #expect(!(await fixture.send(fixture.prepare)).ok)
+    #expect(await fixture.enrollment.calls == ["enroll", "reportReady"])
+    #expect(fixture.credentials.counts.saves == 1)
+    // A changed installation cannot borrow the prior attempt's local approval.
+    let old = fixture.enrollment.installation
+    let encoded = try JSONEncoder().encode(old)
+    var fields = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+    fields["installation_id"] = "different-installation"
+    let different = try JSONDecoder().decode(DesktopControlInstallation.self, from: JSONSerialization.data(withJSONObject: fields))
+    try fixture.credentials.save(different)
+    fixture.runtime.cuaProbeReady = true
+    #expect(!(await fixture.send(fixture.prepare)).ok)
+    #expect(await fixture.enrollment.calls == ["enroll", "reportReady"])
 }

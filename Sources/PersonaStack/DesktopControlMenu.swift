@@ -150,6 +150,9 @@ struct DesktopControlMenu: View {
                 .foregroundStyle(.red)
         }
         Text(DesktopControlRuntime.shared.isCuaReady() ? "CUA: Ready" : "CUA: Not ready")
+        if !DesktopControlRuntime.shared.isCuaReady() {
+            Text(DesktopControlRuntime.shared.cuaSetupMessage).font(.caption)
+        }
         Text(DesktopControlRuntime.shared.gatewayConnected ? "PersonaStack: Connected" : "PersonaStack: Disconnected")
         Button("Set Up CUA…") {
             CuaSetupWindow.shared.presentForRepair()

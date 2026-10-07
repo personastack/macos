@@ -13,6 +13,12 @@ final class DesktopControlDiagnosticsModel: ObservableObject {
     private var checkTask: Task<Void, Never>?
     private var generation = UUID()
 
+    var needsCuaSetup: Bool { report?.guiReady == false }
+    var cuaGuidance: String? {
+        guard let report, !report.guiReady else { return nil }
+        return report.cuaCheckFailure ?? "CUA needs attention. Choose Set Up CUA to continue."
+    }
+
     init(read: @escaping @MainActor () async -> DesktopControlDiagnosticReport = {
         await DesktopControlRuntime.shared.diagnosticReport()
     }, repair: @escaping @MainActor () async throws -> Void = {
@@ -75,7 +81,7 @@ final class DesktopControlDiagnosticsModel: ObservableObject {
         } catch {
             if generation == current {
                 repairMessage = nil
-                repairError = error.localizedDescription
+                repairError = DesktopControlRuntime.cuaSetupFailureMessage(error)
             }
         }
         guard generation == current else { return }
@@ -132,6 +138,9 @@ struct DesktopControlDiagnosticsView: View {
             if let error = model.repairError {
                 Text(error).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
             }
+            if let guidance = model.cuaGuidance {
+                Text(guidance).fixedSize(horizontal: false, vertical: true)
+            }
             ScrollView {
                 if let report = model.report {
                     Text(report.text).font(.system(.body, design: .monospaced))
@@ -158,13 +167,16 @@ struct DesktopControlDiagnosticsView: View {
 
     private var checkButton: some View {
         Button("Check CUA Connection") { model.checkConnection() }
-            .buttonStyle(.borderedProminent)
             .disabled(model.isRepairing)
     }
 
+    @ViewBuilder
     private var setupButton: some View {
-        Button("Set Up CUA…") { CuaSetupWindow.shared.presentForRepair() }
-            .disabled(model.isRepairing)
+        if model.needsCuaSetup {
+            Button("Set Up CUA…") { CuaSetupWindow.shared.presentForRepair() }
+                .buttonStyle(.borderedProminent)
+                .disabled(model.isRepairing)
+        }
     }
 
     private var copyButton: some View {

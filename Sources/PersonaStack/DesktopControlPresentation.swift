@@ -4,6 +4,46 @@ import Foundation
 import PersonaStackCore
 import ServiceManagement
 
+/// Current local observations only. Cloud enrollment is a separate journey.
+enum CuaSetupReadiness: Equatable, Sendable {
+    case unknown
+    case absent
+    case installed
+    case stopped
+    case permissions(CuaDriverPermissionSnapshot)
+    case ready
+    case unavailable(installed: Bool, message: String)
+
+    var installed: Bool {
+        switch self {
+        case .unknown, .absent: false
+        case .unavailable(let installed, _): installed
+        default: true
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .unknown: "Check CUA on this Mac to find the next step."
+        case .absent: "Install CUA to let your agents control this Mac."
+        case .installed: "CUA is installed. Check its connection to continue."
+        case .stopped: "CUA is installed but isn't running. Start CUA to continue."
+        case .ready: "CUA is running and its permissions are ready."
+        case .unavailable(_, let message): message
+        case .permissions(let grants):
+            if !grants.accessibility && !grants.screenRecording {
+                "CUA needs Accessibility and Screen Recording access. Click Grant CUA Permissions, then allow CUA in System Settings."
+            } else if !grants.accessibility {
+                "CUA needs Accessibility access. Click Grant CUA Permissions, then allow CUA in System Settings."
+            } else if !grants.screenRecording {
+                "CUA needs Screen Recording access. Click Grant CUA Permissions, then allow CUA in System Settings."
+            } else {
+                "CUA needs permission to capture your screen directly. Click Grant CUA Permissions and complete the macOS prompt."
+            }
+        }
+    }
+}
+
 enum DesktopControlActivityKind: String, Sendable {
     case observing = "Observing the desktop"
     case input = "Using keyboard or mouse"

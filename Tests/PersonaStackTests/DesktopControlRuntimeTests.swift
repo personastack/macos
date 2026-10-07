@@ -746,12 +746,13 @@ private actor StandaloneRuntimeServiceFixture: DesktopControlCuaServicing {
     let runtime = DesktopControlRuntime.makeForTesting(installer: installer, cuaService: service,
         credentials: EmptyDesktopControlCredentialStore(), paused: true)
     #expect(try await runtime.cuaInstalledForSetup())
+    #expect(try await runtime.observeCuaForSetup() == .stopped)
     #expect(!(await runtime.refreshCuaReadiness()))
     await #expect(throws: CuaMCPProxyError.notStarted) { try await runtime.checkCuaConnectionForSetup() }
     #expect(await installer.installations == 0)
     #expect(await service.setups == 0)
     #expect(await service.permissionRequests == 0)
-    #expect(await service.inspections == 1)
+    #expect(await service.inspections == 2)
     #expect(runtime.paused)
     #expect(!runtime.gatewayConnected)
 }
@@ -786,6 +787,11 @@ private actor StandaloneRuntimeServiceFixture: DesktopControlCuaServicing {
     #expect(runtime.paused)
     #expect(runtime.executorCleanupFailedForTesting)
     #expect(!runtime.permissionSetupAvailable)
+    #expect(runtime.cuaSetupBlockReason?.contains("Retry Stop PersonaStack Control") == true)
+    let observed = try? await runtime.observeCuaForSetup()
+    if case .unavailable(_, let message) = observed {
+        #expect(message.contains("Retry Stop PersonaStack Control"))
+    } else { Issue.record("Cleanup failure must retain its specific recovery guidance") }
     #expect(!runtime.isReady())
     await runtime.pause()
     #expect(!runtime.executorCleanupFailedForTesting)

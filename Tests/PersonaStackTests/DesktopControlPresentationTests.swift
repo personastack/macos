@@ -125,7 +125,9 @@ import Testing
         await model.repairControl()
         #expect(repairs == 1)
         #expect(!model.isRepairing)
-        #expect(model.repairError == "Service unavailable")
+        #expect(model.repairError == DesktopControlRuntime.cuaSetupFailureMessage(Failure()))
+        #expect(!model.needsCuaSetup)
+        #expect(model.cuaGuidance == nil)
     }
 }
 

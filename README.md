@@ -31,7 +31,9 @@ The build uses the pinned Developer ID Application certificate for PersonaStack,
 
 ## Desktop Control with CUA
 
-Choose **Desktop Control → Set Up CUA…** in PersonaStack. Click **Install CUA** to download and install the verified official Cua Driver app. A compatible existing installation is reused. Complete CUA's own macOS permission prompts, then check the connection and connect PersonaStack.
+Choose **Desktop Control → Set Up CUA…** in PersonaStack. The window shows the next button: **Install CUA**, **Start CUA**, or **Grant CUA Permissions**. A compatible installation is reused. Allow CUA in the macOS prompts or System Settings. The window checks readiness before showing **Done** or **Connect PersonaStack**.
+
+Failures stay visible with a recovery action. A startup or permission failure keeps the installed app. Use **Retry Start**, **Grant CUA Permissions**, or **Check Again** as shown. CUA runs as a service, so opening its app does not guarantee a settings window. Repairing CUA does not replace your Desktop Control integration or resume paused control. If linking fails after CUA is ready, choose **Return to Connection** and use **Check Again** in Desktop Control.
 
 CUA controls this Mac. PersonaStack connects your authorized agents to CUA. CUA has its own login service and remains installed after PersonaStack is removed. Cloud control through PersonaStack still requires PersonaStack to run. The menu shows CUA readiness separately from the cloud connection.
 

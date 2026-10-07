@@ -125,21 +125,25 @@ protocol DesktopControlPermissionPresenting: AnyObject {
 }
 
 private enum DesktopControlPermissionBridgeError: LocalizedError {
-    case busy, scopeChanged, incomplete
+    case busy, preparationPending, outcomeUnknown, scopeChanged, incomplete, timedOut
 
     var errorDescription: String? {
         switch self {
         case .busy: "CUA setup is already open."
+        case .preparationPending: "The previous Desktop Control connection is still finishing. Return to PersonaStack and click Check Again."
+        case .outcomeUnknown: "The previous connection result could not be confirmed. Return to PersonaStack and click Check Again before starting another connection."
         case .scopeChanged: "This Desktop Control setup changed. Reopen setup in the current workspace."
         case .incomplete: "Complete CUA setup before connecting this desktop."
+        case .timedOut: "The connection result could not be confirmed. Return to PersonaStack and click Check Again."
         }
     }
 
     var code: String {
         switch self {
-        case .busy: "setup_busy"
+        case .busy, .preparationPending: "setup_busy"
         case .scopeChanged: "setup_scope_changed"
         case .incomplete: "permissions_incomplete"
+        case .timedOut, .outcomeUnknown: "setup_timeout"
         }
     }
 }
@@ -150,19 +154,86 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         configurationProvider: { try LaunchConfiguration.selectedEnvironment() }
     )
 
+    /// Owns one WebKit reply and its automatic work. Settlement releases the reply
+    /// immediately, even when a cancelled dependency takes longer to unwind.
+    @MainActor
+    fileprivate final class Request {
+        let command: DesktopControlSetupCommand
+        var task: Task<Void, Never>?
+        private var deadline: Task<Void, Never>?
+        private var reply: (@MainActor @Sendable (Any?, String?) -> Void)?
+
+        init(command: DesktopControlSetupCommand,
+             reply: @escaping @MainActor @Sendable (Any?, String?) -> Void) {
+            self.command = command
+            self.reply = reply
+        }
+
+        func startDeadline(after duration: Duration) {
+            guard deadline == nil, reply != nil else { return }
+            deadline = Task { @MainActor [weak self] in
+                do { try await Task.sleep(for: duration) } catch { return }
+                self?.cancel(DesktopControlPermissionBridgeError.timedOut)
+            }
+        }
+
+        func finish(_ response: [String: Any]) { settle(response, nil) }
+
+        func fail(_ error: any Error) {
+            if case .cuaSetup = command {
+                let code = (error as? DesktopControlPermissionBridgeError)?.code
+                    ?? (error is CancellationError ? "setup_cancelled" : "permissions_incomplete")
+                settle(["ok": false, "version": "1", "error_code": code], nil)
+            } else {
+                settle(nil, (error as? LocalizedError)?.errorDescription
+                    ?? DesktopControlEnrollmentError.rejected.localizedDescription)
+            }
+        }
+
+        func cancel(_ error: any Error = CancellationError()) {
+            task?.cancel()
+            task = nil
+            fail(error)
+        }
+
+        private func settle(_ response: Any?, _ error: String?) {
+            let callback = reply
+            reply = nil
+            deadline?.cancel()
+            deadline = nil
+            callback?(response, error)
+        }
+    }
+
+    @MainActor
     final class Page {
         let appURL: URL
         var setupScope = DesktopControlSetupScope()
         fileprivate var permissionGeneration: UUID?
         fileprivate var didPrepare = false
         fileprivate var requiresExplicitPermissions = false
+        fileprivate struct Preparation {
+            let ticket: String
+            let generation: UUID
+            var installation: DesktopControlInstallation?
+        }
+        fileprivate var preparation: Preparation?
         private(set) var isRetired = false
+        fileprivate var requests: [UUID: Request] = [:]
+
+        fileprivate func cancelRequests(_ error: any Error = CancellationError()) {
+            let pending = requests.values
+            requests.removeAll()
+            for request in pending { request.cancel(error) }
+        }
 
         init(appURL: URL) { self.appURL = appURL }
 
         func retire() {
             isRetired = true
             setupScope.synchronize("")
+            preparation = nil
+            cancelRequests(DesktopControlPermissionBridgeError.scopeChanged)
         }
     }
 
@@ -180,6 +251,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         presenter.onCancel = { [weak self] in
             guard let self, let page = self.permissionPage else { return }
             self.cancelPermissions(for: page)
+            page.cancelRequests()
             page.setupScope.synchronize("")
         }
         cachedPermissionPresenter = presenter
@@ -187,6 +259,9 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
     }
     private weak var permissionPage: Page?
     private var permissionRequest: UUID?
+    private var activePrepare: UUID?
+    private var completionDeadline: Task<Void, Never>?
+    private let automaticRequestTimeout: Duration
 
     init(
         runtime: any DesktopControlSetupRuntime = DesktopControlRuntime.shared,
@@ -194,7 +269,8 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         credentials: (any DesktopControlCredentialStoring)? = nil,
         preferences: UserDefaults = .standard,
         configurationProvider: @escaping () throws -> DesktopEnvironmentConfiguration = { try LaunchConfiguration.selectedEnvironment() },
-        permissionPresenter: (any DesktopControlPermissionPresenting)? = nil
+        permissionPresenter: (any DesktopControlPermissionPresenting)? = nil,
+        automaticRequestTimeout: Duration = .seconds(60)
     ) {
         self.runtime = runtime
         self.enrollment = enrollment
@@ -202,12 +278,15 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         self.preferences = preferences
         self.configurationProvider = configurationProvider
         self.cachedPermissionPresenter = permissionPresenter
+        self.automaticRequestTimeout = automaticRequestTimeout
         super.init()
     }
 
     func invalidate(_ view: WKWebView) {
-        if let page = pages.object(forKey: view) { cancelPermissions(for: page) }
-        pages.object(forKey: view)?.setupScope.synchronize("")
+        guard let page = pages.object(forKey: view) else { return }
+        cancelPermissions(for: page)
+        page.cancelRequests()
+        page.setupScope.synchronize("")
     }
 
     func unregister(_ view: WKWebView) {
@@ -219,6 +298,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
     func registeredPage(for view: WKWebView) -> Page? { pages.object(forKey: view) }
 
     func register(_ view: WKWebView, appURL: URL) {
+        unregister(view)
         pages.setObject(Page(appURL: appURL), forKey: view)
     }
 
@@ -242,57 +322,71 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             replyHandler(nil, DesktopControlEnrollmentError.invalidRequest.localizedDescription)
             return
         }
-        if case .sync(let scope) = command, !scope.isEmpty {
-            if page.setupScope.value != scope { cancelPermissions(for: page) }
+        if case .sync(let scope) = command {
+            if scope.isEmpty || page.setupScope.value != scope {
+                cancelPermissions(for: page)
+                page.cancelRequests()
+            }
             page.setupScope.synchronize(scope)
-            replyHandler(Self.scopeReply, nil)
-            return
+            if !scope.isEmpty {
+                replyHandler(Self.scopeReply, nil)
+                return
+            }
         }
         logger.notice("desktop control setup \(command.actionName, privacy: .public)")
-        Task { @MainActor in
+        let id = UUID()
+        let request = Request(command: command, reply: replyHandler)
+        page.requests[id] = request
+        switch command {
+        case .cuaSetup(_, .open, _), .prepare: break // Human consent has no transport deadline.
+        default: request.startDeadline(after: automaticRequestTimeout)
+        }
+        request.task = Task { @MainActor in
+            defer { page.requests.removeValue(forKey: id); request.task = nil }
             do {
-                let response = try await apply(command, page: page)
-                replyHandler(response, nil)
+                try Task.checkCancellation()
+                let response = try await apply(command, page: page, beginAutomaticWork: {
+                    request.startDeadline(after: self.automaticRequestTimeout)
+                })
+                try Task.checkCancellation()
+                request.finish(response)
             } catch {
-                if case .cuaSetup = command {
-                    let code = (error as? DesktopControlPermissionBridgeError)?.code
-                        ?? (error is CancellationError ? "setup_cancelled" : "permissions_incomplete")
-                    replyHandler(["ok": false, "version": "1", "error_code": code], nil)
-                    return
-                }
-                let safeMessage = (error as? LocalizedError)?.errorDescription
-                    ?? DesktopControlEnrollmentError.rejected.localizedDescription
                 logger.error("desktop control setup \(command.actionName, privacy: .public) failed")
-                replyHandler(nil, safeMessage)
+                request.fail(error)
             }
         }
     }
 
-    func apply(_ command: DesktopControlSetupCommand, page: Page) async throws -> [String: Any] {
+    func apply(_ command: DesktopControlSetupCommand, page: Page,
+               beginAutomaticWork: (() -> Void)? = nil) async throws -> [String: Any] {
+        try Task.checkCancellation()
         guard !page.isRetired else { throw DesktopControlEnrollmentError.invalidRequest }
         let credentials = credentials ?? FileDesktopControlCredentialStore(appURL: page.appURL)
         switch command {
         case .sync(let scope):
             if scope.isEmpty || page.setupScope.value != scope { cancelPermissions(for: page) }
             page.setupScope.synchronize(scope)
+            let generation = page.setupScope.generation
             if scope.isEmpty {
                 try await runtime.finishSetupIfIdle()
-                try requireCurrentScope(scope, page: page)
+                try requireCurrentScope(scope, generation: generation, page: page)
             }
             return Self.scopeReply
         case .state(let scope):
-            try requireCurrentScope(scope, page: page)
+            let generation = page.setupScope.generation
+            try requireCurrentScope(scope, generation: generation, page: page)
             let installation = try await savedInstallation(credentials: credentials, appURL: page.appURL)
-            try requireCurrentScope(scope, page: page)
+            try requireCurrentScope(scope, generation: generation, page: page)
             var configurationInUse = false
             if let installation {
                 configurationInUse = try await enrollment.configurationState(installation: installation, appURL: page.appURL).hasConfig
-                try requireCurrentScope(scope, page: page)
+                try requireCurrentScope(scope, generation: generation, page: page)
             }
             return [
                 "ok": true,
                 "operating_system": "macos",
                 "cua_setup_version": "1",
+                "setup_recovery_version": "1",
                 "permissions_checklist_version": "1",
                 "installation_id": installation?.installationID as Any? ?? NSNull(),
                 "configuration_in_use": configurationInUse,
@@ -307,7 +401,14 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             if phase != .repair { page.requiresExplicitPermissions = true }
             return try await permissions(scope: scope, phase: phase, message: message, page: page)
         case .prepare(let scope, let ticket):
-            let legacy = !page.requiresExplicitPermissions && page.permissionGeneration == nil && permissionPage == nil
+            guard activePrepare == nil else { throw DesktopControlPermissionBridgeError.preparationPending }
+            let preparation = UUID()
+            activePrepare = preparation
+            // Cancellation rejects the bridge reply immediately, but cannot prove a
+            // remote mutation stopped. Keep exclusion until its actual await settles.
+            defer { if activePrepare == preparation { activePrepare = nil } }
+            let legacy = page.preparation == nil && !page.requiresExplicitPermissions
+                && page.permissionGeneration == nil && permissionPage == nil
             if legacy {
                 // Older hosted pages acquire the existing five-minute ticket first.
                 // Keep the native Finish gate. The API still owns ticket expiry.
@@ -315,15 +416,21 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             }
             let legacyRequest = legacy ? permissionRequest : nil
             let legacyGeneration = page.setupScope.generation
+            beginAutomaticWork?()
             do { return try await prepare(scope: scope, ticket: ticket, page: page, credentials: credentials) }
             catch {
-                if legacy, let legacyRequest, permissionRequest == legacyRequest,
+                if legacy, !Task.isCancelled, let legacyRequest, permissionRequest == legacyRequest,
                    permissionPage === page, page.setupScope.generation == legacyGeneration {
-                    permissionPresenter.failSetup(message: "Desktop Control could not finish. Retry setup to obtain a fresh setup reference.")
+                    completionDeadline?.cancel()
+                    completionDeadline = nil
+                    permissionPresenter.failSetup(message: "Desktop Control could not finish. Return to PersonaStack to check the connection and continue setup.")
                     page.permissionGeneration = nil
                     page.didPrepare = false
                     permissionPage = nil
                     permissionRequest = nil
+                }
+                if page.preparation != nil, !Task.isCancelled {
+                    throw DesktopControlPermissionBridgeError.outcomeUnknown
                 }
                 throw error
             }
@@ -333,19 +440,34 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
     private func prepare(scope: String, ticket: String, page: Page,
                          credentials: any DesktopControlCredentialStoring) async throws -> [String: Any] {
         let generation = page.setupScope.generation
-        try page.setupScope.require(scope, generation: generation)
-        try requireFinishedPermissions(page: page, generation: generation)
+        try requireCurrentScope(scope, generation: generation, page: page)
+        let recovery = page.preparation
+        if let recovery {
+            guard recovery.ticket == ticket, recovery.generation == generation, recovery.installation != nil else {
+                throw DesktopControlPermissionBridgeError.outcomeUnknown
+            }
+        } else {
+            try requireFinishedPermissions(page: page, generation: generation)
+        }
         let saved = try await savedInstallation(credentials: credentials, appURL: page.appURL)
         try requireCurrentScope(scope, generation: generation, page: page)
-        try requireFinishedPermissions(page: page, generation: generation)
-        if let saved {
-            try await runtime.disconnect()
-            try requireCurrentScope(scope, generation: generation, page: page)
-            try await enrollment.attach(ticket: ticket, installation: saved, appURL: page.appURL)
-            try requireCurrentScope(scope, generation: generation, page: page)
+        if let recovery {
+            guard saved == recovery.installation else { throw DesktopControlPermissionBridgeError.outcomeUnknown }
+        } else {
+            try requireFinishedPermissions(page: page, generation: generation)
+            if let saved {
+                try await runtime.disconnect()
+                try requireCurrentScope(scope, generation: generation, page: page)
+                page.preparation = .init(ticket: ticket, generation: generation)
+                try await enrollment.attach(ticket: ticket, installation: saved, appURL: page.appURL)
+                try confirmPreparation(saved, ticket: ticket, scope: scope, generation: generation, page: page)
+                try requireCurrentScope(scope, generation: generation, page: page)
+            }
         }
         let runtimeGeneration = try runtime.beginResume()
         try await runtime.resumeForSetup(generation: runtimeGeneration)
+        try requireCurrentScope(scope, generation: generation, page: page)
+        try requireCurrentLifecycle(runtimeGeneration)
         guard await runtime.refreshCuaReadiness() else {
             throw DesktopControlPermissionBridgeError.incomplete
         }
@@ -360,14 +482,19 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             try requireCurrentLifecycle(runtimeGeneration)
         } else {
             let enrollmentRuntimeGeneration = runtimeGeneration
+            page.preparation = .init(ticket: ticket, generation: generation)
             installation = try await enrollment.enroll(
                 ticket: ticket,
                 appURL: page.appURL,
                 commitCredential: { [weak self] installation in
                     guard let self else { throw CancellationError() }
-                    try self.requireCurrentScope(scope, generation: generation, page: page)
+                    // Preserve an API-issued credential after a transport deadline
+                    // only while its original page and runtime still own the attempt.
+                    guard !page.isRetired else { throw CancellationError() }
+                    try page.setupScope.require(scope, generation: generation)
                     try self.requireCurrentLifecycle(enrollmentRuntimeGeneration)
                     try credentials.save(installation)
+                    try self.confirmPreparation(installation, ticket: ticket, scope: scope, generation: generation, page: page)
                 }
             )
             try requireCurrentScope(scope, generation: generation, page: page)
@@ -402,9 +529,17 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         ]
     }
 
+    private func confirmPreparation(_ installation: DesktopControlInstallation, ticket: String,
+                                    scope: String, generation: UUID, page: Page) throws {
+        guard !page.isRetired, page.preparation?.ticket == ticket,
+              page.preparation?.generation == generation else { throw CancellationError() }
+        try page.setupScope.require(scope, generation: generation)
+        page.preparation?.installation = installation
+    }
+
     private static var scopeReply: [String: Any] {
         ["ok": true, "version": "1", "operating_system": "macos",
-         "cua_setup_version": "1", "permissions_checklist_version": "1"]
+         "cua_setup_version": "1", "setup_recovery_version": "1", "permissions_checklist_version": "1"]
     }
 
     private func permissions(scope: String, phase: DesktopControlSetupCommand.PermissionPhase,
@@ -414,7 +549,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             throw DesktopControlPermissionBridgeError.scopeChanged
         }
         if phase == .repair {
-            guard permissionPage == nil else { throw DesktopControlPermissionBridgeError.busy }
+            guard permissionPage == nil, activePrepare == nil else { throw DesktopControlPermissionBridgeError.busy }
             permissionPresenter.presentForRepair()
             return Self.scopeReply
         }
@@ -433,6 +568,7 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
                 }
                 guard permissionPresenter.isFinishing else { throw DesktopControlPermissionBridgeError.incomplete }
                 page.permissionGeneration = generation
+                startCompletionDeadline(for: page, request: request)
                 return ["ok": true, "cua_setup_version": "1", "permissions_checklist_version": "1", "prerequisites_ready": true]
             } catch {
                 if permissionRequest == request { cancelPermissions(for: page) }
@@ -445,6 +581,8 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
                 throw DesktopControlPermissionBridgeError.incomplete
             }
             try await requireCompletionReadiness(page: page)
+            try requireCurrentScope(scope, generation: generation, page: page)
+            try requireFinishedPermissions(page: page, generation: generation, request: request)
             let credentials = credentials ?? FileDesktopControlCredentialStore(appURL: page.appURL)
             guard let installation = try await savedInstallation(credentials: credentials, appURL: page.appURL) else {
                 throw DesktopControlPermissionBridgeError.incomplete
@@ -461,9 +599,12 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
             try requireCurrentScope(scope, generation: generation, page: page)
             try requireFinishedPermissions(page: page, generation: generation, request: request)
             permissionPresenter.completeSetup()
+            page.preparation = nil
         } else {
             permissionPresenter.failSetup(message: message ?? "Desktop Control setup could not finish. Check the app connection and retry.")
         }
+        completionDeadline?.cancel()
+        completionDeadline = nil
         page.permissionGeneration = nil
         page.didPrepare = false
         permissionPage = nil
@@ -485,10 +626,38 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         }
     }
 
+    private func startCompletionDeadline(for page: Page, request: UUID) {
+        completionDeadline?.cancel()
+        completionDeadline = Task { @MainActor [weak self, weak page] in
+            guard let duration = self?.automaticRequestTimeout else { return }
+            do { try await Task.sleep(for: duration) } catch { return }
+            guard let self, let page, self.permissionRequest == request,
+                  self.permissionPage === page else { return }
+            // A missing hosted callback must not strand the window in Connecting.
+            // The web page retains the setup reference and reconciles API state.
+            for pending in page.requests.values {
+                switch pending.command {
+                case .prepare, .cuaSetup(_, .completed, _):
+                    pending.cancel(DesktopControlPermissionBridgeError.timedOut)
+                default: break
+                }
+            }
+            self.permissionPresenter.failSetup(message: DesktopControlPermissionBridgeError.timedOut.localizedDescription)
+            page.permissionGeneration = nil
+            page.didPrepare = false
+            self.permissionPage = nil
+            self.permissionRequest = nil
+            self.completionDeadline = nil
+        }
+    }
+
     private func cancelPermissions(for page: Page) {
+        page.preparation = nil
         page.permissionGeneration = nil
         page.didPrepare = false
         guard permissionPage === page else { return }
+        completionDeadline?.cancel()
+        completionDeadline = nil
         permissionRequest = nil
         permissionPage = nil
         permissionPresenter.cancel()
@@ -503,11 +672,8 @@ final class DesktopControlSetupManager: NSObject, WKScriptMessageHandlerWithRepl
         return try await runtime.savedInstallation(for: appURL)
     }
 
-    private func requireCurrentScope(_ scope: String, page: Page) throws {
-        try requireCurrentScope(scope, generation: page.setupScope.generation, page: page)
-    }
-
     private func requireCurrentScope(_ scope: String, generation: UUID, page: Page) throws {
+        try Task.checkCancellation()
         guard !page.isRetired else { throw CancellationError() }
         try page.setupScope.require(scope, generation: generation)
         if page.permissionGeneration != nil { try requireFinishedPermissions(page: page, generation: generation) }
