@@ -40,8 +40,8 @@ private actor WorkflowCua: CuaToolCalling {
             throw CuaToolCatalog.ValidationError.invalidArguments
         }
         if name == "end_session", suspendEnd { await withCheckedContinuation { endGate = $0 } }
-        let result = next.result ?? (name == "end_session"
-            ? .object(["structuredContent": .object(["session": .string(owned), "active": .bool(false)])])
+        let result = next.result ?? (["start_session", "end_session"].contains(name)
+            ? .object(["structuredContent": .object(["session": .string(owned), "active": .bool(name == "start_session")])])
             : .object(["content": .array([])]))
         return try JSONEncoder().encode(DesktopControlJSONValue.object([
             "jsonrpc": .string("2.0"), "id": .number(1), "result": result,
@@ -60,12 +60,13 @@ struct DesktopCuaRemoteWorkflowTests {
     private let target = DesktopControlTarget(installationID: "fixture-install", workspaceID: "fixture-workspace",
         configID: "fixture-config", personaID: "fixture-persona", runID: "fixture-run", generation: 1, configVersion: nil)
 
-    private func frame(_ operation: String, _ fields: [String: DesktopControlJSONValue] = [:]) -> DesktopControlFrame {
-        DesktopControlFrame(type: "command", requestID: UUID().uuidString, target: target, operation: operation,
+    private func frame(_ operation: String, _ fields: [String: DesktopControlJSONValue] = [:],
+                       target: DesktopControlTarget? = nil) -> DesktopControlFrame {
+        DesktopControlFrame(type: "command", requestID: UUID().uuidString, target: target ?? self.target, operation: operation,
             arguments: .object(fields), deadlineAt: Date().addingTimeInterval(30))
     }
-    private func acquire(_ executor: DesktopControlCommandExecutor) async throws -> String {
-        let response = await executor.handle(frame("desktop_control_acquire"), proxy: nil)
+    private func acquire(_ executor: DesktopControlCommandExecutor, target: DesktopControlTarget? = nil) async throws -> String {
+        let response = await executor.handle(frame("desktop_control_acquire", target: target), proxy: nil)
         #expect(response.type == "result")
         guard case .object(let fields)? = response.result, case .string(let token)? = fields["control_token"] else {
             throw CuaToolCatalog.ValidationError.invalidArguments
@@ -73,9 +74,61 @@ struct DesktopCuaRemoteWorkflowTests {
         return token
     }
     private func call(_ executor: DesktopControlCommandExecutor, _ proxy: WorkflowCua, _ token: String,
-                      _ tool: String, _ arguments: [String: DesktopControlJSONValue] = [:]) async -> DesktopControlFrame {
+                      _ tool: String, _ arguments: [String: DesktopControlJSONValue] = [:],
+                      target: DesktopControlTarget? = nil) async -> DesktopControlFrame {
         await executor.handle(frame("desktop_control_cua", ["control_token": .string(token),
-            "tool": .string(tool), "arguments": .object(arguments)]), proxy: proxy)
+            "tool": .string(tool), "arguments": .object(arguments)], target: target), proxy: proxy)
+    }
+
+    private func namedTarget(_ name: String, run: String = "fixture-run") -> DesktopControlTarget {
+        DesktopControlTarget(installationID: target.installationID, workspaceID: target.workspaceID,
+            configID: target.configID, personaID: target.personaID, runID: run, generation: target.generation,
+            ownerDisplay: .init(personaName: name, workspaceName: "Fixture workspace"))
+    }
+
+    @Test(arguments: ["Lumina", "  Lumina  ", "default", "__cua_runtime_persona", "研究者 🌟"])
+    func personaCursorLabelIsStableAndRevivedForEachLease(name: String) async throws {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let expectedLabel = trimmed == "default" || trimmed.hasPrefix("__cua_runtime_") ? "Persona: \(trimmed)" : trimmed
+        let steps: [WorkflowCua.Expected] = [.init(name: "start_session"), .init(name: "get_config"),
+            .init(name: "get_config"), .init(name: "end_session", timeout: 5)]
+        let proxy = WorkflowCua(steps + steps)
+        let executor = DesktopControlCommandExecutor()
+        var previousToken: String?
+        for run in ["first-run", "second-run"] {
+            let owner = namedTarget(name, run: run)
+            let token = try await acquire(executor, target: owner)
+            #expect(token != previousToken)
+            previousToken = token
+            #expect(await call(executor, proxy, token, "get_config", target: owner).type == "result")
+            #expect(await proxy.observedSession() == expectedLabel)
+            #expect(await proxy.observedSession() != token)
+            // Refreshing display metadata cannot switch an active CUA session.
+            let renamed = namedTarget("Renamed persona", run: run)
+            #expect(try await acquire(executor, target: renamed) == token)
+            #expect(await call(executor, proxy, token, "get_config", target: renamed).type == "result")
+            #expect(await executor.handle(frame("desktop_control_release", ["control_token": .string(token)], target: owner),
+                proxy: proxy).type == "result")
+        }
+        #expect(await proxy.callCount() == 8)
+        await proxy.assertDrained()
+        #expect(await executor.close())
+    }
+
+    @Test(arguments: ["foreign", "inactive", "missing", "numeric"])
+    func unconfirmedNamedSessionNeverDispatchesTheRequestedTool(mode: String) async throws {
+        let owner = namedTarget("Lumina")
+        let result: DesktopControlJSONValue = mode == "missing" ? .object([:]) : .object([
+            "structuredContent": .object(["session": .string(mode == "foreign" ? "Another persona" : "Lumina"),
+                                          "active": mode == "numeric" ? .number(1) : .bool(mode != "inactive")]),
+        ])
+        let proxy = WorkflowCua([.init(name: "start_session", result: result), .init(name: "end_session", timeout: 5)])
+        let executor = DesktopControlCommandExecutor()
+        let token = try await acquire(executor, target: owner)
+        #expect(await call(executor, proxy, token, "get_config", target: owner).type == "failure")
+        #expect(await proxy.callCount() == 1)
+        #expect(await executor.close())
+        await proxy.assertDrained()
     }
 
     @Test func upstreamBrowserAndRecordingCallsRemainDirectAndSessionScoped() async throws {
@@ -94,6 +147,8 @@ struct DesktopCuaRemoteWorkflowTests {
             #expect(response.type == "result", "\(name): \(response.errorCode ?? "")")
         }
         #expect(await proxy.observedSession() != token)
+        let fallbackSession = try #require(await proxy.observedSession())
+        #expect(UUID(uuidString: fallbackSession) != nil)
         let released = await executor.handle(frame("desktop_control_release", ["control_token": .string(token)]), proxy: proxy)
         #expect(released.type == "result")
         #expect(await call(executor, proxy, token, "get_config").type == "failure")
@@ -120,6 +175,7 @@ struct DesktopCuaRemoteWorkflowTests {
             ("unknown_tool", [:]), ("get_config", ["unknown": .bool(true)]),
             ("install_extension", ["name": .string("perception"), "confirm": .bool(true)]),
             ("get_config", ["_session_id": .string("foreign")]),
+            ("get_config", ["_public_session_label": .string("Another persona")]),
             ("get_config", ["session": .string("foreign")]),
             ("check_permissions", ["prompt": .bool(true)]),
             ("check_permissions", ["probe_direct_capture": .bool(true)]),

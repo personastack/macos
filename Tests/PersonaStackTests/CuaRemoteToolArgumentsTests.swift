@@ -33,7 +33,7 @@ struct CuaRemoteToolArgumentsTests {
     }
 
     @Test func callersCannotChooseSessionAuthority() {
-        for key in ["session", "_session_id", "_transport_session_id", "unknown"] {
+        for key in ["session", "_session_id", "_transport_session_id", "_public_session_label", "unknown"] {
             #expect(throws: (any Error).self) {
                 try CuaRemoteToolArguments.prepare(name: "get_config", arguments: .object([key: .string("foreign")]), session: "owned")
             }

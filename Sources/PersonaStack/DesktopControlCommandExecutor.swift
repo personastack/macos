@@ -31,7 +31,8 @@ final class DesktopControlCommandExecutor {
         let owner: Owner
         let configVersion: Int64
         let token: String
-        let cuaSession = UUID().uuidString
+        let cuaSession: String
+        var cuaSessionNeedsStart: Bool
         let started: ContinuousClock.Instant
         var lastActivity: ContinuousClock.Instant
     }
@@ -305,7 +306,7 @@ final class DesktopControlCommandExecutor {
                 let ready = !closed && !unavailable && !revocationInProgress && nativeVerificationID == nil
                 result = ["available": ready, "native_executor_ready": ready, "busy": validLease() != nil || nativeVerificationID != nil]
             case "desktop_control_acquire":
-                result = try await acquire(owner, scope: scope, configVersion: configVersion)
+                result = try await acquire(owner, scope: scope, configVersion: configVersion, ownerDisplay: target.ownerDisplay)
                 if validLease()?.owner == owner { leaseOwnerDisplay = target.ownerDisplay }
             case "desktop_control_release":
                 try requireLease(owner, arguments: frame.arguments, renew: false)
@@ -349,7 +350,8 @@ final class DesktopControlCommandExecutor {
         cleanupFailureMayRestoreAvailability = true
     }
 
-    private func acquire(_ owner: Owner, scope: ConfigScope, configVersion: Int64) async throws -> [String: Any] {
+    private func acquire(_ owner: Owner, scope: ConfigScope, configVersion: Int64,
+                         ownerDisplay: DesktopControlOwnerDisplay?) async throws -> [String: Any] {
         guard nativeVerificationID == nil else { throw CommandError.executorUnavailable }
         if let active = validLease() {
             guard active.owner == owner else { throw CommandError.busy }
@@ -376,7 +378,15 @@ final class DesktopControlCommandExecutor {
         try DesktopControlExecution.check()
         let token = UUID().uuidString.lowercased()
         let now = now()
-        lease = Lease(owner: owner, configVersion: configVersion, token: token, started: now, lastActivity: now)
+        let personaName = ownerDisplay?.personaName.trimmingCharacters(in: .whitespacesAndNewlines)
+        // CUA reserves these session labels. Prefix only those names so they
+        // still identify the persona without selecting an implicit/private session.
+        let cuaSession = personaName.map {
+            $0 == "default" || $0.hasPrefix("__cua_runtime_") ? "Persona: \($0)" : $0
+        } ?? UUID().uuidString
+        lease = Lease(owner: owner, configVersion: configVersion, token: token,
+                      cuaSession: cuaSession, cuaSessionNeedsStart: personaName != nil,
+                      started: now, lastActivity: now)
         return ["control_token": token, "expires_in_seconds": 90]
     }
 
@@ -562,7 +572,36 @@ final class DesktopControlCommandExecutor {
                                                      controlToken: lease?.cuaSession ?? "")
         guard let currentLease = validLease() else { throw CommandError.controlRequired }
         leaseCuaProxy = proxy
-        let encoded = try JSONEncoder().encode(preparedArguments)
+        if currentLease.cuaSessionNeedsStart {
+            // Named sessions need explicit revival after a previous lease ends.
+            // No capture policy, permission request, or cursor setting is supplied.
+            let started = try await invokeCua(name: "start_session",
+                arguments: .object(["session": .string(currentLease.cuaSession)]), proxy: proxy)
+            let decoded = try JSONDecoder().decode(DesktopControlJSONValue.self,
+                from: JSONSerialization.data(withJSONObject: started))
+            guard case .object(let startedFields) = decoded,
+                  case .object(let confirmation)? = startedFields["structuredContent"],
+                  confirmation["session"] == .string(currentLease.cuaSession),
+                  confirmation["active"] == .bool(true) else { throw CommandError.commandFailed }
+            try requireCurrentCuaLease(currentLease)
+            lease?.cuaSessionNeedsStart = false
+        }
+        let result = try await invokeCua(name: name, arguments: preparedArguments, proxy: proxy)
+        try requireCurrentCuaLease(currentLease)
+        return try Self.boundedCuaImageResult(result)
+    }
+
+    private func requireCurrentCuaLease(_ currentLease: Lease) throws {
+        guard isBindingAuthorized(currentLease.owner) else { throw CommandError.bindingRevoked }
+        guard isConfigVersionAuthorized(Self.scope(currentLease.owner), currentLease.configVersion) else {
+            throw CommandError.configurationRevoked
+        }
+        guard validLease()?.token == currentLease.token else { throw CommandError.controlRequired }
+    }
+
+    private func invokeCua(name: String, arguments: DesktopControlJSONValue,
+                           proxy: any CuaToolCalling) async throws -> [String: Any] {
+        let encoded = try JSONEncoder().encode(arguments)
         let response = try await proxy.callTool(name: name, argumentsJSON: encoded, timeout: 60)
         guard let object = try JSONSerialization.jsonObject(with: response) as? [String: Any],
               let result = object["result"] as? [String: Any], object["error"] == nil else {
@@ -573,12 +612,7 @@ final class DesktopControlCommandExecutor {
             logger.error("Cua tool returned an error tool=\(name, privacy: .public)")
             throw DesktopCuaFailure.from(result, tool: name)
         }
-        guard isBindingAuthorized(currentLease.owner) else { throw CommandError.bindingRevoked }
-        guard isConfigVersionAuthorized(Self.scope(currentLease.owner), currentLease.configVersion) else {
-            throw CommandError.configurationRevoked
-        }
-        guard validLease()?.token == currentLease.token else { throw CommandError.controlRequired }
-        return try Self.boundedCuaImageResult(result)
+        return result
     }
 
     static func cuaArguments(name: String, arguments: DesktopControlJSONValue,
