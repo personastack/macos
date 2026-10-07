@@ -28,6 +28,10 @@ import AppKit
     func install() {}
     func installConcernNavigation(_ action: @escaping @MainActor (URL) -> Void) {}
 }
+@MainActor final class ChatWindowManager {
+    static let shared = ChatWindowManager()
+    var navigateMainWindow: (URL) -> Void = { _ in }
+}
 @MainActor final class MainWebViewHost {
     static let shared = MainWebViewHost()
     let coordinator = NavigationProbe()
