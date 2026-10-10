@@ -224,17 +224,16 @@ else:
 
 
 class HomebrewWorkflowTests(unittest.TestCase):
-    def test_all_release_tags_share_a_non_cancelling_job_queue(self):
+    def test_all_release_tags_share_a_non_cancelling_workflow_queue(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
-        # The whole job owns the queue, from tap checkout through the final feed
-        # push. Tag-specific groups would let older --latest calls race newer ones.
-        self.assertIn("""  release:
-    runs-on: macos-26
-    concurrency:
-      group: macos-release-${{ github.event_name == 'push' && 'publication' || github.run_id }}
-      cancel-in-progress: false
-      queue: max
-    steps:
+        # The whole workflow owns preparation, acceptance and final feed push.
+        # Tag-specific groups would let older --latest calls race newer ones.
+        self.assertIn("""concurrency:
+  group: macos-release-${{ github.event_name == 'push' && 'publication' || github.run_id }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
 """, workflow)
 
     def test_tap_publication_is_mandatory_for_tags_and_excluded_from_validation(self):

@@ -13,14 +13,20 @@ on:
 
 permissions:
   contents: write
+  actions: read
+
+concurrency:
+  group: macos-release-${{ github.event_name == 'push' && 'publication' || github.run_id }}
+  cancel-in-progress: false
+  queue: max
 
 jobs:
-  release:
+  prepare:
     runs-on: macos-26
-    concurrency:
-      group: macos-release-${{ github.event_name == 'push' && 'publication' || github.run_id }}
-      cancel-in-progress: false
-      queue: max
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      installer_sha256: ${{ steps.candidate.outputs.sha256 }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,13 +42,23 @@ jobs:
           GOSUMDB: off
         run: cd agent-bridge && go test -parallel "$(sysctl -n hw.logicalcpu)" ./...
       - name: Select release version
+        id: version
         env:
           REQUESTED_VERSION: ${{ inputs.version || github.ref_name }}
-        run: printf 'RELEASE_VERSION=%s\n' "${REQUESTED_VERSION#v}" >> "$GITHUB_ENV"
+        run: |
+          printf 'RELEASE_VERSION=%s\n' "${REQUESTED_VERSION#v}" >> "$GITHUB_ENV"
+          printf 'version=%s\n' "${REQUESTED_VERSION#v}" >> "$GITHUB_OUTPUT"
       - name: Test appcast validation fixtures
         run: python3 -m unittest discover -s scripts/tests
       - name: Validate authored release notes
         run: python3 scripts/release_notes.py "$RELEASE_VERSION" "release-notes/$RELEASE_VERSION.md"
+      - name: Require protected publication handoff before signing
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/environments/macos-release-publication" > "$RUNNER_TEMP/publication-environment.json"
+          python3 scripts/release_candidate.py environment "$RUNNER_TEMP/publication-environment.json"
       - name: Import pinned release signing identity
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
@@ -116,6 +132,75 @@ jobs:
               --triple "$architecture-apple-macosx14.0" -c release --product PersonaStack
           done
           ./scripts/build-agent-bridge.sh build/validation-agent-bridge "$RELEASE_VERSION"
+      - name: Seal signed acceptance candidate
+        id: candidate
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          candidate_sha256=$(python3 scripts/release_candidate.py seal artifacts --version "$RELEASE_VERSION" --source-sha "$GITHUB_SHA")
+          printf 'sha256=%s\n' "$candidate_sha256" >> "$GITHUB_OUTPUT"
+          cp "release-notes/$RELEASE_VERSION.md" artifacts/release-notes.md
+      - name: Retain immutable signed candidate for installed acceptance
+        id: upload
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-signed-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            artifacts/PersonaStack-${{ env.RELEASE_VERSION }}-developerid.dmg
+            artifacts/release-candidate.json
+            artifacts/release-notes.md
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 30
+      - name: Record candidate acceptance identity
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          CANDIDATE_ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          CANDIDATE_ARCHIVE_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          CANDIDATE_SHA256: ${{ steps.candidate.outputs.sha256 }}
+        run: |
+          printf 'Signed candidate: version %s, source %s, run %s attempt %s, artifact %s, archive digest %s, DMG SHA-256 %s.\n\n' "$RELEASE_VERSION" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$CANDIDATE_ARTIFACT_ID" "$CANDIDATE_ARCHIVE_DIGEST" "$CANDIDATE_SHA256" >> "$GITHUB_STEP_SUMMARY"
+          printf 'The release owner must record installed acceptance for these exact bytes before approving macos-release-publication. Failed acceptance blocks GitHub Release, Homebrew and Sparkle publication. Actions artifacts remain accessible to repository readers.\n' >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove temporary signing keychain
+        if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          signing_dir="$RUNNER_TEMP/personastack-release-signing"
+          if [ -f "$signing_dir/signing.keychain-db" ]; then
+            security delete-keychain "$signing_dir/signing.keychain-db"
+          fi
+          rm -rf "$signing_dir"
+          rm -f "$RUNNER_TEMP/personastack-notary.p8"
+
+  publish:
+    needs: prepare
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-26
+    environment: macos-release-publication
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Recheck publication protection
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/environments/macos-release-publication" > "$RUNNER_TEMP/publication-environment.json"
+          python3 scripts/release_candidate.py environment "$RUNNER_TEMP/publication-environment.json"
+      - name: Download the accepted installer without rebuilding
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.artifact_id }}
+          path: artifacts
+      - name: Verify exact accepted candidate bytes and notes
+        env:
+          EXPECTED_SHA256: ${{ needs.prepare.outputs.installer_sha256 }}
+        run: |
+          python3 scripts/release_candidate.py verify artifacts --version "$RELEASE_VERSION" --source-sha "$GITHUB_SHA" --expected-sha256 "$EXPECTED_SHA256"
+          cmp artifacts/release-notes.md "release-notes/$RELEASE_VERSION.md"
+          python3 scripts/release_notes.py "$RELEASE_VERSION" "release-notes/$RELEASE_VERSION.md"
       - name: Publish GitHub release
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
@@ -156,12 +241,3 @@ jobs:
             "$GITHUB_WORKSPACE/artifacts/PersonaStack-$RELEASE_VERSION-developerid.dmg" \
             "$GITHUB_WORKSPACE/build/homebrew-tap" "$RUNNER_TEMP/personastack-sparkle" \
             "$GITHUB_WORKSPACE/release-notes/$RELEASE_VERSION.md"
-      - name: Remove temporary signing keychain
-        if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        run: |
-          signing_dir="$RUNNER_TEMP/personastack-release-signing"
-          if [ -f "$signing_dir/signing.keychain-db" ]; then
-            security delete-keychain "$signing_dir/signing.keychain-db"
-          fi
-          rm -rf "$signing_dir"
-          rm -f "$RUNNER_TEMP/personastack-notary.p8"
