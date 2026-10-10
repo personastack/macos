@@ -100,7 +100,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         switch command.action {
         case "discover": return try await discover(command, page: page, document: document)
         case "migration_prepare": return try await migrate(command, page: page, cookies: cookies, document: document, view: view)
-        case "prepare": return try await prepare(command, page: page, document: document)
+        case "prepare": return try await prepare(command, page: page, cookies: cookies, document: document, view: view)
         case "enroll": return try await enroll(command, page: page, document: document)
         case "connections": return try await connections(page: page, cookies: cookies, scope: command.scope, document: document)
         default: return try await manage(command, page: page, cookies: cookies, document: document, view: view)
@@ -142,11 +142,12 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         }]
     }
 
-    private func prepare(_ command: AgentBridgePageCommand, page: Page, document: UUID) async throws -> [String: Any] {
+    private func prepare(_ command: AgentBridgePageCommand, page: Page, cookies: String, document: UUID, view: WKWebView, canRecoverMigration: Bool = true) async throws -> [String: Any] {
         guard let profile = command.profileCandidateID, let candidate = page.profiles[profile],
               candidate.runtimeKind == command.runtime else { throw AgentBridgeFailure.scopeChanged }
         if let pending = page.pendingMigration {
             guard pending.persona == command.personaID, pending.profile == profile else { throw AgentBridgeFailure.scopeChanged }
+            try await pending.coordinator.ensureRevoked()
         }
         try await ready(page, scope: command.scope, document: document)
         let request = try AgentBridgeRequest(operation: "prepare", payload: [
@@ -156,6 +157,11 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         ])
         let result = try await client.send(request, returning: AgentBridgePreparation.self)
         try current(page, scope: command.scope, document: document)
+        if result.migrationPending == true {
+            guard canRecoverMigration else { throw AgentBridgeFailure.migrationIncomplete }
+            try await recoverMigration(command, page: page, cookies: cookies, document: document, view: view)
+            return try await prepare(command, page: page, cookies: cookies, document: document, view: view, canRecoverMigration: false)
+        }
         if let existing = result.existingBindingKey {
             guard existing.environmentID == page.configuration.appOrigin else { throw AgentBridgeFailure.scopeChanged }
             return ["ok": true, "existing_connection_id": existing.connectionID]
@@ -168,9 +174,14 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
             guard pending.persona == command.personaID, pending.profile == profile else { throw AgentBridgeFailure.scopeChanged }
             page.migrations[preparation] = (pending.coordinator, pending.cutover)
         }
-        return ["ok": true, "desktop_preparation": [
+        var response: [String: Any] = ["ok": true, "desktop_preparation": [
             "preparation_id": preparation.uuidString.lowercased(), "device_public_key": publicKey,
             "profile_candidate_id": profile], "expires_at": expires]
+        if let pending = page.pendingMigration {
+            response["migration_started"] = true
+            response["was_paused"] = pending.cutover.wasPaused
+        }
+        return response
     }
 
     private func enroll(_ command: AgentBridgePageCommand, page: Page, document: UUID) async throws -> [String: Any] {
@@ -200,7 +211,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         page.migrating = true
         defer { page.migrating = false }
         let csrf = try await csrfReader(view)
-        let authority = AgentBridgeMigrationAuthority()
+        let authority = AgentBridgeMigrationAuthority(transport: hosted.transport)
         let persona = command.personaID!, workspace = command.workspaceID!
         let validate: @MainActor @Sendable () async throws -> Void = { [self] in
             _ = try await self.cookies(view: view, page: page)
@@ -221,7 +232,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
                 try await validate()
                 return try await authority.pause(configuration: page.configuration, cookies: cookies, csrf: csrf, persona: persona, paused: paused, expectedVersion: version)
             },
-            capture: { [self] in
+            capture: { [self] wasPaused, pauseVersion in
                 try await validate()
                 let old = try await hosted.read(configuration: page.configuration, cookies: cookies, persona: persona)
                 try old.require(workspace: workspace, persona: persona, connection: command.connectionID!,
@@ -230,7 +241,8 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
                     "environment_id": .string(page.configuration.appOrigin), "workspace_id": .string(workspace),
                     "persona_id": .string(persona), "connection_id": .string(command.connectionID!),
                     "connection_generation": .integer(command.connectionGeneration!), "runtime_kind": .string(command.runtime!.rawValue),
-                    "profile_candidate_id": .string(profile), "document_id": .string(document.uuidString.lowercased())
+                    "profile_candidate_id": .string(profile), "document_id": .string(document.uuidString.lowercased()),
+                    "was_paused": .bool(wasPaused), "pause_version": .integer(pauseVersion)
                 ]), returning: AgentBridgeMigrationCapture.self)
             },
             stopSupervisor: { scope in try await validate(); try AgentBridgeLegacySupervisor.stop(scope: scope) },
@@ -241,25 +253,23 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
             },
             validateScope: validate,
             readiness: { [self] binding in
-                for _ in 0..<120 {
-                    try await validate()
-                    let remote = try await hosted.read(configuration: page.configuration, cookies: cookies, persona: persona)
-                    guard remote.workspaceID == workspace, remote.personaID == persona,
-                          remote.connectionID == binding.connectionID, remote.clientKind == "macos_app" else { throw AgentBridgeFailure.scopeChanged }
-                    let local = try await client.send(AgentBridgeRequest(operation: "check", payload: ["binding_key": bindingValue(binding)]), returning: AgentBridgeConnections.self)
-                    if remote.readinessStatus == "wakeable", local.connections.contains(where: { $0.bindingKey == binding && $0.readinessState == "ready" }) { return }
-                    try await Task.sleep(for: .milliseconds(250))
-                }
-                throw AgentBridgeFailure.runtimeConflict
+                try await awaitMigrationReadiness(page: page, cookies: cookies, persona: persona, workspace: workspace,
+                    binding: binding, validate: validate)
             },
             test: { try await validate(); try await authority.test(configuration: page.configuration, cookies: cookies, csrf: csrf, persona: persona) }
         ))
         let cutover: AgentBridgeMigrationCoordinator.Cutover
         do { cutover = try await coordinator.begin() }
-        catch { throw coordinator.revoked ? AgentBridgeFailure.migrationIncomplete : error }
+        catch {
+            if coordinator.revoked, let pending = coordinator.preparedCutover {
+                page.pendingMigration = (persona, profile, coordinator, pending)
+                throw AgentBridgeFailure.migrationIncomplete
+            }
+            throw error
+        }
         guard cutover.capture.profileCandidateID == profile else { throw AgentBridgeFailure.scopeChanged }
         page.pendingMigration = (persona, profile, coordinator, cutover)
-        let preparation = try await prepare(command, page: page, document: document)
+        let preparation = try await prepare(command, page: page, cookies: cookies, document: document, view: view)
         guard let value = preparation["desktop_preparation"] as? [String: String],
               let rawID = value["preparation_id"], let id = UUID(uuidString: rawID) else { throw AgentBridgeFailure.scopeChanged }
         page.migrations[id] = (coordinator, cutover)
@@ -267,6 +277,73 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         result["migration_started"] = true
         result["was_paused"] = cutover.wasPaused
         return result
+    }
+
+    private func recoverMigration(_ command: AgentBridgePageCommand, page: Page, cookies: String, document: UUID, view: WKWebView) async throws {
+        let persona = command.personaID!, workspace = command.workspaceID!, profile = command.profileCandidateID!
+        let validate: @MainActor @Sendable () async throws -> Void = { [self] in
+            _ = try await self.cookies(view: view, page: page)
+            try current(page, scope: command.scope, document: document)
+        }
+        let absent = try await hosted.read(configuration: page.configuration, cookies: cookies, persona: persona)
+        guard absent.workspaceID == workspace, absent.personaID == persona,
+              absent.connectionID == nil || absent.connectionID == "" else { throw AgentBridgeFailure.scopeChanged }
+        let authority = AgentBridgeMigrationAuthority(transport: hosted.transport)
+        let state = try await authority.state(configuration: page.configuration, cookies: cookies, persona: persona)
+        guard state.userPaused, state.laneIdle else { throw AgentBridgeFailure.busy }
+        try await validate()
+        guard Self.confirmMigrationResume() else { throw AgentBridgeFailure.migrationIncomplete }
+        let csrf = try await csrfReader(view)
+        try await validate()
+        // Repeat absence after the dialog. A replacement binding blocks takeover.
+        let afterDialog = try await hosted.read(configuration: page.configuration, cookies: cookies, persona: persona)
+        guard afterDialog.workspaceID == workspace, afterDialog.personaID == persona,
+              afterDialog.connectionID == nil || afterDialog.connectionID == "" else { throw AgentBridgeFailure.scopeChanged }
+        try await validate()
+        let capture = try await client.send(AgentBridgeRequest(operation: "migration_repair", payload: [
+            "environment_id": .string(page.configuration.appOrigin), "workspace_id": .string(workspace), "persona_id": .string(persona),
+            "runtime_kind": .string(command.runtime!.rawValue), "profile_candidate_id": .string(profile),
+            "document_id": .string(document.uuidString.lowercased()), "pause_version": .integer(state.pauseVersion), "revocation_readback": .object([
+                "environment_id": .string(page.configuration.appOrigin), "workspace_id": .string(workspace),
+                "persona_id": .string(persona), "binding_absent": .bool(true)
+            ])
+        ]), returning: AgentBridgeMigrationCapture.self)
+        try await validate()
+        guard capture.profileCandidateID == profile, let wasPaused = capture.wasPaused,
+              let pauseVersion = capture.pauseVersion else { throw AgentBridgeFailure.migrationIncomplete }
+        let currentState = try await authority.state(configuration: page.configuration, cookies: cookies, persona: persona)
+        guard currentState.userPaused, currentState.laneIdle, currentState.pauseVersion == pauseVersion else {
+            throw AgentBridgeFailure.scopeChanged
+        }
+        let coordinator = AgentBridgeMigrationCoordinator(.init(
+            setPause: { paused, version in
+                try await validate()
+                return try await authority.pause(configuration: page.configuration, cookies: cookies, csrf: csrf,
+                    persona: persona, paused: paused, expectedVersion: version)
+            },
+            validateScope: validate,
+            readiness: { [self] binding in
+                try await awaitMigrationReadiness(page: page, cookies: cookies, persona: persona, workspace: workspace,
+                    binding: binding, validate: validate)
+            },
+            test: { try await validate(); try await authority.test(configuration: page.configuration, cookies: cookies, csrf: csrf, persona: persona) }
+        ))
+        let cutover = try coordinator.recover(capture, wasPaused: wasPaused, pauseVersion: pauseVersion)
+        page.pendingMigration = (persona, profile, coordinator, cutover)
+    }
+
+    private func awaitMigrationReadiness(page: Page, cookies: String, persona: String, workspace: String,
+                                        binding: AgentBridgeBindingKey, validate: @MainActor @Sendable () async throws -> Void) async throws {
+        for _ in 0..<120 {
+            try await validate()
+            let remote = try await hosted.read(configuration: page.configuration, cookies: cookies, persona: persona)
+            guard remote.workspaceID == workspace, remote.personaID == persona,
+                  remote.connectionID == binding.connectionID, remote.clientKind == "macos_app" else { throw AgentBridgeFailure.scopeChanged }
+            let local = try await client.send(AgentBridgeRequest(operation: "check", payload: ["binding_key": bindingValue(binding)]), returning: AgentBridgeConnections.self)
+            if remote.readinessStatus == "wakeable", local.connections.contains(where: { $0.bindingKey == binding && $0.readinessState == "ready" }) { return }
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        throw AgentBridgeFailure.runtimeConflict
     }
 
     private func connections(page: Page, cookies: String, scope: String, document: UUID) async throws -> [String: Any] {
@@ -384,6 +461,14 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         alert.messageText = "Start the native gateway for this profile?"
         alert.informativeText = "Repair \(persona) may start or restart its selected Hermes or OpenClaw gateway. Other profiles remain connected. Cancel preserves the current setup."
         alert.addButton(withTitle: "Allow Gateway Repair")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+    private static func confirmMigrationResume() -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Resume this interrupted migration?"
+        alert.informativeText = "The old binding is revoked and this persona is paused. Background Agents still hold the verified profile capture. Resume uses that capture to finish setup. The original pause setting returns after readiness. A previously paused persona stays paused."
+        alert.addButton(withTitle: "Resume Migration")
         alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn
     }

@@ -6,15 +6,15 @@ import PersonaStackCore
 final class AgentBridgeMigrationCoordinator {
     enum WorkChoice { case wait, stop, cancel }
     struct Dependencies {
-        var verifyReplacement: @MainActor () async throws -> Void
-        var readState: @MainActor () async throws -> AgentBridgeMigrationState
-        var stopAssignedRun: @MainActor () async throws -> Void
-        var confirmWork: @MainActor () -> WorkChoice
-        var confirmCutover: @MainActor () -> Bool
+        var verifyReplacement: @MainActor () async throws -> Void = { throw AgentBridgeFailure.migrationRequired }
+        var readState: @MainActor () async throws -> AgentBridgeMigrationState = { throw AgentBridgeFailure.migrationRequired }
+        var stopAssignedRun: @MainActor () async throws -> Void = { throw AgentBridgeFailure.migrationRequired }
+        var confirmWork: @MainActor () -> WorkChoice = { .cancel }
+        var confirmCutover: @MainActor () -> Bool = { false }
         var setPause: @MainActor (Bool, Int) async throws -> Int
-        var capture: @MainActor () async throws -> AgentBridgeMigrationCapture
-        var stopSupervisor: @MainActor (String) async throws -> Void
-        var revoke: @MainActor () async throws -> Void
+        var capture: @MainActor (Bool, Int) async throws -> AgentBridgeMigrationCapture = { _, _ in throw AgentBridgeFailure.migrationRequired }
+        var stopSupervisor: @MainActor (String) async throws -> Void = { _ in throw AgentBridgeFailure.migrationRequired }
+        var revoke: @MainActor () async throws -> Void = { throw AgentBridgeFailure.migrationRequired }
         var validateScope: @MainActor () async throws -> Void
         var readiness: @MainActor (AgentBridgeBindingKey) async throws -> Void
         var test: @MainActor () async throws -> Void
@@ -27,10 +27,13 @@ final class AgentBridgeMigrationCoordinator {
     }
     private let dependencies: Dependencies
     private(set) var revoked = false
+    private(set) var preparedCutover: Cutover?
+    private(set) var revocationVerified = false
     private var resumeVersion: Int?
     init(_ dependencies: Dependencies) { self.dependencies = dependencies }
 
     func begin() async throws -> Cutover {
+        guard !revoked else { throw AgentBridgeFailure.scopeChanged }
         try await dependencies.verifyReplacement()
         let original = try await dependencies.readState()
         if !original.laneIdle {
@@ -57,16 +60,19 @@ final class AgentBridgeMigrationCoordinator {
             }
             try await waitForIdle()
             try await dependencies.validateScope()
-            let capture = try await dependencies.capture()
+            let capture = try await dependencies.capture(original.userPaused, pauseVersion)
             guard capture.legacyServiceScope == "user_launch_agent" else { throw AgentBridgeFailure.migrationRequired }
             // The caller has proven the lane is idle after the consented Pause.
             try await dependencies.stopSupervisor(capture.legacyServiceScope)
             try await dependencies.validateScope()
             // From the first revoke attempt onward rollback never resumes old credentials.
+            let cutover = Cutover(capture: capture, wasPaused: original.userPaused, pauseVersion: pauseVersion)
+            preparedCutover = cutover
             revoked = true
             try await dependencies.revoke()
+            revocationVerified = true
             resumeVersion = pauseVersion
-            return Cutover(capture: capture, wasPaused: original.userPaused, pauseVersion: pauseVersion)
+            return cutover
         } catch {
             if pauseChanged && !revoked {
                 do {
@@ -78,8 +84,26 @@ final class AgentBridgeMigrationCoordinator {
         }
     }
 
-    func finish(_ cutover: Cutover, binding: AgentBridgeBindingKey) async throws -> Bool {
+    /// Called only after authenticated absence and exact helper-capture readback.
+    func recover(_ capture: AgentBridgeMigrationCapture, wasPaused: Bool, pauseVersion: Int) throws -> Cutover {
+        guard capture.legacyServiceScope == "user_launch_agent", capture.wasPaused == wasPaused,
+              capture.pauseVersion == pauseVersion, pauseVersion >= 0 else { throw AgentBridgeFailure.scopeChanged }
+        let cutover = Cutover(capture: capture, wasPaused: wasPaused, pauseVersion: pauseVersion)
+        preparedCutover = cutover
+        revoked = true; revocationVerified = true; resumeVersion = pauseVersion
+        return cutover
+    }
+
+    func ensureRevoked() async throws {
         guard revoked else { throw AgentBridgeFailure.scopeChanged }
+        guard !revocationVerified else { return }
+        try await dependencies.validateScope()
+        try await dependencies.revoke()
+        revocationVerified = true
+    }
+
+    func finish(_ cutover: Cutover, binding: AgentBridgeBindingKey) async throws -> Bool {
+        guard revoked, revocationVerified else { throw AgentBridgeFailure.scopeChanged }
         try await dependencies.validateScope()
         try await dependencies.readiness(binding)
         try await dependencies.validateScope()

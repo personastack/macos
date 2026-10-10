@@ -16,6 +16,8 @@ jobs:
       PERSONASTACK_MODULES_TOKEN: ${{ secrets.PERSONASTACK_MODULES_TOKEN || github.token }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version-file: agent-bridge/go.mod

@@ -158,7 +158,7 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
     @Test @MainActor func nativeStateIssuesScopeAndForeignDocumentHasNoHelperCalls() async throws {
         let transport = AgentBridgeFixtureTransport([])
         let client = AgentBridgeControlClient(transport: transport)
-        let service = AgentBridgeService(registration: AgentBridgeFixtureRegistration(), client: client, requireSignature: {}, clearDisabledPreference: {})
+        let service = AgentBridgeService(registration: AgentBridgeFixtureRegistration(), client: client, preferences: UserDefaults(suiteName: "AgentBridgeTests." + UUID().uuidString)!, requireSignature: {}, clearDisabledPreference: {})
         let manager = AgentBridgeSetupManager(service: service, client: client, configuration: { _ in .production },
             approveEnvironment: { _ in }, prepareBackgroundEnable: {}, cookieReader: { _, _ in "personastack_session=fixture" })
         let first = WKWebView(), second = WKWebView()
@@ -187,7 +187,7 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
         ])
         let client = AgentBridgeControlClient(transport: transport)
         let registration = AgentBridgeFixtureRegistration()
-        let service = AgentBridgeService(registration: registration, client: client, requireSignature: {}, clearDisabledPreference: {})
+        let service = AgentBridgeService(registration: registration, client: client, preferences: UserDefaults(suiteName: "AgentBridgeTests." + UUID().uuidString)!, requireSignature: {}, clearDisabledPreference: {})
         let manager = AgentBridgeSetupManager(service: service, client: client, configuration: { _ in .production },
             approveEnvironment: { _ in }, prepareBackgroundEnable: {}, cookieReader: { _, _ in "personastack_session=fixture" })
         let view = WKWebView()

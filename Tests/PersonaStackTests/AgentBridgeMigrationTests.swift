@@ -34,7 +34,7 @@ private final class AgentBridgeMigrationFixture {
                 self.paused = paused; self.version += 1
                 return self.version
             },
-            capture: {
+            capture: { _, _ in
                 try self.record("capture")
                 let data = Data("{\"migration_id\":\"11111111-1111-1111-1111-111111111111\",\"legacy_service_scope\":\"\(self.capturedScope)\",\"profile_candidate_id\":\"profile-a\"}".utf8)
                 return try JSONDecoder().decode(AgentBridgeMigrationCapture.self, from: data)
@@ -95,7 +95,13 @@ private final class AgentBridgeMigrationFixture {
         let first = failedRevoke.coordinator()
         await #expect(throws: AgentBridgeFailure.runtimeConflict) { _ = try await first.begin() }
         #expect(failedRevoke.paused && first.revoked)
+        #expect(!first.revocationVerified)
+        #expect(first.preparedCutover != nil)
         #expect(!failedRevoke.events.contains("resume"))
+        failedRevoke.fail = nil
+        do { try await first.ensureRevoked() } catch { Issue.record("exact revoke retry failed: \(error)") }
+        #expect(first.revocationVerified)
+        #expect(failedRevoke.events.suffix(2) == ["revoke", "revoke"])
         let failedReady = AgentBridgeMigrationFixture(); failedReady.fail = "ready"
         let second = failedReady.coordinator()
         do {
@@ -134,5 +140,18 @@ private final class AgentBridgeMigrationFixture {
         #expect(throws: AgentBridgeFailure.invalidRequest) { _ = try AgentBridgePageCommand.parse(forged) }
         forged = proposal; forged["legacy_service_scope"] = "user_launch_agent"
         #expect(throws: AgentBridgeFailure.invalidRequest) { _ = try AgentBridgePageCommand.parse(forged) }
+    }
+
+    @Test func recoveredNativeCapturePreservesOriginalPauseAndCannotRepeatLegacyCutover() async throws {
+        let fixture = AgentBridgeMigrationFixture()
+        fixture.paused = true; fixture.version = 8
+        let coordinator = fixture.coordinator()
+        let capture = try JSONDecoder().decode(AgentBridgeMigrationCapture.self, from: Data(#"{"migration_id":"11111111-1111-1111-1111-111111111111","legacy_service_scope":"user_launch_agent","profile_candidate_id":"profile-a","was_paused":false,"pause_version":8}"#.utf8))
+        let cutover = try coordinator.recover(capture, wasPaused: false, pauseVersion: 8)
+        #expect(coordinator.revoked && coordinator.revocationVerified)
+        await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await coordinator.begin() }
+        #expect(fixture.events.isEmpty)
+        #expect(try await coordinator.finish(cutover, binding: binding))
+        #expect(fixture.events == ["ready", "resume", "test"])
     }
 }

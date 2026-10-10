@@ -52,9 +52,10 @@ public struct AgentBridgePreparation: Codable, Sendable {
     public let profileCandidateID: String?
     public let expiresAt: String?
     public let existingBindingKey: AgentBridgeBindingKey?
+    public let migrationPending: Bool?
     enum CodingKeys: String, CodingKey {
         case preparationID = "preparation_id", devicePublicKey = "device_public_key"
-        case profileCandidateID = "profile_candidate_id", expiresAt = "expires_at", existingBindingKey = "existing_binding_key"
+        case profileCandidateID = "profile_candidate_id", expiresAt = "expires_at", existingBindingKey = "existing_binding_key", migrationPending = "migration_pending"
     }
 }
 
@@ -74,9 +75,12 @@ public struct AgentBridgeConnection: Codable, Sendable {
 }
 public struct AgentBridgeMigrationCapture: Codable, Sendable {
     public let migrationID: UUID
+    public let wasPaused: Bool?
+    public let pauseVersion: Int?
     public let legacyServiceScope: String
     public let profileCandidateID: String
     enum CodingKeys: String, CodingKey {
+        case wasPaused = "was_paused", pauseVersion = "pause_version"
         case migrationID = "migration_id", legacyServiceScope = "legacy_service_scope", profileCandidateID = "profile_candidate_id"
     }
 }
@@ -103,7 +107,7 @@ public struct AgentBridgeRequest: Encodable, Sendable {
     public let operation: String
     private let payload: [String: AgentBridgeValue]
     public init(requestID: UUID = UUID(), operation: String, payload: [String: AgentBridgeValue]) throws {
-        guard ["discover", "prepare", "enroll", "status", "check", "repair", "disconnect", "quiesce", "resume", "stop_background", "migration_prepare"].contains(operation) else {
+        guard ["discover", "prepare", "enroll", "status", "check", "repair", "disconnect", "quiesce", "resume", "stop_background", "migration_prepare", "migration_repair"].contains(operation) else {
             throw AgentBridgeFailure.invalidRequest
         }
         self.requestID = requestID; self.operation = operation; self.payload = payload

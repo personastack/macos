@@ -38,6 +38,7 @@ private final class AgentBridgeUpdaterState {
     @Test @MainActor func stagedUpdatePreventsEnableAndUnexpectedQuitDoesNotTouchHelper() {
         let state = AgentBridgeUpdaterState()
         let updater = DesktopUpdater(updaterFactory: { _, _ in AgentBridgeUpdaterClient() },
+                                     preferences: UserDefaults(suiteName: "AgentBridgeUpdaterTests." + UUID().uuidString)!,
                                      agentBridgeNeedsHandoff: { state.needsHandoff },
                                      prepareAgentBridgeUpdate: { state.calls.append("quiesce") },
                                      cancelAgentBridgeUpdate: { state.calls.append("resume") })
@@ -50,6 +51,7 @@ private final class AgentBridgeUpdaterState {
     @Test @MainActor func ordinaryQuitAndExplicitInstallHaveDistinctHelperEffects() async {
         let state = AgentBridgeUpdaterState()
         let updater = DesktopUpdater(updaterFactory: { _, _ in AgentBridgeUpdaterClient() },
+                                     preferences: UserDefaults(suiteName: "AgentBridgeUpdaterTests." + UUID().uuidString)!,
                                      agentBridgeNeedsHandoff: { state.needsHandoff },
                                      prepareAgentBridgeUpdate: { state.calls.append("quiesce-idle-retire") },
                                      cancelAgentBridgeUpdate: { state.calls.append("restore-resume") })
