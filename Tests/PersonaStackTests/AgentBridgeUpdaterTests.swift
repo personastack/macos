@@ -25,6 +25,8 @@ private final class AgentBridgeUpdaterState {
         preferences.set(true, forKey: "SUAutomaticallyUpdate")
         let client = AgentBridgeUpdaterClient(), state = AgentBridgeUpdaterState()
         let updater = DesktopUpdater(updaterFactory: { _, _ in client }, preferences: preferences,
+                                     presentAvailableReminder: { _ in }, presentReadyReminder: { _ in },
+                                     clearAvailableNotification: { _ in }, clearUpdateNotifications: { _ in },
                                      agentBridgeNeedsHandoff: { state.needsHandoff }, prepareAgentBridgeUpdate: {}, cancelAgentBridgeUpdate: {})
         updater.start(publicKey: Data(repeating: 1, count: 32).base64EncodedString(), feed: DesktopUpdatePolicy.feedURL)
         #expect(updater.automaticallyDownloadsUpdates)
@@ -39,6 +41,8 @@ private final class AgentBridgeUpdaterState {
         let state = AgentBridgeUpdaterState()
         let updater = DesktopUpdater(updaterFactory: { _, _ in AgentBridgeUpdaterClient() },
                                      preferences: UserDefaults(suiteName: "AgentBridgeUpdaterTests." + UUID().uuidString)!,
+                                     presentAvailableReminder: { _ in }, presentReadyReminder: { _ in },
+                                     clearAvailableNotification: { _ in }, clearUpdateNotifications: { _ in },
                                      agentBridgeNeedsHandoff: { state.needsHandoff },
                                      prepareAgentBridgeUpdate: { state.calls.append("quiesce") },
                                      cancelAgentBridgeUpdate: { state.calls.append("resume") })
@@ -52,6 +56,8 @@ private final class AgentBridgeUpdaterState {
         let state = AgentBridgeUpdaterState()
         let updater = DesktopUpdater(updaterFactory: { _, _ in AgentBridgeUpdaterClient() },
                                      preferences: UserDefaults(suiteName: "AgentBridgeUpdaterTests." + UUID().uuidString)!,
+                                     presentAvailableReminder: { _ in }, presentReadyReminder: { _ in },
+                                     clearAvailableNotification: { _ in }, clearUpdateNotifications: { _ in },
                                      agentBridgeNeedsHandoff: { state.needsHandoff },
                                      prepareAgentBridgeUpdate: { state.calls.append("quiesce-idle-retire") },
                                      cancelAgentBridgeUpdate: { state.calls.append("restore-resume") })
