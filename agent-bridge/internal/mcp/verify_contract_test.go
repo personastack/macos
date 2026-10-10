@@ -3,8 +3,10 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/personastack/macos/agent-bridge/internal/config"
@@ -192,6 +194,81 @@ func TestDesktopAgentBridgeDirectMCPRejectsErrorOrMalformedSuccessBothRuntimes(t
 						t.Fatalf("direct result %+v calls%d", result, calls)
 					}
 				})
+			}
+		})
+	}
+}
+
+type directMCPEnvelopeFixture struct {
+	name, contentType, response string
+	kind                        runtime.AdapterKind
+	stage                       int
+	valid                       bool
+}
+
+func directMCPEnvelopeFixtures() []directMCPEnvelopeFixture {
+	fixtures := []directMCPEnvelopeFixture{}
+	for _, stage := range []int{1, 3} {
+		id, result := 1, `{"protocolVersion":"2025-11-25"}`
+		if stage == 3 {
+			id, result = 2, `{"tools":[{"name":"my_persona_info"},{"name":"baseline_prompt"}]}`
+		}
+		envelopes := []struct {
+			name, response string
+			valid          bool
+		}{
+			{"valid", fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":%s}`, id, result), true},
+			{"wrong id", fmt.Sprintf(`{"jsonrpc":"2.0","id":99,"result":%s}`, result), false},
+			{"missing id", fmt.Sprintf(`{"jsonrpc":"2.0","result":%s}`, result), false},
+			{"wrong protocol", fmt.Sprintf(`{"jsonrpc":"1.0","id":%d,"result":%s}`, id, result), false},
+			{"missing protocol", fmt.Sprintf(`{"id":%d,"result":%s}`, id, result), false},
+			{"notification", fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"notifications/progress","result":%s}`, id, result), false},
+			{"null result", fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":null}`, id), false},
+		}
+		for _, kind := range []runtime.AdapterKind{runtime.AdapterKindHermes, runtime.AdapterKindOpenClaw} {
+			for _, contentType := range []string{"application/json", "text/event-stream"} {
+				for _, envelope := range envelopes {
+					fixtures = append(fixtures, directMCPEnvelopeFixture{fmt.Sprintf("%s/%s/stage%d/%s", kind.String(), contentType, stage, envelope.name), contentType, envelope.response, kind, stage, envelope.valid})
+				}
+			}
+		}
+	}
+	return fixtures
+}
+
+func TestDesktopAgentBridgeDirectMCPRejectsUncorrelatedEnvelope(t *testing.T) {
+	t.Parallel()
+	for _, fixture := range directMCPEnvelopeFixtures() {
+		t.Run(fixture.name, func(t *testing.T) {
+			t.Parallel()
+			calls, wantCalls := 0, fixture.stage
+			if fixture.valid {
+				wantCalls = 3
+			}
+			client := &http.Client{Transport: verifyContractRoundTripper(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if calls > wantCalls || req.Method != http.MethodPost || req.URL.String() != "https://mcp.example.test/mcp" || req.Header.Get("Authorization") != "Bearer token" {
+					t.Fatal("unplanned direct MCP request")
+				}
+				response := `{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}`
+				status, contentType := http.StatusOK, fixture.contentType
+				switch calls {
+				case 2:
+					status, response, contentType = http.StatusAccepted, "", "application/json"
+				case 3:
+					response = `{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"my_persona_info"},{"name":"baseline_prompt"}]}}`
+				}
+				if calls == fixture.stage {
+					response = fixture.response
+				}
+				if contentType == "text/event-stream" {
+					response = "data: " + response + "\n\n"
+				}
+				return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": []string{contentType}}, Body: io.NopCloser(strings.NewReader(response)), Request: req}, nil
+			})}
+			result := VerifyBindingLive(context.Background(), config.Binding{RuntimeKind: fixture.kind, PersonaMCPURL: "https://mcp.example.test/mcp", PersonaMCPToken: "token"}, client)
+			if result.OK != fixture.valid || calls != wantCalls || (!fixture.valid && result.DiagnosticCode != "runtime_error") {
+				t.Fatalf("response verification: %+v calls%d", result, calls)
 			}
 		})
 	}

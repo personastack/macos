@@ -170,6 +170,42 @@ func TestDesktopAgentBridgeOpenClawPartialProgressRequiresExplicitTerminal(t *te
 	}
 }
 
+func TestDesktopAgentBridgeOpenClawMalformedWaitFailsWithoutLifecycleEvents(t *testing.T) {
+	t.Parallel()
+	for _, fixture := range []struct {
+		name    string
+		payload string
+	}{
+		{"run identity", `{"status":"completed","runId":123}`},
+		{"output", `{"runId":"assigned","status":"completed","output":123}`},
+		{"error", `{"runId":"assigned","status":"completed","error":123}`},
+		{"status", `{"runId":"assigned","status":123}`},
+		{"syntax", `{"status":"completed"`},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			t.Parallel()
+			events := []RunEvent{}
+			handle := func(event RunEvent) error { events = append(events, event); return nil }
+			session := &openClawRPCSession{nativeRunID: "assigned", handle: handle}
+			calls := 0
+			result, err := waitForOpenClawRun(context.Background(), "assigned", handle, session, func(_ context.Context, request openClawRequest) (openClawResponse, error) {
+				calls++
+				if calls != 1 {
+					t.Fatal("malformed native wait was retried")
+				}
+				params, marshalErr := json.Marshal(request.Params)
+				if marshalErr != nil || request.Type != "req" || request.ID != "wait-assigned" || request.Method != "agent.wait" || string(params) != `{"runId":"assigned","timeoutMs":30000}` {
+					t.Fatalf("unexpected native wait: %+v %s %v", request, params, marshalErr)
+				}
+				return openClawResponse{Payload: json.RawMessage(fixture.payload)}, nil
+			})
+			if err == nil || calls != 1 || len(events) != 0 || result != (RunResult{}) {
+				t.Fatalf("malformed reply produced lifecycle state: result=%+v err=%v calls=%d events=%v", result, err, calls, events)
+			}
+		})
+	}
+}
+
 func TestDesktopAgentBridgeOpenClawPartialProgressDeadlineCancelAndTransportError(t *testing.T) {
 	t.Parallel()
 	for _, mode := range []string{"deadline", "cancel", "transport_timeout", "foreign_terminal"} {

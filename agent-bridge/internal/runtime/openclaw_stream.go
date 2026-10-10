@@ -173,7 +173,10 @@ func waitForOpenClawRun(ctx context.Context, nativeRunID string, handle RunEvent
 		if !response.isResponseOK() {
 			return RunResult{}, fmt.Errorf("OpenClaw wait response not ok")
 		}
-		result, terminal := openClawRunResultFromResponse(response.payload())
+		result, terminal, err := openClawRunResultFromResponse(response.payload())
+		if err != nil {
+			return RunResult{}, err
+		}
 		if result.RunID != "" && result.RunID != strings.TrimSpace(nativeRunID) {
 			return RunResult{}, fmt.Errorf("OpenClaw wait response changed native run")
 		}

@@ -953,16 +953,17 @@ func openClawAgentUsable(agent openClawAgent) bool {
 	return agent.Enabled == nil || *agent.Enabled
 }
 
-func openClawRunResultFromResponse(raw json.RawMessage) (openClawRunResult, bool) {
+func openClawRunResultFromResponse(raw json.RawMessage) (openClawRunResult, bool, error) {
 	var result openClawRunResult
-	if len(raw) > 0 {
-		_ = json.Unmarshal(raw, &result)
+	err := json.Unmarshal(raw, &result)
+	if err != nil {
+		return openClawRunResult{}, false, fmt.Errorf("decode OpenClaw wait result: %w", err)
 	}
 	switch strings.ToLower(strings.TrimSpace(result.Status)) {
 	case "completed", "success", "succeeded", "failed", "error", "cancelled", "canceled", "aborted", "timeout":
-		return result, true
+		return result, true, nil
 	default:
-		return result, false
+		return result, false, nil
 	}
 }
 

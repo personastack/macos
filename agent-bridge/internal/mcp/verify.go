@@ -35,7 +35,7 @@ func VerifyBindingLive(ctx context.Context, binding config.Binding, client *http
 	if err != nil {
 		return LiveVerifyResult{Note: "initialize failed: " + err.Error(), DiagnosticCode: diagnosticCodeForMCPLiveError(err)}
 	}
-	if err := requireJSONRPCResult(raw); err != nil {
+	if err := requireJSONRPCResult(raw, json.RawMessage("1")); err != nil {
 		return LiveVerifyResult{Note: "initialize invalid: " + err.Error(), DiagnosticCode: "runtime_error"}
 	}
 	_, err = proxy.forward(ctx, mcpURL, token, []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`), &session, nil)
@@ -46,7 +46,7 @@ func VerifyBindingLive(ctx context.Context, binding config.Binding, client *http
 	if err != nil {
 		return LiveVerifyResult{Note: "tools/list failed: " + err.Error(), DiagnosticCode: diagnosticCodeForMCPLiveError(err)}
 	}
-	if err := requireJSONRPCResult(raw); err != nil {
+	if err := requireJSONRPCResult(raw, json.RawMessage("2")); err != nil {
 		return LiveVerifyResult{Note: "tools/list invalid: " + err.Error(), DiagnosticCode: "runtime_error"}
 	}
 	if binding.RuntimeKind == runtime.AdapterKindHermes {
@@ -95,22 +95,28 @@ func diagnosticCodeForMCPLiveError(err error) string {
 	}
 }
 
-func requireJSONRPCResult(raw []byte) error {
+func requireJSONRPCResult(raw []byte, requestID json.RawMessage) error {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 {
 		return fmt.Errorf("empty response")
 	}
 	var envelope struct {
-		Result json.RawMessage `json:"result"`
-		Error  json.RawMessage `json:"error"`
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Method  string          `json:"method"`
+		Result  json.RawMessage `json:"result"`
+		Error   json.RawMessage `json:"error"`
 	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return err
 	}
+	if envelope.JSONRPC != "2.0" || envelope.Method != "" || !jsonRawMessagesEqual(envelope.ID, requestID) {
+		return fmt.Errorf("response does not match JSON-RPC request")
+	}
 	if len(envelope.Error) != 0 && !bytes.Equal(bytes.TrimSpace(envelope.Error), []byte("null")) {
 		return fmt.Errorf("error response is not a successful result")
 	}
-	if len(envelope.Result) == 0 {
+	if len(envelope.Result) == 0 || bytes.Equal(bytes.TrimSpace(envelope.Result), []byte("null")) {
 		return fmt.Errorf("missing result")
 	}
 	return nil
