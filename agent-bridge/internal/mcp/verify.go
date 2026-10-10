@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/personastack/macos/agent-bridge/internal/config"
+	"github.com/personastack/macos/agent-bridge/internal/runtime"
 )
 
 type LiveVerifyResult struct {
@@ -48,7 +49,38 @@ func VerifyBindingLive(ctx context.Context, binding config.Binding, client *http
 	if err := requireJSONRPCResult(raw); err != nil {
 		return LiveVerifyResult{Note: "tools/list invalid: " + err.Error(), DiagnosticCode: "runtime_error"}
 	}
+	if binding.RuntimeKind == runtime.AdapterKindHermes {
+		err = requireHermesPersonaTools(raw)
+		if err != nil {
+			return LiveVerifyResult{Note: err.Error(), DiagnosticCode: "capability_missing"}
+		}
+	}
 	return LiveVerifyResult{OK: true, Note: "PersonaStack MCP endpoint verified"}
+}
+
+// These core producer names do not require stack membership. tell_persona is
+// conditional and cannot be a prerequisite for a standalone persona.
+func requireHermesPersonaTools(raw []byte) error {
+	var response struct {
+		Result struct {
+			Tools *[]struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	err := json.Unmarshal(raw, &response)
+	if err != nil || response.Result.Tools == nil {
+		return fmt.Errorf("PersonaStack MCP tools/list is malformed")
+	}
+	identity, baseline := false, false
+	for _, tool := range *response.Result.Tools {
+		identity = identity || tool.Name == "my_persona_info"
+		baseline = baseline || tool.Name == "baseline_prompt"
+	}
+	if !identity || !baseline {
+		return fmt.Errorf("PersonaStack MCP core persona tools are unavailable")
+	}
+	return nil
 }
 
 func diagnosticCodeForMCPLiveError(err error) string {
@@ -68,9 +100,15 @@ func requireJSONRPCResult(raw []byte) error {
 	if len(raw) == 0 {
 		return fmt.Errorf("empty response")
 	}
-	var envelope rpcMessage
+	var envelope struct {
+		Result json.RawMessage `json:"result"`
+		Error  json.RawMessage `json:"error"`
+	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return err
+	}
+	if len(envelope.Error) != 0 && !bytes.Equal(bytes.TrimSpace(envelope.Error), []byte("null")) {
+		return fmt.Errorf("error response is not a successful result")
 	}
 	if len(envelope.Result) == 0 {
 		return fmt.Errorf("missing result")

@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"fmt"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -49,4 +50,103 @@ func enableHermesAPIMCP(doc *yaml.Node, server string) error {
 	}
 	tools.Content = kept
 	return nil
+}
+
+// Match the producer's configured API MCP allowlist. This is configuration
+// evidence, not a claim about the running native gateway's discovered registry.
+func verifyHermesAPIMCP(doc *yaml.Node, server string) error {
+	root := doc.Content[0]
+	platforms, _ := entryAt(root, "platform_toolsets")
+	tools, err := hermesToolsetList(platforms, "api_server")
+	if err != nil {
+		return err
+	}
+	entries, _ := entryAt(root, "mcp_servers")
+	explicit := false
+	selected := false
+	for _, name := range tools {
+		if name == "no_mcp" {
+			return fmt.Errorf("Hermes API toolset disables MCP")
+		}
+		entry, _ := entryAt(entries, name)
+		if entry != nil && hermesServerEnabled(entry) {
+			explicit = true
+			selected = selected || name == server
+		}
+	}
+	if explicit && !selected {
+		return fmt.Errorf("Hermes API toolset excludes the issued PersonaStack server")
+	}
+	agent, _ := entryAt(root, "agent")
+	disabled, err := hermesToolsetList(agent, "disabled_toolsets")
+	if err != nil {
+		return err
+	}
+	for _, name := range disabled {
+		name = strings.TrimSpace(name)
+		if name == server || name == "mcp-"+server {
+			return fmt.Errorf("Hermes global toolset policy disables PersonaStack MCP")
+		}
+	}
+	return nil
+}
+
+func hermesToolsetList(parent *yaml.Node, key string) ([]string, error) {
+	if parent == nil || parent.Tag == "!!null" {
+		return nil, nil
+	}
+	if parent.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("Hermes toolset policy must be a map")
+	}
+	tools, _ := entryAt(parent, key)
+	if tools == nil || tools.Tag == "!!null" {
+		return nil, nil
+	}
+	if tools.Kind == yaml.ScalarNode && tools.Tag == "!!str" {
+		var parsed yaml.Node
+		err := yaml.Unmarshal([]byte(tools.Value), &parsed)
+		if err != nil || len(parsed.Content) != 1 {
+			return nil, fmt.Errorf("Hermes toolset list invalid")
+		}
+		tools = parsed.Content[0]
+	}
+	if tools.Kind != yaml.SequenceNode {
+		return nil, fmt.Errorf("Hermes toolsets must be a list")
+	}
+	result := make([]string, 0, len(tools.Content))
+	for _, tool := range tools.Content {
+		if tool.Kind != yaml.ScalarNode || tool.Tag != "!!str" {
+			return nil, fmt.Errorf("Hermes toolset name invalid")
+		}
+		result = append(result, tool.Value)
+	}
+	return result, nil
+}
+func hermesServerEnabled(entry *yaml.Node) bool {
+	enabled, _ := entryAt(entry, "enabled")
+	if enabled == nil {
+		return true
+	}
+	var value any
+	if err := enabled.Decode(&value); err != nil {
+		return true
+	}
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case int:
+		return typed != 0
+	case int64:
+		return typed != 0
+	case uint64:
+		return typed != 0
+	case float64:
+		return typed != 0
+	case string:
+		switch strings.ToLower(strings.TrimSpace(typed)) {
+		case "false", "0", "no", "off":
+			return false
+		}
+	}
+	return true
 }

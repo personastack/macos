@@ -13,9 +13,9 @@ import (
 	"testing"
 )
 
-func TestDesktopAgentBridgeHermesToolsetRepairPreservesProfileAndRequiresEffectiveCatalog(t *testing.T) {
+func TestDesktopAgentBridgeHermesToolsetRepairPreservesProfileAndConfiguredReadiness(t *testing.T) {
 	t.Parallel()
-	for _, api := range []string{"[terminal, no_mcp, unrelated]", "[]", "\"['terminal', 'no_mcp', 'unrelated']\""} {
+	for _, api := range []string{"[terminal, no_mcp, unrelated]", "\"['terminal', 'no_mcp', 'unrelated']\""} {
 		t.Run(api, func(t *testing.T) {
 			t.Parallel()
 			b, store, path := installedFixture(t)
@@ -31,27 +31,7 @@ func TestDesktopAgentBridgeHermesToolsetRepairPreservesProfileAndRequiresEffecti
 			if strings.Contains(string(before), "- issued") {
 				t.Fatal("ordinary install granted toolset consent")
 			}
-			nativeCalls, directCalls := 0, 0
-			catalog := func(ctx context.Context, selected config.Binding, endpoint string) (bool, string) {
-				nativeCalls++
-				if selected.HermesHome != b.HermesHome || selected.NativeMCPServer != "issued" || endpoint != "http://127.0.0.1:25001" {
-					t.Fatal("effective catalog queried another profile")
-				}
-				doc, err := readConfig(selected.NativeConfigPath)
-				if err != nil {
-					t.Fatal(err)
-				}
-				platforms, _ := entryAt(doc.Content[0], "platform_toolsets")
-				tools, _ := entryAt(platforms, "api_server")
-				allowed := false
-				for _, tool := range tools.Content {
-					if tool.Value == "no_mcp" {
-						return false, "MCP disabled by selected API toolset"
-					}
-					allowed = allowed || tool.Value == "issued"
-				}
-				return allowed, "mocked selected effective catalog"
-			}
+			directCalls := 0
 			client := &http.Client{Transport: verifyContractRoundTripper(func(req *http.Request) (*http.Response, error) {
 				directCalls++
 				if req.Method != http.MethodPost || req.URL.String() != b.PersonaMCPURL || req.Header.Get("Authorization") != "Bearer secret" {
@@ -68,15 +48,15 @@ func TestDesktopAgentBridgeHermesToolsetRepairPreservesProfileAndRequiresEffecti
 				if directCalls > len(want) || request.Method != want[directCalls-1] {
 					t.Fatal("unplanned MCP call")
 				}
-				status, response := 200, `{"jsonrpc":"2.0","id":`+string(request.ID)+`,"result":{"tools":[]}}`
+				status, response := 200, `{"jsonrpc":"2.0","id":`+string(request.ID)+`,"result":{"tools":[{"name":"my_persona_info"},{"name":"baseline_prompt"}]}}`
 				if directCalls == 2 {
 					status, response = http.StatusAccepted, ""
 				}
 				return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(response)), Request: req}, nil
 			})}
-			initial := verifyBindingWithNative(context.Background(), "", b, client, "http://127.0.0.1:25001", catalog)
-			if initial.State == runtime.AdapterStateMCPVerified || directCalls != 0 || nativeCalls != 1 {
-				t.Fatal("native toolset failure was bypassed")
+			initial := VerifyBindingWithLiveAt(context.Background(), "", b, client, "http://127.0.0.1:25001")
+			if initial.State == runtime.AdapterStateMCPVerified || directCalls != 0 {
+				t.Fatal("configured toolset refusal was bypassed")
 			}
 			err := config.UpdateBinding(store, b, func(current *config.Binding) error {
 				_, err := ConfigureBinding(current, true)
@@ -90,9 +70,9 @@ func TestDesktopAgentBridgeHermesToolsetRepairPreservesProfileAndRequiresEffecti
 			if !strings.Contains(string(after), "user_key: keep") || !strings.Contains(string(after), "command: user-tool") || !strings.Contains(string(after), "cli: [no_mcp, file]") {
 				t.Fatal("repair changed unrelated config or another platform")
 			}
-			repaired := verifyBindingWithNative(context.Background(), "", b, client, "http://127.0.0.1:25001", catalog)
-			if repaired.State != runtime.AdapterStateMCPVerified || directCalls != 3 || nativeCalls != 2 {
-				t.Fatalf("repaired effective catalog not verified: %+v", repaired)
+			repaired := VerifyBindingWithLiveAt(context.Background(), "", b, client, "http://127.0.0.1:25001")
+			if repaired.State != runtime.AdapterStateMCPVerified || directCalls != 3 {
+				t.Fatalf("repaired configured profile not verified: %+v", repaired)
 			}
 		})
 	}
@@ -176,7 +156,18 @@ func TestDesktopAgentBridgeMCPUserEditRefusal(t *testing.T) {
 }
 func TestDesktopAgentBridgeNativeMCPFailureBlocksDirectProbe(t *testing.T) {
 	t.Parallel()
-	b, _, _ := installedFixture(t)
+	b, _, path := installedFixture(t)
+	b.RuntimeKind = runtime.AdapterKindOpenClaw
+	b.OpenClawAgentID = "writer"
+	b.MCPOwnership = config.MCPOwnership{}
+	if err := os.WriteFile(path, []byte(`{"mcp":{"servers":{}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store := config.NewMemoryStore(config.State{Bindings: []config.Binding{b}})
+	if _, err := (Installer{Store: &store}).InstallBinding(b); err != nil {
+		t.Fatal(err)
+	}
+	b, _ = config.BindingFor(&store, b)
 	calls := 0
 	result := verifyBindingWithNative(context.Background(), "", b, &http.Client{Transport: verifyContractRoundTripper(func(r *http.Request) (*http.Response, error) {
 		t.Fatal("direct probe bypassed native failure")
@@ -188,7 +179,7 @@ func TestDesktopAgentBridgeNativeMCPFailureBlocksDirectProbe(t *testing.T) {
 		}
 		return false, "selected catalog rejected"
 	})
-	if calls != 1 || result.State == runtime.AdapterStateMCPVerified || result.DiagnosticCode != "capability_missing" {
+	if calls != 1 || result.State == runtime.AdapterStateMCPVerified || result.DiagnosticCode != "runtime_unsupported" {
 		t.Fatalf("false readiness %+v calls%d", result, calls)
 	}
 }

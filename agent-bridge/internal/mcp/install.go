@@ -360,6 +360,15 @@ func VerifyBinding(home string, b config.Binding) VerifyResult {
 	if entry == nil || b.MCPOwnership.Fingerprint != fingerprint(entry, b.InventorySeed) {
 		r.State = runtime.AdapterStateMCPConfigMissing
 		r.Note = "owned native MCP entry missing or changed"
+		return r
+	}
+	if b.RuntimeKind == runtime.AdapterKindHermes {
+		err = verifyHermesAPIMCP(doc, b.NativeMCPServer)
+		if err != nil {
+			r.State = runtime.AdapterStateCapabilityMissing
+			r.DiagnosticCode = "capability_missing"
+			r.Note = err.Error()
+		}
 	}
 	return r
 }
@@ -383,14 +392,13 @@ func verifyBindingWithNative(ctx context.Context, home string, b config.Binding,
 	if r.State != runtime.AdapterStateMCPRestartRequired {
 		return r
 	}
-	ok, note := native(ctx, b, runtimeURL)
+	ok, note := true, ""
+	if b.RuntimeKind != runtime.AdapterKindHermes {
+		ok, note = native(ctx, b, runtimeURL)
+	}
 	if !ok {
 		r.Note = note
 		r.DiagnosticCode = "native_mcp_unreachable"
-		if b.RuntimeKind == runtime.AdapterKindHermes {
-			r.State = runtime.AdapterStateCapabilityMissing
-			r.DiagnosticCode = "capability_missing"
-		}
 		if b.RuntimeKind == runtime.AdapterKindOpenClaw {
 			r.State = runtime.AdapterStateCapabilityMissing
 			r.DiagnosticCode = "runtime_unsupported"
@@ -405,6 +413,9 @@ func verifyBindingWithNative(ctx context.Context, home string, b config.Binding,
 	}
 	r.State = runtime.AdapterStateMCPVerified
 	r.Note = "selected runtime and PersonaStack MCP verified"
+	if b.RuntimeKind == runtime.AdapterKindHermes {
+		r.Note = "Hermes profile configuration and PersonaStack MCP verified; native discovery requires wake acceptance."
+	}
 	return r
 }
 func VerifyBindingInUserHome(b config.Binding) VerifyResult { return VerifyBinding("", b) }

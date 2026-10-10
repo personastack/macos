@@ -376,6 +376,8 @@ func acceptedMCPCredentialClient(t *testing.T, firstRead func()) *http.Client {
 		if calls == 2 {
 			status = http.StatusAccepted
 			body = ""
+		} else if calls == 3 {
+			body = `{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"my_persona_info"},{"name":"baseline_prompt"}]}}`
 		}
 		return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
 	})}

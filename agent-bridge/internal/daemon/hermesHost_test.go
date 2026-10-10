@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"os"
@@ -101,7 +102,7 @@ func TestDesktopAgentBridgeHermesStoppedCheckDoesNotGrantHostConsent(t *testing.
 	}
 }
 
-func TestDesktopAgentBridgeHermesCatalogFailureCannotBeReady(t *testing.T) {
+func TestDesktopAgentBridgeHermesDoesNotFabricateNativeCatalog(t *testing.T) {
 	t.Parallel()
 	check := runtime.VerifyHermesMCPServerLoadedWithHome(context.Background(), "issued", t.TempDir())
 	if check.OK || !strings.Contains(check.Note, "supported live MCP catalog") {
@@ -109,7 +110,7 @@ func TestDesktopAgentBridgeHermesCatalogFailureCannotBeReady(t *testing.T) {
 	}
 }
 
-func TestDesktopAgentBridgeHermesTwoNamedProfilesShareHostAndKeepKeys(t *testing.T) {
+func TestDesktopAgentBridgeHermesTwoNamedProfilesVerifyAndDispatchWithScopedKeys(t *testing.T) {
 	t.Parallel()
 	home := t.TempDir()
 	host := filepath.Join(home, ".hermes")
@@ -178,7 +179,28 @@ func TestDesktopAgentBridgeHermesTwoNamedProfilesShareHostAndKeepKeys(t *testing
 		calls := 0
 		adapter.Client = &http.Client{Transport: credentialTransport(func(req *http.Request) (*http.Response, error) {
 			calls++
-			if req.Method != http.MethodGet || !strings.HasPrefix(req.URL.Path, "/p/"+name+"/") {
+			if req.Method == http.MethodPost {
+				if calls != 5 || req.URL.Path != "/p/"+name+"/v1/runs" || req.Header.Get("Authorization") != "Bearer "+name+"-profile-key-123" || req.Header.Get("Content-Type") != "application/json" || req.Header.Get("Idempotency-Key") != "assignment-"+name || req.Header.Get("X-Hermes-Session-Key") == "" {
+					t.Fatal("wrong assigned native submission")
+				}
+				var body struct {
+					Input        string            `json:"input"`
+					Server       string            `json:"native_mcp_server"`
+					Namespace    string            `json:"native_mcp_namespace"`
+					IncludeTools bool              `json:"include_native_tools"`
+					Metadata     map[string]string `json:"metadata"`
+				}
+				decoder := json.NewDecoder(req.Body)
+				decoder.DisallowUnknownFields()
+				if err := decoder.Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if body.Input != "fully composed assigned wake" || body.Server != b.NativeMCPServer || body.Namespace != b.NativeMCPNamespace || !body.IncludeTools || body.Metadata["personastack_assignment_id"] != "assignment-"+name {
+					t.Fatal("assigned prompt or selected MCP scope changed")
+				}
+				return &http.Response{StatusCode: http.StatusAccepted, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"run_id":"native-` + name + `"}`)), Request: req}, nil
+			}
+			if calls > 4 || req.Method != http.MethodGet || !strings.HasPrefix(req.URL.Path, "/p/"+name+"/") {
 				t.Fatal("unplanned native submission or foreign profile route")
 			}
 			if req.URL.Path != "/p/"+name+"/health" && req.Header.Get("Authorization") != "Bearer "+name+"-profile-key-123" {
@@ -190,9 +212,18 @@ func TestDesktopAgentBridgeHermesTwoNamedProfilesShareHostAndKeepKeys(t *testing
 			}
 			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
 		})}
+		runner.MCPHTTPClient = acceptedMCPCredentialClient(t, nil)
 		detection := runner.bindingReadinessAtHomeContext(context.Background(), adapter, b, home, resolved.HermesHome, adapter.BaseURL)
-		if calls != 4 || detection.State != runtime.AdapterStateCapabilityMissing || detection.DiagnosticCode != "capability_missing" || canStartRunWithReadiness(detection.State, nil) {
-			t.Fatalf("configured profile bypassed actual gateway MCP proof %+v calls%d", detection, calls)
+		if calls != 4 || detection.State != runtime.AdapterStateMCPVerified {
+			t.Fatalf("configured authenticated profile not ready %+v calls%d", detection, calls)
+		}
+		frame := externalagentprotocol.Frame{ConnectionID: string(b.ConnectionID), ConnectionGeneration: b.ConnectionGeneration, PersonaID: string(b.PersonaID), RunID: "wake-" + name, AssignmentID: "assignment-" + name, RunStart: &externalagentprotocol.RunStartPayload{ConversationID: "conversation-" + name, FullyComposedPrompt: "fully composed assigned wake", NativeMCPServerName: b.NativeMCPServer, NativeMCPToolNamespace: b.NativeMCPNamespace}}
+		if err := runner.activateRun(b, frame); err != nil {
+			t.Fatal(err)
+		}
+		nativeRun, err := adapter.StartRun(assignedRunRequest(frame))
+		if err != nil || nativeRun != "native-"+name || calls != 5 {
+			t.Fatalf("assigned dispatch %q %v calls%d", nativeRun, err, calls)
 		}
 		if b.RuntimeLaunchAllowed {
 			t.Fatal("eligible attach granted shared host startup")

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/personastack/macos/agent-bridge/internal/config"
+	"github.com/personastack/macos/agent-bridge/internal/runtime"
 )
 
 type verifyContractRoundTripper func(*http.Request) (*http.Response, error)
@@ -147,5 +148,51 @@ func TestDesktopAgentBridgeVerifyBindingLiveContractStopsAfterAuthenticationReje
 	}
 	if call != 1 {
 		t.Fatalf("request count = %d, want 1", call)
+	}
+}
+
+func TestDesktopAgentBridgeDirectMCPRejectsErrorOrMalformedSuccessBothRuntimes(t *testing.T) {
+	t.Parallel()
+	const core = `{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"my_persona_info"},{"name":"baseline_prompt"}]}}`
+	for _, kind := range []runtime.AdapterKind{runtime.AdapterKindHermes, runtime.AdapterKindOpenClaw} {
+		t.Run(kind.String(), func(t *testing.T) {
+			t.Parallel()
+			for _, tc := range []struct {
+				name, response string
+				stage          int
+				ok             bool
+			}{
+				{name: "success", response: core, stage: 3, ok: true},
+				{name: "null error is not failure", response: `{"jsonrpc":"2.0","id":2,"error":null,"result":{"tools":[{"name":"my_persona_info"},{"name":"baseline_prompt"}]}}`, stage: 3, ok: true},
+				{name: "initialize error with result", response: `{"jsonrpc":"2.0","id":1,"error":{"code":-32000},"result":{}}`, stage: 1},
+				{name: "tools error with result", response: `{"jsonrpc":"2.0","id":2,"error":{"code":-32000},"result":{"tools":[{"name":"my_persona_info"},{"name":"baseline_prompt"}]}}`, stage: 3},
+				{name: "tools error only", response: `{"jsonrpc":"2.0","id":2,"error":{"code":-32000}}`, stage: 3},
+				{name: "malformed tools", response: `{"jsonrpc":"2.0","id":2,`, stage: 3},
+				{name: "result missing", response: `{"jsonrpc":"2.0","id":2}`, stage: 3},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					t.Parallel()
+					calls := 0
+					client := &http.Client{Transport: verifyContractRoundTripper(func(req *http.Request) (*http.Response, error) {
+						calls++
+						if calls > tc.stage || req.Method != http.MethodPost || req.URL.String() != "https://mcp.example.test/mcp" || req.Header.Get("Authorization") != "Bearer token" {
+							t.Fatal("unplanned direct MCP request")
+						}
+						status, response := http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}`
+						if calls == 2 {
+							status, response = http.StatusAccepted, ""
+						}
+						if calls == tc.stage {
+							response = tc.response
+						}
+						return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(bytes.NewBufferString(response)), Request: req}, nil
+					})}
+					result := VerifyBindingLive(context.Background(), config.Binding{RuntimeKind: kind, PersonaMCPURL: "https://mcp.example.test/mcp", PersonaMCPToken: "token"}, client)
+					if result.OK != tc.ok || calls != tc.stage || (!tc.ok && result.DiagnosticCode != "runtime_error") {
+						t.Fatalf("direct result %+v calls%d", result, calls)
+					}
+				})
+			}
+		})
 	}
 }
