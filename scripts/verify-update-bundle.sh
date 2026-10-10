@@ -28,7 +28,8 @@ lipo "$bundle/Contents/MacOS/PersonaStack" -verify_arch arm64
 lipo "$bundle/Contents/MacOS/PersonaStack" -verify_arch x86_64
 lipo "$bundle/Contents/MacOS/PersonaStackHarnessHook" -verify_arch arm64
 lipo "$bundle/Contents/MacOS/PersonaStackHarnessHook" -verify_arch x86_64
-lipo "$bundle/Contents/MacOS/PersonaStackAgentBridge" -verify_arch arm64 x86_64
+lipo -verify_arch arm64 "$bundle/Contents/MacOS/PersonaStackAgentBridge"
+lipo -verify_arch x86_64 "$bundle/Contents/MacOS/PersonaStackAgentBridge"
 test -x "$framework/Versions/B/Autoupdate"
 test -x "$framework/Versions/B/Updater.app/Contents/MacOS/Updater"
 test -x "$framework/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"
