@@ -168,3 +168,35 @@ func TestDesktopAgentBridgeMalformedNativeConfigPreserved(t *testing.T) {
 		t.Fatal("malformed config rewritten")
 	}
 }
+
+func TestDesktopAgentBridgeOwnedCredentialAndKeyRotation(t *testing.T) {
+	t.Parallel()
+	b, store, path := installedFixture(t)
+	b.PersonaMCPToken = "new-authorized-token"
+	b.NativeMCPServer = "new-issued"
+	b.NativeMCPNamespace = "mcp_new"
+	if err := store.SaveBinding(b); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (Installer{Store: store}).InstallBinding(b); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := readConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := nativeEntries(doc, b.RuntimeKind, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, _ := entryAt(entries, "issued")
+	current, _ := entryAt(entries, "new-issued")
+	unrelated, _ := entryAt(entries, "unrelated")
+	if old != nil || current == nil || unrelated == nil {
+		t.Fatal("owned key rotation duplicated old key or removed unrelated entry")
+	}
+	saved, _ := config.BindingFor(store, b)
+	if saved.PersonaMCPToken != "new-authorized-token" || saved.MCPOwnership.EntryKey != "new-issued" || saved.MCPOwnership.Fingerprint != fingerprint(current, b.InventorySeed) {
+		t.Fatal("rotation custody/ownership readback incorrect")
+	}
+}

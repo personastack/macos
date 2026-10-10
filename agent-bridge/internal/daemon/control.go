@@ -9,6 +9,8 @@ import (
 	"github.com/personastack/macos/agent-bridge/internal/mcp"
 	"github.com/personastack/macos/agent-bridge/internal/runtime"
 	"github.com/personastack/macos/agent-bridge/internal/targetruntime"
+	"net/url"
+	"strings"
 )
 
 func targetForBinding(b config.Binding) *externalagentprotocol.RuntimeTarget {
@@ -71,4 +73,39 @@ func (r Runner) RepairBinding(ctx context.Context, b config.Binding, restartConf
 	// Explicit repair may replace a missing exact owned entry, but never a user edit.
 	_, err = (mcp.Installer{Store: r.Store}).InstallBinding(latest)
 	return err
+}
+
+// Canonical refresh metadata is authority from the authenticated gateway session.
+// The protocol does not carry token material. Missing tokens require native
+// scoped disconnect and fresh enrollment instead of claiming repair succeeded.
+func (r Runner) applyMCPConfiguration(binding config.Binding, p *externalagentprotocol.ConfigRefreshPayload) error {
+	if p == nil {
+		return nil
+	}
+	if p.MCPURL != "" {
+		parsed, err := url.Parse(p.MCPURL)
+		if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
+			return fmt.Errorf("invalid canonical MCP URL")
+		}
+	}
+	for _, value := range []string{p.NativeMCPServerName, p.NativeMCPToolNamespace} {
+		if len(value) > 128 || strings.ContainsAny(value, "\r\n\x00") {
+			return fmt.Errorf("invalid canonical MCP server metadata")
+		}
+	}
+	return config.UpdateBinding(r.Store, binding, func(latest *config.Binding) error {
+		if latest.ConnectionGeneration != binding.ConnectionGeneration {
+			return fmt.Errorf("stale connection generation")
+		}
+		if p.MCPURL != "" {
+			latest.PersonaMCPURL = p.MCPURL
+		}
+		if p.NativeMCPServerName != "" {
+			latest.NativeMCPServer = p.NativeMCPServerName
+		}
+		if p.NativeMCPToolNamespace != "" {
+			latest.NativeMCPNamespace = p.NativeMCPToolNamespace
+		}
+		return nil
+	})
 }

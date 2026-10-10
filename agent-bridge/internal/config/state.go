@@ -36,6 +36,8 @@ func (kind ExternalAgentKind) String() string {
 }
 
 type MigrationCapture struct {
+	WasPaused           bool
+	PauseVersion        int64
 	ID                  string
 	ConfigPath          string
 	CanonicalConfigPath string

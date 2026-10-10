@@ -85,3 +85,35 @@ func transferCapturedEntry(entries *yaml.Node, b config.Binding, canonical strin
 	entries.Content = append(entries.Content[:index], entries.Content[index+2:]...)
 	return nil
 }
+
+// LegacyEntryMatchesMetadata checks a known legacy key and endpoint for manual
+// inspection guidance. It does not prove credential custody or permit deletion.
+func LegacyEntryMatchesMetadata(b config.Binding) bool {
+	if b.NativeMCPServer == "" {
+		return false
+	}
+	doc, err := readConfig(b.NativeConfigPath)
+	if err != nil {
+		return false
+	}
+	entries, err := nativeEntries(doc, b.RuntimeKind, false)
+	if err != nil {
+		return false
+	}
+	entry, _ := entryAt(entries, b.NativeMCPServer)
+	if entry == nil {
+		return false
+	}
+	var metadata struct {
+		Transport string   `yaml:"transport"`
+		URL       string   `yaml:"url"`
+		Command   string   `yaml:"command"`
+		Args      []string `yaml:"args"`
+	}
+	if entry.Decode(&metadata) != nil {
+		return false
+	}
+	direct := b.PersonaMCPURL != "" && metadata.URL == b.PersonaMCPURL && (metadata.Transport == "streamable-http" || metadata.Transport == "sse")
+	stdio := filepath.Base(metadata.Command) == "personastack-connector" && reflect.DeepEqual(metadata.Args, []string{"mcp", "stdio", "--binding", string(b.ConnectionID)})
+	return direct || stdio
+}

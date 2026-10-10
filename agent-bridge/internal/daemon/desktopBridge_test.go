@@ -95,3 +95,31 @@ func TestDesktopAgentBridgeWireGenerationAndTargetEpoch(t *testing.T) {
 		t.Fatal("clear status stale")
 	}
 }
+
+func TestDesktopAgentBridgeCanonicalMCPRefreshScope(t *testing.T) {
+	t.Parallel()
+	b := config.Binding{EnvironmentID: "https://one.example", PersonaID: "p", ConnectionID: "same", ConnectionGeneration: 2, NativeMCPServer: "old", PersonaMCPToken: "durable"}
+	other := b
+	other.EnvironmentID = "https://two.example"
+	store := config.NewMemoryStore(config.State{Bindings: []config.Binding{b, other}})
+	runner := Runner{Store: &store}
+	refresh := &externalagentprotocol.ConfigRefreshPayload{MCPURL: "https://mcp.example/v1/mcp", NativeMCPServerName: "new-issued", NativeMCPToolNamespace: "mcp_new"}
+	if err := runner.applyMCPConfiguration(b, refresh); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := config.BindingFor(&store, b)
+	sibling, _ := config.BindingFor(&store, other)
+	if current.NativeMCPServer != "new-issued" || current.PersonaMCPToken != "durable" || sibling.NativeMCPServer != "old" {
+		t.Fatal("canonical metadata crossed keyed scope or changed token")
+	}
+	stale := b
+	stale.ConnectionGeneration = 1
+	refresh.NativeMCPServerName = "foreign"
+	if err := runner.applyMCPConfiguration(stale, refresh); err == nil {
+		t.Fatal("stale metadata admitted")
+	}
+	readback, _ := config.BindingFor(&store, b)
+	if readback.NativeMCPServer != "new-issued" {
+		t.Fatal("failed metadata mutation had effects")
+	}
+}

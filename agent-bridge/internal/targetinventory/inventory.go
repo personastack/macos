@@ -41,7 +41,7 @@ func CanonicalPath(path string) (string, error) {
 	return filepath.Clean(absolute), nil
 }
 func SharedPhysicalTarget(a, b ResolvedTarget) bool {
-	if a.StateRoot == b.StateRoot || a.ConfigPath == b.ConfigPath {
+	if (a.StateRoot != "" && a.StateRoot == b.StateRoot) || (a.ConfigPath != "" && a.ConfigPath == b.ConfigPath) {
 		return true
 	}
 	for _, pair := range [][2]string{{a.StateRoot, b.StateRoot}, {a.ConfigPath, b.ConfigPath}} {

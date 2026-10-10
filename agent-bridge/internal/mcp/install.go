@@ -91,6 +91,15 @@ func (i Installer) install(b config.Binding) (InstallResult, error) {
 	if err = transferCapturedEntry(entries, b, canonical); err != nil {
 		return InstallResult{}, err
 	}
+	if b.Migration == nil && b.MCPOwnership.EntryKey != "" && b.MCPOwnership.EntryKey != b.NativeMCPServer {
+		previous, previousIndex := entryAt(entries, b.MCPOwnership.EntryKey)
+		if previous != nil {
+			if fingerprint(previous, b.InventorySeed) != b.MCPOwnership.Fingerprint {
+				return InstallResult{}, fmt.Errorf("cleanup_required: previous owned MCP entry changed")
+			}
+			entries.Content = append(entries.Content[:previousIndex], entries.Content[previousIndex+2:]...)
+		}
+	}
 	old, index := entryAt(entries, b.NativeMCPServer)
 	if old != nil {
 		if b.MCPOwnership.EntryKey != b.NativeMCPServer || b.MCPOwnership.Fingerprint != fingerprint(old, b.InventorySeed) {

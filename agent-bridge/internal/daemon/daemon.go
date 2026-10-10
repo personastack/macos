@@ -583,10 +583,11 @@ func (r Runner) runBindingSession(ctx context.Context, binding config.Binding, s
 	}
 	runObservations := newRunObservationRegistry()
 	type pendingRefresh struct {
-		target   *externalagentprotocol.RuntimeTarget
-		clear    bool
-		revision int64
-		epoch    int64
+		configuration *externalagentprotocol.ConfigRefreshPayload
+		target        *externalagentprotocol.RuntimeTarget
+		clear         bool
+		revision      int64
+		epoch         int64
 	}
 	var pendingRuntimeRefresh *pendingRefresh
 	applyConfigRefresh := func(refresh pendingRefresh) error {
@@ -602,6 +603,16 @@ func (r Runner) runBindingSession(ctx context.Context, binding config.Binding, s
 		}
 		if refresh.epoch <= 0 || refresh.revision != refresh.target.SelectionRevision {
 			return fmt.Errorf("target revision and epoch required")
+		}
+		current := reconciler.snapshotCopy()
+		if refresh.revision < current.TargetRevision || refresh.epoch < current.TargetEpoch {
+			return nil
+		}
+		if refresh.revision == current.TargetRevision && current.Target != nil && !runtimeTargetsEqual(refresh.target, current.Target) {
+			return fmt.Errorf("target changed without new selection revision")
+		}
+		if err := r.applyMCPConfiguration(binding, refresh.configuration); err != nil {
+			return err
 		}
 		reconciler.setTarget(refresh.target, refresh.epoch)
 		return nil
@@ -751,9 +762,10 @@ func (r Runner) runBindingSession(ctx context.Context, binding config.Binding, s
 				return fmt.Errorf("runtime target required for config refresh")
 			}
 			refresh := pendingRefresh{
-				target:   cloneRuntimeTarget(frame.ConfigRefresh.RuntimeTarget),
-				revision: frame.ConfigRefresh.TargetSelectionRevision,
-				epoch:    frame.ConfigRefresh.TargetEpoch,
+				configuration: frame.ConfigRefresh,
+				target:        cloneRuntimeTarget(frame.ConfigRefresh.RuntimeTarget),
+				revision:      frame.ConfigRefresh.TargetSelectionRevision,
+				epoch:         frame.ConfigRefresh.TargetEpoch,
 			}
 			if refresh.target != nil && refresh.revision == 0 {
 				refresh.revision = refresh.target.SelectionRevision

@@ -46,23 +46,32 @@ type Connection struct {
 	DiagnosticMessage string            `json:"diagnostic_message,omitempty"`
 }
 type Result struct {
-	MigrationID        string             `json:"migration_id,omitempty"`
-	LegacyServiceScope string             `json:"legacy_service_scope,omitempty"`
-	Operation          string             `json:"-"`
-	Profiles           []Profile          `json:"profiles,omitempty"`
-	DiscoveryStatus    string             `json:"discovery_status,omitempty"`
-	PreparationID      string             `json:"preparation_id,omitempty"`
-	DevicePublicKey    string             `json:"device_public_key,omitempty"`
-	ProfileCandidateID string             `json:"profile_candidate_id,omitempty"`
-	ExpiresAt          *time.Time         `json:"expires_at,omitempty"`
-	ExistingBindingKey *config.BindingKey `json:"existing_binding_key,omitempty"`
-	BindingKey         *config.BindingKey `json:"binding_key,omitempty"`
-	PersonaID          string             `json:"persona_id,omitempty"`
-	Connections        []Connection       `json:"connections,omitempty"`
-	ActiveRunIDs       []string           `json:"active_run_ids,omitempty"`
-	Quiesced           *bool              `json:"quiesced,omitempty"`
-	Disconnected       *bool              `json:"disconnected,omitempty"`
-	Disabled           *bool              `json:"disabled,omitempty"`
+	ProfileLabel          string             `json:"profile_label,omitempty"`
+	ProfileConfigPath     string             `json:"profile_config_path,omitempty"`
+	LegacyEntryKey        string             `json:"legacy_entry_key,omitempty"`
+	BackupDirectory       string             `json:"backup_directory,omitempty"`
+	Cancelled             *bool              `json:"cancelled,omitempty"`
+	PendingMigrationCount int                `json:"pending_migration_count"`
+	MigrationPending      bool               `json:"migration_pending,omitempty"`
+	WasPaused             *bool              `json:"was_paused,omitempty"`
+	PauseVersion          *int64             `json:"pause_version,omitempty"`
+	MigrationID           string             `json:"migration_id,omitempty"`
+	LegacyServiceScope    string             `json:"legacy_service_scope,omitempty"`
+	Operation             string             `json:"-"`
+	Profiles              []Profile          `json:"profiles,omitempty"`
+	DiscoveryStatus       string             `json:"discovery_status,omitempty"`
+	PreparationID         string             `json:"preparation_id,omitempty"`
+	DevicePublicKey       string             `json:"device_public_key,omitempty"`
+	ProfileCandidateID    string             `json:"profile_candidate_id,omitempty"`
+	ExpiresAt             *time.Time         `json:"expires_at,omitempty"`
+	ExistingBindingKey    *config.BindingKey `json:"existing_binding_key,omitempty"`
+	BindingKey            *config.BindingKey `json:"binding_key,omitempty"`
+	PersonaID             string             `json:"persona_id,omitempty"`
+	Connections           []Connection       `json:"connections,omitempty"`
+	ActiveRunIDs          []string           `json:"active_run_ids,omitempty"`
+	Quiesced              *bool              `json:"quiesced,omitempty"`
+	Disconnected          *bool              `json:"disconnected,omitempty"`
+	Disabled              *bool              `json:"disabled,omitempty"`
 }
 type DiscoverPayload struct {
 	EnvironmentID string `json:"environment_id"`
@@ -131,8 +140,9 @@ func (r Result) MarshalJSON() ([]byte, error) {
 			r.Connections = []Connection{}
 		}
 		return json.Marshal(struct {
-			Connections []Connection `json:"connections"`
-		}{r.Connections})
+			Connections           []Connection `json:"connections"`
+			PendingMigrationCount int          `json:"pending_migration_count"`
+		}{r.Connections, r.PendingMigrationCount})
 	case "quiesce", "resume":
 		if r.ActiveRunIDs == nil {
 			r.ActiveRunIDs = []string{}
@@ -148,7 +158,40 @@ func (r Result) MarshalJSON() ([]byte, error) {
 }
 
 type MigrationPreparePayload struct {
+	WasPaused    *bool  `json:"was_paused"`
+	PauseVersion *int64 `json:"pause_version"`
 	PreparePayload
 	ConnectionID         config.ConnectionID `json:"connection_id"`
 	ConnectionGeneration int64               `json:"connection_generation"`
+}
+
+type MigrationAbsenceReadback struct {
+	EnvironmentID string `json:"environment_id"`
+	WorkspaceID   string `json:"workspace_id"`
+	PersonaID     string `json:"persona_id"`
+	BindingAbsent bool   `json:"binding_absent"`
+}
+type MigrationRepairPayload struct {
+	PauseVersion *int64 `json:"pause_version"`
+	PreparePayload
+	RevocationReadback MigrationAbsenceReadback `json:"revocation_readback"`
+}
+
+type LegacyPresenceReadback struct {
+	EnvironmentID        string              `json:"environment_id"`
+	WorkspaceID          string              `json:"workspace_id"`
+	PersonaID            string              `json:"persona_id"`
+	ConnectionID         config.ConnectionID `json:"connection_id"`
+	ConnectionGeneration int64               `json:"connection_generation"`
+	BindingPresent       bool                `json:"binding_present"`
+}
+type MigrationCancelPayload struct {
+	MigrationID           string                 `json:"migration_id"`
+	DocumentID            string                 `json:"document_id"`
+	LegacyBindingReadback LegacyPresenceReadback `json:"legacy_binding_readback"`
+}
+
+type MigrationHelpPayload struct {
+	PreparePayload
+	RevocationReadback MigrationAbsenceReadback `json:"revocation_readback"`
 }
