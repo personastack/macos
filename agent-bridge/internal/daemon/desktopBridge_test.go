@@ -2,12 +2,19 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"github.com/google/uuid"
 	"github.com/personastack/agent-gateway/pkg/externalagentprotocol"
+	"github.com/personastack/macos/agent-bridge/internal/bridge"
 	"github.com/personastack/macos/agent-bridge/internal/config"
+	"github.com/personastack/macos/agent-bridge/internal/control"
 	"github.com/personastack/macos/agent-bridge/internal/runtime"
+	"github.com/personastack/macos/agent-bridge/internal/targetinventory"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -60,7 +67,7 @@ func TestDesktopAgentBridgeAssignedRunGenerationAndRevocation(t *testing.T) {
 
 func TestDesktopAgentBridgeWireGenerationAndTargetEpoch(t *testing.T) {
 	t.Parallel()
-	binding := config.Binding{EnvironmentID: "https://a.example", PersonaID: "persona", ConnectionID: "connection", ConnectionGeneration: 3}
+	binding := config.Binding{EnvironmentID: "https://a.example", PersonaID: "persona", ConnectionID: "connection", ConnectionGeneration: 3, RuntimeKind: runtime.AdapterKindHermes, AccountCandidateID: "account", ProfileCandidateID: "profile"}
 	frame := externalagentprotocol.Frame{PersonaID: "persona", ConnectionID: "connection", ConnectionGeneration: 3}
 	if !matchesFrameScope(binding, frame) {
 		t.Fatal("exact frame denied")
@@ -75,7 +82,9 @@ func TestDesktopAgentBridgeWireGenerationAndTargetEpoch(t *testing.T) {
 		t.Fatal("foreign persona admitted")
 	}
 	store := config.NewMemoryStore(config.State{Bindings: []config.Binding{binding}})
-	reconciler := newSessionReconciler(context.Background(), Runner{Store: &store}, binding, nil, runtime.Detection{})
+	reconciler := newSessionReconciler(context.Background(), Runner{Store: &store, ResolveTarget: func(config.Binding, *externalagentprotocol.RuntimeTarget) (targetinventory.ResolvedTarget, error) {
+		return targetinventory.ResolvedTarget{}, nil
+	}}, binding, nil, runtime.Detection{})
 	target := &externalagentprotocol.RuntimeTarget{AccountCandidateID: "account", ProfileCandidateID: "profile", RuntimeKind: externalagentprotocol.RuntimeKindHermes, SelectionRevision: 4}
 	if !reconciler.setTarget(target, 2) {
 		t.Fatal("target not selected")
@@ -246,5 +255,284 @@ func TestDesktopAgentBridgeRepairRejectedMCPCredentialHasNoRuntimeMutation(t *te
 				t.Fatalf("unplanned credential HTTP calls %d", calls)
 			}
 		})
+	}
+}
+
+func freshSelectedFixture(t *testing.T) (config.Binding, *config.MemoryStore, Runner) {
+	t.Helper()
+	root := t.TempDir()
+	path := filepath.Join(root, "config.yaml")
+	if err := os.WriteFile(path, []byte("mcp_servers: {}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	b := config.Binding{EnvironmentID: "https://app.example", ConnectionID: "connection", PersonaID: "persona", ConnectionGeneration: 2, RuntimeKind: runtime.AdapterKindHermes, AccountCandidateID: "account", ProfileCandidateID: "profile", NativeStateRoot: root, NativeConfigPath: path, HermesHome: root, NativeMCPServer: "issued", NativeMCPNamespace: "mcp_issued", PersonaMCPURL: "https://mcp.example/v1/mcp", PersonaMCPToken: "token", InventorySeed: "seed"}
+	store := config.NewMemoryStore(config.State{Bindings: []config.Binding{b}})
+	runner := Runner{Store: &store, ResolveTarget: func(reference config.Binding, target *externalagentprotocol.RuntimeTarget) (targetinventory.ResolvedTarget, error) {
+		if reference.Key() != b.Key() || target.AccountCandidateID != "account" || target.ProfileCandidateID != "profile" {
+			t.Fatal("unplanned profile resolution")
+		}
+		return targetinventory.ResolvedTarget{HomeDir: root, HermesHome: root, StateRoot: root, ConfigPath: path, UID: os.Geteuid(), GID: os.Getegid()}, nil
+	}, VerifyRuntimeEndpoint: func(context.Context, string, string, string, string) (bool, error) { return false, nil }}
+	return b, &store, runner
+}
+func acceptedMCPCredentialClient(t *testing.T, firstRead func()) *http.Client {
+	t.Helper()
+	calls := 0
+	return &http.Client{Transport: credentialTransport(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 && firstRead != nil {
+			firstRead()
+		}
+		if req.Method != "POST" || req.URL.String() != "https://mcp.example/v1/mcp" || req.Header.Get("Authorization") != "Bearer token" {
+			t.Fatal("wrong MCP authorization scope")
+		}
+		var message struct {
+			Method string          `json:"method"`
+			ID     json.RawMessage `json:"id"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&message); err != nil {
+			t.Fatal(err)
+		}
+		expected := []string{"initialize", "notifications/initialized", "tools/list"}
+		if calls > 3 || message.Method != expected[calls-1] {
+			t.Fatalf("unplanned MCP credential call %s", message.Method)
+		}
+		status := http.StatusOK
+		body := `{"jsonrpc":"2.0","id":` + string(message.ID) + `,"result":{}}`
+		if calls == 2 {
+			status = http.StatusAccepted
+			body = ""
+		}
+		return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})}
+}
+
+func TestDesktopAgentBridgeFreshTargetStoppedRuntimeCanBeRepaired(t *testing.T) {
+	t.Parallel()
+	b, store, runner := freshSelectedFixture(t)
+	runner.MCPHTTPClient = acceptedMCPCredentialClient(t, nil)
+	reconciler := newSessionReconciler(context.Background(), runner, b, nil, runtime.Detection{})
+	target := targetForBinding(b)
+	target.SelectionRevision = 3
+	foreign := *target
+	foreign.ProfileCandidateID = "foreign"
+	if reconciler.setTarget(&foreign, 1) {
+		t.Fatal("foreign profile selection persisted")
+	}
+	before, _ := config.BindingFor(store, b)
+	if before.TargetSelectionRevision != 0 {
+		t.Fatal("rejected target mutation had side effects")
+	}
+	if !reconciler.setTarget(target, 1) {
+		t.Fatal("fresh API target rejected")
+	}
+	selected, _ := config.BindingFor(store, b)
+	if selected.TargetSelectionRevision != 3 || selected.ReadinessState == runtime.AdapterStateMCPVerified || selected.RuntimeLaunchAllowed {
+		t.Fatal("selection was not durable or claimed readiness/consent")
+	}
+	snapshot := reconciler.snapshotCopy()
+	result, err := runner.reconcileTarget(context.Background(), selected, snapshot)
+	if err == nil || !strings.Contains(err.Error(), "native consent required") {
+		t.Fatalf("stopped runtime did not require consent: %v", err)
+	}
+	result.Detection = detectionForReconcileError(b.RuntimeKind, err)
+	reconciler.publish(snapshot, result)
+	selected, _ = config.BindingFor(store, b)
+	if err := runner.RepairBinding(context.Background(), selected, true); err != nil {
+		t.Fatal(err)
+	}
+	repaired, _ := config.BindingFor(store, b)
+	if repaired.TargetSelectionRevision != 3 || !repaired.RuntimeLaunchAllowed || repaired.MCPOwnership.EntryKey != "issued" || repaired.ReadinessState == runtime.AdapterStateMCPVerified {
+		t.Fatal("explicit repair did not preserve unverified selection and scoped consent")
+	}
+	env, err := os.ReadFile(filepath.Join(b.HermesHome, ".env"))
+	if err != nil || !strings.Contains(string(env), "API_SERVER_ENABLED=true") {
+		t.Fatal("selected Hermes API setup missing")
+	}
+}
+
+func TestDesktopAgentBridgeQuiescedAssignedRunRetainsControlAndReplays(t *testing.T) {
+	t.Parallel()
+	for _, kind := range []runtime.AdapterKind{runtime.AdapterKindHermes, runtime.AdapterKindOpenClaw} {
+		t.Run(kind.String(), func(t *testing.T) {
+			t.Parallel()
+			b, store, runner := freshSelectedFixture(t)
+			b.RuntimeKind = kind
+			b.ActiveRunID = "assigned"
+			b.ActiveAssignmentID = "assignment"
+			b.ActiveNativeRunID = "native"
+			b.TargetSelectionRevision = 3
+			if err := store.SaveBinding(b); err != nil {
+				t.Fatal(err)
+			}
+			key := b.Key()
+			payload, _ := json.Marshal(control.BindingPayload{BindingKey: &key})
+			encoded, _ := json.Marshal(control.Request{Version: 1, RequestID: uuid.NewString(), Operation: "quiesce", Payload: payload})
+			response := (&control.Controller{Store: store}).Dispatch(context.Background(), encoded)
+			if response.Error != nil || response.Result.Quiesced == nil || !*response.Result.Quiesced {
+				t.Fatalf("scoped native quiesce failed: %+v", response)
+			}
+			b, _ = config.BindingFor(store, b)
+			cancelled := 0
+			adapter := assignedCancelAdapter{cancel: func(id string) error {
+				if id != "native" {
+					t.Fatal("foreign run stopped")
+				}
+				cancelled++
+				return nil
+			}}
+			reconciler := newSessionReconciler(context.Background(), runner, b, nil, runtime.Detection{})
+			reconciler.snapshot.Target = targetForBinding(b)
+			reconciler.snapshot.TargetRevision = 3
+			reconciler.snapshot.Adapter = adapter
+			snapshot := reconciler.snapshotCopy()
+			result, err := runner.reconcileTarget(context.Background(), b, snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reconciler.publish(snapshot, result)
+			if reconciler.snapshotCopy().Adapter == nil {
+				t.Fatal("quiesce erased active execution adapter")
+			}
+			frame := externalagentprotocol.Frame{MessageType: externalagentprotocol.FrameTypeRunStart, MessageID: "redelivery", ConnectionID: string(b.ConnectionID), PersonaID: string(b.PersonaID), ConnectionGeneration: 2, RunID: "assigned", AssignmentID: "assignment", RunStart: &externalagentprotocol.RunStartPayload{RuntimeTarget: targetForBinding(b)}}
+			session := bridge.Session{Binding: b}
+			cache := newCommandFrameCache()
+			replies, replayed := runner.runStartReplayReplies(b, frame, session, cache)
+			if !replayed || len(replies) != 2 || replies[0].RunAccepted == nil || replies[1].RunStarted == nil {
+				t.Fatal("quiesce rejected accepted assignment replay")
+			}
+			fresh := frame
+			fresh.RunID = "new"
+			fresh.AssignmentID = "new-assignment"
+			fresh.MessageID = "new-message"
+			if _, ok := runner.runStartReplayReplies(b, fresh, session, cache); ok {
+				t.Fatal("new run reused accepted replay")
+			}
+			if err := runner.activateRun(b, fresh); err == nil {
+				t.Fatal("quiesce admitted new run")
+			}
+			stop := frame
+			stop.MessageType = externalagentprotocol.FrameTypeRunCancel
+			stop.MessageID = "stop"
+			stop.RunCancel = &externalagentprotocol.RunCancelPayload{}
+			if err := runner.cancelAssignedRun(b, stop, nil, reconciler, cache); err != nil || cancelled != 1 {
+				t.Fatalf("active Stop lost selected adapter: %v", err)
+			}
+			active, _ := config.BindingFor(store, b)
+			if active.ActiveRunID != "assigned" {
+				t.Fatal("Stop acceptance cleared unsettled run")
+			}
+			if err := runner.clearRunState(b, "assigned"); err != nil {
+				t.Fatal(err)
+			}
+			settled, _ := config.BindingFor(store, b)
+			if settled.ActiveRunID != "" || !settled.Quiesced {
+				t.Fatal("terminal acknowledgement did not retain quiesce")
+			}
+			next := reconciler.snapshotCopy()
+			idle, err := runner.reconcileTarget(context.Background(), settled, next)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reconciler.publish(next, idle)
+			if _, ok := runner.runStartReplayReplies(b, frame, session, newCommandFrameCache()); ok {
+				t.Fatal("settled assignment replayed")
+			}
+		})
+	}
+}
+
+func TestDesktopAgentBridgeRepairConcurrentAdmissionDoesNotOverwriteState(t *testing.T) {
+	t.Parallel()
+	for _, change := range []string{"run_start", "quiesce", "generation", "target_revision"} {
+		t.Run(change, func(t *testing.T) {
+			t.Parallel()
+			b, store, runner := freshSelectedFixture(t)
+			b.TargetSelectionRevision = 3
+			if err := store.SaveBinding(b); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(b.NativeConfigPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runner.MCPHTTPClient = acceptedMCPCredentialClient(t, func() {
+				if err := config.UpdateBinding(store, b, func(current *config.Binding) error {
+					switch change {
+					case "run_start":
+						current.ActiveRunID = "accepted"
+						current.ActiveAssignmentID = "accepted-assignment"
+						current.ActiveNativeRunID = "native"
+					case "quiesce":
+						current.Quiesced = true
+					case "generation":
+						current.ConnectionGeneration++
+					case "target_revision":
+						current.TargetSelectionRevision++
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			})
+			if err := runner.RepairBinding(context.Background(), b, true); err == nil {
+				t.Fatal("stale Repair admission accepted")
+			}
+			current, _ := config.BindingFor(store, b)
+			if current.RuntimeLaunchAllowed || current.MCPOwnership.EntryKey != "" {
+				t.Fatal("stale Repair mutated consent or MCP ownership")
+			}
+			switch change {
+			case "run_start":
+				if current.ActiveRunID != "accepted" || current.ActiveNativeRunID != "native" {
+					t.Fatal("Repair clobbered accepted run")
+				}
+			case "quiesce":
+				if !current.Quiesced {
+					t.Fatal("Repair undid quiesce")
+				}
+			case "generation":
+				if current.ConnectionGeneration != 3 {
+					t.Fatal("Repair overwrote fresh generation")
+				}
+			case "target_revision":
+				if current.TargetSelectionRevision != 4 {
+					t.Fatal("Repair overwrote fresh target")
+				}
+			}
+			after, _ := os.ReadFile(b.NativeConfigPath)
+			if string(after) != string(before) {
+				t.Fatal("stale Repair changed native config")
+			}
+			if _, err := os.Stat(filepath.Join(b.HermesHome, ".env")); !os.IsNotExist(err) {
+				t.Fatal("stale Repair changed Hermes API setup")
+			}
+		})
+	}
+}
+
+func TestDesktopAgentBridgeQuiescedAcceptedAssignmentRestoresSelectedControlAdapter(t *testing.T) {
+	t.Parallel()
+	b, store, runner := freshSelectedFixture(t)
+	b.Quiesced = true
+	b.ActiveRunID = "accepted"
+	b.ActiveAssignmentID = "assignment"
+	b.ActiveNativeRunID = "native"
+	b.TargetSelectionRevision = 3
+	if err := store.SaveBinding(b); err != nil {
+		t.Fatal(err)
+	}
+	runner.VerifyRuntimeEndpoint = func(context.Context, string, string, string, string) (bool, error) {
+		t.Fatal("quiesced accepted work probed or started runtime")
+		return false, nil
+	}
+	snapshot := runtimeSnapshot{Generation: b.ConnectionGeneration, Target: targetForBinding(b), TargetRevision: 3}
+	result, err := runner.reconcileTarget(context.Background(), b, snapshot)
+	if err != nil || result.Adapter == nil || result.Adapter.Kind() != runtime.AdapterKindHermes {
+		t.Fatalf("selected control adapter not restored: %+v %v", result, err)
+	}
+	current, _ := config.BindingFor(store, b)
+	if current.ActiveRunID != "accepted" || !current.Quiesced || current.MCPOwnership.EntryKey != "" || current.RuntimeLaunchAllowed {
+		t.Fatal("accepted control restoration changed admission/config")
 	}
 }

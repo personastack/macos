@@ -497,6 +497,12 @@ func (c *Controller) repair(ctx context.Context, p RepairPayload) (Result, error
 	}
 	err = c.Repair(ctx, b, p.RestartConfirmed)
 	if err != nil {
+		if strings.HasPrefix(err.Error(), "busy:") {
+			return Result{}, issue("busy", "Stop the assigned run or resume this connection before Repair.")
+		}
+		if strings.HasPrefix(err.Error(), "scope_changed:") {
+			return Result{}, issue("scope_changed", "Connection selection changed. Check this connection before Repair.")
+		}
 		if strings.HasPrefix(err.Error(), "credential_unavailable:") {
 			return Result{}, issue("credential_unavailable", "Allow this helper to read its stored Keychain credential before retrying.")
 		}

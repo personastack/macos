@@ -85,6 +85,9 @@ func TestDesktopAgentBridgeMCPConfigSymlink(t *testing.T) {
 	os.Symlink(path, alias)
 	b.NativeConfigPath = alias
 	b.MCPOwnership.ConfigPath = alias
+	if err := store.SaveBinding(b); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := (Installer{Store: store}).InstallBinding(b); err != nil {
 		t.Fatal(err)
 	}
@@ -114,6 +117,9 @@ func TestDesktopAgentBridgeCapturedLegacyTransfer(t *testing.T) {
 	b.NativeMCPNamespace = "mcp_new"
 	b.PersonaMCPToken = "new-secret"
 	b.MCPOwnership = config.MCPOwnership{}
+	if err := store.SaveBinding(b); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = (Installer{Store: store}).InstallBinding(b); err != nil {
 		t.Fatal(err)
 	}
@@ -146,6 +152,9 @@ func TestDesktopAgentBridgeCapturedLegacyEditRefusal(t *testing.T) {
 	b.Migration = &capture
 	b.NativeMCPServer = "new"
 	b.MCPOwnership = config.MCPOwnership{}
+	if err := store.SaveBinding(b); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = (Installer{Store: store}).InstallBinding(b); err == nil {
 		t.Fatal("changed captured entry replaced")
 	}
@@ -198,5 +207,48 @@ func TestDesktopAgentBridgeOwnedCredentialAndKeyRotation(t *testing.T) {
 	saved, _ := config.BindingFor(store, b)
 	if saved.PersonaMCPToken != "new-authorized-token" || saved.MCPOwnership.EntryKey != "new-issued" || saved.MCPOwnership.Fingerprint != fingerprint(current, b.InventorySeed) {
 		t.Fatal("rotation custody/ownership readback incorrect")
+	}
+}
+
+func TestDesktopAgentBridgeInstallerAdmissionGuardPreservesAssignedWork(t *testing.T) {
+	t.Parallel()
+	for _, guard := range []string{"active_run", "quiesced", "stale_generation", "stale_profile"} {
+		t.Run(guard, func(t *testing.T) {
+			t.Parallel()
+			b, store, path := installedFixture(t)
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := config.UpdateBinding(store, b, func(latest *config.Binding) error {
+				switch guard {
+				case "active_run":
+					latest.ActiveRunID = "assigned"
+				case "quiesced":
+					latest.Quiesced = true
+				case "stale_generation":
+					latest.ConnectionGeneration++
+				case "stale_profile":
+					latest.NativeConfigPath = path + ".foreign"
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := (Installer{Store: store}).InstallBinding(b); err == nil {
+				t.Fatal("native install ignored current admission guard")
+			}
+			after, _ := os.ReadFile(path)
+			if string(before) != string(after) {
+				t.Fatal("refused install changed native config")
+			}
+			latest, _ := config.BindingFor(store, b)
+			if guard == "active_run" && latest.ActiveRunID != "assigned" {
+				t.Fatal("installer changed accepted work")
+			}
+			if guard == "quiesced" && !latest.Quiesced {
+				t.Fatal("installer resumed quiesced binding")
+			}
+		})
 	}
 }

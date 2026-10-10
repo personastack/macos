@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -536,6 +537,30 @@ func TestDesktopAgentBridgeNativeStatusAndRepairExposeReconnectRequired(t *testi
 				}
 			} else if result.Error != nil || checks != 1 || repairs != 1 {
 				t.Fatal("runtime repair incorrectly blocked by MCP custody")
+			}
+		})
+	}
+}
+
+func TestDesktopAgentBridgeRepairReportsAdmissionAndSelectionConflict(t *testing.T) {
+	t.Parallel()
+	for _, code := range []string{"busy", "scope_changed"} {
+		t.Run(code, func(t *testing.T) {
+			t.Parallel()
+			c, store, _ := fixture(t)
+			b := config.Binding{EnvironmentID: "https://app.test", ConnectionID: "connection", PersonaMCPToken: "token"}
+			if err := store.SaveBinding(b); err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			c.Repair = func(context.Context, config.Binding, bool) error {
+				calls++
+				return fmt.Errorf("%s: current state changed", code)
+			}
+			raw, _ := json.Marshal(RepairPayload{BindingKey: b.Key(), RestartConfirmed: true})
+			result := request(t, c, "repair", string(raw))
+			if result.Error == nil || result.Error.Code != code || calls != 1 {
+				t.Fatalf("Repair conflict mapped to unsafe cleanup: %+v", result)
 			}
 		})
 	}

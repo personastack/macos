@@ -27,6 +27,8 @@ import (
 )
 
 type Runner struct {
+	ResolveTarget           func(config.Binding, *externalagentprotocol.RuntimeTarget) (targetinventory.ResolvedTarget, error)
+	VerifyRuntimeEndpoint   func(context.Context, string, string, string, string) (bool, error)
 	Store                   config.Store
 	MCPHTTPClient           *http.Client
 	ServiceScope            externalagentprotocol.ServiceScope
@@ -613,10 +615,15 @@ func (r Runner) runBindingSession(ctx context.Context, binding config.Binding, s
 		if refresh.revision == current.TargetRevision && current.Target != nil && !runtimeTargetsEqual(refresh.target, current.Target) {
 			return fmt.Errorf("target changed without new selection revision")
 		}
+		if err := r.validateSelectedTarget(binding, refresh.target); err != nil {
+			return err
+		}
 		if err := r.applyMCPConfiguration(binding, refresh.configuration); err != nil {
 			return err
 		}
-		reconciler.setTarget(refresh.target, refresh.epoch)
+		if !reconciler.setTarget(refresh.target, refresh.epoch) {
+			return nil
+		}
 		return nil
 	}
 	if accepted.ConnectAccepted.ProtocolVersion != externalagentprotocol.ProtocolVersionV4 {
@@ -634,7 +641,10 @@ func (r Runner) runBindingSession(ctx context.Context, binding config.Binding, s
 					return
 				case <-ticker.C:
 					snapshot := reconciler.snapshotCopy()
-					if snapshot.Target == nil || snapshot.Adapter == nil || !canStartRunWithReadiness(snapshot.Detection.State, snapshot.WakeProbeAt) {
+					if !r.bindingHasActiveRun(binding) {
+						return
+					}
+					if snapshot.Target == nil || snapshot.Adapter == nil {
 						continue
 					}
 					if err := r.replayActiveRun(sessionCtx, binding, session, snapshot.Adapter, runObservations, writeFrame); err != nil {
@@ -819,35 +829,24 @@ func (r Runner) runBindingSession(ctx context.Context, binding config.Binding, s
 				}
 			}
 		case externalagentprotocol.FrameTypeRunStart:
+			if frame.RunStart == nil {
+				continue
+			}
+			if replies, replayed := r.runStartReplayReplies(binding, frame, session, commandCache); replayed {
+				for _, reply := range replies {
+					if err := writeFrame(reply); err != nil {
+						return fmt.Errorf("write assigned run replay: %w", err)
+					}
+				}
+				if len(replies) > 1 {
+					_ = markRunStarted(frame.RunID)
+				}
+				continue
+			}
 			latestBinding, exists := config.BindingFor(r.Store, binding)
 			if !exists || latestBinding.Quiesced {
 				if err := writeFrame(session.RunTerminalFrame(frame, externalagentprotocol.RunStatusFailed, externalagentprotocol.TerminalReasonFailed, "background agent quiesced")); err != nil {
 					return err
-				}
-				continue
-			}
-
-			if frame.RunStart == nil {
-				continue
-			}
-			if cached, ok := commandCache.cachedReplies(frame); ok {
-				for _, reply := range cached {
-					if err := writeFrame(reply); err != nil {
-						return fmt.Errorf("write cached run response: %w", err)
-					}
-				}
-				continue
-			}
-			if nativeRunID, ok := r.activeNativeRunIDForRunStart(binding, frame); ok {
-				accepted := session.RunAcceptedFrame(frame, nativeRunID)
-				started := session.RunStartedFrame(frame, nativeRunID, time.Time{})
-				commandCache.storeReplies(frame, []externalagentprotocol.Frame{accepted, started})
-				if err := writeFrame(accepted); err != nil {
-					return fmt.Errorf("write redelivered run accepted: %w", err)
-				}
-				_ = markRunStarted(frame.RunID)
-				if err := writeFrame(started); err != nil {
-					return fmt.Errorf("write redelivered run started: %w", err)
 				}
 				continue
 			}
@@ -1023,7 +1022,7 @@ func (r Runner) refreshMCPConfig(binding config.Binding, targets ...*externalage
 	if target == nil {
 		return fmt.Errorf("runtime target required for MCP refresh")
 	}
-	resolved, err := targetinventory.Resolve(latest.RuntimeKind, target, latest.InventorySeed)
+	resolved, err := r.resolveTarget(latest, target)
 	if err != nil {
 		return err
 	}
@@ -1152,6 +1151,23 @@ func (cache *commandFrameCache) mark(frame externalagentprotocol.Frame) {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	cache.seenIDs[key] = struct{}{}
+}
+
+// Replay belongs to an accepted assignment and precedes new-run admission.
+func (r Runner) runStartReplayReplies(binding config.Binding, frame externalagentprotocol.Frame, session bridge.Session, cache *commandFrameCache) ([]externalagentprotocol.Frame, bool) {
+	if frame.RunStart == nil || !matchesFrameScope(binding, frame) {
+		return nil, false
+	}
+	if replies, ok := cache.cachedReplies(frame); ok {
+		return replies, true
+	}
+	native, ok := r.activeNativeRunIDForRunStart(binding, frame)
+	if !ok {
+		return nil, false
+	}
+	replies := []externalagentprotocol.Frame{session.RunAcceptedFrame(frame, native), session.RunStartedFrame(frame, native, time.Time{})}
+	cache.storeReplies(frame, replies)
+	return replies, true
 }
 
 func (r Runner) activeNativeRunIDForRunStart(binding config.Binding, frame externalagentprotocol.Frame) (string, bool) {
@@ -1541,7 +1557,7 @@ func (r Runner) adapterForRuntimeTarget(binding config.Binding, target *external
 }
 
 func (r Runner) targetAdapter(binding config.Binding, target *externalagentprotocol.RuntimeTarget) (runtime.Adapter, targetinventory.ResolvedTarget, error) {
-	resolvedTarget, err := targetinventory.Resolve(binding.RuntimeKind, target, binding.InventorySeed)
+	resolvedTarget, err := r.resolveTarget(binding, target)
 	if err != nil {
 		return nil, targetinventory.ResolvedTarget{}, err
 	}
@@ -1878,4 +1894,24 @@ func jitterDuration(base time.Duration) time.Duration {
 
 func matchesFrameScope(binding config.Binding, frame externalagentprotocol.Frame) bool {
 	return frame.PersonaID == string(binding.PersonaID) && frame.ConnectionID == string(binding.ConnectionID) && frame.ConnectionGeneration == binding.ConnectionGeneration
+}
+
+func (r Runner) resolveTarget(binding config.Binding, target *externalagentprotocol.RuntimeTarget) (targetinventory.ResolvedTarget, error) {
+	if r.ResolveTarget != nil {
+		return r.ResolveTarget(binding, target)
+	}
+	return targetinventory.Resolve(binding.RuntimeKind, target, binding.InventorySeed)
+}
+func (r Runner) verifyRuntimeEndpoint(ctx context.Context, endpoint string, resolved targetinventory.ResolvedTarget, kind runtime.AdapterKind) (bool, error) {
+	if r.VerifyRuntimeEndpoint != nil {
+		return r.VerifyRuntimeEndpoint(ctx, endpoint, resolved.StateRoot, resolved.ConfigPath, kind.String())
+	}
+	return targetruntime.VerifyEndpoint(ctx, endpoint, resolved.StateRoot, resolved.ConfigPath, kind.String())
+}
+func (r Runner) validateSelectedTarget(binding config.Binding, target *externalagentprotocol.RuntimeTarget) error {
+	if target == nil || target.SelectionRevision <= 0 || target.AccountCandidateID != binding.AccountCandidateID || target.ProfileCandidateID != binding.ProfileCandidateID || target.RuntimeKind != targetForBinding(binding).RuntimeKind {
+		return fmt.Errorf("scope_changed: API target differs from prepared profile")
+	}
+	_, err := r.resolveTarget(binding, target)
+	return err
 }

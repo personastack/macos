@@ -15,7 +15,6 @@ import (
 	"github.com/personastack/macos/agent-bridge/internal/openclawsetup"
 	"github.com/personastack/macos/agent-bridge/internal/runtime"
 	"github.com/personastack/macos/agent-bridge/internal/targetinventory"
-	"github.com/personastack/macos/agent-bridge/internal/targetruntime"
 )
 
 type runtimeSnapshot struct {
@@ -145,6 +144,24 @@ func (reconciler *sessionReconciler) setTarget(target *externalagentprotocol.Run
 	if target.SelectionRevision == reconciler.snapshot.TargetRevision && runtimeTargetsEqual(target, reconciler.snapshot.Target) && wireEpoch <= reconciler.snapshot.TargetEpoch {
 		return false
 	}
+	if err := reconciler.runner.validateSelectedTarget(reconciler.binding, target); err != nil {
+		return false
+	}
+	err := config.UpdateBinding(reconciler.runner.Store, reconciler.binding, func(latest *config.Binding) error {
+		if latest.ConnectionGeneration != reconciler.binding.ConnectionGeneration {
+			return fmt.Errorf("scope_changed: generation changed")
+		}
+		if target.SelectionRevision < latest.TargetSelectionRevision {
+			return fmt.Errorf("scope_changed: stale target selection")
+		}
+		latest.TargetSelectionRevision = target.SelectionRevision
+		latest.ReadinessState = runtime.AdapterStateRuntimeMissing
+		latest.ReadinessDiagnosticCode = "runtime_missing"
+		return nil
+	})
+	if err != nil {
+		return false
+	}
 	if reconciler.attemptCancel != nil {
 		reconciler.attemptCancel()
 		reconciler.attemptCancel = nil
@@ -159,12 +176,6 @@ func (reconciler *sessionReconciler) setTarget(target *externalagentprotocol.Run
 	reconciler.snapshot.Detection = runtime.Detection{Kind: reconciler.binding.RuntimeKind, State: runtime.AdapterStateRuntimeMissing, DiagnosticCode: string(externalagentprotocol.DiagnosticCodeRuntimeMissing), Note: "selected runtime target is being reconciled"}
 	reconciler.snapshot.MCPApplied = false
 	reconciler.snapshot.WakeProbeAt = nil
-	_ = config.UpdateBinding(reconciler.runner.Store, reconciler.binding, func(latest *config.Binding) error {
-		if latest.ConnectionGeneration == reconciler.binding.ConnectionGeneration {
-			latest.ReadinessState = reconciler.snapshot.Detection.State
-		}
-		return nil
-	})
 	reconciler.wakeNow()
 	return true
 }
@@ -288,7 +299,9 @@ func (reconciler *sessionReconciler) publish(start runtimeSnapshot, result recon
 	if reconciler.snapshot.Generation != start.Generation || reconciler.snapshot.Epoch != start.Epoch || reconciler.snapshot.TargetRevision != start.TargetRevision || !runtimeTargetsEqual(reconciler.snapshot.Target, start.Target) {
 		return
 	}
-	reconciler.snapshot.Adapter = result.Adapter
+	if result.Adapter != nil || !reconciler.runner.bindingHasActiveRun(reconciler.binding) {
+		reconciler.snapshot.Adapter = result.Adapter
+	}
 	reconciler.snapshot.Resolved = result.Resolved
 	reconciler.snapshot.RuntimeURL = result.RuntimeURL
 	reconciler.snapshot.Detection = result.Detection
@@ -309,12 +322,22 @@ func (reconciler *sessionReconciler) publish(start runtimeSnapshot, result recon
 
 func (r Runner) reconcileTarget(ctx context.Context, binding config.Binding, snapshot runtimeSnapshot) (reconcileResult, error) {
 	latest, exists := config.BindingFor(r.Store, binding)
-	if !exists {
-		return reconcileResult{}, fmt.Errorf("binding removed")
+	if !exists || latest.ConnectionGeneration != binding.ConnectionGeneration {
+		return reconcileResult{}, fmt.Errorf("scope_changed: binding removed or generation changed")
 	}
 	binding = latest
 	if binding.Quiesced {
-		return reconcileResult{Detection: runtime.Detection{Kind: binding.RuntimeKind, State: runtime.AdapterStateRuntimeStopped, Note: "background agent quiesced"}}, nil
+		result := reconcileResult{Adapter: snapshot.Adapter, Resolved: snapshot.Resolved, RuntimeURL: snapshot.RuntimeURL, MCPApplied: snapshot.MCPApplied, Detection: runtime.Detection{Kind: binding.RuntimeKind, State: runtime.AdapterStateRuntimeStopped, Note: "background agent quiesced"}}
+		if binding.ActiveRunID != "" && result.Adapter == nil {
+			adapter, resolved, err := r.targetAdapter(binding, snapshot.Target)
+			if err != nil {
+				return result, err
+			}
+			result.Adapter = adapter
+			result.Resolved = resolved
+			result.RuntimeURL, _ = r.targetRuntimeURL(binding, snapshot.Target)
+		}
+		return result, nil
 	}
 
 	adapter, resolved, err := r.targetAdapter(binding, snapshot.Target)
@@ -325,7 +348,7 @@ func (r Runner) reconcileTarget(ctx context.Context, binding config.Binding, sna
 	if err != nil {
 		return reconcileResult{Adapter: adapter, Resolved: resolved}, err
 	}
-	owned, ownershipErr := targetruntime.VerifyEndpoint(ctx, runtimeURL, resolved.StateRoot, resolved.ConfigPath, binding.RuntimeKind.String())
+	owned, ownershipErr := r.verifyRuntimeEndpoint(ctx, runtimeURL, resolved, binding.RuntimeKind)
 	if ownershipErr != nil {
 		return reconcileResult{Adapter: adapter, Resolved: resolved}, ownershipErr
 	}

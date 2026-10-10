@@ -8,7 +8,6 @@ import (
 	"github.com/personastack/macos/agent-bridge/internal/hermessetup"
 	"github.com/personastack/macos/agent-bridge/internal/mcp"
 	"github.com/personastack/macos/agent-bridge/internal/runtime"
-	"github.com/personastack/macos/agent-bridge/internal/targetruntime"
 	"net/url"
 	"strings"
 )
@@ -50,19 +49,22 @@ func (r Runner) CheckBinding(ctx context.Context, b config.Binding) (runtime.Det
 	if err != nil {
 		return runtime.Detection{}, err
 	}
-	owned, err := targetruntime.VerifyEndpoint(ctx, endpoint, resolved.StateRoot, resolved.ConfigPath, b.RuntimeKind.String())
+	owned, err := r.verifyRuntimeEndpoint(ctx, endpoint, resolved, b.RuntimeKind)
 	if err != nil || !owned {
 		return runtime.Detection{Kind: b.RuntimeKind, State: runtime.AdapterStateRuntimeStopped}, err
 	}
 	return r.bindingReadinessAtHomeContext(ctx, adapter, b, resolved.HomeDir, resolved.HermesHome, endpoint), nil
 }
 func (r Runner) RepairBinding(ctx context.Context, b config.Binding, restartConfirmed bool) error {
-	if b.TargetSelectionRevision <= 0 {
-		return fmt.Errorf("scope_changed: API-selected target required before repair")
-	}
 	latest, ok := config.BindingFor(r.Store, b)
 	if !ok || latest.ConnectionGeneration != b.ConnectionGeneration {
 		return fmt.Errorf("scope_changed: binding changed")
+	}
+	if latest.TargetSelectionRevision <= 0 {
+		return fmt.Errorf("scope_changed: API-selected target required before repair")
+	}
+	if latest.ActiveRunID != "" || latest.Quiesced {
+		return fmt.Errorf("busy: assigned run or quiesce prevents repair")
 	}
 	if latest.PersonaMCPSecretUnavailable {
 		return fmt.Errorf("credential_unavailable: stored Keychain credential cannot be read")
@@ -75,31 +77,29 @@ func (r Runner) RepairBinding(ctx context.Context, b config.Binding, restartConf
 	} else if required {
 		return fmt.Errorf("reconnect_required: Disconnect and reconnect to renew PersonaStack MCP authorization")
 	}
-	if latest.ActiveRunID != "" {
-		return fmt.Errorf("busy: assigned run active")
-	}
-	latest.RuntimeLaunchAllowed = restartConfirmed
-	writer, ok := r.Store.(config.WritableStore)
-	if !ok {
-		return fmt.Errorf("writable bridge store required")
-	}
-	err := writer.SaveBinding(latest)
-	if err != nil {
-		return err
-	}
-	if latest.RuntimeKind == runtime.AdapterKindHermes {
-		endpoint, err := r.targetRuntimeURL(latest, targetForBinding(latest))
-		if err != nil {
+	return config.UpdateBinding(r.Store, b, func(current *config.Binding) error {
+		if current.ConnectionGeneration != latest.ConnectionGeneration || current.TargetSelectionRevision != latest.TargetSelectionRevision || current.PersonaMCPToken != latest.PersonaMCPToken {
+			return fmt.Errorf("scope_changed: binding changed during repair")
+		}
+		if current.ActiveRunID != "" || current.Quiesced {
+			return fmt.Errorf("busy: assigned run or quiesce prevents repair")
+		}
+		if current.RuntimeKind == runtime.AdapterKindHermes {
+			endpoint, err := r.targetRuntimeURL(*current, targetForBinding(*current))
+			if err != nil {
+				return err
+			}
+			_, err = hermessetup.EnsureAPISetupForPathsAt(hermessetup.ResolvePaths("", current.HermesHome), endpoint)
+			if err != nil {
+				return err
+			}
+		}
+		if _, err := mcp.ConfigureBinding(current); err != nil {
 			return err
 		}
-		_, err = hermessetup.EnsureAPISetupForPathsAt(hermessetup.ResolvePaths("", latest.HermesHome), endpoint)
-		if err != nil {
-			return err
-		}
-	}
-	// Explicit repair may replace a missing exact owned entry, but never a user edit.
-	_, err = (mcp.Installer{Store: r.Store}).InstallBinding(latest)
-	return err
+		current.RuntimeLaunchAllowed = restartConfirmed
+		return nil
+	})
 }
 
 // Canonical refresh metadata is authority from the authenticated gateway session.

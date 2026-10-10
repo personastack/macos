@@ -69,12 +69,26 @@ func (i Installer) InstallBindingForTarget(b config.Binding, home, hermesHome st
 	return i.install(b)
 }
 func (i Installer) install(b config.Binding) (InstallResult, error) {
+	var result InstallResult
+	err := config.UpdateBinding(i.Store, b, func(latest *config.Binding) error {
+		if latest.ConnectionGeneration != b.ConnectionGeneration || latest.TargetSelectionRevision != b.TargetSelectionRevision || latest.ProfileCandidateID != b.ProfileCandidateID || latest.NativeConfigPath != b.NativeConfigPath || latest.NativeMCPServer != b.NativeMCPServer || latest.PersonaMCPToken != b.PersonaMCPToken {
+			return fmt.Errorf("scope_changed: binding changed before native config mutation")
+		}
+		if latest.ActiveRunID != "" || latest.Quiesced {
+			return fmt.Errorf("busy: assigned run or quiesce prevents native config mutation")
+		}
+		configured, err := ConfigureBinding(latest)
+		result = configured
+		return err
+	})
+	return result, err
+}
+
+// ConfigureBinding runs only inside the existing store mutation/admission guard.
+// It changes native config and its ownership fields without a nested store write.
+func ConfigureBinding(b *config.Binding) (InstallResult, error) {
 	if b.NativeConfigPath == "" || b.NativeMCPServer == "" || b.InventorySeed == "" || b.PersonaMCPToken == "" || b.PersonaMCPURL == "" {
 		return InstallResult{}, fmt.Errorf("scoped profile and native MCP credential required")
-	}
-	_, ok := i.Store.(config.WritableStore)
-	if !ok {
-		return InstallResult{}, fmt.Errorf("writable binding store required")
 	}
 	doc, err := readConfig(b.NativeConfigPath)
 	if err != nil {
@@ -88,7 +102,7 @@ func (i Installer) install(b config.Binding) (InstallResult, error) {
 	if err != nil {
 		return InstallResult{}, err
 	}
-	if err = transferCapturedEntry(entries, b, canonical); err != nil {
+	if err = transferCapturedEntry(entries, *b, canonical); err != nil {
 		return InstallResult{}, err
 	}
 	if b.Migration == nil && b.MCPOwnership.EntryKey != "" && b.MCPOwnership.EntryKey != b.NativeMCPServer {
@@ -133,23 +147,7 @@ func (i Installer) install(b config.Binding) (InstallResult, error) {
 		return InstallResult{}, err
 	}
 	b.MCPOwnership = config.MCPOwnership{ConfigPath: b.NativeConfigPath, CanonicalConfigPath: canonical, EntryKey: b.NativeMCPServer, Fingerprint: fingerprint(entry, b.InventorySeed), FormatVersion: 1}
-	err = config.UpdateBinding(i.Store, b, func(latest *config.Binding) error {
-		if latest.ConnectionGeneration != b.ConnectionGeneration {
-			return fmt.Errorf("scope_changed: connection generation changed")
-		}
-		latest.Migration = nil
-		latest.MCPOwnership = b.MCPOwnership
-		latest.TargetSelectionRevision = b.TargetSelectionRevision
-		latest.AccountCandidateID = b.AccountCandidateID
-		latest.NativeStateRoot = b.NativeStateRoot
-		latest.NativeConfigPath = b.NativeConfigPath
-		latest.RuntimeURL = b.RuntimeURL
-		latest.OpenClawAgentID = b.OpenClawAgentID
-		return nil
-	})
-	if err != nil {
-		return InstallResult{}, fmt.Errorf("save native MCP ownership after config write: %w", err)
-	}
+	b.Migration = nil
 	return InstallResult{ConnectionID: b.ConnectionID, Runtime: b.RuntimeKind, Path: b.NativeConfigPath, ServerName: b.NativeMCPServer, Note: "native MCP entry configured"}, nil
 }
 func RemoveOwned(b config.Binding) error {
