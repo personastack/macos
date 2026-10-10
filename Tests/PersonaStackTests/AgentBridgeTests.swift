@@ -16,6 +16,11 @@ private actor AgentBridgeFixtureTransport: AgentBridgeControlTransport {
         #expect(object["version"] as? Int == 1)
         let operation = try #require(object["operation"] as? String)
         operations.append(operation)
+        if operation == "repair" {
+            let payload = try #require(object["payload"] as? [String: Any])
+            #expect(payload["restart_confirmed"] as? Bool == true)
+            #expect(payload["openclaw_apps_confirmed"] as? Bool == true)
+        }
         if operation == "prepare", let expectedAgentChoice {
             let payload = try #require(object["payload"] as? [String: Any])
             #expect(payload["openclaw_agent_candidate_id"] as? String == expectedAgentChoice)
@@ -62,10 +67,12 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
             "runtime_kind": "hermes", "workspace_id": "ws_11111111111111111111111111111111",
             "persona_id": "persona-a", "profile_candidate_id": "rt_profile_a"]
         _ = try AgentBridgePageCommand.parse(valid)
-        for extra in ["gateway_url", "token", "path", "command", "document_id", "restart_confirmed"] {
+        for extra in ["gateway_url", "token", "path", "command", "document_id", "restart_confirmed", "openclaw_apps_confirmed", "session_key", "expected_existing_session_id"] {
             var input = valid; input[extra] = "untrusted"
             #expect(throws: AgentBridgeFailure.invalidRequest) { try AgentBridgePageCommand.parse(input) }
         }
+        var appsGrant = valid; appsGrant["openclaw_apps_confirmed"] = true
+        #expect(throws: AgentBridgeFailure.invalidRequest) { try AgentBridgePageCommand.parse(appsGrant) }
         for action in ["quiesce", "resume", "stop_background", "register", "execute", "migration_help", "migration_repair", "migration_cancel"] {
             #expect(throws: AgentBridgeFailure.invalidRequest) {
                 try AgentBridgePageCommand.parse(["version": "1", "action": action, "scope": "native-document"])
@@ -207,7 +214,10 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
     @Test(arguments: [false, true]) @MainActor func enrollmentAndReopenedCompletionRefuseUnverifiedGatewayScope(_ reopen: Bool) async throws {
         try await enrollmentWorkflow(staleInventory: reopen, runtimeKind: "openclaw", reopen: reopen, missingScope: true)
     }
-    @MainActor private func enrollmentWorkflow(staleInventory: Bool, runtimeKind: String, reopen: Bool, missingScope: Bool = false) async throws {
+    @Test(arguments: [false, true], [false, true]) @MainActor func enrollmentAndReopenedCompletionRequireExplicitAppsConsent(_ reopen: Bool, _ approveApps: Bool) async throws {
+        try await enrollmentWorkflow(staleInventory: reopen, runtimeKind: "openclaw", reopen: reopen, approveApps: approveApps)
+    }
+    @MainActor private func enrollmentWorkflow(staleInventory: Bool, runtimeKind: String, reopen: Bool, missingScope: Bool = false, approveApps: Bool? = nil) async throws {
         let id = UUID()
         let key = Data(repeating: 1, count: 32).base64EncodedString()
         let prepared = "{\"preparation_id\":\"\(id.uuidString)\",\"device_public_key\":\"\(key)\",\"profile_candidate_id\":\"rt_profile_a\",\"expires_at\":\"2026-10-10T12:00:00Z\"}"
@@ -228,18 +238,21 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
             let pending = "{\"connections\":[{\"binding_key\":{\"environment_id\":\"https://my.personastack.ai\",\"connection_id\":\"conn-a\"},\"persona_id\":\"persona-a\",\"runtime_kind\":\"\(runtimeKind)\",\"readiness_state\":\"target_selection_required\",\"connection_generation\":7,\"prepared_target\":{\"workspace_id\":\"ws_11111111111111111111111111111111\",\"account_candidate_id\":\"rt_account_a\",\"profile_candidate_id\":\"rt_profile_a\",\"runtime_kind\":\"\(runtimeKind)\"}}]}"
             expected.append(("check", pending))
         }
-        expected.append(("check", readinessJSON))
-        if !missingScope { expected.append(("check", readinessJSON)) }
-        if reopen && !missingScope { expected.append(("status", readinessJSON)) }
+        let appsDisabled = readinessJSON.replacingOccurrences(of: "\"readiness_state\":\"mcp_verified\"", with: "\"readiness_state\":\"unavailable\",\"diagnostic_code\":\"mcp_apps_disabled\"")
+        expected.append(("check", approveApps == nil ? readinessJSON : appsDisabled))
+        if approveApps == true { expected.append(("repair", readinessJSON)) }
+        if !missingScope && approveApps != false { expected.append(("check", readinessJSON)) }
+        if reopen && !missingScope && approveApps != false { expected.append(("status", readinessJSON)) }
         let transport = AgentBridgeFixtureTransport(expected, selectedTarget: targetFixture, agentChoice: runtimeKind == "openclaw" ? "rt_agent_b" : nil)
         let client = AgentBridgeControlClient(transport: transport)
         let registration = AgentBridgeFixtureRegistration()
         let service = AgentBridgeService(registration: registration, client: client, preferences: UserDefaults(suiteName: "AgentBridgeTests." + UUID().uuidString)!, requireSignature: {}, clearDisabledPreference: {})
-        var helpCount = 0, confirmCount = 0
+        var helpCount = 0, confirmCount = 0, appsCount = 0
         let manager = AgentBridgeSetupManager(service: service, client: client, hosted: AgentBridgeHostedAuthority(transport: targetFixture), configuration: { _ in .production },
             approveEnvironment: { _ in }, prepareBackgroundEnable: {}, cookieReader: { _, _ in "personastack_session=fixture" },
             chooseOpenClawAgent: { _, _ in "rt_agent_b" },
-            confirmRuntimeStart: { _ in confirmCount += 1; return false }, showProfileScopeHelp: { helpCount += 1 },
+            confirmRuntimeStart: { _ in confirmCount += 1; return true },
+            confirmOpenClawApps: { _ in appsCount += 1; return approveApps == true }, showProfileScopeHelp: { helpCount += 1 },
             waitForSettlement: {}, csrfReader: { _ in "csrf-fixture" })
         let view = WKWebView()
         manager.register(view, appURL: DesktopEnvironmentConfiguration.production.appURL)
@@ -268,9 +281,10 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
             completion = try command("repair", scope: try #require(fresh["scope"] as? String), fields: [
                 "workspace_id": "ws_11111111111111111111111111111111", "persona_id": "persona-a", "connection_id": "conn-a", "connection_generation": 7])
         }
-        if missingScope {
+        if missingScope || approveApps == false {
             await #expect(throws: AgentBridgeFailure.runtimeConflict) { _ = try await manager.apply(completion, view: view) }
-            #expect(helpCount == 1)
+            #expect(helpCount == (missingScope ? 1 : 0))
+            #expect(appsCount == (approveApps == false ? 1 : 0))
             #expect(confirmCount == 0)
             #expect(await transport.operations == expected.map { $0.0 })
             #expect(await targetFixture.saves == (staleInventory ? [7, 8] : [7]))
@@ -280,7 +294,9 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
         if reopen { #expect((result["connections"] as? [[String: Any]])?.first?["prepared_target"] == nil) }
         #expect(Set(result.keys) == (reopen ? ["ok", "connection_id", "persona_id", "connections"] : ["ok", "connection_id", "persona_id"]))
         await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(enroll, view: view) }
-        #expect(await transport.operations == (reopen ? ["status", "discover", "status", "prepare", "enroll", "check", "check", "check", "status"] : ["status", "discover", "status", "prepare", "enroll", "check", "check"]))
+        #expect(await transport.operations == expected.map { $0.0 })
+        #expect(appsCount == (approveApps == true ? 1 : 0))
+        #expect(confirmCount == (approveApps == true ? 1 : 0))
         #expect(await targetFixture.saves == (staleInventory ? [7, 8] : [7]))
         #expect(registration.calls == ["register"])
     }

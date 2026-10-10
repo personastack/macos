@@ -11,7 +11,8 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
     private(set) var performed: [String] = []
     private var afterCheck: (@MainActor @Sendable () -> Void)?
     func setAfterCheck(_ action: @escaping @MainActor @Sendable () -> Void) { afterCheck = action }
-    init(_ expected: [Step]) { self.expected = expected }
+    private let expectedAppsConfirmation: Bool?
+    init(_ expected: [Step], appsConfirmation: Bool? = nil) { self.expected = expected; expectedAppsConfirmation = appsConfirmation }
     private func consume(_ operation: String) throws -> String {
         guard !expected.isEmpty else { throw AgentBridgeFailure.invalidRequest }
         let step = expected.removeFirst()
@@ -26,6 +27,10 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
         let payload = try #require(object["payload"] as? [String: Any])
         let binding = try #require(payload["binding_key"] as? [String: String])
         #expect(binding == ["environment_id": "https://my.personastack.ai", "connection_id": "conn-a"])
+        if operation == "repair", let expectedAppsConfirmation {
+            #expect(payload["restart_confirmed"] as? Bool == true)
+            #expect(payload["openclaw_apps_confirmed"] as? Bool == expectedAppsConfirmation)
+        }
         if operation == "disconnect" {
             let proof = try #require(payload["revocation_readback"] as? [String: Any])
             #expect(proof["binding_absent"] as? Bool == true)
@@ -75,6 +80,7 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
 
     @MainActor private func manager(_ fixture: AgentBridgeManagementFixture, confirmStop: @escaping @MainActor (String) -> Bool = { _ in false },
                                    confirmRepair: @escaping @MainActor (String) -> Bool = { _ in false },
+                                   confirmApps: @escaping @MainActor (String) -> Bool = { _ in false },
                                    showScopeHelp: @escaping @MainActor () -> Void = {},
                                    cookieReader: @escaping @MainActor (WKWebView, DesktopEnvironmentConfiguration) async throws -> String = { _, _ in "personastack_session=fixture" }) -> AgentBridgeSetupManager {
         let client = AgentBridgeControlClient(transport: fixture)
@@ -82,7 +88,7 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
             preferences: UserDefaults(suiteName: "AgentBridgeManagementTests." + UUID().uuidString)!, requireSignature: {}, clearDisabledPreference: {})
         return AgentBridgeSetupManager(service: service, client: client, hosted: AgentBridgeHostedAuthority(transport: fixture),
             configuration: { _ in .production }, approveEnvironment: { _ in }, prepareBackgroundEnable: {},
-            cookieReader: cookieReader, confirmRuntimeStart: confirmRepair, showProfileScopeHelp: showScopeHelp,
+            cookieReader: cookieReader, confirmRuntimeStart: confirmRepair, confirmOpenClawApps: confirmApps, showProfileScopeHelp: showScopeHelp,
             confirmDisconnectStop: confirmStop, waitForSettlement: {}, csrfReader: { _ in "csrf-fixture" })
     }
     @MainActor private func command(_ action: String, manager: AgentBridgeSetupManager, view: WKWebView) async throws -> AgentBridgePageCommand {
@@ -129,11 +135,66 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
         let command = try await command("repair", manager: manager, view: view)
         if fault == "changed_document" { await fixture.setAfterCheck { manager.invalidate(view) } }
         if fault == "changed_cookie" { await fixture.setAfterCheck { cookie = "personastack_session=changed" } }
-        let expected: AgentBridgeFailure = (fault == "exact" || fault == "foreign_message") ? .runtimeConflict : .scopeChanged
+        let expected: AgentBridgeFailure = fault == "exact" ? .runtimeConflict : .scopeChanged
         await #expect(throws: expected) { _ = try await manager.apply(command, view: view) }
         #expect(helpCount == (fault == "exact" ? 1 : 0))
-        #expect(confirmCount == (fault == "foreign_message" ? 1 : 0))
+        #expect(confirmCount == 0)
         #expect(await fixture.performed == ["GET /user/personas/external-runtime", "check"])
+    }
+
+    @Test(arguments: ["allow", "apps_enabled", "decline_apps", "decline_restart", "changed_document", "changed_cookie", "changed_generation", "changed_account", "changed_profile", "changed_revision", "changed_inventory", "changed_runtime", "changed_after_restart"]) @MainActor func openClawAppsConsentAndRestartRequireSeparateCurrentTargetAuthority(_ outcome: String) async throws {
+        let target = #", "target_inventory":{"inventory_generation":8,"accounts":[{"candidate_id":"rt_account_a","profiles":[{"candidate_id":"rt_profile_a","runtime_kind":"openclaw"}]}]},"target_selection":{"account_candidate_id":"rt_account_a","profile_candidate_id":"rt_profile_a","runtime_kind":"openclaw","selection_revision":9,"validated_generation":8,"state":"target_selected"}"#
+        let owner = String(current.dropLast()) + target + "}"
+        let retained = #", "prepared_target":{"workspace_id":"ws_11111111111111111111111111111111","account_candidate_id":"rt_account_a","profile_candidate_id":"rt_profile_a","runtime_kind":"openclaw"}"#
+        let verified = local.replacingOccurrences(of: "hermes", with: "openclaw").replacingOccurrences(of: "}]}" , with: retained + "}]}")
+        let diagnostic = outcome == "apps_enabled" ? "mcp_unverified" : "mcp_apps_disabled"
+        let needsRepair = verified.replacingOccurrences(of: "\"readiness_state\":\"mcp_verified\"", with: "\"readiness_state\":\"unavailable\",\"diagnostic_code\":\"" + diagnostic + "\"")
+        var changed = owner
+        switch outcome {
+        case "changed_generation", "changed_after_restart": changed = owner.replacingOccurrences(of: "\"connection_generation\":7", with: "\"connection_generation\":8")
+        case "changed_account": changed = owner.replacingOccurrences(of: "rt_account_a", with: "rt_account_b")
+        case "changed_profile": changed = owner.replacingOccurrences(of: "rt_profile_a", with: "rt_profile_b")
+        case "changed_revision": changed = owner.replacingOccurrences(of: "\"selection_revision\":9", with: "\"selection_revision\":10")
+        case "changed_inventory": changed = owner.replacingOccurrences(of: "\"inventory_generation\":8", with: "\"inventory_generation\":9")
+        case "changed_runtime": changed = owner.replacingOccurrences(of: "openclaw", with: "hermes")
+        default: break
+        }
+        var steps: [AgentBridgeManagementFixture.Step] = [
+            .init(operation: "GET /user/personas/external-runtime", json: owner), .init(operation: "check", json: needsRepair),
+            .init(operation: "GET /user/personas/external-runtime", json: owner)
+        ]
+        let appsDialogInvalidates = ["changed_document", "changed_cookie"].contains(outcome)
+        let appsReadbackDenies = ["changed_generation", "changed_account", "changed_profile", "changed_revision", "changed_inventory", "changed_runtime"].contains(outcome)
+        if outcome != "decline_apps" && !appsDialogInvalidates && outcome != "apps_enabled" {
+            steps.append(.init(operation: "GET /user/personas/external-runtime", json: appsReadbackDenies ? changed : owner))
+        }
+        let startReached = outcome == "allow" || outcome == "apps_enabled" || outcome == "decline_restart" || outcome == "changed_after_restart"
+        if startReached && outcome != "decline_restart" {
+            steps.append(.init(operation: "GET /user/personas/external-runtime", json: changed))
+        }
+        let succeeds = outcome == "allow" || outcome == "apps_enabled"
+        if succeeds { steps.append(.init(operation: "repair", json: verified)) }
+        let fixture = AgentBridgeManagementFixture(steps, appsConfirmation: outcome == "allow")
+        var dialogs: [String] = [], cookie = "personastack_session=fixture"
+        let view = WKWebView()
+        var manager: AgentBridgeSetupManager!
+        manager = self.manager(fixture, confirmRepair: { _ in dialogs.append("restart"); return outcome != "decline_restart" }, confirmApps: { _ in
+            dialogs.append("apps")
+            if outcome == "changed_document" { manager.invalidate(view) }
+            if outcome == "changed_cookie" { cookie = "personastack_session=changed" }
+            return outcome != "decline_apps"
+        }, cookieReader: { _, _ in cookie })
+        let command = try await command("repair", manager: manager, view: view)
+        if succeeds {
+            let result = try await manager.apply(command, view: view)
+            #expect(result["openclaw_apps_confirmed"] == nil)
+            #expect((result["connections"] as? [[String: Any]])?.first?["prepared_target"] == nil)
+        } else {
+            let failure: AgentBridgeFailure = outcome == "decline_apps" || outcome == "decline_restart" ? .runtimeConflict : .scopeChanged
+            await #expect(throws: failure) { _ = try await manager.apply(command, view: view) }
+        }
+        #expect(dialogs == (outcome == "apps_enabled" ? ["restart"] : startReached ? ["apps", "restart"] : ["apps"]))
+        #expect(await fixture.performed == steps.map(\.operation))
     }
 
     @Test @MainActor func busyDisconnectCancellationHasNoMutation() async throws {
