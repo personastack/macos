@@ -9,6 +9,7 @@ public enum AgentBridgeFailure: String, Error, Sendable {
     case runtimeUnsupported = "runtime_unsupported"
     case runtimeConflict = "runtime_conflict"
     case credentialUnavailable = "credential_unavailable"
+    case reconnectRequired = "reconnect_required"
     case busy
     case cleanupRequired = "cleanup_required"
     case migrationRequired = "migration_required"
@@ -67,6 +68,10 @@ public struct AgentBridgeConnection: Codable, Sendable {
     public let activeRunID: String?
     public let diagnosticCode: String?
     public let diagnosticMessage: String?
+    public var isMCPVerified: Bool { readinessState == "mcp_verified" }
+    public var requiresReconnect: Bool {
+        ["reconnect_required", "mcp_token_rejected", "mcp_auth_missing"].contains(diagnosticCode ?? "")
+    }
     enum CodingKeys: String, CodingKey {
         case bindingKey = "binding_key", personaID = "persona_id", runtimeKind = "runtime_kind"
         case readinessState = "readiness_state", activeRunID = "active_run_id"

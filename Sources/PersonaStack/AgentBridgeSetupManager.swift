@@ -28,6 +28,8 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
     private let prepareBackgroundEnable: @MainActor () throws -> Void
     private let cookieReader: @MainActor (WKWebView, DesktopEnvironmentConfiguration) async throws -> String
     private let confirmRuntimeStart: @MainActor (String) -> Bool
+    private let confirmDisconnectStop: @MainActor (String) -> Bool
+    private let waitForSettlement: @MainActor () async throws -> Void
     private let csrfReader: @MainActor (WKWebView) async throws -> String
 
     init(service: AgentBridgeService = .shared, client: AgentBridgeControlClient = AgentBridgeControlClient(),
@@ -38,11 +40,14 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
          prepareBackgroundEnable: @escaping @MainActor () throws -> Void = { try DesktopUpdater.shared.prepareToEnableBackgroundAgents() },
          cookieReader: @escaping @MainActor (WKWebView, DesktopEnvironmentConfiguration) async throws -> String = AgentBridgeSetupManager.readCookies,
          confirmRuntimeStart: @escaping @MainActor (String) -> Bool = AgentBridgeSetupManager.confirmStart,
+         confirmDisconnectStop: @escaping @MainActor (String) -> Bool = AgentBridgeSetupManager.confirmStopForDisconnect,
+         waitForSettlement: @escaping @MainActor () async throws -> Void = { try await Task.sleep(for: .milliseconds(250)) },
          csrfReader: @escaping @MainActor (WKWebView) async throws -> String = AgentBridgeSetupManager.readCSRF) {
         self.service = service; self.client = client; self.hosted = hosted; self.configuration = configuration
         self.approveEnvironment = approveEnvironment; self.prepareBackgroundEnable = prepareBackgroundEnable; self.cookieReader = cookieReader
         self.confirmRuntimeStart = confirmRuntimeStart
         self.csrfReader = csrfReader
+        self.confirmDisconnectStop = confirmDisconnectStop; self.waitForSettlement = waitForSettlement
     }
     var hasPendingMigrationCutover: Bool {
         (pages.objectEnumerator()?.allObjects as? [Page] ?? []).contains {
@@ -406,10 +411,14 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
             guard remote.workspaceID == workspace, remote.personaID == persona,
                   remote.connectionID == binding.connectionID, remote.clientKind == "macos_app" else { throw AgentBridgeFailure.scopeChanged }
             let local = try await client.send(AgentBridgeRequest(operation: "check", payload: ["binding_key": bindingValue(binding)]), returning: AgentBridgeConnections.self)
-            if remote.readinessStatus == "wakeable", local.connections.contains(where: { $0.bindingKey == binding && $0.readinessState == "ready" }) { return }
+            if Self.migrationReady(remote: remote, local: local, binding: binding) { return }
             try await Task.sleep(for: .milliseconds(250))
         }
         throw AgentBridgeFailure.runtimeConflict
+    }
+
+    static func migrationReady(remote: AgentBridgeHostedBinding, local: AgentBridgeConnections, binding: AgentBridgeBindingKey) -> Bool {
+        remote.readinessStatus == "wakeable" && local.connections.contains { $0.bindingKey == binding && $0.isMCPVerified }
     }
 
     private func connections(page: Page, cookies: String, scope: String, document: UUID) async throws -> [String: Any] {
@@ -428,28 +437,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
     private func manage(_ command: AgentBridgePageCommand, page: Page, cookies: String, document: UUID, view: WKWebView) async throws -> [String: Any] {
         let key = AgentBridgeBindingKey(environmentID: page.configuration.appOrigin, connectionID: command.connectionID!)
         if command.action == "disconnect" {
-            let csrf = try await csrfReader(view)
-            _ = try await self.cookies(view: view, page: page)
-            try current(page, scope: command.scope, document: document)
-            try await hosted.revoke(configuration: page.configuration, cookies: cookies, workspace: command.workspaceID!,
-                                    persona: command.personaID!, connection: key.connectionID, generation: command.connectionGeneration!,
-                                    csrfToken: csrf, validateScope: { [self] in
-                _ = try await self.cookies(view: view, page: page)
-                try current(page, scope: command.scope, document: document)
-            })
-            try current(page, scope: command.scope, document: document)
-            _ = try await self.cookies(view: view, page: page)
-            try current(page, scope: command.scope, document: document)
-            let claims: [String: AgentBridgeValue] = ["environment_id": .string(key.environmentID),
-                "workspace_id": .string(command.workspaceID!), "persona_id": .string(command.personaID!),
-                "connection_id": .string(key.connectionID), "connection_generation": .integer(command.connectionGeneration!),
-                "binding_absent": .bool(true)]
-            let result = try await client.send(AgentBridgeRequest(operation: "disconnect", payload: [
-                "binding_key": bindingValue(key), "workspace_id": .string(command.workspaceID!), "persona_id": .string(command.personaID!),
-                "connection_generation": .integer(command.connectionGeneration!), "revocation_readback": .object(claims)
-            ]), returning: AgentBridgeAcknowledgement.self)
-            guard result.disconnected == true else { throw AgentBridgeFailure.cleanupRequired }
-            return ["ok": true]
+            return try await disconnect(command, page: page, cookies: cookies, document: document, view: view, key: key)
         }
         let binding = try await hosted.read(configuration: page.configuration, cookies: cookies, persona: command.personaID!)
         try binding.require(workspace: command.workspaceID!, persona: command.personaID!, connection: key.connectionID,
@@ -463,7 +451,8 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
                 throw AgentBridgeFailure.scopeChanged
             }
             guard selected.activeRunID == nil || selected.activeRunID == "" else { throw AgentBridgeFailure.busy }
-            let needsStart = selected.readinessState != "ready"
+            guard !selected.requiresReconnect else { throw AgentBridgeFailure.reconnectRequired }
+            let needsStart = !selected.isMCPVerified
             if needsStart && !confirmRuntimeStart(command.personaID!) { throw AgentBridgeFailure.runtimeConflict }
             // A native dialog never grants a changed account/profile authority.
             _ = try await self.cookies(view: view, page: page)
@@ -476,6 +465,9 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         }
         let result = try await client.send(AgentBridgeRequest(operation: command.action, payload: payload), returning: AgentBridgeConnections.self)
         try current(page, scope: command.scope, document: document)
+        if command.action == "repair", result.connections.contains(where: { $0.bindingKey == key && $0.requiresReconnect }) {
+            throw AgentBridgeFailure.reconnectRequired
+        }
         var response: [String: Any] = ["ok": true, "connections": result.connections.filter { $0.bindingKey == key }.map(connectionValue)]
         if command.action == "repair", let pending = page.pendingMigration, pending.persona == command.personaID {
             response["test_dispatched"] = try await pending.coordinator.finish(pending.cutover, binding: key)
@@ -483,6 +475,98 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
             page.pendingMigration = nil
         }
         return response
+    }
+
+    /// Quiesce admission and settle accepted work before revoking its reporting credential.
+    private func disconnect(_ command: AgentBridgePageCommand, page: Page, cookies: String, document: UUID,
+                            view: WKWebView, key: AgentBridgeBindingKey) async throws -> [String: Any] {
+        let workspace = command.workspaceID!, persona = command.personaID!, generation = command.connectionGeneration!
+        let remote = try await hosted.read(configuration: page.configuration, cookies: cookies, persona: persona)
+        guard remote.workspaceID == workspace, remote.personaID == persona else { throw AgentBridgeFailure.scopeChanged }
+        let local = try await selectedConnection(key, persona: persona)
+        try current(page, scope: command.scope, document: document)
+        if remote.connectionID == nil || remote.connectionID == "" {
+            guard (local.activeRunID ?? "").isEmpty else { throw AgentBridgeFailure.busy }
+            _ = try await self.cookies(view: view, page: page)
+            try current(page, scope: command.scope, document: document)
+            return try await cleanupDisconnectedBinding(key, workspace: workspace, persona: persona, generation: generation)
+        }
+        try remote.require(workspace: workspace, persona: persona, connection: key.connectionID, generation: generation)
+        var stopConfirmed = false
+        if remote.runLaneStatus != "idle" || !(local.activeRunID ?? "").isEmpty {
+            guard confirmDisconnectStop(persona) else { throw AgentBridgeFailure.busy }
+            stopConfirmed = true
+        }
+        let csrf = try await csrfReader(view)
+        _ = try await self.cookies(view: view, page: page)
+        try current(page, scope: command.scope, document: document)
+        let admission = try await client.send(AgentBridgeRequest(operation: "quiesce", payload: ["binding_key": bindingValue(key)]), returning: AgentBridgeAdmission.self)
+        guard admission.quiesced else { throw AgentBridgeFailure.busy }
+        var revokeStarted = false
+        do {
+            if !admission.activeRunIDs.isEmpty && !stopConfirmed {
+                guard confirmDisconnectStop(persona) else { throw AgentBridgeFailure.busy }
+                stopConfirmed = true
+            }
+            if stopConfirmed {
+                _ = try await self.cookies(view: view, page: page)
+                try current(page, scope: command.scope, document: document)
+                let owner = try await hosted.read(configuration: page.configuration, cookies: cookies, persona: persona)
+                try owner.require(workspace: workspace, persona: persona, connection: key.connectionID, generation: generation)
+                try await AgentBridgeMigrationAuthority(transport: hosted.transport).stop(configuration: page.configuration,
+                    cookies: cookies, csrf: csrf, persona: persona)
+            }
+            try await awaitDisconnectIdle(command, page: page, cookies: cookies, document: document, view: view, key: key)
+            revokeStarted = true
+            try await hosted.revoke(configuration: page.configuration, cookies: cookies, workspace: workspace, persona: persona,
+                connection: key.connectionID, generation: generation, csrfToken: csrf, requireIdle: true, validateScope: { [self] in
+                    _ = try await self.cookies(view: view, page: page)
+                    try current(page, scope: command.scope, document: document)
+                    let selected = try await selectedConnection(key, persona: persona)
+                    guard (selected.activeRunID ?? "").isEmpty else { throw AgentBridgeFailure.busy }
+                })
+            return try await cleanupDisconnectedBinding(key, workspace: workspace, persona: persona, generation: generation)
+        } catch {
+            // An attempted revoke may already have removed the cloud credential. Never reopen it.
+            if !revokeStarted && local.diagnosticCode != "busy" {
+                _ = try? await client.send(AgentBridgeRequest(operation: "resume", payload: ["binding_key": bindingValue(key)]), returning: AgentBridgeAdmission.self)
+            }
+            throw error
+        }
+    }
+
+    private func cleanupDisconnectedBinding(_ key: AgentBridgeBindingKey, workspace: String, persona: String, generation: Int) async throws -> [String: Any] {
+        let claims: [String: AgentBridgeValue] = ["environment_id": .string(key.environmentID),
+            "workspace_id": .string(workspace), "persona_id": .string(persona), "connection_id": .string(key.connectionID),
+            "connection_generation": .integer(generation), "binding_absent": .bool(true)]
+        let result = try await client.send(AgentBridgeRequest(operation: "disconnect", payload: ["binding_key": bindingValue(key),
+            "workspace_id": .string(workspace), "persona_id": .string(persona), "connection_generation": .integer(generation),
+            "revocation_readback": .object(claims)]), returning: AgentBridgeAcknowledgement.self)
+        guard result.disconnected == true else { throw AgentBridgeFailure.cleanupRequired }
+        return ["ok": true]
+    }
+
+    private func selectedConnection(_ key: AgentBridgeBindingKey, persona: String) async throws -> AgentBridgeConnection {
+        let result = try await client.send(AgentBridgeRequest(operation: "status", payload: ["binding_key": bindingValue(key)]), returning: AgentBridgeConnections.self)
+        guard let selected = result.connections.first(where: { $0.bindingKey == key }), selected.personaID == persona else {
+            throw AgentBridgeFailure.scopeChanged
+        }
+        return selected
+    }
+
+    private func awaitDisconnectIdle(_ command: AgentBridgePageCommand, page: Page, cookies: String, document: UUID,
+                                     view: WKWebView, key: AgentBridgeBindingKey) async throws {
+        for _ in 0..<120 {
+            _ = try await self.cookies(view: view, page: page)
+            try current(page, scope: command.scope, document: document)
+            let remote = try await hosted.read(configuration: page.configuration, cookies: cookies, persona: command.personaID!)
+            try remote.require(workspace: command.workspaceID!, persona: command.personaID!, connection: key.connectionID,
+                               generation: command.connectionGeneration!)
+            let local = try await selectedConnection(key, persona: command.personaID!)
+            if remote.runLaneStatus == "idle", (local.activeRunID ?? "").isEmpty { return }
+            try await waitForSettlement()
+        }
+        throw AgentBridgeFailure.busy
     }
 
     private func bindingValue(_ key: AgentBridgeBindingKey) -> AgentBridgeValue {
@@ -527,6 +611,14 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         alert.messageText = "Start the native gateway for this profile?"
         alert.informativeText = "Repair \(persona) may start or restart its selected Hermes or OpenClaw gateway. Other profiles remain connected. Cancel preserves the current setup."
         alert.addButton(withTitle: "Allow Gateway Repair")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+    private static func confirmStopForDisconnect(persona: String) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Stop assigned work before disconnecting?"
+        alert.informativeText = "Disconnecting \(persona) stops its PersonaStack-assigned run. Background Agents wait for the API and local runtime to settle before revoking this connection."
+        alert.addButton(withTitle: "Stop and Disconnect")
         alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn
     }

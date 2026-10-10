@@ -58,7 +58,7 @@ struct AgentBridgeHostedAuthority: Sendable {
 
     /// Readback is authoritative. A token.revoked notification cannot enter this path.
     func revoke(configuration: DesktopEnvironmentConfiguration, cookies: String, workspace: String,
-                persona: String, connection: String, generation: Int, csrfToken: String, clientKind: String = "macos_app",
+                persona: String, connection: String, generation: Int, csrfToken: String, clientKind: String = "macos_app", requireIdle: Bool = false,
                 validateScope: @MainActor @Sendable () async throws -> Void = {}) async throws {
         guard !csrfToken.isEmpty, csrfToken.utf8.count <= 512, !csrfToken.contains(where: { $0.isWhitespace }) else {
             throw AgentBridgeFailure.invalidRequest
@@ -67,6 +67,7 @@ struct AgentBridgeHostedAuthority: Sendable {
         guard before.workspaceID == workspace, before.personaID == persona else { throw AgentBridgeFailure.scopeChanged }
         if before.connectionID == nil || before.connectionID == "" { return }
         try before.require(workspace: workspace, persona: persona, connection: connection, generation: generation, clientKind: clientKind)
+        if requireIdle && before.runLaneStatus != "idle" { throw AgentBridgeFailure.busy }
         try await validateScope()
         let deletion = try request(configuration: configuration, cookies: cookies, method: "DELETE", persona: persona,
                                    connection: connection, generation: generation)
