@@ -195,8 +195,14 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
             return outcome != "decline_feature"
         }
         manager = self.manager(fixture, confirmRepair: { _ in dialogs.append("restart"); return outcome != "decline_repair" },
-            confirmApps: runtimeKind == "openclaw" ? approveFeature : { _ in Issue.record("Hermes cannot grant OpenClaw Apps"); return false },
-            confirmHost: runtimeKind == "hermes" ? approveFeature : { _ in Issue.record("OpenClaw cannot grant Hermes host startup"); return false },
+            confirmApps: { persona in
+                guard runtimeKind == "openclaw" else { Issue.record("Hermes cannot grant OpenClaw Apps"); return false }
+                return approveFeature(persona)
+            },
+            confirmHost: { persona in
+                guard runtimeKind == "hermes" else { Issue.record("OpenClaw cannot grant Hermes host startup"); return false }
+                return approveFeature(persona)
+            },
             cookieReader: { _, _ in cookie })
         let command = try await command("repair", manager: manager, view: view)
         if succeeds {
