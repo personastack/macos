@@ -7,8 +7,34 @@ permissions:
   contents: read
 
 jobs:
-  validate:
+  native:
     # Official runner reference: docs.github.com/en/actions/reference/runners/github-hosted-runners
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Resolve public Swift dependencies
+        run: swift package resolve
+      - name: Test native source contracts
+        run: |
+          python3 -m unittest discover -s scripts/tests
+          if swift test --help-hidden | grep -q -- '--experimental-maximum-parallelization-width'; then
+            scheduling=(--experimental-maximum-parallelization-width 2)
+          else
+            scheduling=(--no-parallel)
+          fi
+          swift test --disable-xctest --skip-update -j 2 "${scheduling[@]}" \
+            --filter '(AgentBridge|LocalSession|DesktopUpdater|DesktopLoginItem|Termination|Quit|MainWebView|ServerSettings|[Hh]arness)'
+      - name: Build both app architectures without signing
+        run: |
+          for architecture in arm64 x86_64; do
+            swift build --scratch-path "build/validation-$architecture" \
+              --triple "$architecture-apple-macosx14.0" -c release --product PersonaStack
+          done
+
+  helper:
     runs-on: macos-26
     timeout-minutes: 30
     env:
@@ -26,23 +52,9 @@ jobs:
         run: |
           git config --global credential.https://github.com.helper '!f() { printf "username=x-access-token\npassword=%s\n" "$PERSONASTACK_MODULES_TOKEN"; }; f'
           (cd agent-bridge && go mod download)
-          swift package resolve
-      - name: Test source contracts
+      - name: Test helper source and Darwin Keychain boundary
+        run: cd agent-bridge && go test -parallel "$(sysctl -n hw.logicalcpu)" ./...
+      - name: Build universal helper without signing
         run: |
-          python3 -m unittest discover -s scripts/tests
-          (cd agent-bridge && go test -parallel "$(sysctl -n hw.logicalcpu)" ./...)
-          if swift test --help-hidden | grep -q -- '--experimental-maximum-parallelization-width'; then
-            scheduling=(--experimental-maximum-parallelization-width 2)
-          else
-            scheduling=(--no-parallel)
-          fi
-          swift test --disable-xctest --skip-update -j 2 "${scheduling[@]}" \
-            --filter '(AgentBridge|LocalSession|DesktopUpdater|DesktopLoginItem|Termination|Quit|MainWebView|ServerSettings|[Hh]arness)'
-      - name: Build both app and helper architectures without signing
-        run: |
-          for architecture in arm64 x86_64; do
-            swift build --scratch-path "build/validation-$architecture" \
-              --triple "$architecture-apple-macosx14.0" -c release --product PersonaStack
-          done
           ./scripts/build-agent-bridge.sh build/validation-agent-bridge 0.0.0
           test "$(build/validation-agent-bridge/PersonaStackAgentBridge --version)" = 0.0.0
