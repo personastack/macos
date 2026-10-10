@@ -481,3 +481,62 @@ func TestDesktopAgentBridgeInterruptedPreparationRetryFencesOldDocument(t *testi
 		t.Fatal("foreign interrupted setup reused reservation")
 	}
 }
+
+func TestDesktopAgentBridgeNativeStatusAndRepairExposeReconnectRequired(t *testing.T) {
+	t.Parallel()
+	for _, fault := range []string{"missing", "rejected", "gateway_auth", "keychain_denied"} {
+		t.Run(fault, func(t *testing.T) {
+			t.Parallel()
+			c, store, _ := fixture(t)
+			b := config.Binding{EnvironmentID: "https://app.test", PersonaID: "persona", ConnectionID: "connection", ConnectionGeneration: 2, PersonaMCPToken: "present", ReadinessState: runtime.AdapterStateAuthMissing}
+			if fault == "missing" {
+				b.PersonaMCPToken = ""
+			}
+			if fault == "rejected" {
+				b.ReadinessDiagnosticCode = "mcp_token_rejected"
+			}
+			if fault == "keychain_denied" {
+				b.PersonaMCPToken = ""
+				b.HasPersonaMCPToken = true
+				b.PersonaMCPSecretUnavailable = true
+			}
+			if err := store.SaveBinding(b); err != nil {
+				t.Fatal(err)
+			}
+			checks, repairs := 0, 0
+			c.Check = func(context.Context, config.Binding) (runtime.Detection, error) {
+				checks++
+				return runtime.Detection{State: runtime.AdapterStateAuthMissing, DiagnosticCode: "credential_unavailable"}, nil
+			}
+			c.Repair = func(context.Context, config.Binding, bool) error { repairs++; return nil }
+			key := b.Key()
+			payload, _ := json.Marshal(BindingPayload{BindingKey: &key})
+			for _, operation := range []string{"status", "check"} {
+				result := request(t, c, operation, string(payload))
+				if result.Error != nil || len(result.Result.Connections) != 1 {
+					t.Fatal("missing native connection")
+				}
+				row := result.Result.Connections[0]
+				if fault != "gateway_auth" && fault != "keychain_denied" && row.DiagnosticCode != "reconnect_required" {
+					t.Fatal("persona MCP fault lost reconnect instruction")
+				}
+				if fault == "gateway_auth" && row.DiagnosticCode == "reconnect_required" {
+					t.Fatal("runtime credential fault conflated with persona MCP")
+				}
+			}
+			repair, _ := json.Marshal(RepairPayload{BindingKey: key, RestartConfirmed: true})
+			result := request(t, c, "repair", string(repair))
+			if fault == "keychain_denied" {
+				if result.Error == nil || result.Error.Code != "credential_unavailable" || checks != 0 || repairs != 0 {
+					t.Fatal("Keychain denial was repaired or mistaken for credential replacement")
+				}
+			} else if fault != "gateway_auth" {
+				if result.Error == nil || result.Error.Code != "reconnect_required" || checks != 0 || repairs != 0 {
+					t.Fatal("custody fault performed repair/check mutation")
+				}
+			} else if result.Error != nil || checks != 1 || repairs != 1 {
+				t.Fatal("runtime repair incorrectly blocked by MCP custody")
+			}
+		})
+	}
+}

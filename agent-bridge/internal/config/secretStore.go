@@ -8,6 +8,18 @@ import (
 	"strings"
 )
 
+// account encodes the complete binding/suffix key before the native C string
+// boundary. BindingKey.String contains a NUL separator that must never truncate.
+func (s KeychainStore) account(key string) (string, error) {
+	if s.service() == "personastack-connector" {
+		if strings.ContainsRune(key, '\x00') {
+			return "", fmt.Errorf("invalid legacy Keychain account")
+		}
+		return key, nil
+	}
+	return "v1:" + base64.RawURLEncoding.EncodeToString([]byte(key)), nil
+}
+
 const keyringService = "ai.personastack.desktop.agent-bridge"
 
 // SecretStore keeps a single Keychain authority. Denial never creates fallback files.
@@ -102,7 +114,9 @@ func loadBindingSecretsWith(secrets SecretStore, binding Binding) Binding {
 		)
 	}
 	if binding.HasPersonaMCPToken && strings.TrimSpace(binding.PersonaMCPToken) == "" {
-		binding.PersonaMCPToken = getSecret(secrets, bindingSecretKey(connectionID, "persona-mcp-token"))
+		value, err := secrets.Get(bindingSecretKey(connectionID, "persona-mcp-token"))
+		binding.PersonaMCPToken = strings.TrimSpace(value)
+		binding.PersonaMCPSecretUnavailable = err != nil && !SecretMissing(err)
 	}
 
 	if binding.HasOpenClawToken && strings.TrimSpace(binding.OpenClawGatewayToken) == "" {
@@ -149,3 +163,9 @@ func deleteBindingSecretsWith(store SecretStore, binding Binding) error {
 	return nil
 }
 func bindingSecretKey(connectionID, name string) string { return connectionID + ":" + name }
+
+// PersonaMCPReconnectRequired is a local custody/rejection fault. Runtime gateway
+// credentials and endpoint availability remain separate diagnostics.
+func PersonaMCPReconnectRequired(binding Binding) bool {
+	return !binding.PersonaMCPSecretUnavailable && (strings.TrimSpace(binding.PersonaMCPToken) == "" || binding.ReadinessDiagnosticCode == "reconnect_required" || binding.ReadinessDiagnosticCode == "mcp_token_missing" || binding.ReadinessDiagnosticCode == "mcp_token_rejected")
+}

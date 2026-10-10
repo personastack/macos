@@ -9,6 +9,15 @@ package config
 #include <stdlib.h>
 #include <string.h>
 
+// Test seam uses the exact CoreFoundation constructor used by all item queries.
+static char *bridgeAccountRoundTrip(const char *account) {
+ CFStringRef a=CFStringCreateWithCString(NULL,account,kCFStringEncodingUTF8);
+ if(a==NULL) return NULL;
+ CFIndex length=CFStringGetMaximumSizeForEncoding(CFStringGetLength(a),kCFStringEncodingUTF8)+1;
+ char *result=malloc(length);
+ if(result!=NULL && !CFStringGetCString(a,result,length,kCFStringEncodingUTF8)){free(result);result=NULL;}
+ CFRelease(a);return result;
+}
 static OSStatus bridgeGet(const char *service, const char *account, char **result, size_t *length) {
  CFStringRef s=CFStringCreateWithCString(NULL,service,kCFStringEncodingUTF8);
  CFStringRef a=CFStringCreateWithCString(NULL,account,kCFStringEncodingUTF8);
@@ -57,14 +66,18 @@ func statusError(status C.OSStatus) error {
 	return fmt.Errorf("credential_unavailable: Keychain status %d", int(status))
 }
 func (store KeychainStore) Get(key string) (string, error) {
+	encoded, err := store.account(key)
+	if err != nil {
+		return "", err
+	}
 	service := C.CString(store.service())
-	account := C.CString(key)
+	account := C.CString(encoded)
 	defer C.free(unsafe.Pointer(service))
 	defer C.free(unsafe.Pointer(account))
 	var raw *C.char
 	var size C.size_t
 	status := C.bridgeGet(service, account, &raw, &size)
-	err := statusError(status)
+	err = statusError(status)
 	if err != nil {
 		return "", err
 	}
@@ -72,8 +85,12 @@ func (store KeychainStore) Get(key string) (string, error) {
 	return C.GoStringN(raw, C.int(size)), nil
 }
 func (store KeychainStore) Set(key, value string) error {
+	encoded, err := store.account(key)
+	if err != nil {
+		return err
+	}
 	service := C.CString(store.service())
-	account := C.CString(key)
+	account := C.CString(encoded)
 	raw := C.CString(value)
 	defer C.free(unsafe.Pointer(service))
 	defer C.free(unsafe.Pointer(account))
@@ -81,8 +98,12 @@ func (store KeychainStore) Set(key, value string) error {
 	return statusError(C.bridgeSet(service, account, raw, C.size_t(len(value))))
 }
 func (store KeychainStore) Delete(key string) error {
+	encoded, err := store.account(key)
+	if err != nil {
+		return err
+	}
 	service := C.CString(store.service())
-	account := C.CString(key)
+	account := C.CString(encoded)
 	defer C.free(unsafe.Pointer(service))
 	defer C.free(unsafe.Pointer(account))
 	status := C.bridgeDelete(service, account)
@@ -90,4 +111,21 @@ func (store KeychainStore) Delete(key string) error {
 		return nil
 	}
 	return statusError(status)
+}
+
+// keychainAccountCFString exercises account serialization without a Keychain item
+// or user prompt. Darwin regression tests use the actual C/CFString boundary.
+func (store KeychainStore) keychainAccountCFString(key string) (string, error) {
+	encoded, err := store.account(key)
+	if err != nil {
+		return "", err
+	}
+	account := C.CString(encoded)
+	defer C.free(unsafe.Pointer(account))
+	result := C.bridgeAccountRoundTrip(account)
+	if result == nil {
+		return "", fmt.Errorf("Keychain account encoding failed")
+	}
+	defer C.free(unsafe.Pointer(result))
+	return C.GoString(result), nil
 }

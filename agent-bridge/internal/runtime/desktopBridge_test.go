@@ -3,10 +3,12 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 type desktopTransport func(*http.Request) (*http.Response, error)
@@ -126,5 +128,98 @@ func TestDesktopAgentBridgeOpenClawLifecycleAndIsolation(t *testing.T) {
 	}
 	if err = adapter.CancelRun(id); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDesktopAgentBridgeOpenClawPartialProgressRequiresExplicitTerminal(t *testing.T) {
+	t.Parallel()
+	for _, terminal := range []string{"completed", "failed", "cancelled"} {
+		t.Run(terminal, func(t *testing.T) {
+			t.Parallel()
+			events := []RunEvent{}
+			handle := func(e RunEvent) error { events = append(events, e); return nil }
+			session := &openClawRPCSession{nativeRunID: "native-a", agentID: "selected", handle: handle}
+			calls := 0
+			result, err := waitForOpenClawRun(context.Background(), "native-a", handle, session, func(ctx context.Context, r openClawRequest) (openClawResponse, error) {
+				calls++
+				raw, _ := json.Marshal(r.Params)
+				if r.Type != "req" || r.ID != "wait-native-a" || r.Method != "agent.wait" || string(raw) != `{"runId":"native-a","timeoutMs":30000}` {
+					t.Fatalf("wrong native wait: %+v %s", r, raw)
+				}
+				switch calls {
+				case 1:
+					if err := session.handleBroadcast(openClawResponse{Event: "agent", Payload: json.RawMessage(`{"runId":"native-a","agentId":"selected","delta":"partial"}`)}); err != nil {
+						t.Fatal(err)
+					}
+					return openClawResponse{Payload: json.RawMessage(`{"runId":"native-a","status":"timeout","output":"partial"}`)}, nil
+				case 2:
+					return openClawResponse{Error: "agent.wait timeout"}, nil
+				case 3:
+					return openClawResponse{Payload: json.RawMessage(`{"runId":"native-a","status":"running","output":"partial","error":"nonterminal detail"}`)}, nil
+				case 4:
+					return openClawResponse{Payload: json.RawMessage(`{"runId":"native-a","status":"` + terminal + `"}`)}, nil
+				default:
+					t.Fatal("unexpected wait after explicit terminal")
+					return openClawResponse{}, nil
+				}
+			})
+			want := RunStatusSucceeded
+			if terminal == "failed" {
+				want = RunStatusFailed
+			}
+			if terminal == "cancelled" {
+				want = RunStatusCancelled
+			}
+			if err != nil || calls != 4 || result.Status != want || len(events) != 2 {
+				t.Fatalf("premature terminal: result=%+v err=%v calls=%d events=%v", result, err, calls, events)
+			}
+			if terminal == "completed" && result.Output != "partial" {
+				t.Fatal("explicit success lost partial output")
+			}
+		})
+	}
+}
+
+func TestDesktopAgentBridgeOpenClawPartialProgressDeadlineCancelAndTransportError(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"deadline", "cancel", "transport_timeout", "foreign_terminal"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+			defer cancel()
+			session := &openClawRPCSession{nativeRunID: "assigned", handle: func(RunEvent) error { return nil }}
+			calls := 0
+			result, err := waitForOpenClawRun(ctx, "assigned", session.handle, session, func(ctx context.Context, r openClawRequest) (openClawResponse, error) {
+				calls++
+				if calls == 1 {
+					session.appendOutput("partial")
+					return openClawResponse{Payload: json.RawMessage(`{"status":"running","output":"partial"}`)}, nil
+				}
+				switch mode {
+				case "deadline":
+					<-ctx.Done()
+					return openClawResponse{}, ctx.Err()
+				case "cancel":
+					cancel()
+					return openClawResponse{}, ctx.Err()
+				case "transport_timeout":
+					return openClawResponse{}, errors.New("native transport timeout")
+				case "foreign_terminal":
+					return openClawResponse{Payload: json.RawMessage(`{"runId":"foreign","status":"completed"}`)}, nil
+				default:
+					t.Fatal("unplanned wait")
+					return openClawResponse{}, nil
+				}
+			})
+			if err == nil || result.Output != "" || calls != 2 {
+				t.Fatalf("partial became success: %+v %v calls=%d", result, err, calls)
+			}
+			if mode == "deadline" && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatal(err)
+			}
+			if mode == "cancel" && !errors.Is(err, context.Canceled) {
+				t.Fatal(err)
+			}
+		})
 	}
 }

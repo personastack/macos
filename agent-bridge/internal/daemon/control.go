@@ -23,6 +23,22 @@ func targetForBinding(b config.Binding) *externalagentprotocol.RuntimeTarget {
 
 // CheckBinding does not mutate config or start a runtime/model run.
 func (r Runner) CheckBinding(ctx context.Context, b config.Binding) (runtime.Detection, error) {
+	latest, ok := config.BindingFor(r.Store, b)
+	if !ok || latest.ConnectionGeneration != b.ConnectionGeneration {
+		return runtime.Detection{}, fmt.Errorf("scope_changed: binding changed")
+	}
+	if latest.PersonaMCPSecretUnavailable {
+		return runtime.Detection{Kind: b.RuntimeKind, State: runtime.AdapterStateAuthMissing, DiagnosticCode: "credential_unavailable", Note: "Allow this helper to read its stored Keychain credential before retrying."}, nil
+	}
+	if config.PersonaMCPReconnectRequired(latest) {
+		return runtime.Detection{Kind: b.RuntimeKind, State: runtime.AdapterStateAuthMissing, DiagnosticCode: "reconnect_required", Note: "Disconnect and reconnect to renew PersonaStack MCP authorization."}, nil
+	}
+	if required, err := r.checkPersonaMCPCredential(ctx, latest); err != nil {
+		return runtime.Detection{}, err
+	} else if required {
+		return runtime.Detection{Kind: b.RuntimeKind, State: runtime.AdapterStateAuthMissing, DiagnosticCode: "reconnect_required", Note: "Disconnect and reconnect to renew PersonaStack MCP authorization."}, nil
+	}
+
 	if b.TargetSelectionRevision <= 0 {
 		return runtime.Detection{Kind: b.RuntimeKind, State: runtime.AdapterStateTargetSelectionRequired}, nil
 	}
@@ -47,6 +63,17 @@ func (r Runner) RepairBinding(ctx context.Context, b config.Binding, restartConf
 	latest, ok := config.BindingFor(r.Store, b)
 	if !ok || latest.ConnectionGeneration != b.ConnectionGeneration {
 		return fmt.Errorf("scope_changed: binding changed")
+	}
+	if latest.PersonaMCPSecretUnavailable {
+		return fmt.Errorf("credential_unavailable: stored Keychain credential cannot be read")
+	}
+	if config.PersonaMCPReconnectRequired(latest) {
+		return fmt.Errorf("reconnect_required: Disconnect and reconnect to renew PersonaStack MCP authorization")
+	}
+	if required, err := r.checkPersonaMCPCredential(ctx, latest); err != nil {
+		return err
+	} else if required {
+		return fmt.Errorf("reconnect_required: Disconnect and reconnect to renew PersonaStack MCP authorization")
 	}
 	if latest.ActiveRunID != "" {
 		return fmt.Errorf("busy: assigned run active")
@@ -108,4 +135,19 @@ func (r Runner) applyMCPConfiguration(binding config.Binding, p *externalagentpr
 		}
 		return nil
 	})
+}
+
+func (r Runner) checkPersonaMCPCredential(ctx context.Context, b config.Binding) (bool, error) {
+	verification := mcp.VerifyBindingLive(ctx, b, r.MCPHTTPClient)
+	if verification.DiagnosticCode != "mcp_token_missing" && verification.DiagnosticCode != "mcp_token_rejected" {
+		return false, nil
+	}
+	err := config.UpdateBinding(r.Store, b, func(latest *config.Binding) error {
+		if latest.ConnectionGeneration != b.ConnectionGeneration {
+			return fmt.Errorf("scope_changed: binding changed")
+		}
+		latest.ReadinessDiagnosticCode = "reconnect_required"
+		return nil
+	})
+	return true, err
 }

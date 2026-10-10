@@ -295,6 +295,9 @@ func (reconciler *sessionReconciler) publish(start runtimeSnapshot, result recon
 	_ = config.UpdateBinding(reconciler.runner.Store, reconciler.binding, func(latest *config.Binding) error {
 		if latest.ConnectionGeneration == start.Generation {
 			latest.ReadinessState = result.Detection.State
+			if !config.PersonaMCPReconnectRequired(*latest) || result.Detection.State == runtime.AdapterStateMCPVerified {
+				latest.ReadinessDiagnosticCode = result.Detection.DiagnosticCode
+			}
 		}
 		return nil
 	})

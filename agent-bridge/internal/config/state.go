@@ -48,6 +48,9 @@ type MigrationCapture struct {
 	LegacyConnectionID  ConnectionID
 }
 type Binding struct {
+	PersonaMCPSecretUnavailable bool `json:"-"`
+	ReadinessDiagnosticCode     string
+
 	Migration               *MigrationCapture `json:",omitempty"`
 	EnvironmentID           string
 	WorkspaceID             string

@@ -92,10 +92,6 @@ func (adapter OpenClawAdapter) openClawStreamOrPollRun(ctx context.Context, nati
 		return RunResult{}, err
 	}
 
-	deadline := time.Now().Add(openClawSetupRetryBudget)
-	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-		deadline = ctxDeadline
-	}
 	conn, err := adapter.connectOperatorWithRetry(ctx)
 	if err != nil {
 		return RunResult{}, err
@@ -103,11 +99,23 @@ func (adapter OpenClawAdapter) openClawStreamOrPollRun(ctx context.Context, nati
 	defer conn.Close()
 	session := newOpenClawRPCSessionForRun(conn, handle, nativeRunID, adapter.AgentID)
 	defer session.close()
+	return waitForOpenClawRun(ctx, nativeRunID, handle, session, func(ctx context.Context, request openClawRequest) (openClawResponse, error) {
+		setOpenClawDeadline(conn, ctx, 35*time.Second)
+		return session.call(ctx, request)
+	})
+}
+
+// waitForOpenClawRun keeps partial progress separate from terminal authority.
+// Only explicit native terminal status ends a run successfully.
+func waitForOpenClawRun(ctx context.Context, nativeRunID string, handle RunEventHandler, session *openClawRPCSession, call func(context.Context, openClawRequest) (openClawResponse, error)) (RunResult, error) {
+	deadline := time.Now().Add(openClawSetupRetryBudget)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return RunResult{}, err
 		}
-		setOpenClawDeadline(conn, ctx, 35*time.Second)
 		request := openClawRequest{
 			Type:   "req",
 			ID:     "wait-" + strings.TrimSpace(nativeRunID),
@@ -117,13 +125,10 @@ func (adapter OpenClawAdapter) openClawStreamOrPollRun(ctx context.Context, nati
 				"timeoutMs": 30000,
 			},
 		}
-		response, err := session.call(ctx, request)
+		response, err := call(ctx, request)
 		if err != nil {
-			if openClawErrorIsTimeout(err.Error()) && strings.TrimSpace(session.output()) != "" {
-				return RunResult{Status: RunStatusSucceeded, Output: session.output()}, nil
-			}
-			if openClawErrorIsTimeout(err.Error()) && ctx.Err() == nil {
-				continue
+			if ctx.Err() != nil {
+				return RunResult{}, ctx.Err()
 			}
 			var retryErr openClawRetryableError
 			if errorsAsOpenClawRetryable(err, &retryErr) && ctx.Err() == nil {
@@ -143,9 +148,6 @@ func (adapter OpenClawAdapter) openClawStreamOrPollRun(ctx context.Context, nati
 			return RunResult{}, err
 		}
 		if errText := response.errorString(); errText != "" {
-			if openClawErrorIsTimeout(errText) && strings.TrimSpace(session.output()) != "" {
-				return RunResult{Status: RunStatusSucceeded, Output: session.output()}, nil
-			}
 			if openClawErrorIsTimeout(errText) && ctx.Err() == nil {
 				continue
 			}
@@ -172,13 +174,10 @@ func (adapter OpenClawAdapter) openClawStreamOrPollRun(ctx context.Context, nati
 			return RunResult{}, fmt.Errorf("OpenClaw wait response not ok")
 		}
 		result, terminal := openClawRunResultFromResponse(response.payload())
+		if result.RunID != "" && result.RunID != strings.TrimSpace(nativeRunID) {
+			return RunResult{}, fmt.Errorf("OpenClaw wait response changed native run")
+		}
 		if !terminal {
-			if output := strings.TrimSpace(session.output()); output != "" {
-				if err := session.emitStarted(handle, openClawRunStartedAtOrNow(response.payload())); err != nil {
-					return RunResult{}, err
-				}
-				return RunResult{Status: RunStatusSucceeded, Output: output}, nil
-			}
 			if err := ctx.Err(); err != nil {
 				return RunResult{}, err
 			}
@@ -195,7 +194,7 @@ func (adapter OpenClawAdapter) openClawStreamOrPollRun(ctx context.Context, nati
 		case "timeout":
 			continue
 		default:
-			return RunResult{Status: RunStatusSucceeded, Output: strings.TrimSpace(result.Output)}, nil
+			return RunResult{Status: RunStatusSucceeded, Output: strings.TrimSpace(firstNonEmpty(result.Output, session.output()))}, nil
 		}
 	}
 }

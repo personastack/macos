@@ -438,6 +438,20 @@ func (c *Controller) status(ctx context.Context, p BindingPayload, probe bool) (
 	result := Result{Connections: []Connection{}, PendingMigrationCount: c.pendingMigrationCount()}
 	for _, b := range bindings {
 		row := Connection{BindingKey: b.Key(), PersonaID: string(b.PersonaID), RuntimeKind: b.RuntimeKind.String(), ReadinessState: b.ReadinessState.String(), ActiveRunID: b.ActiveRunID}
+		if b.PersonaMCPSecretUnavailable {
+			row.ReadinessState = "unavailable"
+			row.DiagnosticCode = "credential_unavailable"
+			row.DiagnosticMessage = "Allow this helper to read its stored Keychain credential before retrying."
+			result.Connections = append(result.Connections, row)
+			continue
+		}
+		if config.PersonaMCPReconnectRequired(b) {
+			row.ReadinessState = "unavailable"
+			row.DiagnosticCode = "reconnect_required"
+			row.DiagnosticMessage = "Disconnect and reconnect to renew PersonaStack MCP authorization."
+			result.Connections = append(result.Connections, row)
+			continue
+		}
 		if b.Quiesced {
 			row.ReadinessState = "unavailable"
 			row.DiagnosticCode = "busy"
@@ -454,6 +468,9 @@ func (c *Controller) status(ctx context.Context, p BindingPayload, probe bool) (
 				} else {
 					row.ReadinessState = detection.State.String()
 					row.DiagnosticCode = detection.DiagnosticCode
+					if row.DiagnosticCode == "mcp_token_missing" || row.DiagnosticCode == "mcp_token_rejected" {
+						row.DiagnosticCode = "reconnect_required"
+					}
 				}
 			}
 		}
@@ -466,6 +483,12 @@ func (c *Controller) repair(ctx context.Context, p RepairPayload) (Result, error
 	if err != nil {
 		return Result{}, err
 	}
+	if b.PersonaMCPSecretUnavailable {
+		return Result{}, issue("credential_unavailable", "Allow this helper to read its stored Keychain credential before retrying.")
+	}
+	if config.PersonaMCPReconnectRequired(b) {
+		return Result{}, issue("reconnect_required", "Disconnect and reconnect to renew PersonaStack MCP authorization.")
+	}
 	if p.PreparationID != "" {
 		return Result{}, issue("scope_changed", "Credential renewal requires the authorized enrollment flow.")
 	}
@@ -474,6 +497,12 @@ func (c *Controller) repair(ctx context.Context, p RepairPayload) (Result, error
 	}
 	err = c.Repair(ctx, b, p.RestartConfirmed)
 	if err != nil {
+		if strings.HasPrefix(err.Error(), "credential_unavailable:") {
+			return Result{}, issue("credential_unavailable", "Allow this helper to read its stored Keychain credential before retrying.")
+		}
+		if strings.HasPrefix(err.Error(), "reconnect_required:") {
+			return Result{}, issue("reconnect_required", "Disconnect and reconnect to renew PersonaStack MCP authorization.")
+		}
 		return Result{}, issue("cleanup_required", "Profile needs repair. Existing files and credentials were preserved.")
 	}
 	return c.status(ctx, BindingPayload{BindingKey: &p.BindingKey}, false)

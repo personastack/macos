@@ -949,9 +949,6 @@ func openClawRunResultFromResponse(raw json.RawMessage) (openClawRunResult, bool
 	case "completed", "success", "succeeded", "failed", "error", "cancelled", "canceled", "aborted", "timeout":
 		return result, true
 	default:
-		if strings.TrimSpace(result.Output) != "" || strings.TrimSpace(result.Error) != "" {
-			return result, true
-		}
 		return result, false
 	}
 }

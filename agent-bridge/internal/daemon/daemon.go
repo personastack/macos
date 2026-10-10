@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -27,6 +28,7 @@ import (
 
 type Runner struct {
 	Store                   config.Store
+	MCPHTTPClient           *http.Client
 	ServiceScope            externalagentprotocol.ServiceScope
 	Now                     func() time.Time
 	ReconnectMin            time.Duration
@@ -987,19 +989,9 @@ func (r Runner) runBindingSession(ctx context.Context, binding config.Binding, s
 				}
 			}(frame, nativeRunID, runAdapter)
 		case externalagentprotocol.FrameTypeRunCancel:
-			if frame.RunCancel == nil {
-				continue
+			if err := r.cancelAssignedRun(binding, frame, adapter, reconciler, commandCache); err != nil {
+				log.Printf("assigned native cancel failed connection_id=%s run_id=%s", binding.ConnectionID, frame.RunID)
 			}
-			if commandCache.seen(frame) {
-				continue
-			}
-			nativeRunID, err := r.nativeRunIDForCancel(binding, frame.RunID)
-			if err != nil {
-				continue
-			}
-			commandCache.mark(frame)
-			_ = adapter.CancelRun(nativeRunID)
-			runObservations.cancel(frame.RunID)
 		case externalagentprotocol.FrameTypeTokenRevoked:
 			if frame.TokenRevoked == nil {
 				continue
@@ -1444,6 +1436,35 @@ func (r Runner) lastWakeProbeAt(binding config.Binding) *time.Time {
 	return &value
 }
 
+// cancelAssignedRun uses the selected v4 runtime adapter. A refused native stop
+// leaves observation running and the command retryable until terminal readback.
+func (r Runner) cancelAssignedRun(binding config.Binding, frame externalagentprotocol.Frame, base runtime.Adapter, reconciler *sessionReconciler, cache *commandFrameCache) error {
+	if frame.RunCancel == nil || !matchesFrameScope(binding, frame) || cache.seen(frame) {
+		return nil
+	}
+	nativeRunID, err := r.nativeRunIDForCancel(binding, frame.RunID)
+	if err != nil {
+		return err
+	}
+	adapter := base
+	if reconciler != nil {
+		snapshot := reconciler.snapshotCopy()
+		if snapshot.Generation != binding.ConnectionGeneration || snapshot.Adapter == nil {
+			return fmt.Errorf("selected assigned-run adapter unavailable")
+		}
+		adapter = snapshot.Adapter
+	}
+	if adapter == nil {
+		return fmt.Errorf("assigned-run adapter unavailable")
+	}
+	if err := adapter.CancelRun(nativeRunID); err != nil {
+		return err
+	}
+	cache.mark(frame)
+	// Keep native observation until settlement. Cancel acceptance is not terminal.
+	return nil
+}
+
 func (r Runner) nativeRunIDForCancel(binding config.Binding, runID string) (string, error) {
 	latest, ok := config.BindingFor(r.Store, binding)
 	if !ok {
@@ -1477,6 +1498,9 @@ func (r Runner) bindingReadinessAtHome(adapter runtime.Adapter, binding config.B
 }
 
 func (r Runner) bindingReadinessAtHomeContext(ctx context.Context, adapter runtime.Adapter, binding config.Binding, homeDir string, hermesHome string, runtimeURLs ...string) runtime.Detection {
+	if latest, ok := config.BindingFor(r.Store, binding); ok && latest.PersonaMCPSecretUnavailable {
+		return runtime.Detection{Kind: binding.RuntimeKind, State: runtime.AdapterStateAuthMissing, DiagnosticCode: "credential_unavailable", Note: "Stored Keychain credential cannot be read."}
+	}
 	detection := runtime.DetectContext(ctx, adapter)
 	if detection.State != runtime.AdapterStateReady {
 		return detection
@@ -1494,7 +1518,7 @@ func (r Runner) bindingReadinessAtHomeContext(ctx context.Context, adapter runti
 	if len(runtimeURLs) > 0 {
 		runtimeURL = runtimeURLs[0]
 	}
-	verify := mcp.VerifyBindingWithLiveAt(ctx, homeDir, verificationBinding, nil, runtimeURL)
+	verify := mcp.VerifyBindingWithLiveAt(ctx, homeDir, verificationBinding, r.MCPHTTPClient, runtimeURL)
 	detection.State = verify.State
 	detection.Note = verify.Note
 	detection.DiagnosticCode = verify.DiagnosticCode
