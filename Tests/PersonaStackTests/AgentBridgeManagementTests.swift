@@ -68,7 +68,7 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
 @Suite struct AgentBridgeManagementTests {
     private let current = #"{"workspace_id":"ws_11111111111111111111111111111111","persona_id":"persona-a","connection_id":"conn-a","connection_generation":7,"client_kind":"macos_app","run_lane_status":"idle","readiness_status":"wakeable"}"#
     private let absent = #"{"workspace_id":"ws_11111111111111111111111111111111","persona_id":"persona-a"}"#
-    private let local = #"{"connections":[{"binding_key":{"environment_id":"https://my.personastack.ai","connection_id":"conn-a"},"persona_id":"persona-a","runtime_kind":"hermes","readiness_state":"mcp_verified"}]}"#
+    private let local = #"{"connections":[{"binding_key":{"environment_id":"https://my.personastack.ai","connection_id":"conn-a"},"persona_id":"persona-a","runtime_kind":"hermes","connection_generation":7,"readiness_state":"mcp_verified"}]}"#
 
     @MainActor private func manager(_ fixture: AgentBridgeManagementFixture, confirmStop: @escaping @MainActor (String) -> Bool = { _ in false },
                                    confirmRepair: @escaping @MainActor (String) -> Bool = { _ in false }) -> AgentBridgeSetupManager {
@@ -165,4 +165,19 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
         await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(command, view: view) }
         #expect(await fixture.performed == steps.map(\.operation))
     }
+    @Test(arguments: ["workspace", "generation", "runtime", "missing_target", "missing_generation"]) @MainActor func reopenedRepairRejectsForeignRetainedScopeBeforeSelection(_ fault: String) async throws {
+        let workspace = fault == "workspace" ? "ws_22222222222222222222222222222222" : "ws_11111111111111111111111111111111"
+        let generation = fault == "generation" ? 6 : 7
+        let runtime = fault == "runtime" ? "openclaw" : "hermes"
+        var pending = "{\"connections\":[{\"binding_key\":{\"environment_id\":\"https://my.personastack.ai\",\"connection_id\":\"conn-a\"},\"persona_id\":\"persona-a\",\"runtime_kind\":\"hermes\",\"readiness_state\":\"target_selection_required\",\"connection_generation\":\(generation),\"prepared_target\":{\"workspace_id\":\"\(workspace)\",\"account_candidate_id\":\"rt_account_a\",\"profile_candidate_id\":\"rt_profile_a\",\"runtime_kind\":\"\(runtime)\"}}]}"
+        if fault == "missing_target" { pending = pending.replacingOccurrences(of: "prepared_target", with: "ignored_target") }
+        if fault == "missing_generation" { pending = pending.replacingOccurrences(of: "\"connection_generation\":7", with: "\"connection_generation\":null") }
+        let fixture = AgentBridgeManagementFixture([.init(operation: "GET /user/personas/external-runtime", json: current), .init(operation: "check", json: pending)])
+        let manager = manager(fixture)
+        let view = WKWebView()
+        let command = try await command("repair", manager: manager, view: view)
+        await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(command, view: view) }
+        #expect(await fixture.performed == ["GET /user/personas/external-runtime", "check"])
+    }
+
 }

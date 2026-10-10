@@ -570,8 +570,20 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
             guard let selected = check.connections.first(where: { $0.bindingKey == key }), selected.personaID == command.personaID else {
                 throw AgentBridgeFailure.scopeChanged
             }
+            guard let generation = selected.connectionGeneration, generation > 0, generation == command.connectionGeneration else { throw AgentBridgeFailure.scopeChanged }
             guard selected.activeRunID == nil || selected.activeRunID == "" else { throw AgentBridgeFailure.busy }
             guard !selected.requiresReconnect else { throw AgentBridgeFailure.reconnectRequired }
+            if selected.readinessState == "target_selection_required" || binding.targetSelection?.isUnselected == true {
+                guard let retained = selected.preparedTarget, retained.workspaceID == command.workspaceID,
+                      retained.runtimeKind == selected.runtimeKind, selected.connectionGeneration == command.connectionGeneration,
+                      !retained.accountCandidateID.isEmpty, !retained.profileCandidateID.isEmpty else { throw AgentBridgeFailure.scopeChanged }
+                let target = AgentBridgePreparedTarget(workspace: retained.workspaceID, persona: selected.personaID,
+                    account: retained.accountCandidateID, profile: retained.profileCandidateID, runtime: retained.runtimeKind)
+                var response = try await completeEnrollment(page: page, cookies: cookies, scope: command.scope, document: document,
+                    view: view, target: target, binding: key)
+                response["connections"] = [connectionValue(try await selectedConnection(key, persona: selected.personaID))]
+                return response
+            }
             if !confirmRuntimeStart(command.personaID!) { throw AgentBridgeFailure.runtimeConflict }
             // A native dialog never grants a changed account/profile authority.
             _ = try await self.cookies(view: view, page: page)

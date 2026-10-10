@@ -98,6 +98,14 @@ func TestNativeOpenClawActualProfileChoiceEnrollmentAndResolution(t *testing.T) 
 	if len(bindings) != 1 || bindings[0].SelectedOpenClawAgentID != "writer" {
 		t.Fatalf("native choice lost %+v", bindings)
 	}
+	status := request(t, c, "status", `{"binding_key":{"environment_id":"https://app.test","connection_id":"eac_connection"}}`)
+	if status.Error != nil || len(status.Result.Connections) != 1 {
+		t.Fatal("native retained status missing")
+	}
+	retained := status.Result.Connections[0]
+	if retained.ConnectionGeneration != 1 || retained.PreparedTarget == nil || retained.PreparedTarget.WorkspaceID != scope.WorkspaceID || retained.PreparedTarget.AccountCandidateID != bindings[0].AccountCandidateID || retained.PreparedTarget.ProfileCandidateID != bindings[0].ProfileCandidateID || retained.PreparedTarget.RuntimeKind != "openclaw" {
+		t.Fatalf("retained scope changed %+v", retained)
+	}
 	nativeProfiles, _ := targetinventory.DiscoverAt(home, "fixture", 501, 20, runtime.AdapterKindOpenClaw, "seed")
 	target := &externalagentprotocol.RuntimeTarget{RuntimeKind: externalagentprotocol.RuntimeKindOpenClaw, AccountCandidateID: bindings[0].AccountCandidateID, ProfileCandidateID: bindings[0].ProfileCandidateID}
 	resolved, err := targetinventory.ResolveProfiles(runtime.AdapterKindOpenClaw, target, nativeProfiles, bindings[0].SelectedOpenClawAgentID)
@@ -114,5 +122,51 @@ func TestNativeOpenClawActualProfileChoiceEnrollmentAndResolution(t *testing.T) 
 	raw, _ := os.ReadFile(path)
 	if string(raw) != document {
 		t.Fatal("native discovery/enrollment changed runtime config before selected API target")
+	}
+}
+
+func TestNativeRetainedTargetStatusIsScopedRedactedAndReadOnly(t *testing.T) {
+	t.Parallel()
+	c, store, _ := fixture(t)
+	owner := config.Binding{EnvironmentID: "https://app.test", ConnectionID: "eac_owner", ConnectionGeneration: 7, PersonaID: "persona", WorkspaceID: "ws_" + strings.Repeat("a", 32), RuntimeKind: runtime.AdapterKindOpenClaw, AccountCandidateID: "rt_account_a", ProfileCandidateID: "rt_profile_a", SelectedOpenClawAgentID: "research", NativeStateRoot: "/private/owner", NativeConfigPath: "/private/owner/config", PersonaMCPToken: "private-mcp-secret", BridgePrivateKey: "private-bridge-secret"}
+	sibling := owner
+	sibling.ConnectionID = "eac_sibling"
+	sibling.PersonaID = "other"
+	sibling.NativeStateRoot = "/private/sibling"
+	sibling.NativeConfigPath = "/private/sibling/config"
+	sibling.ProfileCandidateID = "rt_profile_b"
+	if err := store.SaveBinding(owner); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveBinding(sibling); err != nil {
+		t.Fatal(err)
+	}
+	response := request(t, c, "status", `{"binding_key":{"environment_id":"https://app.test","connection_id":"eac_owner"}}`)
+	if response.Error != nil || len(response.Result.Connections) != 1 {
+		t.Fatal("scoped status failed")
+	}
+	row := response.Result.Connections[0]
+	if row.ConnectionGeneration != 7 || row.PreparedTarget == nil || row.PreparedTarget.WorkspaceID != owner.WorkspaceID || row.PreparedTarget.AccountCandidateID != "rt_account_a" || row.PreparedTarget.ProfileCandidateID != "rt_profile_a" || row.PreparedTarget.RuntimeKind != "openclaw" {
+		t.Fatalf("private target changed %+v", row)
+	}
+	raw, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"/private/owner", "/private/sibling", "private-mcp-secret", "private-bridge-secret", "SelectedOpenClawAgentID"} {
+		if strings.Contains(string(raw), secret) {
+			t.Fatal("private path or credential leaked into retry DTO")
+		}
+	}
+	if !strings.Contains(string(raw), `"prepared_target":{"workspace_id":"`+owner.WorkspaceID+`","account_candidate_id":"rt_account_a","profile_candidate_id":"rt_profile_a","runtime_kind":"openclaw"}`) {
+		t.Fatal("private producer field names changed")
+	}
+	actual, _ := store.BindingKey(sibling.Key())
+	if actual != sibling {
+		t.Fatal("scoped status mutated sibling")
+	}
+	actual, _ = store.BindingKey(owner.Key())
+	if actual != owner {
+		t.Fatal("scoped status mutated owner")
 	}
 }

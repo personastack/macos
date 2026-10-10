@@ -68,11 +68,23 @@ public struct AgentBridgePreparation: Codable, Sendable {
     }
 }
 
+public struct AgentBridgeRetainedTarget: Codable, Sendable {
+    public let workspaceID: String
+    public let accountCandidateID: String
+    public let profileCandidateID: String
+    public let runtimeKind: AgentBridgeRuntime
+    enum CodingKeys: String, CodingKey {
+        case workspaceID = "workspace_id", accountCandidateID = "account_candidate_id"
+        case profileCandidateID = "profile_candidate_id", runtimeKind = "runtime_kind"
+    }
+}
 public struct AgentBridgeConnection: Codable, Sendable {
     public let bindingKey: AgentBridgeBindingKey
     public let personaID: String
     public let runtimeKind: AgentBridgeRuntime
     public let readinessState: String
+    public let connectionGeneration: Int?
+    public let preparedTarget: AgentBridgeRetainedTarget?
     public let activeRunID: String?
     public let diagnosticCode: String?
     public let diagnosticMessage: String?
@@ -84,6 +96,7 @@ public struct AgentBridgeConnection: Codable, Sendable {
         case bindingKey = "binding_key", personaID = "persona_id", runtimeKind = "runtime_kind"
         case readinessState = "readiness_state", activeRunID = "active_run_id"
         case diagnosticCode = "diagnostic_code", diagnosticMessage = "diagnostic_message"
+        case connectionGeneration = "connection_generation", preparedTarget = "prepared_target"
     }
 }
 public struct AgentBridgeMigrationHelp: Codable, Sendable {

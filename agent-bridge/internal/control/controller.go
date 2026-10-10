@@ -474,7 +474,10 @@ func (c *Controller) status(ctx context.Context, p BindingPayload, probe bool) (
 	}
 	result := Result{Connections: []Connection{}, PendingMigrationCount: c.pendingMigrationCount()}
 	for _, b := range bindings {
-		row := Connection{BindingKey: b.Key(), PersonaID: string(b.PersonaID), RuntimeKind: b.RuntimeKind.String(), ReadinessState: b.ReadinessState.String(), ActiveRunID: b.ActiveRunID}
+		row := Connection{ConnectionGeneration: b.ConnectionGeneration, BindingKey: b.Key(), PersonaID: string(b.PersonaID), RuntimeKind: b.RuntimeKind.String(), ReadinessState: b.ReadinessState.String(), ActiveRunID: b.ActiveRunID}
+		if validWorkspaceID(b.WorkspaceID) && b.AccountCandidateID != "" && b.ProfileCandidateID != "" {
+			row.PreparedTarget = &PreparedTarget{WorkspaceID: b.WorkspaceID, AccountCandidateID: b.AccountCandidateID, ProfileCandidateID: b.ProfileCandidateID, RuntimeKind: b.RuntimeKind.String()}
+		}
 		if b.PersonaMCPSecretUnavailable {
 			row.ReadinessState = "unavailable"
 			row.DiagnosticCode = "credential_unavailable"

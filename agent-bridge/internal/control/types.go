@@ -42,14 +42,24 @@ type Profile struct {
 	RuntimeKind              string                `json:"runtime_kind"`
 	ConflictCode             string                `json:"conflict_code,omitempty"`
 }
+
+// PreparedTarget remains on private native IPC. The page never receives this retry authority.
+type PreparedTarget struct {
+	WorkspaceID        string `json:"workspace_id"`
+	AccountCandidateID string `json:"account_candidate_id"`
+	ProfileCandidateID string `json:"profile_candidate_id"`
+	RuntimeKind        string `json:"runtime_kind"`
+}
 type Connection struct {
-	BindingKey        config.BindingKey `json:"binding_key"`
-	PersonaID         string            `json:"persona_id"`
-	RuntimeKind       string            `json:"runtime_kind"`
-	ReadinessState    string            `json:"readiness_state"`
-	ActiveRunID       string            `json:"active_run_id,omitempty"`
-	DiagnosticCode    string            `json:"diagnostic_code,omitempty"`
-	DiagnosticMessage string            `json:"diagnostic_message,omitempty"`
+	PreparedTarget       *PreparedTarget   `json:"prepared_target,omitempty"`
+	ConnectionGeneration int64             `json:"connection_generation"`
+	BindingKey           config.BindingKey `json:"binding_key"`
+	PersonaID            string            `json:"persona_id"`
+	RuntimeKind          string            `json:"runtime_kind"`
+	ReadinessState       string            `json:"readiness_state"`
+	ActiveRunID          string            `json:"active_run_id,omitempty"`
+	DiagnosticCode       string            `json:"diagnostic_code,omitempty"`
+	DiagnosticMessage    string            `json:"diagnostic_message,omitempty"`
 }
 type Result struct {
 	ProfileLabel          string             `json:"profile_label,omitempty"`
