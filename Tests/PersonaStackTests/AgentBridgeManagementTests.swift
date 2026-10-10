@@ -12,7 +12,10 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
     private var afterCheck: (@MainActor @Sendable () -> Void)?
     func setAfterCheck(_ action: @escaping @MainActor @Sendable () -> Void) { afterCheck = action }
     private let expectedAppsConfirmation: Bool?
-    init(_ expected: [Step], appsConfirmation: Bool? = nil) { self.expected = expected; expectedAppsConfirmation = appsConfirmation }
+    private let expectedHostConfirmation: Bool?
+    init(_ expected: [Step], appsConfirmation: Bool? = nil, hostConfirmation: Bool? = nil) {
+        self.expected = expected; expectedAppsConfirmation = appsConfirmation; expectedHostConfirmation = hostConfirmation
+    }
     private func consume(_ operation: String) throws -> String {
         guard !expected.isEmpty else { throw AgentBridgeFailure.invalidRequest }
         let step = expected.removeFirst()
@@ -27,12 +30,13 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
         let payload = try #require(object["payload"] as? [String: Any])
         let binding = try #require(payload["binding_key"] as? [String: String])
         #expect(binding == ["environment_id": "https://my.personastack.ai", "connection_id": "conn-a"])
-        if operation == "repair", let expectedAppsConfirmation {
-            #expect(Set(payload.keys) == ["binding_key", "connection_generation", "target_selection_revision", "restart_confirmed", "openclaw_apps_confirmed"])
+        if operation == "repair" {
+            #expect(Set(payload.keys) == ["binding_key", "connection_generation", "target_selection_revision", "restart_confirmed", "openclaw_apps_confirmed", "hermes_host_confirmed"])
             #expect(payload["connection_generation"] as? Int == 7)
             #expect(payload["target_selection_revision"] as? Int == 9)
             #expect(payload["restart_confirmed"] as? Bool == true)
-            #expect(payload["openclaw_apps_confirmed"] as? Bool == expectedAppsConfirmation)
+            #expect(payload["openclaw_apps_confirmed"] as? Bool == (expectedAppsConfirmation ?? false))
+            #expect(payload["hermes_host_confirmed"] as? Bool == (expectedHostConfirmation ?? false))
         }
         if operation == "disconnect" {
             let proof = try #require(payload["revocation_readback"] as? [String: Any])
@@ -84,6 +88,7 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
     @MainActor private func manager(_ fixture: AgentBridgeManagementFixture, confirmStop: @escaping @MainActor (String) -> Bool = { _ in false },
                                    confirmRepair: @escaping @MainActor (String) -> Bool = { _ in false },
                                    confirmApps: @escaping @MainActor (String) -> Bool = { _ in false },
+                                   confirmHost: @escaping @MainActor (String) -> Bool = { _ in false },
                                    showScopeHelp: @escaping @MainActor () -> Void = {},
                                    cookieReader: @escaping @MainActor (WKWebView, DesktopEnvironmentConfiguration) async throws -> String = { _, _ in "personastack_session=fixture" }) -> AgentBridgeSetupManager {
         let client = AgentBridgeControlClient(transport: fixture)
@@ -91,7 +96,7 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
             preferences: UserDefaults(suiteName: "AgentBridgeManagementTests." + UUID().uuidString)!, requireSignature: {}, clearDisabledPreference: {})
         return AgentBridgeSetupManager(service: service, client: client, hosted: AgentBridgeHostedAuthority(transport: fixture),
             configuration: { _ in .production }, approveEnvironment: { _ in }, prepareBackgroundEnable: {},
-            cookieReader: cookieReader, confirmRuntimeStart: confirmRepair, confirmOpenClawApps: confirmApps, showProfileScopeHelp: showScopeHelp,
+            cookieReader: cookieReader, confirmRuntimeStart: { persona, _ in confirmRepair(persona) }, confirmOpenClawApps: confirmApps, confirmHermesHost: confirmHost, showProfileScopeHelp: showScopeHelp, showHermesHostHelp: showScopeHelp,
             confirmDisconnectStop: confirmStop, waitForSettlement: {}, csrfReader: { _ in "csrf-fixture" })
     }
     @MainActor private func command(_ action: String, manager: AgentBridgeSetupManager, view: WKWebView) async throws -> AgentBridgePageCommand {
@@ -123,13 +128,14 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
         }
     }
 
-    @Test(arguments: ["exact", "foreign_persona", "foreign_binding", "stale_generation", "changed_document", "changed_cookie", "foreign_message"]) @MainActor func unverifiedGatewayScopeHelpRequiresCurrentExactOwner(_ fault: String) async throws {
-        var unavailable = local.replacingOccurrences(of: "hermes", with: "openclaw")
-            .replacingOccurrences(of: "\"readiness_state\":\"mcp_verified\"", with: "\"readiness_state\":\"unavailable\",\"diagnostic_code\":\"runtime_conflict\",\"diagnostic_message\":\"" + AgentBridgeSetupManager.profileScopeHelpMessage + "\"")
+    @Test(arguments: ["hermes", "openclaw"], ["exact", "foreign_persona", "foreign_binding", "stale_generation", "changed_document", "changed_cookie", "foreign_message"]) @MainActor func unverifiedGatewayScopeHelpRequiresCurrentExactOwner(_ runtimeKind: String, _ fault: String) async throws {
+        let message = runtimeKind == "hermes" ? AgentBridgeSetupManager.hermesHostHelpMessage : AgentBridgeSetupManager.profileScopeHelpMessage
+        var unavailable = local.replacingOccurrences(of: "hermes", with: runtimeKind)
+            .replacingOccurrences(of: "\"readiness_state\":\"mcp_verified\"", with: "\"readiness_state\":\"unavailable\",\"diagnostic_code\":\"runtime_conflict\",\"diagnostic_message\":\"" + message + "\"")
         if fault == "foreign_persona" { unavailable = unavailable.replacingOccurrences(of: "persona-a", with: "persona-b") }
         if fault == "foreign_binding" { unavailable = unavailable.replacingOccurrences(of: "conn-a", with: "conn-b") }
         if fault == "stale_generation" { unavailable = unavailable.replacingOccurrences(of: "\"connection_generation\":7", with: "\"connection_generation\":6") }
-        if fault == "foreign_message" { unavailable = unavailable.replacingOccurrences(of: AgentBridgeSetupManager.profileScopeHelpMessage, with: "Untrusted profile diagnostic") }
+        if fault == "foreign_message" { unavailable = unavailable.replacingOccurrences(of: message, with: "Untrusted profile diagnostic") }
         let fixture = AgentBridgeManagementFixture([.init(operation: "GET /user/personas/external-runtime", json: current), .init(operation: "check", json: unavailable)])
         var helpCount = 0, confirmCount = 0
         var cookie = "personastack_session=fixture"
@@ -145,12 +151,13 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
         #expect(await fixture.performed == ["GET /user/personas/external-runtime", "check"])
     }
 
-    @Test(arguments: ["allow", "apps_enabled", "decline_apps", "decline_restart", "changed_document", "changed_cookie", "changed_generation", "changed_account", "changed_profile", "changed_revision", "changed_inventory", "changed_runtime", "changed_after_restart"]) @MainActor func openClawAppsConsentAndRestartRequireSeparateCurrentTargetAuthority(_ outcome: String) async throws {
+    @Test(arguments: ["hermes", "openclaw"], ["allow", "already_enabled", "decline_feature", "decline_repair", "changed_document", "changed_cookie", "changed_generation", "changed_account", "changed_profile", "changed_revision", "changed_inventory", "changed_runtime", "changed_after_restart"]) @MainActor func nativeFeatureAndRuntimeRepairRequireSeparateCurrentTargetAuthority(_ runtimeKind: String, _ outcome: String) async throws {
         let target = #", "target_inventory":{"inventory_generation":8,"accounts":[{"candidate_id":"rt_account_a","profiles":[{"candidate_id":"rt_profile_a","runtime_kind":"openclaw"}]}]},"target_selection":{"account_candidate_id":"rt_account_a","profile_candidate_id":"rt_profile_a","runtime_kind":"openclaw","selection_revision":9,"validated_generation":8,"state":"target_selected"}"#
-        let owner = String(current.dropLast()) + target + "}"
+        let owner = (String(current.dropLast()) + target + "}").replacingOccurrences(of: "openclaw", with: runtimeKind)
         let retained = #", "prepared_target":{"workspace_id":"ws_11111111111111111111111111111111","account_candidate_id":"rt_account_a","profile_candidate_id":"rt_profile_a","runtime_kind":"openclaw"}"#
-        let verified = local.replacingOccurrences(of: "hermes", with: "openclaw").replacingOccurrences(of: "}]}" , with: retained + "}]}")
-        let diagnostic = outcome == "apps_enabled" ? "mcp_unverified" : "mcp_apps_disabled"
+        let verified = local.replacingOccurrences(of: "hermes", with: runtimeKind).replacingOccurrences(of: "}]}" , with: retained.replacingOccurrences(of: "openclaw", with: runtimeKind) + "}]}")
+        let featureDiagnostic = runtimeKind == "hermes" ? "hermes_host_consent_required" : "mcp_apps_disabled"
+        let diagnostic = outcome == "already_enabled" ? "mcp_unverified" : featureDiagnostic
         let needsRepair = verified.replacingOccurrences(of: "\"readiness_state\":\"mcp_verified\"", with: "\"readiness_state\":\"unavailable\",\"diagnostic_code\":\"" + diagnostic + "\"")
         var changed = owner
         switch outcome {
@@ -159,44 +166,66 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
         case "changed_profile": changed = owner.replacingOccurrences(of: "rt_profile_a", with: "rt_profile_b")
         case "changed_revision": changed = owner.replacingOccurrences(of: "\"selection_revision\":9", with: "\"selection_revision\":10")
         case "changed_inventory": changed = owner.replacingOccurrences(of: "\"inventory_generation\":8", with: "\"inventory_generation\":9")
-        case "changed_runtime": changed = owner.replacingOccurrences(of: "openclaw", with: "hermes")
+        case "changed_runtime": changed = owner.replacingOccurrences(of: runtimeKind, with: runtimeKind == "hermes" ? "openclaw" : "hermes")
         default: break
         }
         var steps: [AgentBridgeManagementFixture.Step] = [
             .init(operation: "GET /user/personas/external-runtime", json: owner), .init(operation: "check", json: needsRepair),
             .init(operation: "GET /user/personas/external-runtime", json: owner)
         ]
-        let appsDialogInvalidates = ["changed_document", "changed_cookie"].contains(outcome)
-        let appsReadbackDenies = ["changed_generation", "changed_account", "changed_profile", "changed_revision", "changed_inventory", "changed_runtime"].contains(outcome)
-        if outcome != "decline_apps" && !appsDialogInvalidates && outcome != "apps_enabled" {
-            steps.append(.init(operation: "GET /user/personas/external-runtime", json: appsReadbackDenies ? changed : owner))
+        let featureDialogInvalidates = ["changed_document", "changed_cookie"].contains(outcome)
+        let featureReadbackDenies = ["changed_generation", "changed_account", "changed_profile", "changed_revision", "changed_inventory", "changed_runtime"].contains(outcome)
+        if outcome != "decline_feature" && !featureDialogInvalidates && outcome != "already_enabled" {
+            steps.append(.init(operation: "GET /user/personas/external-runtime", json: featureReadbackDenies ? changed : owner))
         }
-        let startReached = outcome == "allow" || outcome == "apps_enabled" || outcome == "decline_restart" || outcome == "changed_after_restart"
-        if startReached && outcome != "decline_restart" {
+        let startReached = outcome == "allow" || outcome == "already_enabled" || outcome == "decline_repair" || outcome == "changed_after_restart"
+        if startReached && outcome != "decline_repair" {
             steps.append(.init(operation: "GET /user/personas/external-runtime", json: changed))
         }
-        let succeeds = outcome == "allow" || outcome == "apps_enabled"
+        let succeeds = outcome == "allow" || outcome == "already_enabled"
         if succeeds { steps.append(.init(operation: "repair", json: verified)) }
-        let fixture = AgentBridgeManagementFixture(steps, appsConfirmation: outcome == "allow")
+        let fixture = AgentBridgeManagementFixture(steps, appsConfirmation: runtimeKind == "openclaw" && outcome == "allow", hostConfirmation: runtimeKind == "hermes" && outcome == "allow")
         var dialogs: [String] = [], cookie = "personastack_session=fixture"
         let view = WKWebView()
         var manager: AgentBridgeSetupManager!
-        manager = self.manager(fixture, confirmRepair: { _ in dialogs.append("restart"); return outcome != "decline_restart" }, confirmApps: { _ in
-            dialogs.append("apps")
+        let approveFeature: @MainActor (String) -> Bool = { _ in
+            dialogs.append(runtimeKind == "hermes" ? "host" : "apps")
             if outcome == "changed_document" { manager.invalidate(view) }
             if outcome == "changed_cookie" { cookie = "personastack_session=changed" }
-            return outcome != "decline_apps"
-        }, cookieReader: { _, _ in cookie })
+            return outcome != "decline_feature"
+        }
+        manager = self.manager(fixture, confirmRepair: { _ in dialogs.append("restart"); return outcome != "decline_repair" },
+            confirmApps: runtimeKind == "openclaw" ? approveFeature : { _ in Issue.record("Hermes cannot grant OpenClaw Apps"); return false },
+            confirmHost: runtimeKind == "hermes" ? approveFeature : { _ in Issue.record("OpenClaw cannot grant Hermes host startup"); return false },
+            cookieReader: { _, _ in cookie })
         let command = try await command("repair", manager: manager, view: view)
         if succeeds {
             let result = try await manager.apply(command, view: view)
             #expect(result["openclaw_apps_confirmed"] == nil)
+            #expect(result["hermes_host_confirmed"] == nil)
             #expect((result["connections"] as? [[String: Any]])?.first?["prepared_target"] == nil)
         } else {
-            let failure: AgentBridgeFailure = outcome == "decline_apps" || outcome == "decline_restart" ? .runtimeConflict : .scopeChanged
+            let failure: AgentBridgeFailure = outcome == "decline_feature" ? (runtimeKind == "hermes" ? .hermesHostConsentRequired : .runtimeConflict) : outcome == "decline_repair" ? .runtimeConflict : .scopeChanged
             await #expect(throws: failure) { _ = try await manager.apply(command, view: view) }
         }
-        #expect(dialogs == (outcome == "apps_enabled" ? ["restart"] : startReached ? ["apps", "restart"] : ["apps"]))
+        let feature = runtimeKind == "hermes" ? "host" : "apps"
+        #expect(dialogs == (outcome == "already_enabled" ? ["restart"] : startReached ? [feature, "restart"] : [feature]))
+        #expect(await fixture.performed == steps.map(\.operation))
+    }
+
+    @Test @MainActor func hermesCheckOnlyReportsHostConsentRequirementWithoutStartingIt() async throws {
+        let stopped = local.replacingOccurrences(of: "\"readiness_state\":\"mcp_verified\"", with: "\"readiness_state\":\"unavailable\",\"diagnostic_code\":\"hermes_host_consent_required\"")
+        let steps: [AgentBridgeManagementFixture.Step] = [.init(operation: "GET /user/personas/external-runtime", json: current), .init(operation: "check", json: stopped)]
+        let fixture = AgentBridgeManagementFixture(steps)
+        let manager = manager(fixture, confirmRepair: { _ in Issue.record("Check cannot approve tools repair"); return true },
+            confirmHost: { _ in Issue.record("Check cannot approve host startup"); return true })
+        let view = WKWebView()
+        let command = try await command("check", manager: manager, view: view)
+        let response = try await manager.apply(command, view: view)
+        let connection = try #require((response["connections"] as? [[String: Any]])?.first)
+        #expect(connection["diagnostic_code"] as? String == "hermes_host_consent_required")
+        #expect(connection["diagnostic_message"] == nil)
+        #expect(connection["hermes_host_confirmed"] == nil)
         #expect(await fixture.performed == steps.map(\.operation))
     }
 

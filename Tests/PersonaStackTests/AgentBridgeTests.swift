@@ -9,8 +9,9 @@ private actor AgentBridgeFixtureTransport: AgentBridgeControlTransport {
     private var expected: [(String, String)]
     private let selectedTarget: AgentBridgeTargetFixture?
     private let expectedAgentChoice: String?
+    private let repairRuntime: String?
     private(set) var operations: [String] = []
-    init(_ expected: [(String, String)], selectedTarget: AgentBridgeTargetFixture? = nil, agentChoice: String? = nil) { self.expected = expected; self.selectedTarget = selectedTarget; self.expectedAgentChoice = agentChoice }
+    init(_ expected: [(String, String)], selectedTarget: AgentBridgeTargetFixture? = nil, agentChoice: String? = nil, repairRuntime: String? = nil) { self.expected = expected; self.selectedTarget = selectedTarget; self.expectedAgentChoice = agentChoice; self.repairRuntime = repairRuntime }
     func exchange(_ request: Data) async throws -> Data {
         let object = try #require(JSONSerialization.jsonObject(with: request) as? [String: Any])
         #expect(object["version"] as? Int == 1)
@@ -18,11 +19,12 @@ private actor AgentBridgeFixtureTransport: AgentBridgeControlTransport {
         operations.append(operation)
         if operation == "repair" {
             let payload = try #require(object["payload"] as? [String: Any])
-            #expect(Set(payload.keys) == ["binding_key", "connection_generation", "target_selection_revision", "restart_confirmed", "openclaw_apps_confirmed"])
+            #expect(Set(payload.keys) == ["binding_key", "connection_generation", "target_selection_revision", "restart_confirmed", "openclaw_apps_confirmed", "hermes_host_confirmed"])
             #expect(payload["connection_generation"] as? Int == 7)
             #expect(payload["target_selection_revision"] as? Int == 1)
             #expect(payload["restart_confirmed"] as? Bool == true)
-            #expect(payload["openclaw_apps_confirmed"] as? Bool == true)
+            #expect(payload["openclaw_apps_confirmed"] as? Bool == (repairRuntime == "openclaw"))
+            #expect(payload["hermes_host_confirmed"] as? Bool == (repairRuntime == "hermes"))
         }
         if operation == "prepare", let expectedAgentChoice {
             let payload = try #require(object["payload"] as? [String: Any])
@@ -70,12 +72,14 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
             "runtime_kind": "hermes", "workspace_id": "ws_11111111111111111111111111111111",
             "persona_id": "persona-a", "profile_candidate_id": "rt_profile_a"]
         _ = try AgentBridgePageCommand.parse(valid)
-        for extra in ["gateway_url", "token", "path", "command", "document_id", "restart_confirmed", "openclaw_apps_confirmed", "target_selection_revision", "session_key", "expected_existing_session_id"] {
+        for extra in ["gateway_url", "token", "path", "command", "document_id", "restart_confirmed", "openclaw_apps_confirmed", "hermes_host_confirmed", "target_selection_revision", "session_key", "expected_existing_session_id"] {
             var input = valid; input[extra] = "untrusted"
             #expect(throws: AgentBridgeFailure.invalidRequest) { try AgentBridgePageCommand.parse(input) }
         }
-        var appsGrant = valid; appsGrant["openclaw_apps_confirmed"] = true
-        #expect(throws: AgentBridgeFailure.invalidRequest) { try AgentBridgePageCommand.parse(appsGrant) }
+        for field in ["openclaw_apps_confirmed", "hermes_host_confirmed"] {
+            var privateGrant = valid; privateGrant[field] = true
+            #expect(throws: AgentBridgeFailure.invalidRequest) { try AgentBridgePageCommand.parse(privateGrant) }
+        }
         for action in ["quiesce", "resume", "stop_background", "register", "execute", "migration_help", "migration_repair", "migration_cancel"] {
             #expect(throws: AgentBridgeFailure.invalidRequest) {
                 try AgentBridgePageCommand.parse(["version": "1", "action": action, "scope": "native-document"])
@@ -214,13 +218,17 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
     @Test(arguments: ["hermes", "openclaw"]) @MainActor func interruptedEnrollmentReopensAndRepairsWithoutNewPairing(_ runtimeKind: String) async throws {
         try await enrollmentWorkflow(staleInventory: true, runtimeKind: runtimeKind, reopen: true)
     }
-    @Test(arguments: [false, true]) @MainActor func enrollmentAndReopenedCompletionRefuseUnverifiedGatewayScope(_ reopen: Bool) async throws {
-        try await enrollmentWorkflow(staleInventory: reopen, runtimeKind: "openclaw", reopen: reopen, missingScope: true)
+    @Test(arguments: [false, true], ["hermes", "openclaw"]) @MainActor func enrollmentAndReopenedCompletionRefuseUnverifiedGatewayScope(_ reopen: Bool, _ runtimeKind: String) async throws {
+        try await enrollmentWorkflow(staleInventory: reopen, runtimeKind: runtimeKind, reopen: reopen, missingScope: true)
     }
     @Test(arguments: [false, true], [false, true]) @MainActor func enrollmentAndReopenedCompletionRequireExplicitAppsConsent(_ reopen: Bool, _ approveApps: Bool) async throws {
         try await enrollmentWorkflow(staleInventory: reopen, runtimeKind: "openclaw", reopen: reopen, approveApps: approveApps)
     }
-    @MainActor private func enrollmentWorkflow(staleInventory: Bool, runtimeKind: String, reopen: Bool, missingScope: Bool = false, approveApps: Bool? = nil) async throws {
+    @Test(arguments: [false, true], [false, true]) @MainActor func enrollmentAndReopenedCompletionRequireDistinctHermesHostConsent(_ reopen: Bool, _ approveHost: Bool) async throws {
+        try await enrollmentWorkflow(staleInventory: reopen, runtimeKind: "hermes", reopen: reopen, approveHost: approveHost)
+    }
+    @MainActor private func enrollmentWorkflow(staleInventory: Bool, runtimeKind: String, reopen: Bool, missingScope: Bool = false, approveApps: Bool? = nil, approveHost: Bool? = nil) async throws {
+        let featureApproval = approveApps ?? approveHost
         let id = UUID()
         let key = Data(repeating: 1, count: 32).base64EncodedString()
         let prepared = "{\"preparation_id\":\"\(id.uuidString)\",\"device_public_key\":\"\(key)\",\"profile_candidate_id\":\"rt_profile_a\",\"expires_at\":\"2026-10-10T12:00:00Z\"}"
@@ -229,7 +237,7 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
         let discoveryJSON = "{\"profiles\":[{\"profile_candidate_id\":\"rt_profile_a\",\"account_candidate_id\":\"rt_account_a\",\"label\":\"Default profile\",\"runtime_kind\":\"\(runtimeKind)\",\"openclaw_agents\":[{\"agent_candidate_id\":\"rt_agent_a\",\"label\":\"Research\"},{\"agent_candidate_id\":\"rt_agent_b\",\"label\":\"Writer\"}]}],\"discovery_status\":\"complete\"}"
         var readinessJSON = "{\"connections\":[{\"binding_key\":{\"environment_id\":\"https://my.personastack.ai\",\"connection_id\":\"conn-a\"},\"persona_id\":\"persona-a\",\"runtime_kind\":\"\(runtimeKind)\",\"readiness_state\":\"mcp_verified\",\"connection_generation\":7,\"prepared_target\":{\"workspace_id\":\"ws_11111111111111111111111111111111\",\"account_candidate_id\":\"rt_account_a\",\"profile_candidate_id\":\"rt_profile_a\",\"runtime_kind\":\"\(runtimeKind)\"}}]}"
         if missingScope {
-            readinessJSON = readinessJSON.replacingOccurrences(of: "\"readiness_state\":\"mcp_verified\"", with: "\"readiness_state\":\"unavailable\",\"diagnostic_code\":\"runtime_conflict\",\"diagnostic_message\":\"" + AgentBridgeSetupManager.profileScopeHelpMessage + "\"")
+            readinessJSON = readinessJSON.replacingOccurrences(of: "\"readiness_state\":\"mcp_verified\"", with: "\"readiness_state\":\"unavailable\",\"diagnostic_code\":\"runtime_conflict\",\"diagnostic_message\":\"" + (runtimeKind == "hermes" ? AgentBridgeSetupManager.hermesHostHelpMessage : AgentBridgeSetupManager.profileScopeHelpMessage) + "\"")
         }
         var expected: [(String, String)] = [
             ("status", #"{"connections":[]}"#),
@@ -241,21 +249,24 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
             let pending = "{\"connections\":[{\"binding_key\":{\"environment_id\":\"https://my.personastack.ai\",\"connection_id\":\"conn-a\"},\"persona_id\":\"persona-a\",\"runtime_kind\":\"\(runtimeKind)\",\"readiness_state\":\"target_selection_required\",\"connection_generation\":7,\"prepared_target\":{\"workspace_id\":\"ws_11111111111111111111111111111111\",\"account_candidate_id\":\"rt_account_a\",\"profile_candidate_id\":\"rt_profile_a\",\"runtime_kind\":\"\(runtimeKind)\"}}]}"
             expected.append(("check", pending))
         }
-        let appsDisabled = readinessJSON.replacingOccurrences(of: "\"readiness_state\":\"mcp_verified\"", with: "\"readiness_state\":\"unavailable\",\"diagnostic_code\":\"mcp_apps_disabled\"")
-        expected.append(("check", approveApps == nil ? readinessJSON : appsDisabled))
-        if approveApps == true { expected.append(("repair", readinessJSON)) }
-        if !missingScope && approveApps != false { expected.append(("check", readinessJSON)) }
-        if reopen && !missingScope && approveApps != false { expected.append(("status", readinessJSON)) }
-        let transport = AgentBridgeFixtureTransport(expected, selectedTarget: targetFixture, agentChoice: runtimeKind == "openclaw" ? "rt_agent_b" : nil)
+        let featureDiagnostic = runtimeKind == "hermes" ? "hermes_host_consent_required" : "mcp_apps_disabled"
+        let featureDisabled = readinessJSON.replacingOccurrences(of: "\"readiness_state\":\"mcp_verified\"", with: "\"readiness_state\":\"unavailable\",\"diagnostic_code\":\"" + featureDiagnostic + "\"")
+        expected.append(("check", featureApproval == nil ? readinessJSON : featureDisabled))
+        if featureApproval == true { expected.append(("repair", readinessJSON)) }
+        if !missingScope && featureApproval != false { expected.append(("check", readinessJSON)) }
+        if reopen && !missingScope && featureApproval != false { expected.append(("status", readinessJSON)) }
+        let transport = AgentBridgeFixtureTransport(expected, selectedTarget: targetFixture, agentChoice: runtimeKind == "openclaw" ? "rt_agent_b" : nil, repairRuntime: featureApproval == true ? runtimeKind : nil)
         let client = AgentBridgeControlClient(transport: transport)
         let registration = AgentBridgeFixtureRegistration()
         let service = AgentBridgeService(registration: registration, client: client, preferences: UserDefaults(suiteName: "AgentBridgeTests." + UUID().uuidString)!, requireSignature: {}, clearDisabledPreference: {})
-        var helpCount = 0, confirmCount = 0, appsCount = 0
+        var helpCount = 0, confirmCount = 0, appsCount = 0, hostCount = 0
         let manager = AgentBridgeSetupManager(service: service, client: client, hosted: AgentBridgeHostedAuthority(transport: targetFixture), configuration: { _ in .production },
             approveEnvironment: { _ in }, prepareBackgroundEnable: {}, cookieReader: { _, _ in "personastack_session=fixture" },
             chooseOpenClawAgent: { _, _ in "rt_agent_b" },
-            confirmRuntimeStart: { _ in confirmCount += 1; return true },
-            confirmOpenClawApps: { _ in appsCount += 1; return approveApps == true }, showProfileScopeHelp: { helpCount += 1 },
+            confirmRuntimeStart: { _, _ in confirmCount += 1; return true },
+            confirmOpenClawApps: { _ in appsCount += 1; return approveApps == true },
+            confirmHermesHost: { _ in hostCount += 1; return approveHost == true },
+            showProfileScopeHelp: { helpCount += 1 }, showHermesHostHelp: { helpCount += 1 },
             waitForSettlement: {}, csrfReader: { _ in "csrf-fixture" })
         let view = WKWebView()
         manager.register(view, appURL: DesktopEnvironmentConfiguration.production.appURL)
@@ -284,10 +295,12 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
             completion = try command("repair", scope: try #require(fresh["scope"] as? String), fields: [
                 "workspace_id": "ws_11111111111111111111111111111111", "persona_id": "persona-a", "connection_id": "conn-a", "connection_generation": 7])
         }
-        if missingScope || approveApps == false {
-            await #expect(throws: AgentBridgeFailure.runtimeConflict) { _ = try await manager.apply(completion, view: view) }
+        if missingScope || featureApproval == false {
+            let failure: AgentBridgeFailure = approveHost == false ? .hermesHostConsentRequired : .runtimeConflict
+            await #expect(throws: failure) { _ = try await manager.apply(completion, view: view) }
             #expect(helpCount == (missingScope ? 1 : 0))
             #expect(appsCount == (approveApps == false ? 1 : 0))
+            #expect(hostCount == (approveHost == false ? 1 : 0))
             #expect(confirmCount == 0)
             #expect(await transport.operations == expected.map { $0.0 })
             #expect(await targetFixture.saves == (staleInventory ? [7, 8] : [7]))
@@ -299,7 +312,8 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
         await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(enroll, view: view) }
         #expect(await transport.operations == expected.map { $0.0 })
         #expect(appsCount == (approveApps == true ? 1 : 0))
-        #expect(confirmCount == (approveApps == true ? 1 : 0))
+        #expect(hostCount == (approveHost == true ? 1 : 0))
+        #expect(confirmCount == (featureApproval == true ? 1 : 0))
         #expect(await targetFixture.saves == (staleInventory ? [7, 8] : [7]))
         #expect(registration.calls == ["register"])
     }

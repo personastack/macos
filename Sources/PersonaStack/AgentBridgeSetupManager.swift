@@ -30,9 +30,11 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
     private let prepareBackgroundEnable: @MainActor () throws -> Void
     private let cookieReader: @MainActor (WKWebView, DesktopEnvironmentConfiguration) async throws -> String
     private let chooseOpenClawAgent: @MainActor (String, [AgentBridgeNativeAgent]) -> String?
-    private let confirmRuntimeStart: @MainActor (String) -> Bool
+    private let confirmRuntimeStart: @MainActor (String, AgentBridgeRuntime) -> Bool
     private let confirmOpenClawApps: @MainActor (String) -> Bool
+    private let confirmHermesHost: @MainActor (String) -> Bool
     private let showProfileScopeHelp: @MainActor () -> Void
+    private let showHermesHostHelp: @MainActor () -> Void
     private let confirmDisconnectStop: @MainActor (String) -> Bool
     private let waitForSettlement: @MainActor () async throws -> Void
     private let csrfReader: @MainActor (WKWebView) async throws -> String
@@ -45,9 +47,11 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
          prepareBackgroundEnable: @escaping @MainActor () throws -> Void = { try DesktopUpdater.shared.prepareToEnableBackgroundAgents() },
          cookieReader: @escaping @MainActor (WKWebView, DesktopEnvironmentConfiguration) async throws -> String = AgentBridgeSetupManager.readCookies,
          chooseOpenClawAgent: @escaping @MainActor (String, [AgentBridgeNativeAgent]) -> String? = AgentBridgeSetupManager.chooseAgent,
-         confirmRuntimeStart: @escaping @MainActor (String) -> Bool = AgentBridgeSetupManager.confirmStart,
+         confirmRuntimeStart: @escaping @MainActor (String, AgentBridgeRuntime) -> Bool = AgentBridgeSetupManager.confirmStart,
          confirmOpenClawApps: @escaping @MainActor (String) -> Bool = AgentBridgeSetupManager.confirmApps,
+         confirmHermesHost: @escaping @MainActor (String) -> Bool = AgentBridgeSetupManager.confirmHost,
          showProfileScopeHelp: @escaping @MainActor () -> Void = AgentBridgeSetupManager.presentProfileScopeHelp,
+         showHermesHostHelp: @escaping @MainActor () -> Void = AgentBridgeSetupManager.presentHermesHostHelp,
          confirmDisconnectStop: @escaping @MainActor (String) -> Bool = AgentBridgeSetupManager.confirmStopForDisconnect,
          waitForSettlement: @escaping @MainActor () async throws -> Void = { try await Task.sleep(for: .milliseconds(250)) },
          csrfReader: @escaping @MainActor (WKWebView) async throws -> String = AgentBridgeSetupManager.readCSRF) {
@@ -56,7 +60,9 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         self.chooseOpenClawAgent = chooseOpenClawAgent
         self.confirmRuntimeStart = confirmRuntimeStart
         self.confirmOpenClawApps = confirmOpenClawApps
+        self.confirmHermesHost = confirmHermesHost
         self.showProfileScopeHelp = showProfileScopeHelp
+        self.showHermesHostHelp = showHermesHostHelp
         self.csrfReader = csrfReader
         self.confirmDisconnectStop = confirmDisconnectStop; self.waitForSettlement = waitForSettlement
     }
@@ -315,7 +321,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
             try await validate()
             guard let selected = result.connections.first(where: { $0.bindingKey == binding }), selected.personaID == target.persona, selected.runtimeKind == target.runtime else { throw AgentBridgeFailure.scopeChanged }
             guard !selected.requiresReconnect else { throw AgentBridgeFailure.reconnectRequired }
-            if Self.hasUnverifiedProfileScope(selected) {
+            if Self.hasUnverifiedProfileScope(selected) || Self.hasUnsafeHermesHost(selected) {
                 let owner = try await hosted.read(configuration: page.configuration, cookies: cookies, persona: target.persona)
                 guard let generation = selected.connectionGeneration, generation > 0 else { throw AgentBridgeFailure.scopeChanged }
                 try owner.require(workspace: target.workspace, persona: target.persona, connection: binding.connectionID, generation: generation)
@@ -333,7 +339,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         throw AgentBridgeFailure.runtimeConflict
     }
 
-    /// Apps approval and gateway restart approval are separate native authorities.
+    /// Shared Hermes host, OpenClaw Apps and profile Repair each need their own native authority.
     private func confirmedRepairPayload(_ selected: AgentBridgeConnection, target: AgentBridgePreparedTarget, page: Page,
                                         cookies: String, validate: @MainActor @Sendable () async throws -> Void) async throws -> [String: AgentBridgeValue] {
         guard let generation = selected.connectionGeneration, generation > 0 else { throw AgentBridgeFailure.scopeChanged }
@@ -356,11 +362,19 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
             guard afterApps.targetSelection?.selection_revision == revision else { throw AgentBridgeFailure.scopeChanged }
             appsConfirmed = true
         }
-        guard confirmRuntimeStart(target.persona) else { throw AgentBridgeFailure.runtimeConflict }
+        var hermesHostConfirmed = false
+        if selected.runtimeKind == .hermes && selected.diagnosticCode == "hermes_host_consent_required" {
+            guard confirmHermesHost(target.persona) else { throw AgentBridgeFailure.hermesHostConsentRequired }
+            let afterHost = try await owner()
+            guard afterHost.targetSelection?.selection_revision == revision else { throw AgentBridgeFailure.scopeChanged }
+            hermesHostConfirmed = true
+        }
+        guard confirmRuntimeStart(target.persona, selected.runtimeKind) else { throw AgentBridgeFailure.runtimeConflict }
         let afterStart = try await owner()
         guard afterStart.targetSelection?.selection_revision == revision else { throw AgentBridgeFailure.scopeChanged }
         return ["binding_key": bindingValue(key), "connection_generation": .integer(generation),
-                "target_selection_revision": .integer(revision), "restart_confirmed": .bool(true), "openclaw_apps_confirmed": .bool(appsConfirmed)]
+                "target_selection_revision": .integer(revision), "restart_confirmed": .bool(true), "openclaw_apps_confirmed": .bool(appsConfirmed),
+                "hermes_host_confirmed": .bool(hermesHostConfirmed)]
     }
 
     private func migrate(_ command: AgentBridgePageCommand, page: Page, cookies: String, document: UUID, view: WKWebView) async throws -> [String: Any] {
@@ -757,7 +771,16 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         connection.runtimeKind == .openclaw && connection.diagnosticCode == "runtime_conflict" &&
             connection.diagnosticMessage == profileScopeHelpMessage
     }
+    static let hermesHostHelpMessage = "Hermes shared gateway cannot be attached safely. Enable its loopback API server, then Repair."
+    private static func hasUnsafeHermesHost(_ connection: AgentBridgeConnection) -> Bool {
+        connection.runtimeKind == .hermes && connection.diagnosticCode == "runtime_conflict" &&
+            connection.diagnosticMessage == hermesHostHelpMessage
+    }
     private func refuseUnverifiedProfileScope(_ connection: AgentBridgeConnection) throws {
+        if Self.hasUnsafeHermesHost(connection) {
+            showHermesHostHelp()
+            throw AgentBridgeFailure.runtimeConflict
+        }
         guard Self.hasUnverifiedProfileScope(connection) else { return }
         showProfileScopeHelp()
         throw AgentBridgeFailure.runtimeConflict
@@ -766,6 +789,13 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         let alert = NSAlert()
         alert.messageText = "OpenClaw profile scope is unavailable."
         alert.informativeText = profileScopeHelpMessage + "\n\nPersonaStack leaves this gateway untouched. Use OpenClaw to stop the preexisting gateway. Then return to this persona's Repair action and approve starting its selected profile."
+        alert.addButton(withTitle: "Close")
+        alert.runModal()
+    }
+    private static func presentHermesHostHelp() {
+        let alert = NSAlert()
+        alert.messageText = "Hermes shared host needs manual setup."
+        alert.informativeText = hermesHostHelpMessage + "\n\nPersonaStack leaves the running host untouched. Use Hermes to configure its existing host safely. Then return to this persona's Repair action."
         alert.addButton(withTitle: "Close")
         alert.runModal()
     }
@@ -803,11 +833,21 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn
     }
-    private static func confirmStart(persona: String) -> Bool {
+    private static func confirmHost(persona: String) -> Bool {
         let alert = NSAlert()
-        alert.messageText = "Start the native gateway for this profile?"
-        alert.informativeText = "Repair \(persona) may enable its selected Hermes MCP toolset and start or restart its Hermes or OpenClaw gateway. Other profiles remain connected. Cancel preserves the current setup."
-        alert.addButton(withTitle: "Allow Gateway Repair")
+        alert.messageText = "Start the shared Hermes host on this Mac?"
+        alert.informativeText = "Connecting \(persona) requires enabling the default/shared Hermes gateway API and starting its host. This may activate configured messaging services and scheduled jobs for other profiles. PersonaStack connects only the selected profile. Disconnecting leaves the shared host running. Cancel leaves the host configuration unchanged."
+        alert.addButton(withTitle: "Enable API and Start Hermes Host")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+    private static func confirmStart(persona: String, runtime: AgentBridgeRuntime) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = runtime == .hermes ? "Repair this Hermes profile's tools?" : "Start the native gateway for this profile?"
+        alert.informativeText = runtime == .hermes
+            ? "Repair \(persona) may enable its selected Hermes MCP toolset. Starting the shared Hermes host requires separate approval. Cancel preserves the current setup."
+            : "Repair \(persona) may start or restart its selected OpenClaw gateway. Other profiles remain connected. Cancel preserves the current setup."
+        alert.addButton(withTitle: runtime == .hermes ? "Allow Profile Repair" : "Allow Gateway Repair")
         alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn
     }

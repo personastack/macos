@@ -17,6 +17,7 @@ public enum AgentBridgeFailure: String, Error, Sendable {
     case backgroundApprovalRequired = "background_approval_required"
     case serviceUnavailable = "service_unavailable"
     case operationTimeout = "operation_timeout"
+    case hermesHostConsentRequired = "hermes_host_consent_required"
 }
 
 public enum AgentBridgeRuntime: String, Codable, Sendable, CaseIterable { case hermes, openclaw }
