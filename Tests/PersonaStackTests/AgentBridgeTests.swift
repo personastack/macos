@@ -7,13 +7,15 @@ import WebKit
 
 private actor AgentBridgeFixtureTransport: AgentBridgeControlTransport {
     private var expected: [(String, String)]
+    private let selectedTarget: AgentBridgeTargetFixture?
     private(set) var operations: [String] = []
-    init(_ expected: [(String, String)]) { self.expected = expected }
-    func exchange(_ request: Data) throws -> Data {
+    init(_ expected: [(String, String)], selectedTarget: AgentBridgeTargetFixture? = nil) { self.expected = expected; self.selectedTarget = selectedTarget }
+    func exchange(_ request: Data) async throws -> Data {
         let object = try #require(JSONSerialization.jsonObject(with: request) as? [String: Any])
         #expect(object["version"] as? Int == 1)
         let operation = try #require(object["operation"] as? String)
         operations.append(operation)
+        if operation == "check", let selectedTarget { #expect(await selectedTarget.isSelected()) }
         guard !expected.isEmpty else { throw AgentBridgeFailure.invalidRequest }
         let next = expected.removeFirst()
         #expect(operation == next.0)
@@ -191,21 +193,26 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
         await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(discover, view: first) }
     }
 
-    @Test @MainActor func registeredDocumentDiscoveryPreparationAndEnrollmentAreOrderedAndRedacted() async throws {
+    @Test(arguments: [false, true]) @MainActor func registeredDocumentDiscoveryPreparationAndEnrollmentAreOrderedAndRedacted(_ staleInventory: Bool) async throws {
         let id = UUID()
         let key = Data(repeating: 1, count: 32).base64EncodedString()
         let prepared = "{\"preparation_id\":\"\(id.uuidString)\",\"device_public_key\":\"\(key)\",\"profile_candidate_id\":\"rt_profile_a\",\"expires_at\":\"2026-10-10T12:00:00Z\"}"
+        let targetFixture = AgentBridgeTargetFixture()
+        await targetFixture.configure(pending: true, stale: staleInventory)
         let transport = AgentBridgeFixtureTransport([
             ("status", #"{"connections":[]}"#),
             ("discover", #"{"profiles":[{"profile_candidate_id":"rt_profile_a","account_candidate_id":"rt_account_a","label":"Default profile","runtime_kind":"hermes"}],"discovery_status":"complete"}"#),
             ("status", #"{"connections":[]}"#), ("prepare", prepared),
-            ("enroll", #"{"binding_key":{"environment_id":"https://my.personastack.ai","connection_id":"conn-a"},"persona_id":"persona-a"}"#)
-        ])
+            ("enroll", #"{"binding_key":{"environment_id":"https://my.personastack.ai","connection_id":"conn-a"},"persona_id":"persona-a"}"#),
+            ("check", #"{"connections":[{"binding_key":{"environment_id":"https://my.personastack.ai","connection_id":"conn-a"},"persona_id":"persona-a","runtime_kind":"hermes","readiness_state":"mcp_verified"}]}"#),
+            ("check", #"{"connections":[{"binding_key":{"environment_id":"https://my.personastack.ai","connection_id":"conn-a"},"persona_id":"persona-a","runtime_kind":"hermes","readiness_state":"mcp_verified"}]}"#)
+        ], selectedTarget: targetFixture)
         let client = AgentBridgeControlClient(transport: transport)
         let registration = AgentBridgeFixtureRegistration()
         let service = AgentBridgeService(registration: registration, client: client, preferences: UserDefaults(suiteName: "AgentBridgeTests." + UUID().uuidString)!, requireSignature: {}, clearDisabledPreference: {})
-        let manager = AgentBridgeSetupManager(service: service, client: client, configuration: { _ in .production },
-            approveEnvironment: { _ in }, prepareBackgroundEnable: {}, cookieReader: { _, _ in "personastack_session=fixture" })
+        let manager = AgentBridgeSetupManager(service: service, client: client, hosted: AgentBridgeHostedAuthority(transport: targetFixture), configuration: { _ in .production },
+            approveEnvironment: { _ in }, prepareBackgroundEnable: {}, cookieReader: { _, _ in "personastack_session=fixture" },
+            waitForSettlement: {}, csrfReader: { _ in "csrf-fixture" })
         let view = WKWebView()
         manager.register(view, appURL: DesktopEnvironmentConfiguration.production.appURL)
         func command(_ action: String, scope: String = "", fields: [String: Any] = [:]) throws -> AgentBridgePageCommand {
@@ -220,10 +227,15 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
             "persona_id": "persona-a", "workspace_id": "ws_11111111111111111111111111111111", "profile_candidate_id": "rt_profile_a"]), view: view)
         #expect((preparedResponse["desktop_preparation"] as? [String: String])?["device_public_key"] == key)
         let enroll = try command("enroll", scope: scope, fields: ["preparation_id": id.uuidString, "code": "fixture-one-use-proof"])
+        if staleInventory {
+            await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(enroll, view: view) }
+            #expect(await transport.operations.last == "enroll")
+        }
         let result = try await manager.apply(enroll, view: view)
         #expect(Set(result.keys) == ["ok", "connection_id", "persona_id"])
         await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(enroll, view: view) }
-        #expect(await transport.operations == ["status", "discover", "status", "prepare", "enroll"])
+        #expect(await transport.operations == ["status", "discover", "status", "prepare", "enroll", "check", "check"])
+        #expect(await targetFixture.saves == (staleInventory ? [7, 8] : [7]))
         #expect(registration.calls == ["register"])
     }
 }

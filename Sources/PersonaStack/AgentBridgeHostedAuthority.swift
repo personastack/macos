@@ -9,10 +9,13 @@ struct AgentBridgeHostedBinding: Decodable, Sendable {
     let clientKind: String?
     let readinessStatus: String?
     let runLaneStatus: String?
+    let targetInventory: AgentBridgeTargetInventory?
+    let targetSelection: AgentBridgeTargetSelection?
     enum CodingKeys: String, CodingKey {
         case workspaceID = "workspace_id", personaID = "persona_id", connectionID = "connection_id"
         case connectionGeneration = "connection_generation", clientKind = "client_kind"
         case readinessStatus = "readiness_status", runLaneStatus = "run_lane_status"
+        case targetInventory = "target_inventory", targetSelection = "target_selection"
     }
     func require(workspace: String, persona: String, connection: String, generation: Int, clientKind expectedKind: String = "macos_app") throws {
         guard workspaceID == workspace, personaID == persona, connectionID == connection,

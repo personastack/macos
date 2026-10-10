@@ -11,7 +11,8 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         let configuration: DesktopEnvironmentConfiguration
         var authority = AgentBridgeDocumentScope()
         var profiles: [String: AgentBridgeProfile] = [:]
-        var preparedPersonas: [UUID: String] = [:]
+        var preparedTargets: [UUID: AgentBridgePreparedTarget] = [:]
+        var pendingEnrollments: [UUID: (AgentBridgePreparedTarget, AgentBridgeEnrollment)] = [:]
         var migrations: [UUID: (AgentBridgeMigrationCoordinator, AgentBridgeMigrationCoordinator.Cutover)] = [:]
         var migrating = false
         var pendingMigration: (persona: String, profile: String, coordinator: AgentBridgeMigrationCoordinator, cutover: AgentBridgeMigrationCoordinator.Cutover)?
@@ -60,7 +61,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
     }
     func invalidate(_ view: WKWebView) {
         guard let page = pages.object(forKey: view) else { return }
-        page.authority.invalidate(); page.profiles.removeAll(); page.preparedPersonas.removeAll(); page.migrations.removeAll(); page.pendingMigration = nil; page.cookiesFingerprint = nil
+        page.authority.invalidate(); page.profiles.removeAll(); page.preparedTargets.removeAll(); page.pendingEnrollments.removeAll(); page.migrations.removeAll(); page.pendingMigration = nil; page.cookiesFingerprint = nil
     }
     func unregister(_ view: WKWebView) {
         pages.object(forKey: view)?.retired = true
@@ -68,7 +69,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
     }
     func invalidateSession() {
         for page in pages.objectEnumerator()?.allObjects as? [Page] ?? [] {
-            page.authority.invalidate(); page.profiles.removeAll(); page.preparedPersonas.removeAll(); page.migrations.removeAll(); page.pendingMigration = nil; page.cookiesFingerprint = nil
+            page.authority.invalidate(); page.profiles.removeAll(); page.preparedTargets.removeAll(); page.pendingEnrollments.removeAll(); page.migrations.removeAll(); page.pendingMigration = nil; page.cookiesFingerprint = nil
         }
     }
     func apply(_ command: AgentBridgePageCommand, view: WKWebView) async throws -> [String: Any] {
@@ -111,7 +112,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         case "discover": return try await discover(command, page: page, document: document)
         case "migration_prepare": return try await migrate(command, page: page, cookies: cookies, document: document, view: view)
         case "prepare": return try await prepare(command, page: page, cookies: cookies, document: document, view: view)
-        case "enroll": return try await enroll(command, page: page, document: document)
+        case "enroll": return try await enroll(command, page: page, cookies: cookies, document: document, view: view)
         case "connections": return try await connections(page: page, cookies: cookies, scope: command.scope, document: document)
         default: return try await manage(command, page: page, cookies: cookies, document: document, view: view)
         }
@@ -183,12 +184,16 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         }
         if let existing = result.existingBindingKey {
             guard existing.environmentID == page.configuration.appOrigin else { throw AgentBridgeFailure.scopeChanged }
-            return ["ok": true, "existing_connection_id": existing.connectionID]
+            let target = preparedTarget(command, candidate: candidate)
+            var response = try await completeEnrollment(page: page, cookies: cookies, scope: command.scope, document: document,
+                view: view, target: target, binding: existing)
+            response["existing_connection_id"] = existing.connectionID
+            return response
         }
         guard let preparation = result.preparationID, let publicKey = result.devicePublicKey, let expires = result.expiresAt,
               result.profileCandidateID == profile, Data(base64Encoded: publicKey)?.count == 32 else { throw AgentBridgeFailure.scopeChanged }
         try page.authority.retain(preparation)
-        page.preparedPersonas[preparation] = command.personaID!
+        page.preparedTargets[preparation] = preparedTarget(command, candidate: candidate)
         if let pending = page.pendingMigration {
             guard pending.persona == command.personaID, pending.profile == profile else { throw AgentBridgeFailure.scopeChanged }
             page.migrations[preparation] = (pending.coordinator, pending.cutover)
@@ -203,25 +208,82 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         return response
     }
 
-    private func enroll(_ command: AgentBridgePageCommand, page: Page, document: UUID) async throws -> [String: Any] {
-        guard let persona = page.preparedPersonas.removeValue(forKey: command.preparationID!) else { throw AgentBridgeFailure.scopeChanged }
-        try page.authority.consume(command.preparationID!, scope: command.scope, documentID: document)
-        var payload: [String: AgentBridgeValue] = [
-            "preparation_id": .string(command.preparationID!.uuidString.lowercased()), "code": .string(command.code!),
-            "document_id": .string(document.uuidString.lowercased())]
-        let migration = page.migrations.removeValue(forKey: command.preparationID!)
+    private func preparedTarget(_ command: AgentBridgePageCommand, candidate: AgentBridgeProfile) -> AgentBridgePreparedTarget {
+        AgentBridgePreparedTarget(workspace: command.workspaceID!, persona: command.personaID!, account: candidate.accountCandidateID,
+                                  profile: candidate.profileCandidateID, runtime: candidate.runtimeKind)
+    }
+
+    private func enroll(_ command: AgentBridgePageCommand, page: Page, cookies: String, document: UUID, view: WKWebView) async throws -> [String: Any] {
+        let preparation = command.preparationID!
+        if let pending = page.pendingEnrollments[preparation] {
+            let response = try await completeEnrollment(page: page, cookies: cookies, scope: command.scope, document: document,
+                view: view, target: pending.0, binding: pending.1.bindingKey)
+            page.pendingEnrollments.removeValue(forKey: preparation)
+            return response
+        }
+        guard let target = page.preparedTargets.removeValue(forKey: preparation) else { throw AgentBridgeFailure.scopeChanged }
+        try page.authority.consume(preparation, scope: command.scope, documentID: document)
+        var payload: [String: AgentBridgeValue] = ["preparation_id": .string(preparation.uuidString.lowercased()),
+            "code": .string(command.code!), "document_id": .string(document.uuidString.lowercased())]
+        let migration = page.migrations.removeValue(forKey: preparation)
         if let migration { payload["migration_id"] = .string(migration.1.capture.migrationID.uuidString.lowercased()) }
-        let request = try AgentBridgeRequest(operation: "enroll", payload: payload)
-        let result = try await client.send(request, returning: AgentBridgeEnrollment.self)
+        let result = try await client.send(AgentBridgeRequest(operation: "enroll", payload: payload), returning: AgentBridgeEnrollment.self)
         try current(page, scope: command.scope, document: document)
-        guard result.bindingKey.environmentID == page.configuration.appOrigin, result.personaID == persona else { throw AgentBridgeFailure.scopeChanged }
-        var response: [String: Any] = ["ok": true, "connection_id": result.bindingKey.connectionID, "persona_id": result.personaID]
-        if let migration {
-            response["test_dispatched"] = try await migration.0.finish(migration.1, binding: result.bindingKey)
-            response["test_deferred_until_resume"] = migration.1.wasPaused
+        guard result.bindingKey.environmentID == page.configuration.appOrigin, result.personaID == target.persona else { throw AgentBridgeFailure.scopeChanged }
+        // Pairing is complete. A selection/readiness retry reuses this exact binding.
+        page.pendingEnrollments[preparation] = (target, result)
+        let response = try await completeEnrollment(page: page, cookies: cookies, scope: command.scope, document: document,
+            view: view, target: target, binding: result.bindingKey)
+        page.pendingEnrollments.removeValue(forKey: preparation)
+        return response
+    }
+
+    private func completeEnrollment(page: Page, cookies: String, scope: String, document: UUID, view: WKWebView,
+                                    target: AgentBridgePreparedTarget, binding: AgentBridgeBindingKey) async throws -> [String: Any] {
+        let validate: @MainActor @Sendable () async throws -> Void = { [self] in
+            _ = try await self.cookies(view: view, page: page)
+            try current(page, scope: scope, document: document)
+        }
+        let csrf = try await csrfReader(view)
+        try await validate()
+        try await AgentBridgeTargetSelectionAuthority(hosted: hosted, wait: waitForSettlement).ensureSelected(
+            configuration: page.configuration, cookies: cookies, csrf: csrf, binding: binding, target: target, validate: validate)
+        try await ensureEnrollmentGateway(binding, target: target, page: page, cookies: cookies, validate: validate)
+        var response: [String: Any] = ["ok": true, "connection_id": binding.connectionID, "persona_id": target.persona]
+        if let pending = page.pendingMigration {
+            guard pending.persona == target.persona, pending.profile == target.profile else { throw AgentBridgeFailure.scopeChanged }
+            response["test_dispatched"] = try await pending.coordinator.finish(pending.cutover, binding: binding)
+            response["test_deferred_until_resume"] = pending.cutover.wasPaused
             page.pendingMigration = nil
+        } else {
+            try await awaitMigrationReadiness(page: page, cookies: cookies, persona: target.persona,
+                workspace: target.workspace, binding: binding, target: target, validate: validate)
         }
         return response
+    }
+
+    private func ensureEnrollmentGateway(_ binding: AgentBridgeBindingKey, target: AgentBridgePreparedTarget, page: Page,
+                                         cookies: String, validate: @MainActor @Sendable () async throws -> Void) async throws {
+        for _ in 0..<120 {
+            try await validate()
+            let result = try await client.send(AgentBridgeRequest(operation: "check", payload: ["binding_key": bindingValue(binding)]), returning: AgentBridgeConnections.self)
+            guard let selected = result.connections.first(where: { $0.bindingKey == binding }), selected.personaID == target.persona, selected.runtimeKind == target.runtime else { throw AgentBridgeFailure.scopeChanged }
+            guard !selected.requiresReconnect else { throw AgentBridgeFailure.reconnectRequired }
+            if selected.isMCPVerified { return }
+            // The helper must receive the API-selected revision before a native Repair can install or launch.
+            if selected.readinessState == "target_selection_required" { try await waitForSettlement(); continue }
+            guard (selected.activeRunID ?? "").isEmpty else { throw AgentBridgeFailure.busy }
+            guard confirmRuntimeStart(target.persona) else { throw AgentBridgeFailure.runtimeConflict }
+            try await validate()
+            let owner = try await hosted.read(configuration: page.configuration, cookies: cookies, persona: target.persona)
+            guard owner.workspaceID == target.workspace, owner.personaID == target.persona, owner.connectionID == binding.connectionID,
+                  owner.clientKind == "macos_app", let inventory = owner.targetInventory, inventory.matches(target),
+                  owner.targetSelection?.isSelected(target, generation: inventory.inventory_generation) == true else { throw AgentBridgeFailure.scopeChanged }
+            _ = try await client.send(AgentBridgeRequest(operation: "repair", payload: ["binding_key": bindingValue(binding),
+                "restart_confirmed": .bool(true)]), returning: AgentBridgeConnections.self)
+            return
+        }
+        throw AgentBridgeFailure.runtimeConflict
     }
 
     private func migrate(_ command: AgentBridgePageCommand, page: Page, cookies: String, document: UUID, view: WKWebView) async throws -> [String: Any] {
@@ -232,6 +294,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         let csrf = try await csrfReader(view)
         let authority = AgentBridgeMigrationAuthority(transport: hosted.transport)
         let persona = command.personaID!, workspace = command.workspaceID!
+        let target = preparedTarget(command, candidate: page.profiles[profile]!)
         let validate: @MainActor @Sendable () async throws -> Void = { [self] in
             _ = try await self.cookies(view: view, page: page)
             try current(page, scope: command.scope, document: document)
@@ -289,7 +352,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
             validateScope: validate,
             readiness: { [self] binding in
                 try await awaitMigrationReadiness(page: page, cookies: cookies, persona: persona, workspace: workspace,
-                    binding: binding, validate: validate)
+                    binding: binding, target: target, validate: validate)
             },
             test: { try await validate(); try await authority.test(configuration: page.configuration, cookies: cookies, csrf: csrf, persona: persona) }
         ))
@@ -352,6 +415,8 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
 
     private func recoverMigration(_ command: AgentBridgePageCommand, page: Page, cookies: String, document: UUID, view: WKWebView) async throws {
         let persona = command.personaID!, workspace = command.workspaceID!, profile = command.profileCandidateID!
+        guard let candidate = page.profiles[profile] else { throw AgentBridgeFailure.scopeChanged }
+        let target = preparedTarget(command, candidate: candidate)
         let validate: @MainActor @Sendable () async throws -> Void = { [self] in
             _ = try await self.cookies(view: view, page: page)
             try current(page, scope: command.scope, document: document)
@@ -395,7 +460,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
             validateScope: validate,
             readiness: { [self] binding in
                 try await awaitMigrationReadiness(page: page, cookies: cookies, persona: persona, workspace: workspace,
-                    binding: binding, validate: validate)
+                    binding: binding, target: target, validate: validate)
             },
             test: { try await validate(); try await authority.test(configuration: page.configuration, cookies: cookies, csrf: csrf, persona: persona) }
         ))
@@ -404,15 +469,17 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
     }
 
     private func awaitMigrationReadiness(page: Page, cookies: String, persona: String, workspace: String,
-                                        binding: AgentBridgeBindingKey, validate: @MainActor @Sendable () async throws -> Void) async throws {
+                                        binding: AgentBridgeBindingKey, target: AgentBridgePreparedTarget, validate: @MainActor @Sendable () async throws -> Void) async throws {
         for _ in 0..<120 {
             try await validate()
             let remote = try await hosted.read(configuration: page.configuration, cookies: cookies, persona: persona)
             guard remote.workspaceID == workspace, remote.personaID == persona,
-                  remote.connectionID == binding.connectionID, remote.clientKind == "macos_app" else { throw AgentBridgeFailure.scopeChanged }
+                  remote.connectionID == binding.connectionID, remote.clientKind == "macos_app",
+                  let inventory = remote.targetInventory, inventory.matches(target),
+                  remote.targetSelection?.isSelected(target, generation: inventory.inventory_generation) == true else { throw AgentBridgeFailure.scopeChanged }
             let local = try await client.send(AgentBridgeRequest(operation: "check", payload: ["binding_key": bindingValue(binding)]), returning: AgentBridgeConnections.self)
             if Self.migrationReady(remote: remote, local: local, binding: binding) { return }
-            try await Task.sleep(for: .milliseconds(250))
+            try await waitForSettlement()
         }
         throw AgentBridgeFailure.runtimeConflict
     }
@@ -443,6 +510,13 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         try binding.require(workspace: command.workspaceID!, persona: command.personaID!, connection: key.connectionID,
                             generation: command.connectionGeneration!)
         try current(page, scope: command.scope, document: document)
+        if command.action == "repair", let pending = page.pendingEnrollments.first(where: { $0.value.1.bindingKey == key }) {
+            var response = try await completeEnrollment(page: page, cookies: cookies, scope: command.scope, document: document,
+                view: view, target: pending.value.0, binding: key)
+            page.pendingEnrollments.removeValue(forKey: pending.key)
+            response["connections"] = [connectionValue(try await selectedConnection(key, persona: command.personaID!))]
+            return response
+        }
         var payload: [String: AgentBridgeValue] = ["binding_key": bindingValue(key)]
         if command.action == "repair" {
             let check = try await client.send(AgentBridgeRequest(operation: "check", payload: payload), returning: AgentBridgeConnections.self)
@@ -589,7 +663,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         guard !cookieHeader.isEmpty else { throw AgentBridgeFailure.credentialUnavailable }
         let fingerprint = Data(SHA256.hash(data: Data(cookieHeader.utf8)))
         if let previous = page.cookiesFingerprint, previous != fingerprint {
-            page.authority.invalidate(); page.profiles.removeAll(); page.preparedPersonas.removeAll(); page.migrations.removeAll(); page.pendingMigration = nil; page.cookiesFingerprint = nil
+            page.authority.invalidate(); page.profiles.removeAll(); page.preparedTargets.removeAll(); page.pendingEnrollments.removeAll(); page.migrations.removeAll(); page.pendingMigration = nil; page.cookiesFingerprint = nil
             throw AgentBridgeFailure.scopeChanged
         }
         page.cookiesFingerprint = fingerprint
