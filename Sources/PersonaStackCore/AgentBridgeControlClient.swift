@@ -9,7 +9,9 @@ public struct AgentBridgeControlClient: Sendable {
     private let transport: any AgentBridgeControlTransport
     public init(transport: any AgentBridgeControlTransport = AgentBridgeSocketTransport()) { self.transport = transport }
     public func send<T: Decodable & Sendable>(_ request: AgentBridgeRequest, returning type: T.Type) async throws -> T {
+        try Task.checkCancellation()
         let data = try await transport.exchange(request.encoded())
+        try Task.checkCancellation()
         return try AgentBridgeResponse.decode(type, data: data, requestID: request.requestID)
     }
 }
@@ -39,6 +41,9 @@ public enum AgentBridgeNativePaths {
 }
 
 public struct AgentBridgeSocketTransport: AgentBridgeControlTransport {
+    // The helper owns an eight-second request work deadline. Two seconds remain
+    // for its bounded reply before this native socket stops waiting.
+    static let responseTimeoutSeconds = 10
     private let directory: URL
     public init(directory: URL = AgentBridgeNativePaths.directory) { self.directory = directory }
     public func exchange(_ request: Data) async throws -> Data {
@@ -61,7 +66,7 @@ public struct AgentBridgeSocketTransport: AgentBridgeControlTransport {
         let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw AgentBridgeFailure.serviceUnavailable }
         defer { Darwin.close(descriptor) }
-        var timeout = timeval(tv_sec: 10, tv_usec: 0)
+        var timeout = timeval(tv_sec: responseTimeoutSeconds, tv_usec: 0)
         var noSignal: Int32 = 1
         _ = setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
         _ = setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
