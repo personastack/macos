@@ -263,7 +263,7 @@ final class DesktopUpdater: NSObject, ObservableObject {
         return true
     }
 
-    private func beginImmediateInstallation(_ immediateInstallHandler: () -> Void) {
+    private func beginImmediateInstallation(_ immediateInstallHandler: @escaping () -> Void) {
         guard !isImmediateInstallRequested else { return }
         isImmediateInstallRequested = true
         if !agentBridgeNeedsHandoff() { finishImmediateInstallation(immediateInstallHandler); return }
