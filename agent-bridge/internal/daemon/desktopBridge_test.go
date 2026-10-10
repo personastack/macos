@@ -11,6 +11,7 @@ import (
 	"github.com/personastack/macos/agent-bridge/internal/control"
 	"github.com/personastack/macos/agent-bridge/internal/runtime"
 	"github.com/personastack/macos/agent-bridge/internal/targetinventory"
+	"gopkg.in/yaml.v3"
 	"io"
 	"net/http"
 	"os"
@@ -310,6 +311,9 @@ func acceptedMCPCredentialClient(t *testing.T, firstRead func()) *http.Client {
 func TestDesktopAgentBridgeFreshTargetStoppedRuntimeCanBeRepaired(t *testing.T) {
 	t.Parallel()
 	b, store, runner := freshSelectedFixture(t)
+	if err := os.WriteFile(b.NativeConfigPath, []byte("user_key: keep\nplatform_toolsets:\n  api_server: [terminal, no_mcp]\n  cli: [no_mcp, file]\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	runner.MCPHTTPClient = acceptedMCPCredentialClient(t, nil)
 	reconciler := newSessionReconciler(context.Background(), runner, b, nil, runtime.Detection{})
 	target := targetForBinding(b)
@@ -348,6 +352,193 @@ func TestDesktopAgentBridgeFreshTargetStoppedRuntimeCanBeRepaired(t *testing.T) 
 	env, err := os.ReadFile(filepath.Join(b.HermesHome, ".env"))
 	if err != nil || !strings.Contains(string(env), "API_SERVER_ENABLED=true") {
 		t.Fatal("selected Hermes API setup missing")
+	}
+	raw, _ := os.ReadFile(b.NativeConfigPath)
+	var toolsets struct {
+		User      string `yaml:"user_key"`
+		Platforms struct {
+			API []string `yaml:"api_server"`
+			CLI []string `yaml:"cli"`
+		} `yaml:"platform_toolsets"`
+	}
+	if err := yaml.Unmarshal(raw, &toolsets); err != nil {
+		t.Fatal(err)
+	}
+	if toolsets.User != "keep" || strings.Join(toolsets.Platforms.API, ",") != "terminal,issued" || strings.Join(toolsets.Platforms.CLI, ",") != "no_mcp,file" {
+		t.Fatal("Repair did not enable only this profile's API MCP toolset")
+	}
+}
+
+type reconnectMutationStore struct {
+	*config.MemoryStore
+	before func()
+}
+
+func (s *reconnectMutationStore) UpdateBinding(key config.BindingKey, change func(*config.Binding) error) error {
+	if s.before != nil {
+		before := s.before
+		s.before = nil
+		before()
+	}
+	return s.MemoryStore.UpdateBinding(key, change)
+}
+
+func TestDesktopAgentBridgeReconnectCapturesCurrentMutationAndDoesNotResurrect(t *testing.T) {
+	t.Parallel()
+	for _, mutation := range []string{"quiesce", "repair", "run_start", "disconnect"} {
+		t.Run(mutation, func(t *testing.T) {
+			t.Parallel()
+			b := config.Binding{EnvironmentID: "https://app.example", ConnectionID: "same", ConnectionGeneration: 4}
+			other := b
+			other.EnvironmentID = "https://other.example"
+			memory := config.NewMemoryStore(config.State{Bindings: []config.Binding{b, other}})
+			store := &reconnectMutationStore{MemoryStore: &memory}
+			store.before = func() {
+				if mutation == "disconnect" {
+					if err := memory.DeleteBindingKey(b.Key()); err != nil {
+						t.Fatal(err)
+					}
+					return
+				}
+				err := memory.UpdateBinding(b.Key(), func(current *config.Binding) error {
+					switch mutation {
+					case "quiesce":
+						current.Quiesced = true
+					case "repair":
+						current.RuntimeLaunchAllowed = true
+						current.TargetSelectionRevision = 7
+						current.MCPOwnership.EntryKey = "current-owned"
+					case "run_start":
+						current.ActiveRunID, current.ActiveNativeRunID = "accepted", "native"
+					}
+					return nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			captured, err := (Runner{Store: store}).advanceConnectionGeneration(b)
+			persisted, exists := config.BindingFor(store, b)
+			if mutation == "disconnect" {
+				if err == nil || exists || captured.ConnectionID != "" {
+					t.Fatal("reconnect recreated a removed binding")
+				}
+			} else {
+				if err != nil || !exists || captured.ConnectionGeneration != 5 || persisted.ConnectionGeneration != 5 {
+					t.Fatalf("reconnect did not capture incremented current state: %v", err)
+				}
+				if captured.Quiesced != persisted.Quiesced || captured.RuntimeLaunchAllowed != persisted.RuntimeLaunchAllowed || captured.MCPOwnership != persisted.MCPOwnership || captured.ActiveNativeRunID != persisted.ActiveNativeRunID {
+					t.Fatal("session snapshot diverged from current mutation")
+				}
+				if mutation == "quiesce" && !captured.Quiesced || mutation == "repair" && (!captured.RuntimeLaunchAllowed || captured.TargetSelectionRevision != 7 || captured.MCPOwnership.EntryKey != "current-owned") || mutation == "run_start" && captured.ActiveRunID != "accepted" {
+					t.Fatal("reconnect discarded concurrent admission or repair")
+				}
+			}
+			foreign, _ := config.BindingFor(store, other)
+			if foreign.ConnectionGeneration != 4 || foreign.Quiesced || foreign.RuntimeLaunchAllowed || foreign.ActiveRunID != "" {
+				t.Fatal("reconnect crossed environment scope")
+			}
+		})
+	}
+}
+
+func TestDesktopAgentBridgeRepairDeniedNativeConsentHasNoMutation(t *testing.T) {
+	t.Parallel()
+	b, store, runner := freshSelectedFixture(t)
+	b.TargetSelectionRevision = 3
+	if err := store.SaveBinding(b); err != nil {
+		t.Fatal(err)
+	}
+	raw := "user_key: keep\nplatform_toolsets:\n  api_server: [terminal, no_mcp]\n"
+	if err := os.WriteFile(b.NativeConfigPath, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	runner.MCPHTTPClient = &http.Client{Transport: credentialTransport(func(*http.Request) (*http.Response, error) {
+		t.Fatal("denied native consent performed protected credential read")
+		return nil, nil
+	})}
+	err := runner.RepairBinding(context.Background(), b, false)
+	if err == nil || !strings.HasPrefix(err.Error(), "runtime_conflict:") {
+		t.Fatalf("denied native consent accepted: %v", err)
+	}
+	after, _ := os.ReadFile(b.NativeConfigPath)
+	current, _ := config.BindingFor(store, b)
+	if string(after) != raw || current.RuntimeLaunchAllowed || current.MCPOwnership.EntryKey != "" {
+		t.Fatal("denied native consent changed profile or store")
+	}
+	if _, err = os.Stat(filepath.Join(b.HermesHome, ".env")); !os.IsNotExist(err) {
+		t.Fatal("denied native consent created runtime environment")
+	}
+}
+
+func TestDesktopAgentBridgeActualOpenClawProfileSelectedAgentDispatch(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	root := filepath.Join(home, ".openclaw-work")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "openclaw.json")
+	raw := `{"agents":{"entries":{"main":{"name":"Other agent"},"research":{"name":"Chosen research"}}},"gateway":{"port":25907,"auth":{"mode":"token","token":"selected-profile-key"}}}`
+	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	profiles, warnings := targetinventory.DiscoverAt(home, "fixture", os.Getuid(), os.Getgid(), runtime.AdapterKindOpenClaw, "seed")
+	if len(warnings) != 0 || len(profiles) != 1 {
+		t.Fatalf("actual selected native profile not discovered: %v", warnings)
+	}
+	profile := profiles[0]
+	candidate := ""
+	for _, agent := range profile.OpenClawAgents {
+		if strings.HasPrefix(agent.Label, "Chosen research") {
+			candidate = agent.CandidateID
+		}
+	}
+	profile, err := targetinventory.SelectOpenClawAgent(profile, candidate)
+	if err != nil || candidate == "" {
+		t.Fatalf("native opaque choice rejected: %v", err)
+	}
+	b := config.Binding{EnvironmentID: "https://app.example", PersonaID: "persona", ConnectionID: "connection", ConnectionGeneration: 3, RuntimeKind: runtime.AdapterKindOpenClaw, AccountCandidateID: profile.AccountCandidateID, ProfileCandidateID: profile.CandidateID, NativeStateRoot: profile.Resolved.StateRoot, NativeConfigPath: profile.Resolved.ConfigPath, SelectedOpenClawAgentID: profile.Resolved.OpenClawAgentID, InventorySeed: "seed"}
+	store := config.NewMemoryStore(config.State{Bindings: []config.Binding{b}})
+	runner := Runner{Store: &store, ResolveTarget: func(binding config.Binding, target *externalagentprotocol.RuntimeTarget) (targetinventory.ResolvedTarget, error) {
+		return targetinventory.ResolveProfiles(binding.RuntimeKind, target, profiles, binding.SelectedOpenClawAgentID)
+	}}
+	adapter, resolved, err := runner.targetAdapter(b, targetForBinding(b))
+	if err != nil || resolved.OpenClawAgentID != "research" {
+		t.Fatalf("selected config did not construct actual chosen adapter: %v", err)
+	}
+	selected := adapter.(runtime.OpenClawAdapter)
+	calls := 0
+	selected.CallNative = func(ctx context.Context, request runtime.OpenClawRequest) (runtime.OpenClawResponse, error) {
+		calls++
+		if request.Method != "agent" || request.ID != "assignment" || selected.AgentID != "research" || selected.Token != "selected-profile-key" || selected.GatewayURL != "ws://127.0.0.1:25907" {
+			t.Fatal("actual native dispatch selected another agent, profile, or credential")
+		}
+		raw, err := json.Marshal(request.Params)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var submission struct {
+			Agent      string `json:"agentId"`
+			Assignment string `json:"idempotencyKey"`
+			Message    string `json:"message"`
+		}
+		if err = json.Unmarshal(raw, &submission); err != nil {
+			t.Fatal(err)
+		}
+		if submission.Agent != "research" || submission.Assignment != "assignment" || submission.Message != "assigned wake" {
+			t.Fatal("native agent DTO lost explicitly selected non-main identity")
+		}
+		ok := true
+		return runtime.OpenClawResponse{OK: &ok, Type: "res", ID: request.ID, Payload: json.RawMessage(`{"runId":"native-research","status":"accepted"}`)}, nil
+	}
+	frame := externalagentprotocol.Frame{PersonaID: "persona", ConnectionID: "connection", ConnectionGeneration: 3, RunID: "wake", AssignmentID: "assignment", RunStart: &externalagentprotocol.RunStartPayload{FullyComposedPrompt: "assigned wake"}}
+	if err = runner.activateRun(b, frame); err != nil {
+		t.Fatal(err)
+	}
+	native, err := selected.StartRun(runtime.RunRequest{RunID: frame.RunID, AssignmentID: frame.AssignmentID, FullyComposedPrompt: frame.RunStart.FullyComposedPrompt})
+	if err != nil || calls != 1 || native != "native-research" {
+		t.Fatalf("actual selected assignment dispatch failed: %s %v", native, err)
 	}
 }
 

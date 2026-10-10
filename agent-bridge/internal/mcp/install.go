@@ -77,7 +77,7 @@ func (i Installer) install(b config.Binding) (InstallResult, error) {
 		if latest.ActiveRunID != "" || latest.Quiesced {
 			return fmt.Errorf("busy: assigned run or quiesce prevents native config mutation")
 		}
-		configured, err := ConfigureBinding(latest)
+		configured, err := ConfigureBinding(latest, false)
 		result = configured
 		return err
 	})
@@ -86,7 +86,7 @@ func (i Installer) install(b config.Binding) (InstallResult, error) {
 
 // ConfigureBinding runs only inside the existing store mutation/admission guard.
 // It changes native config and its ownership fields without a nested store write.
-func ConfigureBinding(b *config.Binding) (InstallResult, error) {
+func ConfigureBinding(b *config.Binding, repairHermesToolset bool) (InstallResult, error) {
 	if b.NativeConfigPath == "" || b.NativeMCPServer == "" || b.InventorySeed == "" || b.PersonaMCPToken == "" || b.PersonaMCPURL == "" {
 		return InstallResult{}, fmt.Errorf("scoped profile and native MCP credential required")
 	}
@@ -141,6 +141,11 @@ func ConfigureBinding(b *config.Binding) (InstallResult, error) {
 	}
 	if b.MCPOwnership.CanonicalConfigPath != "" && b.MCPOwnership.CanonicalConfigPath != canonical {
 		return InstallResult{}, fmt.Errorf("cleanup_required: config symlink target changed")
+	}
+	if repairHermesToolset && b.RuntimeKind == runtime.AdapterKindHermes {
+		if err = enableHermesAPIMCP(doc, b.NativeMCPServer); err != nil {
+			return InstallResult{}, err
+		}
 	}
 	err = writeConfig(canonical, doc, b.RuntimeKind)
 	if err != nil {

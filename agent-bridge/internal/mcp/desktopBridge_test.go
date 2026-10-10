@@ -2,14 +2,128 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"github.com/personastack/macos/agent-bridge/internal/config"
 	"github.com/personastack/macos/agent-bridge/internal/runtime"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestDesktopAgentBridgeHermesToolsetRepairPreservesProfileAndRequiresEffectiveCatalog(t *testing.T) {
+	t.Parallel()
+	for _, api := range []string{"[terminal, no_mcp, unrelated]", "[]", "\"['terminal', 'no_mcp', 'unrelated']\""} {
+		t.Run(api, func(t *testing.T) {
+			t.Parallel()
+			b, store, path := installedFixture(t)
+			raw, _ := os.ReadFile(path)
+			raw = append(raw, []byte("platform_toolsets:\n  api_server: "+api+"\n  cli: [no_mcp, file]\n")...)
+			if err := os.WriteFile(path, raw, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := (Installer{Store: store}).InstallBinding(b); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := os.ReadFile(path)
+			if strings.Contains(string(before), "- issued") {
+				t.Fatal("ordinary install granted toolset consent")
+			}
+			nativeCalls, directCalls := 0, 0
+			catalog := func(ctx context.Context, selected config.Binding, endpoint string) (bool, string) {
+				nativeCalls++
+				if selected.HermesHome != b.HermesHome || selected.NativeMCPServer != "issued" || endpoint != "http://127.0.0.1:25001" {
+					t.Fatal("effective catalog queried another profile")
+				}
+				doc, err := readConfig(selected.NativeConfigPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				platforms, _ := entryAt(doc.Content[0], "platform_toolsets")
+				tools, _ := entryAt(platforms, "api_server")
+				allowed := false
+				for _, tool := range tools.Content {
+					if tool.Value == "no_mcp" {
+						return false, "MCP disabled by selected API toolset"
+					}
+					allowed = allowed || tool.Value == "issued"
+				}
+				return allowed, "mocked selected effective catalog"
+			}
+			client := &http.Client{Transport: verifyContractRoundTripper(func(req *http.Request) (*http.Response, error) {
+				directCalls++
+				if req.Method != http.MethodPost || req.URL.String() != b.PersonaMCPURL || req.Header.Get("Authorization") != "Bearer secret" {
+					t.Fatal("wrong direct MCP scope")
+				}
+				var request struct {
+					Method string          `json:"method"`
+					ID     json.RawMessage `json:"id"`
+				}
+				if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+					t.Fatal(err)
+				}
+				want := []string{"initialize", "notifications/initialized", "tools/list"}
+				if directCalls > len(want) || request.Method != want[directCalls-1] {
+					t.Fatal("unplanned MCP call")
+				}
+				status, response := 200, `{"jsonrpc":"2.0","id":`+string(request.ID)+`,"result":{"tools":[]}}`
+				if directCalls == 2 {
+					status, response = http.StatusAccepted, ""
+				}
+				return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(response)), Request: req}, nil
+			})}
+			initial := verifyBindingWithNative(context.Background(), "", b, client, "http://127.0.0.1:25001", catalog)
+			if initial.State == runtime.AdapterStateMCPVerified || directCalls != 0 || nativeCalls != 1 {
+				t.Fatal("native toolset failure was bypassed")
+			}
+			err := config.UpdateBinding(store, b, func(current *config.Binding) error {
+				_, err := ConfigureBinding(current, true)
+				return err
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, _ = config.BindingFor(store, b)
+			after, _ := os.ReadFile(path)
+			if !strings.Contains(string(after), "user_key: keep") || !strings.Contains(string(after), "command: user-tool") || !strings.Contains(string(after), "cli: [no_mcp, file]") {
+				t.Fatal("repair changed unrelated config or another platform")
+			}
+			repaired := verifyBindingWithNative(context.Background(), "", b, client, "http://127.0.0.1:25001", catalog)
+			if repaired.State != runtime.AdapterStateMCPVerified || directCalls != 3 || nativeCalls != 2 {
+				t.Fatalf("repaired effective catalog not verified: %+v", repaired)
+			}
+		})
+	}
+}
+
+func TestDesktopAgentBridgeHermesToolsetMalformedRepairPreservesConfig(t *testing.T) {
+	t.Parallel()
+	for _, fragment := range []string{"platform_toolsets: []", "platform_toolsets: {api_server: terminal}", "platform_toolsets: {api_server: {terminal: true}}", "platform_toolsets: {api_server: [terminal, 123]}"} {
+		t.Run(fragment, func(t *testing.T) {
+			t.Parallel()
+			b, store, path := installedFixture(t)
+			raw, _ := os.ReadFile(path)
+			raw = append(raw, []byte(fragment+"\n")...)
+			if err := os.WriteFile(path, raw, 0600); err != nil {
+				t.Fatal(err)
+			}
+			err := config.UpdateBinding(store, b, func(current *config.Binding) error {
+				_, err := ConfigureBinding(current, true)
+				return err
+			})
+			if err == nil || !strings.HasPrefix(err.Error(), "cleanup_required:") {
+				t.Fatalf("malformed toolsets replaced: %v", err)
+			}
+			after, _ := os.ReadFile(path)
+			current, _ := config.BindingFor(store, b)
+			if string(raw) != string(after) || current.MCPOwnership != b.MCPOwnership {
+				t.Fatal("failed repair changed config or ownership")
+			}
+		})
+	}
+}
 
 func installedFixture(t *testing.T) (config.Binding, *config.MemoryStore, string) {
 	t.Helper()

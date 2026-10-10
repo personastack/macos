@@ -514,6 +514,11 @@ type openClawRequest struct {
 	Params any    `json:"params,omitempty"`
 }
 
+// These aliases expose the existing typed in-process transport seam to helper
+// owners without introducing a second wire representation.
+type OpenClawRequest = openClawRequest
+type OpenClawResponse = openClawResponse
+
 type openClawResponse struct {
 	OK      *bool           `json:"ok,omitempty"`
 	Type    string          `json:"type,omitempty"`

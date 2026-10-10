@@ -306,23 +306,11 @@ func (r Runner) runBindingLoop(ctx context.Context, binding config.Binding) erro
 		return true
 	}
 	for {
-		latest, ok := config.BindingFor(r.Store, binding)
-		if !ok {
-			return nil
-		}
-		current := latest
-		current.ConnectionGeneration++
-		if current.ConnectionGeneration <= 0 {
-			current.ConnectionGeneration = 1
-		}
-		writable, ok := r.Store.(config.WritableStore)
-		if !ok {
-			if !waitForBackoff() {
+		current, err := r.advanceConnectionGeneration(binding)
+		if err != nil {
+			if _, exists := config.BindingFor(r.Store, binding); !exists {
 				return nil
 			}
-			continue
-		}
-		if err := writable.SaveBinding(current); err != nil {
 			if !waitForBackoff() {
 				return nil
 			}
@@ -370,6 +358,19 @@ func (r Runner) runBindingLoop(ctx context.Context, binding config.Binding) erro
 			return nil
 		}
 	}
+}
+
+func (r Runner) advanceConnectionGeneration(reference config.Binding) (config.Binding, error) {
+	var current config.Binding
+	err := config.UpdateBinding(r.Store, reference, func(latest *config.Binding) error {
+		latest.ConnectionGeneration++
+		if latest.ConnectionGeneration <= 0 {
+			latest.ConnectionGeneration = 1
+		}
+		current = *latest
+		return nil
+	})
+	return current, err
 }
 
 func (r Runner) drainReconnectDelay(err error) time.Duration {
@@ -1027,8 +1028,8 @@ func (r Runner) refreshMCPConfig(binding config.Binding, targets ...*externalage
 		return err
 	}
 
-	// The selected OpenClaw agent is operation-scoped. Installer calls do not
-	// save Binding, and config.Store scrubs this legacy field on every write.
+	// This resolved agent belongs to this operation. Native configuration writes
+	// preserve the stored explicit selection rather than saving this local copy.
 	latest.OpenClawAgentID = resolved.OpenClawAgentID
 	if target.ProfileCandidateID != latest.ProfileCandidateID {
 		return fmt.Errorf("scope_changed: selected profile differs from prepared profile")
@@ -1549,8 +1550,7 @@ func (r Runner) adapterForBinding(binding config.Binding) runtime.Adapter {
 }
 
 // adapterForRuntimeTarget constructs an adapter for the API-selected
-// account/profile. It deliberately keeps home and profile paths out of Binding
-// storage. Runtime readiness and startup belong to the session reconciler.
+// account/profile. Runtime readiness and startup belong to the session reconciler.
 func (r Runner) adapterForRuntimeTarget(binding config.Binding, target *externalagentprotocol.RuntimeTarget) (runtime.Adapter, error) {
 	adapter, _, err := r.targetAdapter(binding, target)
 	return adapter, err
@@ -1900,7 +1900,7 @@ func (r Runner) resolveTarget(binding config.Binding, target *externalagentproto
 	if r.ResolveTarget != nil {
 		return r.ResolveTarget(binding, target)
 	}
-	return targetinventory.Resolve(binding.RuntimeKind, target, binding.InventorySeed)
+	return targetinventory.Resolve(binding.RuntimeKind, target, binding.InventorySeed, binding.SelectedOpenClawAgentID)
 }
 func (r Runner) verifyRuntimeEndpoint(ctx context.Context, endpoint string, resolved targetinventory.ResolvedTarget, kind runtime.AdapterKind) (bool, error) {
 	if r.VerifyRuntimeEndpoint != nil {

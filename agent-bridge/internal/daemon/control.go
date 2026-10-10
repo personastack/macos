@@ -56,6 +56,9 @@ func (r Runner) CheckBinding(ctx context.Context, b config.Binding) (runtime.Det
 	return r.bindingReadinessAtHomeContext(ctx, adapter, b, resolved.HomeDir, resolved.HermesHome, endpoint), nil
 }
 func (r Runner) RepairBinding(ctx context.Context, b config.Binding, restartConfirmed bool) error {
+	if !restartConfirmed {
+		return fmt.Errorf("runtime_conflict: native consent required before profile repair")
+	}
 	latest, ok := config.BindingFor(r.Store, b)
 	if !ok || latest.ConnectionGeneration != b.ConnectionGeneration {
 		return fmt.Errorf("scope_changed: binding changed")
@@ -94,7 +97,7 @@ func (r Runner) RepairBinding(ctx context.Context, b config.Binding, restartConf
 				return err
 			}
 		}
-		if _, err := mcp.ConfigureBinding(current); err != nil {
+		if _, err := mcp.ConfigureBinding(current, true); err != nil {
 			return err
 		}
 		current.RuntimeLaunchAllowed = restartConfirmed
