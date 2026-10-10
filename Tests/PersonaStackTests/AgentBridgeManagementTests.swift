@@ -28,6 +28,9 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
         let binding = try #require(payload["binding_key"] as? [String: String])
         #expect(binding == ["environment_id": "https://my.personastack.ai", "connection_id": "conn-a"])
         if operation == "repair", let expectedAppsConfirmation {
+            #expect(Set(payload.keys) == ["binding_key", "connection_generation", "target_selection_revision", "restart_confirmed", "openclaw_apps_confirmed"])
+            #expect(payload["connection_generation"] as? Int == 7)
+            #expect(payload["target_selection_revision"] as? Int == 9)
             #expect(payload["restart_confirmed"] as? Bool == true)
             #expect(payload["openclaw_apps_confirmed"] as? Bool == expectedAppsConfirmation)
         }

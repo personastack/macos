@@ -18,6 +18,9 @@ private actor AgentBridgeFixtureTransport: AgentBridgeControlTransport {
         operations.append(operation)
         if operation == "repair" {
             let payload = try #require(object["payload"] as? [String: Any])
+            #expect(Set(payload.keys) == ["binding_key", "connection_generation", "target_selection_revision", "restart_confirmed", "openclaw_apps_confirmed"])
+            #expect(payload["connection_generation"] as? Int == 7)
+            #expect(payload["target_selection_revision"] as? Int == 1)
             #expect(payload["restart_confirmed"] as? Bool == true)
             #expect(payload["openclaw_apps_confirmed"] as? Bool == true)
         }
@@ -67,7 +70,7 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
             "runtime_kind": "hermes", "workspace_id": "ws_11111111111111111111111111111111",
             "persona_id": "persona-a", "profile_candidate_id": "rt_profile_a"]
         _ = try AgentBridgePageCommand.parse(valid)
-        for extra in ["gateway_url", "token", "path", "command", "document_id", "restart_confirmed", "openclaw_apps_confirmed", "session_key", "expected_existing_session_id"] {
+        for extra in ["gateway_url", "token", "path", "command", "document_id", "restart_confirmed", "openclaw_apps_confirmed", "target_selection_revision", "session_key", "expected_existing_session_id"] {
             var input = valid; input[extra] = "untrusted"
             #expect(throws: AgentBridgeFailure.invalidRequest) { try AgentBridgePageCommand.parse(input) }
         }

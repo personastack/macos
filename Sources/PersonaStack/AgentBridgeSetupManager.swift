@@ -348,17 +348,19 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
             return current
         }
         let before = try await owner()
+        guard let revision = before.targetSelection?.selection_revision, revision > 0 else { throw AgentBridgeFailure.scopeChanged }
         var appsConfirmed = false
         if selected.runtimeKind == .openclaw && selected.diagnosticCode == "mcp_apps_disabled" {
             guard confirmOpenClawApps(target.persona) else { throw AgentBridgeFailure.runtimeConflict }
             let afterApps = try await owner()
-            guard afterApps.targetSelection?.selection_revision == before.targetSelection?.selection_revision else { throw AgentBridgeFailure.scopeChanged }
+            guard afterApps.targetSelection?.selection_revision == revision else { throw AgentBridgeFailure.scopeChanged }
             appsConfirmed = true
         }
         guard confirmRuntimeStart(target.persona) else { throw AgentBridgeFailure.runtimeConflict }
         let afterStart = try await owner()
-        guard afterStart.targetSelection?.selection_revision == before.targetSelection?.selection_revision else { throw AgentBridgeFailure.scopeChanged }
-        return ["binding_key": bindingValue(key), "restart_confirmed": .bool(true), "openclaw_apps_confirmed": .bool(appsConfirmed)]
+        guard afterStart.targetSelection?.selection_revision == revision else { throw AgentBridgeFailure.scopeChanged }
+        return ["binding_key": bindingValue(key), "connection_generation": .integer(generation),
+                "target_selection_revision": .integer(revision), "restart_confirmed": .bool(true), "openclaw_apps_confirmed": .bool(appsConfirmed)]
     }
 
     private func migrate(_ command: AgentBridgePageCommand, page: Page, cookies: String, document: UUID, view: WKWebView) async throws -> [String: Any] {
