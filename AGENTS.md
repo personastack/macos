@@ -1,5 +1,14 @@
 # macos instructions
 
+
+## Cross-repository workspace setup
+
+Before significant cross-repository feature work, use the main `agent-root` workspace. Clone `git@github.com:personastack/agent-root.git` into a directory named `personastack`, then clone all 37 PersonaStack child repositories under it at the exact destinations listed in [`docs/REPOSITORY_STRUCTURE.md`](../docs/REPOSITORY_STRUCTURE.md). Each service is an independent sibling Git repository. Do not clone peers inside this standalone service checkout. This repository should be used from its mapped child directory under `personastack/` for cross-repository work.
+
+If you started with only this repository, prepare the main workspace and all peer checkouts before cross-repository discovery or implementation. Verify each path resolves to its own Git root and expected `origin` remote. The structure guide gives the clone URL and destination for every repository.
+
+Fetch `origin` separately in every repository the task will inspect or change. Fetching `agent-root` does not fetch this repository or its peers. Inspect local changes before fetching and preserve them; do not merge or overwrite changes automatically.
+
 - Keep hosted user, workspace, integration, persona, and billing state under `my.personastack.ai` and `personastack-api`. For Desktop Control, the native app owns standalone CUA discovery, explicit user-requested installation and setup handoff, a per-user machine credential in a private native credential file, and the authenticated forwarding connection to `agent-gateway`. CUA owns its service, permissions, settings, and GUI execution. Unrelated Local Run, harness, and skill features retain their own local process/filesystem operations. It must not become a second human auth/API/product-state/datastore authority.
 - Gate remote machine commands through the authenticated gateway contract and current API-projected persona/config/workspace scope. Local Run commands instead require a native-redeemed API startup ticket and that window's authenticated private worker socket. Local runs do not require Desktop Control enrollment. Never accept bearer credentials, machine IDs, arbitrary URLs, paths, commands, or raw frames from an untrusted WebView bridge as authorization.
 - Standalone CUA owns Desktop Control permission requests. Report CUA's readiness and denied capability. Only an explicit local CUA setup action may invoke upstream consent prompts. Passive checks and remote commands must never install, request permissions, change policy, or restart CUA. Never reset PersonaStack TCC grants as Desktop Control repair. PersonaStack quit, disconnect, and uninstall leave standalone CUA intact. Do not elevate remote commands or log their content.
