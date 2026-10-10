@@ -385,7 +385,7 @@ func TestDesktopAgentBridgeOpenClawUnsupportedNativeCatalogBlocksDirectMCP(t *te
 		return nil, nil
 	})}
 	result := VerifyBindingWithLiveAt(context.Background(), "", binding, client, "ws://127.0.0.1:25907")
-	if result.State != runtime.AdapterStateCapabilityMissing || result.DiagnosticCode != "runtime_unsupported" || !strings.Contains(result.Note, "cold session discovery") {
+	if result.State != runtime.AdapterStateCapabilityMissing || result.DiagnosticCode != "runtime_unsupported" || !strings.Contains(result.Note, "owned") {
 		t.Fatalf("unsupported native capability was hidden: %+v", result)
 	}
 	after, _ := os.ReadFile(path)

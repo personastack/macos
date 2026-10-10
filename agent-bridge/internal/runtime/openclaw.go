@@ -19,16 +19,21 @@ const minOpenClawProtocolVersion = 3
 const maxOpenClawProtocolVersion = 4
 
 type OpenClawAdapter struct {
-	StateRoot       string
-	ConfigPath      string
-	CallNative      func(context.Context, openClawRequest) (openClawResponse, error)
-	GatewayURL      string
-	Token           string
-	Password        string
-	DeviceToken     string
-	AgentID         string
-	DeviceTokenSink func(string) error
-	Dialer          *websocket.Dialer
+	StateRoot          string
+	ConfigPath         string
+	CallNative         func(context.Context, openClawRequest) (openClawResponse, error)
+	GatewayURL         string
+	Token              string
+	Password           string
+	DeviceToken        string
+	AgentID            string
+	SessionOwner       string
+	NativeMCPServer    string
+	NativeMCPNamespace string
+	ReadinessSession   OpenClawSessionIdentity
+	MCPAppsEnabled     func() (bool, error)
+	DeviceTokenSink    func(string) error
+	Dialer             *websocket.Dialer
 }
 
 func NewOpenClawAdapter(gatewayURL string, token string) OpenClawAdapter {
@@ -69,6 +74,9 @@ func (adapter OpenClawAdapter) DetectContext(ctx context.Context) Detection {
 	if !adapter.hasAuth() {
 		return Detection{Kind: AdapterKindOpenClaw, State: AdapterStateAuthMissing, Note: "OpenClaw operator token, password, or device token is required"}
 	}
+	if adapter.CallNative != nil {
+		return adapter.detectWithNativeCaller(ctx)
+	}
 	conn, err := adapter.connectOperatorWithRetry(ctx)
 	if err != nil {
 		if openClawConnectErrorIsAuth(err) {
@@ -105,6 +113,25 @@ func (adapter OpenClawAdapter) DetectContext(ctx context.Context) Detection {
 		return Detection{Kind: AdapterKindOpenClaw, State: AdapterStateCapabilityMissing, Note: err.Error()}
 	}
 	return Detection{Kind: AdapterKindOpenClaw, State: AdapterStateReady, Note: "OpenClaw Gateway reachable"}
+}
+
+func (adapter OpenClawAdapter) detectWithNativeCaller(ctx context.Context) Detection {
+	for n, method := range []string{"health", "status", "agents.list"} {
+		response, err := adapter.callNative(ctx, openClawRequest{Type: "req", ID: fmt.Sprintf("detect-%d", n+1), Method: method})
+		if err != nil || !response.isResponseOK() || response.errorString() != "" {
+			return Detection{Kind: AdapterKindOpenClaw, State: AdapterStateCapabilityMissing, Note: "selected native capability unavailable"}
+		}
+		if method == "agents.list" {
+			agents, err := openClawAgentsFromResult(response.payload())
+			if err != nil {
+				return Detection{Kind: AdapterKindOpenClaw, State: AdapterStateCapabilityMissing, Note: "selected native agent unavailable"}
+			}
+			if err = adapter.validateAgentSelection(agents); err != nil {
+				return Detection{Kind: AdapterKindOpenClaw, State: AdapterStateCapabilityMissing, Note: err.Error()}
+			}
+		}
+	}
+	return Detection{Kind: AdapterKindOpenClaw, State: AdapterStateReady}
 }
 
 func (adapter OpenClawAdapter) probeOpenClawMethod(conn *websocket.Conn, requestID string, method string) (json.RawMessage, Detection, bool) {
@@ -177,11 +204,10 @@ type OpenClawMCPVerificationResult struct {
 }
 
 func (adapter OpenClawAdapter) VerifyMCPCatalog(ctx context.Context, serverName string) OpenClawMCPVerificationResult {
-	// tools.catalog is a static core/plugin catalog. tools.effective reads an
-	// already-warm persisted session and cannot initialize its MCP runtime.
-	// This helper has no supported cold discovery operation for its assigned
-	// session. Never substitute a plugin-name match or direct MCP reachability.
-	return OpenClawMCPVerificationResult{Note: "OpenClaw native MCP verification is unsupported: no supported cold session discovery operation"}
+	if adapter.ReadinessSession.ID == "" || adapter.ReadinessSession.Key == "" || adapter.ReadinessSession.Key != adapter.OwnedSessionKey("setup", "") {
+		return OpenClawMCPVerificationResult{Note: "selected OpenClaw readiness session is not owned by this binding"}
+	}
+	return adapter.VerifyOwnedMCPSession(ctx, serverName, adapter.ReadinessSession)
 }
 
 func (adapter OpenClawAdapter) DescribeNativeCapabilities(ctx context.Context, nativeMCPServerName string) ([]NativeCapability, error) {
@@ -307,10 +333,18 @@ func (adapter OpenClawAdapter) StartRun(runRequest RunRequest) (string, error) {
 	connectCtx, cancel := context.WithTimeout(context.Background(), openClawSetupRetryBudget)
 	defer cancel()
 	agentID := strings.TrimSpace(adapter.AgentID)
-	if agentID == "" {
-		agentID = "main"
+	if agentID == "" || adapter.NativeMCPServer == "" || adapter.NativeMCPNamespace == "" || runRequest.NativeMCPServerName != adapter.NativeMCPServer || runRequest.NativeMCPToolNamespace != adapter.NativeMCPNamespace {
+		return "", fmt.Errorf("OpenClaw selected agent and issued MCP scope required")
 	}
-	params := openClawAgentSubmission{AgentID: agentID, IdempotencyKey: nativeRunID, Message: strings.TrimSpace(runRequest.FullyComposedPrompt)}
+	conversation := runRequest.ConversationID
+	if conversation == "" {
+		conversation = "assignment:" + assignmentID
+	}
+	session, err := adapter.PrepareOwnedMCPSession(connectCtx, "conversation", conversation)
+	if err != nil {
+		return "", err
+	}
+	params := openClawAgentSubmission{AgentID: agentID, IdempotencyKey: nativeRunID, Message: strings.TrimSpace(runRequest.FullyComposedPrompt), SessionKey: session.Key, ExpectedExistingSessionID: session.ID, ExpectedExistingSessionLifecycleRevision: session.Revision}
 	request := openClawRequest{
 		Type:   "req",
 		ID:     assignmentID,
@@ -988,9 +1022,12 @@ func (adapter OpenClawAdapter) callNative(ctx context.Context, request openClawR
 }
 
 type openClawAgentSubmission struct {
-	AgentID        string `json:"agentId"`
-	IdempotencyKey string `json:"idempotencyKey"`
-	Message        string `json:"message"`
+	AgentID                                  string `json:"agentId"`
+	IdempotencyKey                           string `json:"idempotencyKey"`
+	Message                                  string `json:"message"`
+	SessionKey                               string `json:"sessionKey"`
+	ExpectedExistingSessionID                string `json:"expectedExistingSessionId"`
+	ExpectedExistingSessionLifecycleRevision string `json:"expectedExistingSessionLifecycleRevision,omitempty"`
 }
 type openClawStopRun struct {
 	RunID string `json:"runId"`

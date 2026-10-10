@@ -27,6 +27,7 @@ import (
 )
 
 type Runner struct {
+	OpenClawNativeCall      func(context.Context, runtime.OpenClawRequest) (runtime.OpenClawResponse, error)
 	ResolveTarget           func(config.Binding, *externalagentprotocol.RuntimeTarget) (targetinventory.ResolvedTarget, error)
 	VerifyRuntimeEndpoint   func(context.Context, string, string, string, string) (bool, error)
 	Store                   config.Store
@@ -364,6 +365,7 @@ func (r Runner) advanceConnectionGeneration(reference config.Binding) (config.Bi
 	var current config.Binding
 	err := config.UpdateBinding(r.Store, reference, func(latest *config.Binding) error {
 		latest.ConnectionGeneration++
+		latest.OpenClawSetupPending = false
 		if latest.ConnectionGeneration <= 0 {
 			latest.ConnectionGeneration = 1
 		}
@@ -1536,7 +1538,12 @@ func (r Runner) bindingReadinessAtHomeContext(ctx context.Context, adapter runti
 	if len(runtimeURLs) > 0 {
 		runtimeURL = runtimeURLs[0]
 	}
-	verify := mcp.VerifyBindingWithLiveAt(ctx, homeDir, verificationBinding, r.MCPHTTPClient, runtimeURL)
+	var verify mcp.VerifyResult
+	if selected, ok := adapter.(runtime.OpenClawAdapter); ok {
+		verify = mcp.VerifyBindingWithOpenClawAdapter(ctx, homeDir, verificationBinding, r.MCPHTTPClient, selected)
+	} else {
+		verify = mcp.VerifyBindingWithLiveAt(ctx, homeDir, verificationBinding, r.MCPHTTPClient, runtimeURL)
+	}
 	detection.State = verify.State
 	detection.Note = verify.Note
 	detection.DiagnosticCode = verify.DiagnosticCode
@@ -1600,6 +1607,12 @@ func (r Runner) targetAdapter(binding config.Binding, target *externalagentproto
 		adapter := runtime.NewOpenClawAdapterWithAuth(runtimeURL, resolved.Auth, resolvedTarget.OpenClawAgentID)
 		adapter.StateRoot = resolvedTarget.StateRoot
 		adapter.ConfigPath = resolvedTarget.ConfigPath
+		adapter.CallNative = r.OpenClawNativeCall
+		adapter.SessionOwner = binding.Key().String()
+		adapter.NativeMCPServer = binding.NativeMCPServer
+		adapter.NativeMCPNamespace = binding.NativeMCPNamespace
+		adapter.ReadinessSession = binding.OpenClawReadinessSession
+		adapter.MCPAppsEnabled = func() (bool, error) { return mcp.OpenClawAppsEnabled(resolvedTarget.ConfigPath) }
 		return adapter, resolvedTarget, nil
 	default:
 		return nil, targetinventory.ResolvedTarget{}, fmt.Errorf("unsupported runtime target")

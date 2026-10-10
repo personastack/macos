@@ -31,7 +31,7 @@ type Controller struct {
 	Discover           func(runtime.AdapterKind, string) ([]targetinventory.Profile, []error)
 	Exchange           func(context.Context, Environment, pairing.Request) (pairing.Result, error)
 	Check              func(context.Context, config.Binding) (runtime.Detection, error)
-	Repair             func(context.Context, config.Binding, bool) error
+	Repair             func(context.Context, config.Binding, bool, bool) error
 	Cleanup            func(config.Binding) error
 	Now                func() time.Time
 	Stop               func() error
@@ -513,6 +513,9 @@ func (c *Controller) status(ctx context.Context, p BindingPayload, probe bool) (
 				} else {
 					row.ReadinessState = detection.State.String()
 					row.DiagnosticCode = detection.DiagnosticCode
+					if row.DiagnosticCode == "mcp_apps_disabled" {
+						row.DiagnosticMessage = "Enable MCP Apps for this OpenClaw profile to verify its PersonaStack tools."
+					}
 					if row.DiagnosticCode == "mcp_token_missing" || row.DiagnosticCode == "mcp_token_rejected" {
 						row.DiagnosticCode = "reconnect_required"
 					}
@@ -528,6 +531,9 @@ func (c *Controller) repair(ctx context.Context, p RepairPayload) (Result, error
 	if err != nil {
 		return Result{}, err
 	}
+	if p.ConnectionGeneration <= 0 || p.TargetSelectionRevision <= 0 || p.ConnectionGeneration != b.ConnectionGeneration || p.TargetSelectionRevision != b.TargetSelectionRevision {
+		return Result{}, issue("scope_changed", "Connection selection changed. Check this connection before Repair.")
+	}
 	if b.PersonaMCPSecretUnavailable {
 		return Result{}, issue("credential_unavailable", "Allow this helper to read its stored Keychain credential before retrying.")
 	}
@@ -540,8 +546,11 @@ func (c *Controller) repair(ctx context.Context, p RepairPayload) (Result, error
 	if c.Repair == nil {
 		return Result{}, issue("runtime_unsupported", "Repair is not available.")
 	}
-	err = c.Repair(ctx, b, p.RestartConfirmed)
+	err = c.Repair(ctx, b, p.RestartConfirmed, p.OpenClawAppsConfirmed)
 	if err != nil {
+		if strings.HasPrefix(err.Error(), "mcp_apps_disabled:") {
+			return Result{}, issue("mcp_apps_disabled", "Enable MCP Apps for this OpenClaw profile to verify its PersonaStack tools.")
+		}
 		if strings.HasPrefix(err.Error(), "busy:") {
 			return Result{}, issue("busy", "Stop the assigned run or resume this connection before Repair.")
 		}
@@ -598,7 +607,14 @@ func (c *Controller) quiesce(p BindingPayload, value bool) (Result, error) {
 	}
 	result := Result{ActiveRunIDs: []string{}, Quiesced: &value}
 	for _, b := range bindings {
-		err = config.UpdateBinding(c.Store, b, func(latest *config.Binding) error { latest.Quiesced = value; b = *latest; return nil })
+		err = config.UpdateBinding(c.Store, b, func(latest *config.Binding) error {
+			latest.Quiesced = value
+			if value {
+				latest.OpenClawSetupPending = false
+			}
+			b = *latest
+			return nil
+		})
 		if err != nil {
 			return Result{}, issue("credential_unavailable", "Could not change native admission state.")
 		}

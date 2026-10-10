@@ -309,7 +309,7 @@ func TestDesktopAgentBridgeRepairRejectedMCPCredentialHasNoRuntimeMutation(t *te
 				}
 				return &http.Response{StatusCode: http.StatusUnauthorized, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("denied")), Request: req}, nil
 			})}}
-			err := runner.RepairBinding(context.Background(), b, true)
+			err := runner.RepairBinding(context.Background(), b, true, false)
 			if err == nil || !strings.HasPrefix(err.Error(), "reconnect_required:") {
 				t.Fatalf("credential repair claimed success: %v", err)
 			}
@@ -415,7 +415,7 @@ func TestDesktopAgentBridgeFreshTargetStoppedRuntimeCanBeRepaired(t *testing.T) 
 	result.Detection = detectionForReconcileError(b.RuntimeKind, err)
 	reconciler.publish(snapshot, result)
 	selected, _ = config.BindingFor(store, b)
-	if err := runner.RepairBinding(context.Background(), selected, true); err != nil {
+	if err := runner.RepairBinding(context.Background(), selected, true, false); err != nil {
 		t.Fatal(err)
 	}
 	repaired, _ := config.BindingFor(store, b)
@@ -530,7 +530,7 @@ func TestDesktopAgentBridgeRepairDeniedNativeConsentHasNoMutation(t *testing.T) 
 		t.Fatal("denied native consent performed protected credential read")
 		return nil, nil
 	})}
-	err := runner.RepairBinding(context.Background(), b, false)
+	err := runner.RepairBinding(context.Background(), b, false, false)
 	if err == nil || !strings.HasPrefix(err.Error(), "runtime_conflict:") {
 		t.Fatalf("denied native consent accepted: %v", err)
 	}
@@ -552,7 +552,7 @@ func TestDesktopAgentBridgeActualOpenClawProfileSelectedAgentDispatch(t *testing
 		t.Fatal(err)
 	}
 	path := filepath.Join(root, "openclaw.json")
-	raw := `{"agents":{"entries":{"main":{"name":"Other agent"},"research":{"name":"Chosen research"}}},"gateway":{"port":25907,"auth":{"mode":"token","token":"selected-profile-key"}}}`
+	raw := `{"agents":{"entries":{"main":{"name":"Other agent"},"research":{"name":"Chosen research"}}},"mcp":{"apps":{"enabled":true}},"gateway":{"port":25907,"auth":{"mode":"token","token":"selected-profile-key"}}}`
 	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -571,7 +571,7 @@ func TestDesktopAgentBridgeActualOpenClawProfileSelectedAgentDispatch(t *testing
 	if err != nil || candidate == "" {
 		t.Fatalf("native opaque choice rejected: %v", err)
 	}
-	b := config.Binding{EnvironmentID: "https://app.example", PersonaID: "persona", ConnectionID: "connection", ConnectionGeneration: 3, RuntimeKind: runtime.AdapterKindOpenClaw, AccountCandidateID: profile.AccountCandidateID, ProfileCandidateID: profile.CandidateID, NativeStateRoot: profile.Resolved.StateRoot, NativeConfigPath: profile.Resolved.ConfigPath, OpenClawAgentID: profile.Resolved.OpenClawAgentID, InventorySeed: "seed"}
+	b := config.Binding{EnvironmentID: "https://app.example", PersonaID: "persona", ConnectionID: "connection", ConnectionGeneration: 3, RuntimeKind: runtime.AdapterKindOpenClaw, AccountCandidateID: profile.AccountCandidateID, ProfileCandidateID: profile.CandidateID, NativeStateRoot: profile.Resolved.StateRoot, NativeConfigPath: profile.Resolved.ConfigPath, OpenClawAgentID: profile.Resolved.OpenClawAgentID, NativeMCPServer: "issued", NativeMCPNamespace: "mcp_issued", InventorySeed: "seed"}
 	statePath := filepath.Join(t.TempDir(), "private", "state.json")
 	initial := config.NewFileStoreWithSecrets(statePath, selectedProfileFixtureSecrets{}).WithInventorySeed("seed")
 	if err := initial.SaveBinding(b); err != nil {
@@ -591,35 +591,54 @@ func TestDesktopAgentBridgeActualOpenClawProfileSelectedAgentDispatch(t *testing
 	}
 	selected := adapter.(runtime.OpenClawAdapter)
 	calls := 0
+	key := selected.OwnedSessionKey("conversation", "api-conversation")
+	methods := []string{"sessions.create", "mcp.app.discover", "sessions.describe", "tools.effective", "sessions.describe", "agent"}
 	selected.CallNative = func(ctx context.Context, request runtime.OpenClawRequest) (runtime.OpenClawResponse, error) {
-		calls++
-		if request.Method != "agent" || request.ID != "assignment" || selected.AgentID != "research" || selected.Token != "selected-profile-key" || selected.GatewayURL != "ws://127.0.0.1:25907" {
-			t.Fatal("actual native dispatch selected another agent, profile, or credential")
+		if calls >= len(methods) || request.Method != methods[calls] || selected.AgentID != "research" || selected.Token != "selected-profile-key" || selected.GatewayURL != "ws://127.0.0.1:25907" {
+			t.Fatal("native verification/dispatch selected another agent/profile/credential or unplanned RPC")
 		}
+		calls++
 		raw, err := json.Marshal(request.Params)
 		if err != nil {
 			t.Fatal(err)
 		}
-		var submission struct {
-			Agent      string `json:"agentId"`
-			Assignment string `json:"idempotencyKey"`
-			Message    string `json:"message"`
-		}
-		if err = json.Unmarshal(raw, &submission); err != nil {
-			t.Fatal(err)
-		}
-		if submission.Agent != "research" || submission.Assignment != "assignment" || submission.Message != "assigned wake" {
-			t.Fatal("native agent DTO lost explicitly selected non-main identity")
+		payload := ""
+		switch request.Method {
+		case "sessions.create":
+			if string(raw) != fmt.Sprintf(`{"key":%q,"agentId":"research","idempotencyKey":%q}`, key, key) {
+				t.Fatal("empty native session create lost private chosen scope or spent a model turn")
+			}
+			payload = fmt.Sprintf(`{"ok":true,"key":%q,"sessionId":"native-owned-session","entry":{"sessionId":"native-owned-session","lifecycleRevision":"rev-1"},"runStarted":false}`, key)
+		case "mcp.app.discover":
+			if string(raw) != fmt.Sprintf(`{"agentId":"research","sessionKey":%q}`, key) {
+				t.Fatal("foreign native discovery")
+			}
+			payload = `{"servers":[],"onboarding":[]}`
+		case "sessions.describe":
+			if string(raw) != fmt.Sprintf(`{"key":%q,"agentId":"research"}`, key) {
+				t.Fatal("foreign native metadata read")
+			}
+			payload = fmt.Sprintf(`{"session":{"key":%q,"sessionId":"native-owned-session","agentId":"research","lifecycleRevision":"rev-1"}}`, key)
+		case "tools.effective":
+			if string(raw) != fmt.Sprintf(`{"agentId":"research","sessionKey":%q}`, key) {
+				t.Fatal("effective verification lost actual dispatch session")
+			}
+			payload = `{"agentId":"research","groups":[{"source":"mcp","tools":[{"source":"mcp","pluginId":"bundle-mcp","mcpServer":"issued","mcpToolName":"get_persona"}]}]}`
+		case "agent":
+			if request.ID != "assignment" || string(raw) != fmt.Sprintf(`{"agentId":"research","idempotencyKey":"assignment","message":"assigned wake","sessionKey":%q,"expectedExistingSessionId":"native-owned-session","expectedExistingSessionLifecycleRevision":"rev-1"}`, key) {
+				t.Fatal("native submission lost verified session fence")
+			}
+			payload = `{"runId":"native-research","status":"accepted"}`
 		}
 		ok := true
-		return runtime.OpenClawResponse{OK: &ok, Type: "res", ID: request.ID, Payload: json.RawMessage(`{"runId":"native-research","status":"accepted"}`)}, nil
+		return runtime.OpenClawResponse{OK: &ok, Type: "res", ID: request.ID, Payload: json.RawMessage(payload)}, nil
 	}
-	frame := externalagentprotocol.Frame{PersonaID: "persona", ConnectionID: "connection", ConnectionGeneration: 3, RunID: "wake", AssignmentID: "assignment", RunStart: &externalagentprotocol.RunStartPayload{FullyComposedPrompt: "assigned wake"}}
+	frame := externalagentprotocol.Frame{PersonaID: "persona", ConnectionID: "connection", ConnectionGeneration: 3, RunID: "wake", AssignmentID: "assignment", RunStart: &externalagentprotocol.RunStartPayload{FullyComposedPrompt: "assigned wake", ConversationID: "api-conversation", NativeMCPServerName: "issued", NativeMCPToolNamespace: "mcp_issued"}}
 	if err = runner.activateRun(b, frame); err != nil {
 		t.Fatal(err)
 	}
-	native, err := selected.StartRun(runtime.RunRequest{RunID: frame.RunID, AssignmentID: frame.AssignmentID, FullyComposedPrompt: frame.RunStart.FullyComposedPrompt})
-	if err != nil || calls != 1 || native != "native-research" {
+	native, err := selected.StartRun(assignedRunRequest(frame))
+	if err != nil || calls != 6 || native != "native-research" {
 		t.Fatalf("actual selected assignment dispatch failed: %s %v", native, err)
 	}
 }
@@ -748,7 +767,7 @@ func TestDesktopAgentBridgeRepairConcurrentAdmissionDoesNotOverwriteState(t *tes
 					t.Fatal(err)
 				}
 			})
-			if err := runner.RepairBinding(context.Background(), b, true); err == nil {
+			if err := runner.RepairBinding(context.Background(), b, true, false); err == nil {
 				t.Fatal("stale Repair admission accepted")
 			}
 			current, _ := config.BindingFor(store, b)

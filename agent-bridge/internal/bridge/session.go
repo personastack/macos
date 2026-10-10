@@ -112,10 +112,15 @@ func (s Session) HeartbeatFrameWithDetectionAndTarget(detection runtime.Detectio
 
 func (s Session) HeartbeatFrameWithDiagnostic(state runtime.AdapterState, diagnosticCode string, lastWakeProbeAt *time.Time) externalagentprotocol.Frame {
 	frame := s.baseFrame(externalagentprotocol.FrameTypeHeartbeat, s.now())
+	wireDiagnostic := diagnosticCodeForAdapterState(state, diagnosticCode)
+	readiness := readinessForAdapterState(state, lastWakeProbeAt)
+	if wireDiagnostic != "" && (state == runtime.AdapterStateReady || state == runtime.AdapterStateMCPVerified) {
+		readiness = externalagentprotocol.ReadinessStatusRuntimeError
+	}
 	frame.Heartbeat = &externalagentprotocol.HeartbeatPayload{
 		ConnectionStatus:       externalagentprotocol.ConnectionStatusBridgeConnected,
-		ReadinessStatus:        readinessForAdapterState(state, lastWakeProbeAt),
-		DiagnosticCode:         externalagentprotocol.DiagnosticCode(diagnosticCodeForAdapterState(state, diagnosticCode)),
+		ReadinessStatus:        readiness,
+		DiagnosticCode:         externalagentprotocol.DiagnosticCode(wireDiagnostic),
 		RuntimeKind:            runtimeKindForAdapter(s.Binding.RuntimeKind),
 		ServiceScope:           s.serviceScope(),
 		ConnectionGeneration:   s.Binding.ConnectionGeneration,
@@ -341,7 +346,8 @@ func readinessForAdapterState(state runtime.AdapterState, lastWakeProbeAt *time.
 
 func diagnosticCodeForAdapterState(state runtime.AdapterState, diagnosticCode string) string {
 	trimmed := strings.TrimSpace(diagnosticCode)
-	if trimmed != "" {
+	switch externalagentprotocol.DiagnosticCode(trimmed) {
+	case externalagentprotocol.DiagnosticCodeRuntimeMissing, externalagentprotocol.DiagnosticCodeRuntimeStopped, externalagentprotocol.DiagnosticCodeAuthMissing, externalagentprotocol.DiagnosticCodeCapabilityMissing, externalagentprotocol.DiagnosticCodeMCPConfigMissing, externalagentprotocol.DiagnosticCodeMCPConfigParseError, externalagentprotocol.DiagnosticCodeMCPConfigConflict, externalagentprotocol.DiagnosticCodeMCPTokenMissing, externalagentprotocol.DiagnosticCodeMCPTokenRejected, externalagentprotocol.DiagnosticCodeMCPEndpointUnreachable, externalagentprotocol.DiagnosticCodeNativeMCPUnreachable, externalagentprotocol.DiagnosticCodeMCPRestartRequired, externalagentprotocol.DiagnosticCodeWakeProbeFailed, externalagentprotocol.DiagnosticCodeRuntimeError, externalagentprotocol.DiagnosticCodeRuntimeTargetUnavailable, "target_selection_required":
 		return trimmed
 	}
 	switch state {
@@ -360,6 +366,9 @@ func diagnosticCodeForAdapterState(state runtime.AdapterState, diagnosticCode st
 	case runtime.AdapterStateWakeProbeFailed:
 		return "wake_probe_failed"
 	case runtime.AdapterStateReady, runtime.AdapterStateMCPVerified:
+		if trimmed != "" {
+			return "runtime_error"
+		}
 		return ""
 	case runtime.AdapterStateTargetSelectionRequired:
 		return "target_selection_required"

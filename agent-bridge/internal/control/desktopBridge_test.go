@@ -492,7 +492,7 @@ func TestDesktopAgentBridgeNativeStatusAndRepairExposeReconnectRequired(t *testi
 		t.Run(fault, func(t *testing.T) {
 			t.Parallel()
 			c, store, _ := fixture(t)
-			b := config.Binding{EnvironmentID: "https://app.test", PersonaID: "persona", ConnectionID: "connection", ConnectionGeneration: 2, PersonaMCPToken: "present", ReadinessState: runtime.AdapterStateAuthMissing}
+			b := config.Binding{EnvironmentID: "https://app.test", PersonaID: "persona", ConnectionID: "connection", ConnectionGeneration: 2, TargetSelectionRevision: 3, PersonaMCPToken: "present", ReadinessState: runtime.AdapterStateAuthMissing}
 			if fault == "missing" {
 				b.PersonaMCPToken = ""
 			}
@@ -512,7 +512,7 @@ func TestDesktopAgentBridgeNativeStatusAndRepairExposeReconnectRequired(t *testi
 				checks++
 				return runtime.Detection{State: runtime.AdapterStateAuthMissing, DiagnosticCode: "credential_unavailable"}, nil
 			}
-			c.Repair = func(context.Context, config.Binding, bool) error { repairs++; return nil }
+			c.Repair = func(context.Context, config.Binding, bool, bool) error { repairs++; return nil }
 			key := b.Key()
 			payload, _ := json.Marshal(BindingPayload{BindingKey: &key})
 			for _, operation := range []string{"status", "check"} {
@@ -528,7 +528,7 @@ func TestDesktopAgentBridgeNativeStatusAndRepairExposeReconnectRequired(t *testi
 					t.Fatal("runtime credential fault conflated with persona MCP")
 				}
 			}
-			repair, _ := json.Marshal(RepairPayload{BindingKey: key, RestartConfirmed: true})
+			repair, _ := json.Marshal(RepairPayload{BindingKey: key, RestartConfirmed: true, ConnectionGeneration: b.ConnectionGeneration, TargetSelectionRevision: b.TargetSelectionRevision})
 			result := request(t, c, "repair", string(repair))
 			if fault == "keychain_denied" {
 				if result.Error == nil || result.Error.Code != "credential_unavailable" || checks != 0 || repairs != 0 {
@@ -552,7 +552,7 @@ func TestNativeProfileScopeDiagnosticIsFixedAndCheckDoesNotMutate(t *testing.T) 
 			t.Parallel()
 			c, store, _ := fixture(t)
 			binding := config.Binding{EnvironmentID: "https://app.test", PersonaID: "persona", ConnectionID: "connection",
-				ConnectionGeneration: 2, PersonaMCPToken: "present", RuntimeKind: runtime.AdapterKindOpenClaw}
+				ConnectionGeneration: 2, TargetSelectionRevision: 3, PersonaMCPToken: "present", RuntimeKind: runtime.AdapterKindOpenClaw}
 			err := store.SaveBinding(binding)
 			if err != nil {
 				t.Fatal(err)
@@ -597,16 +597,16 @@ func TestDesktopAgentBridgeRepairReportsAdmissionAndSelectionConflict(t *testing
 		t.Run(code, func(t *testing.T) {
 			t.Parallel()
 			c, store, _ := fixture(t)
-			b := config.Binding{EnvironmentID: "https://app.test", ConnectionID: "connection", PersonaMCPToken: "token"}
+			b := config.Binding{EnvironmentID: "https://app.test", ConnectionID: "connection", ConnectionGeneration: 2, TargetSelectionRevision: 3, PersonaMCPToken: "token"}
 			if err := store.SaveBinding(b); err != nil {
 				t.Fatal(err)
 			}
 			calls := 0
-			c.Repair = func(context.Context, config.Binding, bool) error {
+			c.Repair = func(context.Context, config.Binding, bool, bool) error {
 				calls++
 				return fmt.Errorf("%s: current state changed", code)
 			}
-			raw, _ := json.Marshal(RepairPayload{BindingKey: b.Key(), RestartConfirmed: true})
+			raw, _ := json.Marshal(RepairPayload{BindingKey: b.Key(), RestartConfirmed: true, ConnectionGeneration: b.ConnectionGeneration, TargetSelectionRevision: b.TargetSelectionRevision})
 			result := request(t, c, "repair", string(raw))
 			if result.Error == nil || result.Error.Code != code || calls != 1 {
 				t.Fatalf("Repair conflict mapped to unsafe cleanup: %+v", result)

@@ -88,29 +88,17 @@ func TestDesktopAgentBridgeHermesIncompleteControl(t *testing.T) {
 }
 func TestDesktopAgentBridgeOpenClawLifecycleAndIsolation(t *testing.T) {
 	t.Parallel()
-	calls := 0
-	adapter := OpenClawAdapter{AgentID: "selected-agent", CallNative: func(ctx context.Context, r openClawRequest) (openClawResponse, error) {
-		calls++
-		raw, _ := json.Marshal(r.Params)
-		switch calls {
-		case 1:
-			if r.Method != "agent" || string(raw) != `{"agentId":"selected-agent","idempotencyKey":"assignment-a","message":"composed wake"}` {
-				t.Fatalf("start request %s %s", r.Method, raw)
-			}
-			return openClawResponse{Payload: json.RawMessage(`{"status":"accepted","runId":"native-a"}`)}, nil
-		case 2:
-			if r.Method != "sessions.abort" || string(raw) != `{"runId":"native-a"}` {
-				t.Fatalf("stop %s %s", r.Method, raw)
-			}
-			return openClawResponse{}, nil
-		default:
-			t.Fatal("unplanned RPC")
-			return openClawResponse{}, nil
+	adapter, calls := sessionFixtureAdapter(t, "")
+	id, err := adapter.StartRun(RunRequest{AssignmentID: "assignment-a", FullyComposedPrompt: "composed wake", NativeMCPServerName: "issued", NativeMCPToolNamespace: "mcp_issued"})
+	if err != nil || id != "native-a" || *calls != 6 {
+		t.Fatalf("native id %s %v calls=%d", id, err, *calls)
+	}
+	adapter.CallNative = func(_ context.Context, request openClawRequest) (openClawResponse, error) {
+		raw, _ := json.Marshal(request.Params)
+		if request.Method != "sessions.abort" || string(raw) != `{"runId":"native-a"}` {
+			t.Fatal("foreign native stop")
 		}
-	}}
-	id, err := adapter.StartRun(RunRequest{AssignmentID: "assignment-a", FullyComposedPrompt: "composed wake"})
-	if err != nil || id != "native-a" {
-		t.Fatalf("native id %s %v", id, err)
+		return openClawResponse{}, nil
 	}
 	events := []RunEvent{}
 	session := openClawRPCSession{nativeRunID: id, agentID: adapter.AgentID, handle: func(e RunEvent) error { events = append(events, e); return nil }}
@@ -242,7 +230,7 @@ func TestDesktopAgentBridgeOpenClawColdMCPVerificationFailsClosed(t *testing.T) 
 				}},
 			}
 			result := adapter.VerifyMCPCatalog(context.Background(), server)
-			if result.OK || !strings.Contains(result.Note, "unsupported") || !strings.Contains(result.Note, "cold session discovery") {
+			if result.OK || !strings.Contains(result.Note, "owned") {
 				t.Fatalf("unproven cold native MCP became Ready: %+v", result)
 			}
 		})

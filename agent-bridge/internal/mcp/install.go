@@ -86,13 +86,21 @@ func (i Installer) install(b config.Binding) (InstallResult, error) {
 
 // ConfigureBinding runs only inside the existing store mutation/admission guard.
 // It changes native config and its ownership fields without a nested store write.
-func ConfigureBinding(b *config.Binding, repairHermesToolset bool) (InstallResult, error) {
+func ConfigureBinding(b *config.Binding, repairHermesToolset bool, openClawAppsConsent ...bool) (InstallResult, error) {
 	if b.NativeConfigPath == "" || b.NativeMCPServer == "" || b.InventorySeed == "" || b.PersonaMCPToken == "" || b.PersonaMCPURL == "" {
 		return InstallResult{}, fmt.Errorf("scoped profile and native MCP credential required")
 	}
 	doc, err := readConfig(b.NativeConfigPath)
 	if err != nil {
 		return InstallResult{}, err
+	}
+	if b.RuntimeKind == runtime.AdapterKindOpenClaw && len(openClawAppsConsent) > 0 {
+		if _, err = OpenClawAppsEnabled(b.NativeConfigPath); err != nil {
+			return InstallResult{}, err
+		}
+		if err = enableOpenClawApps(doc, openClawAppsConsent[0]); err != nil {
+			return InstallResult{}, err
+		}
 	}
 	entries, err := nativeEntries(doc, b.RuntimeKind, true)
 	if err != nil {
@@ -361,6 +369,15 @@ func VerifyBindingWithLive(ctx context.Context, home string, b config.Binding, c
 func VerifyBindingWithLiveAt(ctx context.Context, home string, b config.Binding, client *http.Client, runtimeURL string) VerifyResult {
 	return verifyBindingWithNative(ctx, home, b, client, runtimeURL, nativeCatalog)
 }
+
+// Reuse the exact selected-profile adapter already admitted by the reconciler.
+func VerifyBindingWithOpenClawAdapter(ctx context.Context, home string, b config.Binding, client *http.Client, adapter runtime.OpenClawAdapter) VerifyResult {
+	adapter.ReadinessSession = b.OpenClawReadinessSession
+	return verifyBindingWithNative(ctx, home, b, client, adapter.GatewayURL, func(ctx context.Context, _ config.Binding, _ string) (bool, string) {
+		result := adapter.VerifyMCPCatalog(ctx, b.NativeMCPServer)
+		return result.OK, result.Note
+	})
+}
 func verifyBindingWithNative(ctx context.Context, home string, b config.Binding, client *http.Client, runtimeURL string, native func(context.Context, config.Binding, string) (bool, string)) VerifyResult {
 	r := VerifyBinding(home, b)
 	if r.State != runtime.AdapterStateMCPRestartRequired {
@@ -403,6 +420,11 @@ func nativeCatalog(ctx context.Context, b config.Binding, runtimeURL string) (bo
 		adapter := runtime.NewOpenClawAdapterWithAuth(runtimeURL, auth.Auth, b.OpenClawAgentID)
 		adapter.StateRoot = b.NativeStateRoot
 		adapter.ConfigPath = b.NativeConfigPath
+		adapter.SessionOwner = b.Key().String()
+		adapter.NativeMCPServer = b.NativeMCPServer
+		adapter.NativeMCPNamespace = b.NativeMCPNamespace
+		adapter.ReadinessSession = b.OpenClawReadinessSession
+		adapter.MCPAppsEnabled = func() (bool, error) { return OpenClawAppsEnabled(b.NativeConfigPath) }
 		native := adapter.VerifyMCPCatalog(ctx, b.NativeMCPServer)
 		return native.OK, native.Note
 	}

@@ -12,6 +12,7 @@ import (
 	"github.com/personastack/agent-gateway/pkg/externalagentprotocol"
 	"github.com/personastack/macos/agent-bridge/internal/config"
 	"github.com/personastack/macos/agent-bridge/internal/hermessetup"
+	"github.com/personastack/macos/agent-bridge/internal/mcp"
 	"github.com/personastack/macos/agent-bridge/internal/openclawsetup"
 	"github.com/personastack/macos/agent-bridge/internal/runtime"
 	"github.com/personastack/macos/agent-bridge/internal/targetinventory"
@@ -154,6 +155,9 @@ func (reconciler *sessionReconciler) setTarget(target *externalagentprotocol.Run
 		if target.SelectionRevision < latest.TargetSelectionRevision {
 			return fmt.Errorf("scope_changed: stale target selection")
 		}
+		if latest.TargetSelectionRevision != target.SelectionRevision {
+			latest.OpenClawSetupPending = false
+		}
 		latest.TargetSelectionRevision = target.SelectionRevision
 		latest.ReadinessState = runtime.AdapterStateRuntimeMissing
 		latest.ReadinessDiagnosticCode = "runtime_missing"
@@ -213,6 +217,7 @@ func (reconciler *sessionReconciler) clearTarget(revision int64, targetEpoch ...
 		if latest.ConnectionGeneration == reconciler.binding.ConnectionGeneration {
 			latest.ReadinessState = runtime.AdapterStateTargetSelectionRequired
 			latest.TargetSelectionRevision = 0
+			latest.OpenClawSetupPending = false
 		}
 		return nil
 	})
@@ -355,6 +360,15 @@ func (r Runner) reconcileTarget(ctx context.Context, binding config.Binding, sna
 	if !owned && !binding.RuntimeLaunchAllowed {
 		return reconcileResult{Adapter: adapter, Resolved: resolved}, fmt.Errorf("runtime_conflict: selected gateway is not running; native consent required")
 	}
+	if binding.RuntimeKind == runtime.AdapterKindOpenClaw {
+		enabled, err := mcp.OpenClawAppsEnabled(binding.NativeConfigPath)
+		if err != nil {
+			return reconcileResult{}, err
+		}
+		if !enabled {
+			return reconcileResult{Adapter: adapter, Resolved: resolved, RuntimeURL: runtimeURL, Detection: runtime.Detection{Kind: binding.RuntimeKind, State: runtime.AdapterStateCapabilityMissing, DiagnosticCode: "mcp_apps_disabled", Note: "Enable MCP Apps for this OpenClaw profile to verify its PersonaStack tools."}}, nil
+		}
+	}
 	detection := safeDetection(runtime.DetectContext(ctx, adapter))
 	if detection.State == runtime.AdapterStateRuntimeMissing || detection.State == runtime.AdapterStateRuntimeStopped {
 		if startErr := r.startTargetRuntime(ctx, binding, snapshot.Target, resolved, runtimeURL); startErr != nil {
@@ -372,8 +386,56 @@ func (r Runner) reconcileTarget(ctx context.Context, binding config.Binding, sna
 		}
 		result.MCPApplied = true
 	}
+	if selected, ok := adapter.(runtime.OpenClawAdapter); ok {
+		selected, err = r.completeOpenClawSetup(ctx, binding, selected)
+		if err != nil {
+			return result, err
+		}
+		adapter = selected
+		result.Adapter = selected
+	}
 	result.Detection = safeDetection(r.bindingReadinessAtHomeContext(ctx, adapter, binding, resolved.HomeDir, resolved.HermesHome, runtimeURL))
 	return result, nil
+}
+
+// Finish only the no-model setup admitted by an explicit, guarded native Repair.
+func (r Runner) completeOpenClawSetup(ctx context.Context, reference config.Binding, adapter runtime.OpenClawAdapter) (runtime.OpenClawAdapter, error) {
+	latest, ok := config.BindingFor(r.Store, reference)
+	if !ok || latest.ConnectionGeneration != reference.ConnectionGeneration || latest.TargetSelectionRevision != reference.TargetSelectionRevision {
+		return adapter, fmt.Errorf("scope_changed: OpenClaw setup owner changed")
+	}
+	adapter.ReadinessSession = latest.OpenClawReadinessSession
+	if !latest.OpenClawSetupPending {
+		return adapter, nil
+	}
+	if latest.Quiesced || latest.ActiveRunID != "" || !latest.RuntimeLaunchAllowed {
+		return adapter, fmt.Errorf("busy: OpenClaw native setup admission changed")
+	}
+	adapter.NativeMCPServer = latest.NativeMCPServer
+	adapter.NativeMCPNamespace = latest.NativeMCPNamespace
+	identity, err := adapter.PrepareOwnedMCPSession(ctx, "setup", "")
+	if err != nil {
+		return adapter, err
+	}
+	err = config.UpdateBinding(r.Store, reference, func(current *config.Binding) error {
+		if current.ConnectionGeneration != latest.ConnectionGeneration || current.TargetSelectionRevision != latest.TargetSelectionRevision || current.OpenClawAgentID != latest.OpenClawAgentID || current.NativeConfigPath != latest.NativeConfigPath || current.NativeStateRoot != latest.NativeStateRoot || current.PersonaMCPToken != latest.PersonaMCPToken || current.NativeMCPNamespace != latest.NativeMCPNamespace || current.NativeMCPServer != latest.NativeMCPServer || !current.OpenClawSetupPending {
+			return fmt.Errorf("scope_changed: OpenClaw setup owner changed during verification")
+		}
+		if current.Quiesced || current.ActiveRunID != "" || !current.RuntimeLaunchAllowed {
+			return fmt.Errorf("busy: OpenClaw setup admission changed during verification")
+		}
+		enabled, err := mcp.OpenClawAppsEnabled(current.NativeConfigPath)
+		if err != nil || !enabled {
+			return fmt.Errorf("mcp_apps_disabled: profile capability changed during setup")
+		}
+		current.OpenClawReadinessSession = identity
+		current.OpenClawSetupPending = false
+		return nil
+	})
+	if err == nil {
+		adapter.ReadinessSession = identity
+	}
+	return adapter, err
 }
 
 func (r Runner) startTargetRuntime(ctx context.Context, binding config.Binding, target *externalagentprotocol.RuntimeTarget, resolved targetinventory.ResolvedTarget, runtimeURL string) error {

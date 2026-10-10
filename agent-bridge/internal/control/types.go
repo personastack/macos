@@ -112,9 +112,12 @@ type BindingPayload struct {
 	BindingKey *config.BindingKey `json:"binding_key,omitempty"`
 }
 type RepairPayload struct {
-	BindingKey       config.BindingKey `json:"binding_key"`
-	PreparationID    string            `json:"preparation_id,omitempty"`
-	RestartConfirmed bool              `json:"restart_confirmed"`
+	BindingKey              config.BindingKey `json:"binding_key"`
+	ConnectionGeneration    int64             `json:"connection_generation"`
+	TargetSelectionRevision int64             `json:"target_selection_revision"`
+	PreparationID           string            `json:"preparation_id,omitempty"`
+	RestartConfirmed        bool              `json:"restart_confirmed"`
+	OpenClawAppsConfirmed   bool              `json:"openclaw_apps_confirmed"`
 }
 type RevocationReadback struct {
 	EnvironmentID        string              `json:"environment_id"`

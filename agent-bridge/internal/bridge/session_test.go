@@ -179,6 +179,36 @@ func TestHeartbeatFrameReportsDiagnosticCode(t *testing.T) {
 	}
 }
 
+func TestDesktopAgentBridgeHeartbeatPrivateDiagnosticBoundary(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		code  string
+		state runtime.AdapterState
+		want  string
+	}{
+		{"mcp_apps_disabled", runtime.AdapterStateCapabilityMissing, "capability_missing"},
+		{"runtime_unsupported", runtime.AdapterStateCapabilityMissing, "capability_missing"},
+		{"runtime_conflict", runtime.AdapterStateRuntimeStopped, "runtime_stopped"},
+		{"reconnect_required", runtime.AdapterStateAuthMissing, "auth_missing"},
+		{"credential_unavailable", runtime.AdapterStateAuthMissing, "auth_missing"},
+		{"unknown private failure", runtime.AdapterStateReady, "runtime_error"},
+		{"mcp_apps_disabled", runtime.AdapterStateMCPVerified, "runtime_error"},
+		{"mcp_config_parse_error", runtime.AdapterStateMCPConfigMissing, "mcp_config_parse_error"},
+		{"", runtime.AdapterStateReady, ""},
+	} {
+		t.Run(test.code+test.want, func(t *testing.T) {
+			t.Parallel()
+			frame := (Session{}).HeartbeatFrameWithDetection(runtime.Detection{State: test.state, DiagnosticCode: test.code}, nil)
+			if string(frame.Heartbeat.DiagnosticCode) != test.want {
+				t.Fatalf("private diagnostic leaked or failure erased: %+v", frame.Heartbeat)
+			}
+			if test.want != "" && (test.state == runtime.AdapterStateReady || test.state == runtime.AdapterStateMCPVerified) && frame.Heartbeat.ReadinessStatus == externalagentprotocol.ReadinessStatusWakeable {
+				t.Fatal("private failure granted wakeable readiness")
+			}
+		})
+	}
+}
+
 func TestHeartbeatAndWakeProbeCarryTargetFence(t *testing.T) {
 	t.Parallel()
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)

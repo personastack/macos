@@ -51,52 +51,54 @@ type Binding struct {
 	PersonaMCPSecretUnavailable bool `json:"-"`
 	ReadinessDiagnosticCode     string
 
-	Migration               *MigrationCapture `json:",omitempty"`
-	EnvironmentID           string
-	WorkspaceID             string
-	ProfileCandidateID      string
-	AccountCandidateID      string
-	TargetSelectionRevision int64
-	InventorySeed           string `json:"-"`
-	PhysicalProfileID       string
-	NativeStateRoot         string
-	NativeConfigPath        string
-	NativeProfileName       string
-	RuntimeURL              string
-	RuntimeLaunchAllowed    bool
-	MCPOwnership            MCPOwnership
-	Quiesced                bool
-	ConnectionID            ConnectionID
-	PersonaID               PersonaID
-	ExternalAgentKind       ExternalAgentKind
-	ConnectionGeneration    int64
-	GatewayWebsocketURL     string
-	BridgeCredentialID      string
-	BridgePrivateKey        string
-	BridgePublicKey         string
-	NativeMCPServer         string
-	NativeMCPNamespace      string
-	HermesHome              string
-	OpenClawAgentID         string
-	OpenClawGatewayToken    string
-	OpenClawPassword        string
-	OpenClawDeviceToken     string
-	PersonaMCPURL           string
-	PersonaMCPToken         string
-	ActiveRunID             string
-	ActiveAssignmentID      string
-	ActiveNativeRunID       string
-	ActiveRunDeadlineAt     time.Time
-	LastHeartbeatAt         time.Time
-	LastWakeProbeAt         time.Time
-	LastWakeProbeGeneration int64
-	RuntimeKind             runtime.AdapterKind
-	ReadinessState          runtime.AdapterState
-	HasBridgeSecret         bool
-	HasOpenClawToken        bool
-	HasOpenClawPassword     bool
-	HasOpenClawDevice       bool
-	HasPersonaMCPToken      bool
+	Migration                *MigrationCapture `json:",omitempty"`
+	EnvironmentID            string
+	WorkspaceID              string
+	ProfileCandidateID       string
+	AccountCandidateID       string
+	TargetSelectionRevision  int64
+	InventorySeed            string `json:"-"`
+	PhysicalProfileID        string
+	NativeStateRoot          string
+	NativeConfigPath         string
+	NativeProfileName        string
+	RuntimeURL               string
+	RuntimeLaunchAllowed     bool
+	MCPOwnership             MCPOwnership
+	Quiesced                 bool
+	ConnectionID             ConnectionID
+	PersonaID                PersonaID
+	ExternalAgentKind        ExternalAgentKind
+	ConnectionGeneration     int64
+	GatewayWebsocketURL      string
+	BridgeCredentialID       string
+	BridgePrivateKey         string
+	BridgePublicKey          string
+	NativeMCPServer          string
+	NativeMCPNamespace       string
+	HermesHome               string
+	OpenClawAgentID          string
+	OpenClawReadinessSession runtime.OpenClawSessionIdentity
+	OpenClawSetupPending     bool
+	OpenClawGatewayToken     string
+	OpenClawPassword         string
+	OpenClawDeviceToken      string
+	PersonaMCPURL            string
+	PersonaMCPToken          string
+	ActiveRunID              string
+	ActiveAssignmentID       string
+	ActiveNativeRunID        string
+	ActiveRunDeadlineAt      time.Time
+	LastHeartbeatAt          time.Time
+	LastWakeProbeAt          time.Time
+	LastWakeProbeGeneration  int64
+	RuntimeKind              runtime.AdapterKind
+	ReadinessState           runtime.AdapterState
+	HasBridgeSecret          bool
+	HasOpenClawToken         bool
+	HasOpenClawPassword      bool
+	HasOpenClawDevice        bool
+	HasPersonaMCPToken       bool
 }
 
 type MCPOwnership struct {

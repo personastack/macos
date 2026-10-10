@@ -32,7 +32,7 @@ func (r Runner) CheckBinding(ctx context.Context, b config.Binding) (runtime.Det
 	if config.PersonaMCPReconnectRequired(latest) {
 		return runtime.Detection{Kind: b.RuntimeKind, State: runtime.AdapterStateAuthMissing, DiagnosticCode: "reconnect_required", Note: "Disconnect and reconnect to renew PersonaStack MCP authorization."}, nil
 	}
-	if required, err := r.checkPersonaMCPCredential(ctx, latest); err != nil {
+	if required, err := r.checkPersonaMCPCredentialUnlessOpenClaw(ctx, latest); err != nil {
 		return runtime.Detection{}, err
 	} else if required {
 		return runtime.Detection{Kind: b.RuntimeKind, State: runtime.AdapterStateAuthMissing, DiagnosticCode: "reconnect_required", Note: "Disconnect and reconnect to renew PersonaStack MCP authorization."}, nil
@@ -50,17 +50,29 @@ func (r Runner) CheckBinding(ctx context.Context, b config.Binding) (runtime.Det
 		return runtime.Detection{}, err
 	}
 	owned, err := r.verifyRuntimeEndpoint(ctx, endpoint, resolved, b.RuntimeKind)
-	if err != nil || !owned {
+	if err != nil {
 		return runtime.Detection{Kind: b.RuntimeKind, State: runtime.AdapterStateRuntimeStopped}, err
+	}
+	if b.RuntimeKind == runtime.AdapterKindOpenClaw {
+		enabled, err := mcp.OpenClawAppsEnabled(b.NativeConfigPath)
+		if err != nil {
+			return runtime.Detection{}, err
+		}
+		if !enabled {
+			return runtime.Detection{Kind: b.RuntimeKind, State: runtime.AdapterStateCapabilityMissing, DiagnosticCode: "mcp_apps_disabled", Note: "Enable MCP Apps for this OpenClaw profile to verify its PersonaStack tools."}, nil
+		}
+	}
+	if !owned {
+		return runtime.Detection{Kind: b.RuntimeKind, State: runtime.AdapterStateRuntimeStopped}, nil
 	}
 	return r.bindingReadinessAtHomeContext(ctx, adapter, b, resolved.HomeDir, resolved.HermesHome, endpoint), nil
 }
-func (r Runner) RepairBinding(ctx context.Context, b config.Binding, restartConfirmed bool) error {
+func (r Runner) RepairBinding(ctx context.Context, b config.Binding, restartConfirmed, openClawAppsConfirmed bool) error {
 	if !restartConfirmed {
 		return fmt.Errorf("runtime_conflict: native consent required before profile repair")
 	}
 	latest, ok := config.BindingFor(r.Store, b)
-	if !ok || latest.ConnectionGeneration != b.ConnectionGeneration {
+	if !ok || latest.ConnectionGeneration != b.ConnectionGeneration || latest.TargetSelectionRevision != b.TargetSelectionRevision {
 		return fmt.Errorf("scope_changed: binding changed")
 	}
 	if latest.TargetSelectionRevision <= 0 {
@@ -75,7 +87,16 @@ func (r Runner) RepairBinding(ctx context.Context, b config.Binding, restartConf
 	if config.PersonaMCPReconnectRequired(latest) {
 		return fmt.Errorf("reconnect_required: Disconnect and reconnect to renew PersonaStack MCP authorization")
 	}
-	if required, err := r.checkPersonaMCPCredential(ctx, latest); err != nil {
+	if latest.RuntimeKind == runtime.AdapterKindOpenClaw {
+		enabled, err := mcp.OpenClawAppsEnabled(latest.NativeConfigPath)
+		if err != nil {
+			return err
+		}
+		if !enabled && !openClawAppsConfirmed {
+			return fmt.Errorf("mcp_apps_disabled: explicit native MCP Apps consent required")
+		}
+	}
+	if required, err := r.checkPersonaMCPCredentialUnlessOpenClaw(ctx, latest); err != nil {
 		return err
 	} else if required {
 		return fmt.Errorf("reconnect_required: Disconnect and reconnect to renew PersonaStack MCP authorization")
@@ -97,12 +118,23 @@ func (r Runner) RepairBinding(ctx context.Context, b config.Binding, restartConf
 				return err
 			}
 		}
-		if _, err := mcp.ConfigureBinding(current, true); err != nil {
+		if _, err := mcp.ConfigureBinding(current, true, openClawAppsConfirmed); err != nil {
 			return err
 		}
 		current.RuntimeLaunchAllowed = restartConfirmed
+		if current.RuntimeKind == runtime.AdapterKindOpenClaw {
+			current.OpenClawSetupPending = true
+			current.OpenClawReadinessSession = runtime.OpenClawSessionIdentity{}
+		}
 		return nil
 	})
+}
+
+func (r Runner) checkPersonaMCPCredentialUnlessOpenClaw(ctx context.Context, b config.Binding) (bool, error) {
+	if b.RuntimeKind == runtime.AdapterKindOpenClaw {
+		return false, nil
+	}
+	return r.checkPersonaMCPCredential(ctx, b)
 }
 
 // Canonical refresh metadata is authority from the authenticated gateway session.
