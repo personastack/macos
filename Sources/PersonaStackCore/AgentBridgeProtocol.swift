@@ -29,15 +29,23 @@ public struct AgentBridgeBindingKey: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey { case environmentID = "environment_id", connectionID = "connection_id" }
 }
 
+public struct AgentBridgeNativeAgent: Codable, Sendable {
+    public let agentCandidateID: String
+    public let label: String
+    enum CodingKeys: String, CodingKey { case agentCandidateID = "agent_candidate_id", label }
+}
 public struct AgentBridgeProfile: Codable, Sendable {
     public let profileCandidateID: String
     public let accountCandidateID: String
     public let label: String
     public let runtimeKind: AgentBridgeRuntime
     public let conflictCode: String?
+    public let openClawAgents: [AgentBridgeNativeAgent]?
+    public let selectedAgentCandidateID: String?
     enum CodingKeys: String, CodingKey {
         case profileCandidateID = "profile_candidate_id", accountCandidateID = "account_candidate_id", label
         case runtimeKind = "runtime_kind", conflictCode = "conflict_code"
+        case openClawAgents = "openclaw_agents", selectedAgentCandidateID = "selected_agent_candidate_id"
     }
 }
 

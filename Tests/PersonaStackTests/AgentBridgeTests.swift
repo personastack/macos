@@ -8,13 +8,18 @@ import WebKit
 private actor AgentBridgeFixtureTransport: AgentBridgeControlTransport {
     private var expected: [(String, String)]
     private let selectedTarget: AgentBridgeTargetFixture?
+    private let expectedAgentChoice: String?
     private(set) var operations: [String] = []
-    init(_ expected: [(String, String)], selectedTarget: AgentBridgeTargetFixture? = nil) { self.expected = expected; self.selectedTarget = selectedTarget }
+    init(_ expected: [(String, String)], selectedTarget: AgentBridgeTargetFixture? = nil, agentChoice: String? = nil) { self.expected = expected; self.selectedTarget = selectedTarget; self.expectedAgentChoice = agentChoice }
     func exchange(_ request: Data) async throws -> Data {
         let object = try #require(JSONSerialization.jsonObject(with: request) as? [String: Any])
         #expect(object["version"] as? Int == 1)
         let operation = try #require(object["operation"] as? String)
         operations.append(operation)
+        if operation == "prepare", let expectedAgentChoice {
+            let payload = try #require(object["payload"] as? [String: Any])
+            #expect(payload["openclaw_agent_candidate_id"] as? String == expectedAgentChoice)
+        }
         if operation == "check", let selectedTarget { #expect(await selectedTarget.isSelected()) }
         guard !expected.isEmpty else { throw AgentBridgeFailure.invalidRequest }
         let next = expected.removeFirst()
@@ -193,26 +198,28 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
         await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(discover, view: first) }
     }
 
-    @Test(arguments: [false, true]) @MainActor func registeredDocumentDiscoveryPreparationAndEnrollmentAreOrderedAndRedacted(_ staleInventory: Bool) async throws {
+    @Test(arguments: [false, true], ["hermes", "openclaw"]) @MainActor func registeredDocumentDiscoveryPreparationAndEnrollmentAreOrderedAndRedacted(_ staleInventory: Bool, _ runtimeKind: String) async throws {
         let id = UUID()
         let key = Data(repeating: 1, count: 32).base64EncodedString()
         let prepared = "{\"preparation_id\":\"\(id.uuidString)\",\"device_public_key\":\"\(key)\",\"profile_candidate_id\":\"rt_profile_a\",\"expires_at\":\"2026-10-10T12:00:00Z\"}"
         let targetFixture = AgentBridgeTargetFixture()
-        await targetFixture.configure(pending: true, stale: staleInventory)
+        await targetFixture.configure(pending: true, stale: staleInventory, runtime: runtimeKind)
+        let discoveryJSON = "{\"profiles\":[{\"profile_candidate_id\":\"rt_profile_a\",\"account_candidate_id\":\"rt_account_a\",\"label\":\"Default profile\",\"runtime_kind\":\"\(runtimeKind)\",\"openclaw_agents\":[{\"agent_candidate_id\":\"rt_agent_a\",\"label\":\"Research\"},{\"agent_candidate_id\":\"rt_agent_b\",\"label\":\"Writer\"}]}],\"discovery_status\":\"complete\"}"
+        let readinessJSON = "{\"connections\":[{\"binding_key\":{\"environment_id\":\"https://my.personastack.ai\",\"connection_id\":\"conn-a\"},\"persona_id\":\"persona-a\",\"runtime_kind\":\"\(runtimeKind)\",\"readiness_state\":\"mcp_verified\"}]}"
         let transport = AgentBridgeFixtureTransport([
             ("status", #"{"connections":[]}"#),
-            ("discover", #"{"profiles":[{"profile_candidate_id":"rt_profile_a","account_candidate_id":"rt_account_a","label":"Default profile","runtime_kind":"hermes"}],"discovery_status":"complete"}"#),
+            ("discover", discoveryJSON),
             ("status", #"{"connections":[]}"#), ("prepare", prepared),
             ("enroll", #"{"binding_key":{"environment_id":"https://my.personastack.ai","connection_id":"conn-a"},"persona_id":"persona-a"}"#),
-            ("check", #"{"connections":[{"binding_key":{"environment_id":"https://my.personastack.ai","connection_id":"conn-a"},"persona_id":"persona-a","runtime_kind":"hermes","readiness_state":"mcp_verified"}]}"#),
-            ("check", #"{"connections":[{"binding_key":{"environment_id":"https://my.personastack.ai","connection_id":"conn-a"},"persona_id":"persona-a","runtime_kind":"hermes","readiness_state":"mcp_verified"}]}"#)
-        ], selectedTarget: targetFixture)
+            ("check", readinessJSON),
+            ("check", readinessJSON)
+        ], selectedTarget: targetFixture, agentChoice: runtimeKind == "openclaw" ? "rt_agent_b" : nil)
         let client = AgentBridgeControlClient(transport: transport)
         let registration = AgentBridgeFixtureRegistration()
         let service = AgentBridgeService(registration: registration, client: client, preferences: UserDefaults(suiteName: "AgentBridgeTests." + UUID().uuidString)!, requireSignature: {}, clearDisabledPreference: {})
         let manager = AgentBridgeSetupManager(service: service, client: client, hosted: AgentBridgeHostedAuthority(transport: targetFixture), configuration: { _ in .production },
             approveEnvironment: { _ in }, prepareBackgroundEnable: {}, cookieReader: { _, _ in "personastack_session=fixture" },
-            waitForSettlement: {}, csrfReader: { _ in "csrf-fixture" })
+            chooseOpenClawAgent: { _, _ in "rt_agent_b" }, waitForSettlement: {}, csrfReader: { _ in "csrf-fixture" })
         let view = WKWebView()
         manager.register(view, appURL: DesktopEnvironmentConfiguration.production.appURL)
         func command(_ action: String, scope: String = "", fields: [String: Any] = [:]) throws -> AgentBridgePageCommand {
@@ -221,9 +228,10 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
         }
         let state = try await manager.apply(command("state"), view: view)
         let scope = try #require(state["scope"] as? String)
-        let discovered = try await manager.apply(command("discover", scope: scope, fields: ["runtime_kind": "hermes"]), view: view)
+        let discovered = try await manager.apply(command("discover", scope: scope, fields: ["runtime_kind": runtimeKind]), view: view)
         #expect((discovered["profiles"] as? [[String: Any]])?.count == 1)
-        let preparedResponse = try await manager.apply(command("prepare", scope: scope, fields: ["runtime_kind": "hermes",
+        #expect((discovered["profiles"] as? [[String: Any]])?.first?["openclaw_agents"] == nil)
+        let preparedResponse = try await manager.apply(command("prepare", scope: scope, fields: ["runtime_kind": runtimeKind,
             "persona_id": "persona-a", "workspace_id": "ws_11111111111111111111111111111111", "profile_candidate_id": "rt_profile_a"]), view: view)
         #expect((preparedResponse["desktop_preparation"] as? [String: String])?["device_public_key"] == key)
         let enroll = try command("enroll", scope: scope, fields: ["preparation_id": id.uuidString, "code": "fixture-one-use-proof"])
@@ -238,4 +246,29 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
         #expect(await targetFixture.saves == (staleInventory ? [7, 8] : [7]))
         #expect(registration.calls == ["register"])
     }
+    @Test(arguments: [false, true]) @MainActor func nativeAgentPickerCancelOrDocumentChangeNeverPrepares(_ changedDocument: Bool) async throws {
+        let transport = AgentBridgeFixtureTransport([
+            ("status", #"{"connections":[]}"#),
+            ("discover", #"{"profiles":[{"profile_candidate_id":"rt_profile_a","account_candidate_id":"rt_account_a","label":"Work","runtime_kind":"openclaw","openclaw_agents":[{"agent_candidate_id":"rt_a","label":"Research"},{"agent_candidate_id":"rt_b","label":"Writer"}]}],"discovery_status":"complete"}"#),
+            ("status", #"{"connections":[]}"#)
+        ])
+        let client = AgentBridgeControlClient(transport: transport)
+        let service = AgentBridgeService(registration: AgentBridgeFixtureRegistration(), client: client,
+            preferences: UserDefaults(suiteName: "AgentBridgeTests." + UUID().uuidString)!, requireSignature: {}, clearDisabledPreference: {})
+        let view = WKWebView()
+        var manager: AgentBridgeSetupManager!
+        manager = AgentBridgeSetupManager(service: service, client: client, configuration: { _ in .production },
+            approveEnvironment: { _ in }, prepareBackgroundEnable: {}, cookieReader: { _, _ in "personastack_session=fixture" },
+            chooseOpenClawAgent: { _, _ in if changedDocument { manager.invalidate(view); return "rt_b" }; return nil })
+        manager.register(view, appURL: DesktopEnvironmentConfiguration.production.appURL)
+        let state = try await manager.apply(AgentBridgePageCommand.parse(["version": "1", "action": "state", "scope": ""]), view: view)
+        let scope = try #require(state["scope"] as? String)
+        _ = try await manager.apply(AgentBridgePageCommand.parse(["version": "1", "action": "discover", "scope": scope, "runtime_kind": "openclaw"]), view: view)
+        let command = try AgentBridgePageCommand.parse(["version": "1", "action": "prepare", "scope": scope, "runtime_kind": "openclaw",
+            "persona_id": "persona-a", "workspace_id": "ws_11111111111111111111111111111111", "profile_candidate_id": "rt_profile_a"])
+        let expected: AgentBridgeFailure = changedDocument ? .scopeChanged : .runtimeConflict
+        await #expect(throws: expected) { _ = try await manager.apply(command, view: view) }
+        #expect(await transport.operations == ["status", "discover", "status"])
+    }
+
 }

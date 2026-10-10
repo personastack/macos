@@ -7,6 +7,7 @@ import (
 	"github.com/personastack/agent-gateway/pkg/externalagentprotocol"
 	"github.com/personastack/macos/agent-bridge/internal/config"
 	"github.com/personastack/macos/agent-bridge/internal/mcp"
+	"github.com/personastack/macos/agent-bridge/internal/targetinventory"
 	"os"
 	"path/filepath"
 	"time"
@@ -36,7 +37,11 @@ func (c *Controller) prepareMigration(p MigrationPreparePayload) (Result, error)
 	var selectedPath string
 	for _, profile := range profiles {
 		if profile.CandidateID == p.ProfileCandidateID {
-			selectedPath = profile.Resolved.ConfigPath
+			chosen, choiceError := targetinventory.SelectOpenClawAgent(profile, p.OpenClawAgentCandidateID)
+			if choiceError != nil {
+				return Result{}, issue("scope_changed", "Selected native dispatch agent changed.")
+			}
+			selectedPath = chosen.Resolved.ConfigPath
 		}
 	}
 	if selectedPath == "" {
@@ -216,7 +221,7 @@ func (c *Controller) repairMigration(p MigrationRepairPayload) (Result, error) {
 	id := ""
 	for candidate, migration := range c.migrations {
 		scope := migration.Scope
-		if scope.EnvironmentID == p.EnvironmentID && scope.WorkspaceID == p.WorkspaceID && scope.PersonaID == p.PersonaID && scope.RuntimeKind == p.RuntimeKind && scope.ProfileCandidateID == p.ProfileCandidateID && c.now().Before(migration.ExpiresAt) {
+		if scope.EnvironmentID == p.EnvironmentID && scope.WorkspaceID == p.WorkspaceID && scope.PersonaID == p.PersonaID && scope.RuntimeKind == p.RuntimeKind && scope.ProfileCandidateID == p.ProfileCandidateID && scope.OpenClawAgentCandidateID == p.OpenClawAgentCandidateID && c.now().Before(migration.ExpiresAt) {
 			if id != "" {
 				return Result{}, issue("scope_changed", "Multiple migration captures require a fresh check.")
 			}

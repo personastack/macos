@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/user"
@@ -27,6 +28,8 @@ type Profile struct {
 	CandidateID, AccountCandidateID, Label string
 	Kind                                   connectorruntime.AdapterKind
 	Resolved                               ResolvedTarget
+	OpenClawAgents                         []OpenClawAgent
+	ConflictCode                           string
 }
 
 func CanonicalPath(path string) (string, error) {
@@ -106,7 +109,7 @@ func DiscoverAt(home, username string, uid, gid int, kind connectorruntime.Adapt
 	profiles := []Profile{}
 	for _, pair := range paths {
 		root, err := CanonicalPath(pair[1])
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
 		if err != nil {
@@ -131,14 +134,20 @@ func DiscoverAt(home, username string, uid, gid int, kind connectorruntime.Adapt
 		resolved := ResolvedTarget{Username: username, HomeDir: home, UID: uid, GID: gid, StateRoot: root, ConfigPath: filepath.Join(pair[1], configName), ProfileName: pair[0], PhysicalID: physical}
 		if kind == connectorruntime.AdapterKindHermes {
 			resolved.HermesHome = root
-		} else {
-			resolved.OpenClawAgentID = "main"
 		}
 		label := pair[0]
 		if label == "default" {
 			label = "Default"
 		}
-		profiles = append(profiles, Profile{CandidateID: physical, AccountCandidateID: opaqueID(seed, "account", strconv.Itoa(uid)), Label: label, Kind: kind, Resolved: resolved})
+		profile := Profile{CandidateID: physical, AccountCandidateID: opaqueID(seed, "account", strconv.Itoa(uid)), Label: label, Kind: kind, Resolved: resolved}
+		if kind == connectorruntime.AdapterKindOpenClaw {
+			profile.OpenClawAgents, err = openClawAgents(configPath, physical, seed)
+			if err != nil {
+				warnings = append(warnings, err)
+				profile.ConflictCode = "native_config_unsupported"
+			}
+		}
+		profiles = append(profiles, profile)
 	}
 	sort.Slice(profiles, func(i, j int) bool { return profiles[i].Label < profiles[j].Label })
 	return profiles, warnings
@@ -171,13 +180,29 @@ func Resolve(kind connectorruntime.AdapterKind, target *externalagentprotocol.Ru
 		seed = seeds[0]
 	}
 	profiles, _ := Profiles(kind, seed)
+	selected := ""
+	if len(seeds) > 1 {
+		selected = seeds[1]
+	}
+	return ResolveProfiles(kind, target, profiles, selected)
+}
+
+// ResolveProfiles shares native profile authority with injected in-process fixtures.
+func ResolveProfiles(kind connectorruntime.AdapterKind, target *externalagentprotocol.RuntimeTarget, profiles []Profile, selected string) (ResolvedTarget, error) {
+	if target == nil || target.RuntimeKind != protocolRuntimeKind(kind) {
+		return ResolvedTarget{}, fmt.Errorf("runtime target required")
+	}
 	for _, p := range profiles {
-		if p.CandidateID == target.ProfileCandidateID && p.AccountCandidateID == target.AccountCandidateID {
+		if p.Kind == kind && p.CandidateID == target.ProfileCandidateID && p.AccountCandidateID == target.AccountCandidateID {
+			if kind == connectorruntime.AdapterKindOpenClaw {
+				return selectStoredOpenClawAgent(p, selected)
+			}
 			return p.Resolved, nil
 		}
 	}
 	return ResolvedTarget{}, fmt.Errorf("selected runtime profile no longer available")
 }
+
 func opaqueID(seed string, parts ...string) string {
 	mac := hmac.New(sha256.New, []byte(seed))
 	_, _ = mac.Write([]byte(strings.Join(parts, "\x00")))

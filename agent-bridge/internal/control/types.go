@@ -29,12 +29,18 @@ type Error struct {
 
 func (e *Error) Error() string { return e.Code + ": " + e.Message }
 
+type NativeOpenClawAgent struct {
+	AgentCandidateID string `json:"agent_candidate_id"`
+	Label            string `json:"label"`
+}
 type Profile struct {
-	ProfileCandidateID string `json:"profile_candidate_id"`
-	AccountCandidateID string `json:"account_candidate_id"`
-	Label              string `json:"label"`
-	RuntimeKind        string `json:"runtime_kind"`
-	ConflictCode       string `json:"conflict_code,omitempty"`
+	OpenClawAgents           []NativeOpenClawAgent `json:"openclaw_agents,omitempty"`
+	SelectedAgentCandidateID string                `json:"selected_agent_candidate_id,omitempty"`
+	ProfileCandidateID       string                `json:"profile_candidate_id"`
+	AccountCandidateID       string                `json:"account_candidate_id"`
+	Label                    string                `json:"label"`
+	RuntimeKind              string                `json:"runtime_kind"`
+	ConflictCode             string                `json:"conflict_code,omitempty"`
 }
 type Connection struct {
 	BindingKey        config.BindingKey `json:"binding_key"`
@@ -78,12 +84,13 @@ type DiscoverPayload struct {
 	RuntimeKind   string `json:"runtime_kind"`
 }
 type PreparePayload struct {
-	EnvironmentID      string `json:"environment_id"`
-	WorkspaceID        string `json:"workspace_id"`
-	PersonaID          string `json:"persona_id"`
-	RuntimeKind        string `json:"runtime_kind"`
-	ProfileCandidateID string `json:"profile_candidate_id"`
-	DocumentID         string `json:"document_id"`
+	OpenClawAgentCandidateID string `json:"openclaw_agent_candidate_id,omitempty"`
+	EnvironmentID            string `json:"environment_id"`
+	WorkspaceID              string `json:"workspace_id"`
+	PersonaID                string `json:"persona_id"`
+	RuntimeKind              string `json:"runtime_kind"`
+	ProfileCandidateID       string `json:"profile_candidate_id"`
+	DocumentID               string `json:"document_id"`
 }
 type EnrollPayload struct {
 	MigrationID   string `json:"migration_id,omitempty"`

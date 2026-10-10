@@ -32,6 +32,7 @@ func fixture(t *testing.T) (*Controller, *config.MemoryStore, []targetinventory.
 		label := []string{"one", "two", "three"}[i]
 		profiles = append(profiles, targetinventory.Profile{CandidateID: "rt_" + label, AccountCandidateID: "rt_account", Label: label, Kind: k, Resolved: targetinventory.ResolvedTarget{StateRoot: "/fixture/" + label, ConfigPath: "/fixture/" + label + "/config", PhysicalID: "physical_" + label}})
 	}
+	profiles[2].OpenClawAgents = []targetinventory.OpenClawAgent{{CandidateID: "rt_agent", ID: "research", Label: "Research"}}
 	c := &Controller{Store: &store, Seed: "seed", Now: func() time.Time { return time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC) }, Environments: func() ([]Environment, error) {
 		return []Environment{{EnvironmentID: "https://app.test", GatewayBaseURL: "https://gateway.test"}}, nil
 	}, Discover: func(k runtime.AdapterKind, seed string) ([]targetinventory.Profile, []error) {

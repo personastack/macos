@@ -253,14 +253,29 @@ func (c *Controller) discover(p DiscoverPayload) (Result, error) {
 		return Result{}, err
 	}
 	profiles, warnings := c.profiles(k)
+	agents := 0
+	for _, profile := range profiles {
+		agents += len(profile.OpenClawAgents)
+	}
+	if len(profiles) > 128 || agents > 256 {
+		return Result{}, issue("runtime_conflict", "Native profile inventory exceeds the supported limit.")
+	}
 	result := Result{Profiles: []Profile{}, DiscoveryStatus: "complete"}
 	if len(warnings) > 0 {
 		result.DiscoveryStatus = "degraded"
 	}
 	for _, profile := range profiles {
-		row := Profile{ProfileCandidateID: profile.CandidateID, AccountCandidateID: profile.AccountCandidateID, Label: profile.Label, RuntimeKind: k.String()}
-		if _, occupied := c.boundProfile(profile); occupied {
+		row := Profile{ProfileCandidateID: profile.CandidateID, AccountCandidateID: profile.AccountCandidateID, Label: profile.Label, RuntimeKind: k.String(), ConflictCode: profile.ConflictCode}
+		for _, agent := range profile.OpenClawAgents {
+			row.OpenClawAgents = append(row.OpenClawAgents, NativeOpenClawAgent{AgentCandidateID: agent.CandidateID, Label: agent.Label})
+		}
+		if bound, occupied := c.boundProfile(profile); occupied {
 			row.ConflictCode = "profile_in_use"
+			for _, agent := range profile.OpenClawAgents {
+				if agent.ID == bound.SelectedOpenClawAgentID {
+					row.SelectedAgentCandidateID = agent.CandidateID
+				}
+			}
 		}
 		result.Profiles = append(result.Profiles, row)
 	}
@@ -295,6 +310,10 @@ func (c *Controller) prepare(p PreparePayload) (Result, error) {
 		if profile.CandidateID != p.ProfileCandidateID {
 			continue
 		}
+		profile, err = targetinventory.SelectOpenClawAgent(profile, p.OpenClawAgentCandidateID)
+		if err != nil {
+			return Result{}, issue("scope_changed", "Selected native OpenClaw agent is unavailable or ambiguous.")
+		}
 		captured := false
 		for _, migration := range c.migrations {
 			scope := migration.Scope
@@ -302,7 +321,7 @@ func (c *Controller) prepare(p PreparePayload) (Result, error) {
 			if scope.ProfileCandidateID != profile.CandidateID && !targetinventory.SharedPhysicalTarget(profile.Resolved, physical) {
 				continue
 			}
-			if scope.EnvironmentID != p.EnvironmentID || scope.WorkspaceID != p.WorkspaceID || scope.PersonaID != p.PersonaID || scope.RuntimeKind != p.RuntimeKind || scope.ProfileCandidateID != p.ProfileCandidateID {
+			if scope.EnvironmentID != p.EnvironmentID || scope.WorkspaceID != p.WorkspaceID || scope.PersonaID != p.PersonaID || scope.RuntimeKind != p.RuntimeKind || scope.ProfileCandidateID != p.ProfileCandidateID || scope.OpenClawAgentCandidateID != p.OpenClawAgentCandidateID {
 				return Result{}, issue("profile_in_use", "This profile has a migration for another persona.")
 			}
 			if scope.DocumentID == p.DocumentID && c.now().Before(migration.ExpiresAt) {
@@ -314,6 +333,9 @@ func (c *Controller) prepare(p PreparePayload) (Result, error) {
 		}
 		if bound, exists := c.boundProfile(profile); exists {
 			if bound.EnvironmentID == p.EnvironmentID && string(bound.PersonaID) == p.PersonaID && bound.WorkspaceID == p.WorkspaceID {
+				if k == runtime.AdapterKindOpenClaw && bound.SelectedOpenClawAgentID != profile.Resolved.OpenClawAgentID {
+					return Result{}, issue("scope_changed", "This profile already has a different native dispatch agent.")
+				}
 				key := bound.Key()
 				return Result{ExistingBindingKey: &key}, nil
 			}
@@ -333,7 +355,7 @@ func (c *Controller) prepare(p PreparePayload) (Result, error) {
 				continue
 			}
 			scope := reserved.Scope
-			if scope.EnvironmentID != p.EnvironmentID || scope.WorkspaceID != p.WorkspaceID || scope.PersonaID != p.PersonaID || scope.RuntimeKind != p.RuntimeKind || scope.ProfileCandidateID != p.ProfileCandidateID {
+			if scope.EnvironmentID != p.EnvironmentID || scope.WorkspaceID != p.WorkspaceID || scope.PersonaID != p.PersonaID || scope.RuntimeKind != p.RuntimeKind || scope.ProfileCandidateID != p.ProfileCandidateID || scope.OpenClawAgentCandidateID != p.OpenClawAgentCandidateID {
 				return Result{}, issue("profile_in_use", "This profile has an active setup.")
 			}
 			delete(c.preparations, id)
@@ -356,6 +378,21 @@ func (c *Controller) enroll(ctx context.Context, p EnrollPayload) (Result, error
 	prepared, ok := c.preparations[p.PreparationID]
 	if !ok || prepared.Scope.DocumentID != p.DocumentID || strings.TrimSpace(p.Code) == "" {
 		return Result{}, issue("scope_changed", "Prepared native scope expired or changed.")
+	}
+	// Re-read the selected physical profile before any pairing exchange or credential write.
+	fresh, _ := c.profiles(prepared.Profile.Kind)
+	valid := false
+	for _, profile := range fresh {
+		if profile.CandidateID != prepared.Profile.CandidateID || !targetinventory.SharedPhysicalTarget(profile.Resolved, prepared.Profile.Resolved) {
+			continue
+		}
+		chosen, choiceError := targetinventory.SelectOpenClawAgent(profile, prepared.Scope.OpenClawAgentCandidateID)
+		if choiceError == nil && chosen.Resolved.OpenClawAgentID == prepared.Profile.Resolved.OpenClawAgentID {
+			valid = true
+		}
+	}
+	if !valid {
+		return Result{}, issue("scope_changed", "Prepared native profile or dispatch agent changed.")
 	}
 	environment, err := c.environment(prepared.Scope.EnvironmentID)
 	if err != nil {
@@ -399,7 +436,7 @@ func (c *Controller) enroll(ctx context.Context, p EnrollPayload) (Result, error
 	binding.NativeConfigPath = prepared.Profile.Resolved.ConfigPath
 	binding.NativeProfileName = prepared.Profile.Resolved.ProfileName
 	binding.HermesHome = prepared.Profile.Resolved.HermesHome
-	binding.OpenClawAgentID = prepared.Profile.Resolved.OpenClawAgentID
+	binding.SelectedOpenClawAgentID = prepared.Profile.Resolved.OpenClawAgentID
 
 	binding.Migration = captured
 	err = c.Store.SaveBinding(binding)
@@ -505,6 +542,9 @@ func (c *Controller) repair(ctx context.Context, p RepairPayload) (Result, error
 		}
 		if strings.HasPrefix(err.Error(), "credential_unavailable:") {
 			return Result{}, issue("credential_unavailable", "Allow this helper to read its stored Keychain credential before retrying.")
+		}
+		if strings.HasPrefix(err.Error(), "runtime_conflict:") {
+			return Result{}, issue("runtime_conflict", "Native confirmation is required before changing this profile.")
 		}
 		if strings.HasPrefix(err.Error(), "reconnect_required:") {
 			return Result{}, issue("reconnect_required", "Disconnect and reconnect to renew PersonaStack MCP authorization.")

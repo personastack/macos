@@ -7,10 +7,10 @@ Install and configure your runtime first. PersonaStack uses its existing profile
 1. Open the persona's settings in the PersonaStack macOS app.
 2. Choose the Hermes or OpenClaw connection action.
 3. Select **Enable background work and find profiles**. Approve the background login item if macOS requests it.
-4. Select the installed profile. Choose **Connect profile**. Review the native confirmation before continuing.
+4. Select the installed profile. Choose **Connect profile**. If OpenClaw has several agents, choose the agent in the native picker. A sole agent is selected automatically. Review the native confirmation before continuing.
 5. Wait for the connection's readiness report. Use **Send test wake** for a bounded assigned task. The test may use your AI provider.
 
-One profile connects to one persona. Repeat these steps with other profiles to connect several personas on the same Mac. Profiles already linked elsewhere cannot be selected. OpenClaw agents that share one profile also share its connection.
+One profile connects to one persona. Repeat these steps with other profiles to connect several personas on the same Mac. Profiles already linked elsewhere cannot be selected. OpenClaw agents that share one profile also share its connection. Assigned work uses the selected agent. Configure an agent in OpenClaw first if the profile explicitly has none. PersonaStack currently requires strict JSON profile configs. JSON5 profiles are reported as unavailable and remain unchanged.
 
 The connection controls require the macOS app. A connection on another Mac is shown as read-only on this Mac. The ordinary CLI setup remains available for Codex, Claude Code, OpenCode and Pi.
 
@@ -20,7 +20,7 @@ Closing app windows or choosing Quit leaves enabled background agents running. U
 
 Connection status reports readiness and work assigned by PersonaStack. It does not report other work started inside your runtime. A ready connection does not prove the entire native profile is idle. Sleep and sign-out make the Mac unavailable for new work.
 
-**Check connection** reads readiness. **Repair** can request consent to start the selected runtime. It cannot renew rejected PersonaStack credentials. If the app asks you to reconnect, use **Disconnect** for that connection and connect the profile again. Runtime or AI provider authorization stays in the runtime's own setup.
+**Check connection** reads readiness. **Repair** requests native consent before enabling the selected Hermes MCP toolset or starting the selected runtime. It cannot renew rejected PersonaStack credentials. If the app asks you to reconnect, use **Disconnect** for that connection and connect the profile again. Runtime or AI provider authorization stays in the runtime's own setup.
 
 ## Migrate an existing Connector
 

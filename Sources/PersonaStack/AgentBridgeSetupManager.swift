@@ -11,6 +11,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         let configuration: DesktopEnvironmentConfiguration
         var authority = AgentBridgeDocumentScope()
         var profiles: [String: AgentBridgeProfile] = [:]
+        var agentChoices: [String: String] = [:]
         var preparedTargets: [UUID: AgentBridgePreparedTarget] = [:]
         var pendingEnrollments: [UUID: (AgentBridgePreparedTarget, AgentBridgeEnrollment)] = [:]
         var migrations: [UUID: (AgentBridgeMigrationCoordinator, AgentBridgeMigrationCoordinator.Cutover)] = [:]
@@ -28,6 +29,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
     private let approveEnvironment: @MainActor (DesktopEnvironmentConfiguration) throws -> Void
     private let prepareBackgroundEnable: @MainActor () throws -> Void
     private let cookieReader: @MainActor (WKWebView, DesktopEnvironmentConfiguration) async throws -> String
+    private let chooseOpenClawAgent: @MainActor (String, [AgentBridgeNativeAgent]) -> String?
     private let confirmRuntimeStart: @MainActor (String) -> Bool
     private let confirmDisconnectStop: @MainActor (String) -> Bool
     private let waitForSettlement: @MainActor () async throws -> Void
@@ -40,12 +42,14 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
          }, approveEnvironment: @escaping @MainActor (DesktopEnvironmentConfiguration) throws -> Void = { try AgentBridgeEnvironments.approve($0) },
          prepareBackgroundEnable: @escaping @MainActor () throws -> Void = { try DesktopUpdater.shared.prepareToEnableBackgroundAgents() },
          cookieReader: @escaping @MainActor (WKWebView, DesktopEnvironmentConfiguration) async throws -> String = AgentBridgeSetupManager.readCookies,
+         chooseOpenClawAgent: @escaping @MainActor (String, [AgentBridgeNativeAgent]) -> String? = AgentBridgeSetupManager.chooseAgent,
          confirmRuntimeStart: @escaping @MainActor (String) -> Bool = AgentBridgeSetupManager.confirmStart,
          confirmDisconnectStop: @escaping @MainActor (String) -> Bool = AgentBridgeSetupManager.confirmStopForDisconnect,
          waitForSettlement: @escaping @MainActor () async throws -> Void = { try await Task.sleep(for: .milliseconds(250)) },
          csrfReader: @escaping @MainActor (WKWebView) async throws -> String = AgentBridgeSetupManager.readCSRF) {
         self.service = service; self.client = client; self.hosted = hosted; self.configuration = configuration
         self.approveEnvironment = approveEnvironment; self.prepareBackgroundEnable = prepareBackgroundEnable; self.cookieReader = cookieReader
+        self.chooseOpenClawAgent = chooseOpenClawAgent
         self.confirmRuntimeStart = confirmRuntimeStart
         self.csrfReader = csrfReader
         self.confirmDisconnectStop = confirmDisconnectStop; self.waitForSettlement = waitForSettlement
@@ -61,7 +65,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
     }
     func invalidate(_ view: WKWebView) {
         guard let page = pages.object(forKey: view) else { return }
-        page.authority.invalidate(); page.profiles.removeAll(); page.preparedTargets.removeAll(); page.pendingEnrollments.removeAll(); page.migrations.removeAll(); page.pendingMigration = nil; page.cookiesFingerprint = nil
+        page.authority.invalidate(); page.profiles.removeAll(); page.agentChoices.removeAll(); page.preparedTargets.removeAll(); page.pendingEnrollments.removeAll(); page.migrations.removeAll(); page.pendingMigration = nil; page.cookiesFingerprint = nil
     }
     func unregister(_ view: WKWebView) {
         pages.object(forKey: view)?.retired = true
@@ -69,7 +73,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
     }
     func invalidateSession() {
         for page in pages.objectEnumerator()?.allObjects as? [Page] ?? [] {
-            page.authority.invalidate(); page.profiles.removeAll(); page.preparedTargets.removeAll(); page.pendingEnrollments.removeAll(); page.migrations.removeAll(); page.pendingMigration = nil; page.cookiesFingerprint = nil
+            page.authority.invalidate(); page.profiles.removeAll(); page.agentChoices.removeAll(); page.preparedTargets.removeAll(); page.pendingEnrollments.removeAll(); page.migrations.removeAll(); page.pendingMigration = nil; page.cookiesFingerprint = nil
         }
     }
     func apply(_ command: AgentBridgePageCommand, view: WKWebView) async throws -> [String: Any] {
@@ -161,11 +165,16 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
             try await pending.coordinator.ensureRevoked()
         }
         try await ready(page, scope: command.scope, document: document)
-        let request = try AgentBridgeRequest(operation: "prepare", payload: [
+        let agent = try selectAgent(candidate, page: page)
+        _ = try await self.cookies(view: view, page: page)
+        try current(page, scope: command.scope, document: document)
+        var payload: [String: AgentBridgeValue] = [
             "environment_id": .string(page.configuration.appOrigin), "workspace_id": .string(command.workspaceID!),
             "persona_id": .string(command.personaID!), "runtime_kind": .string(command.runtime!.rawValue),
             "profile_candidate_id": .string(profile), "document_id": .string(document.uuidString.lowercased())
-        ])
+        ]
+        if let agent { payload["openclaw_agent_candidate_id"] = .string(agent) }
+        let request = try AgentBridgeRequest(operation: "prepare", payload: payload)
         let result: AgentBridgePreparation
         do { result = try await client.send(request, returning: AgentBridgePreparation.self) }
         catch {
@@ -206,6 +215,36 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
             response["was_paused"] = pending.cutover.wasPaused
         }
         return response
+    }
+
+    private func selectAgent(_ profile: AgentBridgeProfile, page: Page) throws -> String? {
+        guard profile.runtimeKind == .openclaw else { return nil }
+        let agents = profile.openClawAgents ?? []
+        guard !agents.isEmpty else { throw AgentBridgeFailure.runtimeConflict }
+        if let retained = page.agentChoices[profile.profileCandidateID], agents.contains(where: { $0.agentCandidateID == retained }) { return retained }
+        let selected = try Self.selectNativeAgent(profile, picker: chooseOpenClawAgent)
+        page.agentChoices[profile.profileCandidateID] = selected
+        return selected
+    }
+
+    static func selectNativeAgent(_ profile: AgentBridgeProfile, picker: @MainActor (String, [AgentBridgeNativeAgent]) -> String?) throws -> String {
+        let agents = profile.openClawAgents ?? []
+        if let selected = profile.selectedAgentCandidateID, agents.contains(where: { $0.agentCandidateID == selected }) { return selected }
+        if agents.count == 1 { return agents[0].agentCandidateID }
+        guard agents.count > 1, let selected = picker(profile.label, agents), agents.contains(where: { $0.agentCandidateID == selected }) else { throw AgentBridgeFailure.runtimeConflict }
+        return selected
+    }
+
+    static func chooseAgent(profile: String, agents: [AgentBridgeNativeAgent]) -> String? {
+        let alert = NSAlert()
+        alert.messageText = "Choose an OpenClaw agent"
+        alert.informativeText = "PersonaStack will send assigned work to this agent in \(profile). The whole profile connects to one persona."
+        let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 320, height: 28))
+        picker.addItems(withTitles: agents.map(\.label))
+        alert.accessoryView = picker
+        alert.addButton(withTitle: "Use agent"); alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn, agents.indices.contains(picker.indexOfSelectedItem) else { return nil }
+        return agents[picker.indexOfSelectedItem].agentCandidateID
     }
 
     private func preparedTarget(_ command: AgentBridgePageCommand, candidate: AgentBridgeProfile) -> AgentBridgePreparedTarget {
@@ -289,6 +328,9 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
     private func migrate(_ command: AgentBridgePageCommand, page: Page, cookies: String, document: UUID, view: WKWebView) async throws -> [String: Any] {
         guard !page.migrating, page.migrations.isEmpty, let profile = command.profileCandidateID,
               page.profiles[profile]?.runtimeKind == command.runtime else { throw AgentBridgeFailure.scopeChanged }
+        let agent = try selectAgent(page.profiles[profile]!, page: page)
+        _ = try await self.cookies(view: view, page: page)
+        try current(page, scope: command.scope, document: document)
         page.migrating = true
         defer { page.migrating = false }
         let csrf = try await csrfReader(view)
@@ -320,6 +362,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
                 try old.require(workspace: workspace, persona: persona, connection: command.connectionID!,
                                 generation: command.connectionGeneration!, clientKind: "standalone_connector")
                 return try await client.send(AgentBridgeRequest(operation: "migration_prepare", payload: [
+                    "openclaw_agent_candidate_id": .string(agent ?? ""),
                     "environment_id": .string(page.configuration.appOrigin), "workspace_id": .string(workspace),
                     "persona_id": .string(persona), "connection_id": .string(command.connectionID!),
                     "connection_generation": .integer(command.connectionGeneration!), "runtime_kind": .string(command.runtime!.rawValue),
@@ -436,7 +479,10 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         guard afterDialog.workspaceID == workspace, afterDialog.personaID == persona,
               afterDialog.connectionID == nil || afterDialog.connectionID == "" else { throw AgentBridgeFailure.scopeChanged }
         try await validate()
+        let agent = try selectAgent(page.profiles[profile]!, page: page)
+        try await validate()
         let capture = try await client.send(AgentBridgeRequest(operation: "migration_repair", payload: [
+            "openclaw_agent_candidate_id": .string(agent ?? ""),
             "environment_id": .string(page.configuration.appOrigin), "workspace_id": .string(workspace), "persona_id": .string(persona),
             "runtime_kind": .string(command.runtime!.rawValue), "profile_candidate_id": .string(profile),
             "document_id": .string(document.uuidString.lowercased()), "pause_version": .integer(state.pauseVersion), "revocation_readback": .object([
@@ -526,8 +572,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
             }
             guard selected.activeRunID == nil || selected.activeRunID == "" else { throw AgentBridgeFailure.busy }
             guard !selected.requiresReconnect else { throw AgentBridgeFailure.reconnectRequired }
-            let needsStart = !selected.isMCPVerified
-            if needsStart && !confirmRuntimeStart(command.personaID!) { throw AgentBridgeFailure.runtimeConflict }
+            if !confirmRuntimeStart(command.personaID!) { throw AgentBridgeFailure.runtimeConflict }
             // A native dialog never grants a changed account/profile authority.
             _ = try await self.cookies(view: view, page: page)
             try current(page, scope: command.scope, document: document)
@@ -535,7 +580,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
             try currentBinding.require(workspace: command.workspaceID!, persona: command.personaID!, connection: key.connectionID,
                                        generation: command.connectionGeneration!)
             try current(page, scope: command.scope, document: document)
-            payload["restart_confirmed"] = .bool(needsStart)
+            payload["restart_confirmed"] = .bool(true)
         }
         let result = try await client.send(AgentBridgeRequest(operation: command.action, payload: payload), returning: AgentBridgeConnections.self)
         try current(page, scope: command.scope, document: document)
@@ -663,7 +708,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         guard !cookieHeader.isEmpty else { throw AgentBridgeFailure.credentialUnavailable }
         let fingerprint = Data(SHA256.hash(data: Data(cookieHeader.utf8)))
         if let previous = page.cookiesFingerprint, previous != fingerprint {
-            page.authority.invalidate(); page.profiles.removeAll(); page.preparedTargets.removeAll(); page.pendingEnrollments.removeAll(); page.migrations.removeAll(); page.pendingMigration = nil; page.cookiesFingerprint = nil
+            page.authority.invalidate(); page.profiles.removeAll(); page.agentChoices.removeAll(); page.preparedTargets.removeAll(); page.pendingEnrollments.removeAll(); page.migrations.removeAll(); page.pendingMigration = nil; page.cookiesFingerprint = nil
             throw AgentBridgeFailure.scopeChanged
         }
         page.cookiesFingerprint = fingerprint
@@ -683,7 +728,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
     private static func confirmStart(persona: String) -> Bool {
         let alert = NSAlert()
         alert.messageText = "Start the native gateway for this profile?"
-        alert.informativeText = "Repair \(persona) may start or restart its selected Hermes or OpenClaw gateway. Other profiles remain connected. Cancel preserves the current setup."
+        alert.informativeText = "Repair \(persona) may enable its selected Hermes MCP toolset and start or restart its Hermes or OpenClaw gateway. Other profiles remain connected. Cancel preserves the current setup."
         alert.addButton(withTitle: "Allow Gateway Repair")
         alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn

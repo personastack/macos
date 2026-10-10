@@ -5,6 +5,7 @@ import Testing
 
 actor AgentBridgeTargetFixture: AgentBridgeHostedTransport {
     var inventoryGeneration = 7
+    var runtimeKind = "hermes"
     var inventoryPending = false
     var staleFirstSave = false
     var wrongWorkspace = false
@@ -13,13 +14,14 @@ actor AgentBridgeTargetFixture: AgentBridgeHostedTransport {
     private var selected = false
     private(set) var operations: [String] = []
     private(set) var saves: [Int] = []
-    func configure(pending: Bool = false, stale: Bool = false, foreign: Bool = false, otherProfile: Bool = false, empty: Bool = false) {
+    func configure(pending: Bool = false, stale: Bool = false, foreign: Bool = false, otherProfile: Bool = false, empty: Bool = false, runtime: String = "hermes") {
+        runtimeKind = runtime
         inventoryPending = pending; staleFirstSave = stale; wrongWorkspace = foreign; selectedOtherProfile = otherProfile; inventoryAlwaysEmpty = empty
     }
     func isSelected() -> Bool { selected }
     private func selection() -> [String: Any] {
         ["account_candidate_id": "rt_account_a", "profile_candidate_id": selectedOtherProfile ? "rt_profile_other" : "rt_profile_a",
-         "runtime_kind": "hermes", "selection_revision": 1, "validated_generation": inventoryGeneration, "state": "target_selected"]
+         "runtime_kind": runtimeKind, "selection_revision": 1, "validated_generation": inventoryGeneration, "state": "target_selected"]
     }
     func request(_ request: URLRequest) throws -> (Data, Int) {
         let method = request.httpMethod ?? "GET", path = request.url!.path
@@ -57,7 +59,7 @@ actor AgentBridgeTargetFixture: AgentBridgeHostedTransport {
         }
         else {
             body["target_inventory"] = ["inventory_generation": inventoryGeneration, "accounts": [["candidate_id": "rt_account_a",
-                "profiles": [["candidate_id": "rt_profile_a", "runtime_kind": "hermes"]]]]]
+                "profiles": [["candidate_id": "rt_profile_a", "runtime_kind": runtimeKind]]]]]
         }
         body["target_selection"] = selected || selectedOtherProfile ? selection() : ["state": "target_selection_required"]
         return (try JSONSerialization.data(withJSONObject: body), 200)
