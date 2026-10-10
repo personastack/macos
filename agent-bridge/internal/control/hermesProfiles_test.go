@@ -84,7 +84,11 @@ func TestDesktopAgentBridgeHermesProfilesEnrollWithoutInheritedHostPermission(t 
 		}
 		reloaded := config.NewFileStoreWithSecrets(statePath, nativeAgentFixtureSecrets{}).WithInventorySeed("seed")
 		b, ok := reloaded.BindingKey(*enrolled.Result.BindingKey)
-		if !ok || b.NativeProfileName != profile.Label || b.RuntimeLaunchAllowed || b.TargetSelectionRevision != 0 || b.HermesHome != filepath.Join(home, ".hermes", "profiles", profile.Label) {
+		expectedHome, err := filepath.EvalSymlinks(filepath.Join(home, ".hermes", "profiles", profile.Label))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok || b.NativeProfileName != profile.Label || b.RuntimeLaunchAllowed || b.TargetSelectionRevision != 0 || b.HermesHome != expectedHome {
 			t.Fatalf("prepared profile or native permission crossed persisted owner %+v", b)
 		}
 		scope.PersonaID = "another-persona"

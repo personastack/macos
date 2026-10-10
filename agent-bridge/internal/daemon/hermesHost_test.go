@@ -138,6 +138,10 @@ func TestDesktopAgentBridgeHermesTwoNamedProfilesShareHostAndKeepKeys(t *testing
 	if len(profiles) != 3 || len(warnings) != 0 {
 		t.Fatalf("profile discovery %v %v", profiles, warnings)
 	}
+	canonicalHost, err := filepath.EvalSymlinks(host)
+	if err != nil {
+		t.Fatal(err)
+	}
 	store := config.NewMemoryStore(config.State{})
 	runner := Runner{Store: &store, ResolveTarget: func(b config.Binding, target *externalagentprotocol.RuntimeTarget) (targetinventory.ResolvedTarget, error) {
 		return targetinventory.ResolveProfiles(b.RuntimeKind, target, profiles, "")
@@ -153,7 +157,7 @@ func TestDesktopAgentBridgeHermesTwoNamedProfilesShareHostAndKeepKeys(t *testing
 			t.Fatal(err)
 		}
 		runner.VerifyRuntimeEndpoint = func(_ context.Context, endpoint, root, path, kind string) (bool, error) {
-			if endpoint != "http://127.0.0.1:8643/p/"+name || root != host || path != filepath.Join(host, "config.yaml") || kind != "hermes" {
+			if endpoint != "http://127.0.0.1:8643/p/"+name || root != canonicalHost || path != filepath.Join(canonicalHost, "config.yaml") || kind != "hermes" {
 				t.Fatal("wrong shared host identity")
 			}
 			return true, nil
