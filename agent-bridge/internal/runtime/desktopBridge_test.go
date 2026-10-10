@@ -1,0 +1,130 @@
+package runtime
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+)
+
+type desktopTransport func(*http.Request) (*http.Response, error)
+
+func (f desktopTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+func nativeResponse(r *http.Request, body string) *http.Response {
+	return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}
+}
+func TestDesktopAgentBridgeHermesLifecycle(t *testing.T) {
+	t.Parallel()
+	calls := []string{}
+	adapter := HermesAdapter{BaseURL: "http://127.0.0.1:25001", APIKey: "profile-a", Client: &http.Client{Transport: desktopTransport(func(r *http.Request) (*http.Response, error) {
+		if r.Header.Get("Authorization") != "Bearer profile-a" {
+			t.Fatal("wrong profile auth")
+		}
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		switch r.Method + " " + r.URL.Path {
+		case "POST /v1/runs":
+			var body struct {
+				Input        string `json:"input"`
+				Session      string `json:"session_id"`
+				Conversation string `json:"conversation"`
+				Server       string `json:"native_mcp_server"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Input != "composed wake" || body.Session != "run-a" || body.Conversation != "assignment-a" || body.Server != "issued-server" {
+				t.Fatalf("bad run body %+v", body)
+			}
+			return nativeResponse(r, `{"run_id":"native-a"}`), nil
+		case "GET /v1/runs/native-a/events":
+			return nativeResponse(r, "data: {\"run_id\":\"native-a\",\"type\":\"output_delta\",\"data\":{\"delta\":\"hello\"}}\n\ndata: {\"run_id\":\"native-a\",\"type\":\"completed\",\"status\":\"completed\",\"output\":\"done\"}\n\n"), nil
+		case "POST /v1/runs/native-a/stop":
+			return nativeResponse(r, `{}`), nil
+		case "GET /v1/runs/native-a":
+			return nativeResponse(r, `{"status":"cancelled"}`), nil
+		default:
+			t.Fatalf("unplanned native call %s %s", r.Method, r.URL)
+			return nil, nil
+		}
+	})}}
+	id, err := adapter.StartRun(RunRequest{RunID: "run-a", AssignmentID: "assignment-a", FullyComposedPrompt: "composed wake", NativeMCPServerName: "issued-server"})
+	if err != nil || id != "native-a" {
+		t.Fatalf("start %s %v", id, err)
+	}
+	events := []RunEvent{}
+	result, err := adapter.StreamOrPollRun(context.Background(), id, func(e RunEvent) error { events = append(events, e); return nil })
+	if err != nil || result.Status != RunStatusSucceeded || len(events) < 1 {
+		t.Fatalf("progress %+v %v %+v", result, err, events)
+	}
+	if err = adapter.CancelRun(id); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 4 {
+		t.Fatalf("calls %v", calls)
+	}
+}
+func TestDesktopAgentBridgeHermesIncompleteControl(t *testing.T) {
+	t.Parallel()
+	adapter := HermesAdapter{BaseURL: "http://127.0.0.1:25002", APIKey: "key", Client: &http.Client{Transport: desktopTransport(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/health", "/health/detailed", "/v1/models":
+			return nativeResponse(r, `{}`), nil
+		case "/v1/capabilities":
+			return nativeResponse(r, `{"features":{"run_submission":true,"run_status":true,"run_events_sse":true,"run_stop":false}}`), nil
+		default:
+			t.Fatalf("unexpected %s", r.URL)
+			return nil, nil
+		}
+	})}}
+	if got := adapter.DetectContext(context.Background()); got.State != AdapterStateCapabilityMissing {
+		t.Fatalf("incomplete native control ready %+v", got)
+	}
+}
+func TestDesktopAgentBridgeOpenClawLifecycleAndIsolation(t *testing.T) {
+	t.Parallel()
+	calls := 0
+	adapter := OpenClawAdapter{AgentID: "selected-agent", CallNative: func(ctx context.Context, r openClawRequest) (openClawResponse, error) {
+		calls++
+		raw, _ := json.Marshal(r.Params)
+		switch calls {
+		case 1:
+			if r.Method != "agent" || string(raw) != `{"agentId":"selected-agent","idempotencyKey":"assignment-a","message":"composed wake"}` {
+				t.Fatalf("start request %s %s", r.Method, raw)
+			}
+			return openClawResponse{Payload: json.RawMessage(`{"status":"accepted","runId":"native-a"}`)}, nil
+		case 2:
+			if r.Method != "sessions.abort" || string(raw) != `{"runId":"native-a"}` {
+				t.Fatalf("stop %s %s", r.Method, raw)
+			}
+			return openClawResponse{}, nil
+		default:
+			t.Fatal("unplanned RPC")
+			return openClawResponse{}, nil
+		}
+	}}
+	id, err := adapter.StartRun(RunRequest{AssignmentID: "assignment-a", FullyComposedPrompt: "composed wake"})
+	if err != nil || id != "native-a" {
+		t.Fatalf("native id %s %v", id, err)
+	}
+	events := []RunEvent{}
+	session := openClawRPCSession{nativeRunID: id, agentID: adapter.AgentID, handle: func(e RunEvent) error { events = append(events, e); return nil }}
+	for _, body := range []string{`{"runId":"foreign","agentId":"selected-agent","delta":"secret"}`, `{"runId":"native-a","agentId":"wrong","delta":"secret"}`, `{"delta":"secret"}`} {
+		if err = session.handleBroadcast(openClawResponse{Event: "agent", Payload: json.RawMessage(body)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(events) != 0 || session.outputBuilder.Len() != 0 {
+		t.Fatal("foreign event mutated assigned run")
+	}
+	if err = session.handleBroadcast(openClawResponse{Event: "agent", Payload: json.RawMessage(`{"runId":"native-a","agentId":"selected-agent","delta":"visible"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || session.outputBuilder.String() != "visible" {
+		t.Fatalf("assigned events %+v", events)
+	}
+	if err = adapter.CancelRun(id); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -1,0 +1,231 @@
+package pairing
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	goruntime "runtime"
+	"strings"
+	"time"
+
+	"github.com/personastack/agent-gateway/pkg/externalagentprotocol"
+	"github.com/personastack/macos/agent-bridge/internal/buildinfo"
+	"github.com/personastack/macos/agent-bridge/internal/config"
+	"github.com/personastack/macos/agent-bridge/internal/runtime"
+)
+
+type Client struct {
+	GatewayBaseURL string
+	HTTPClient     *http.Client
+}
+
+type Request struct {
+	Code               string
+	RuntimeKind        runtime.AdapterKind
+	ConfigureMCP       bool
+	PrivateKey         ed25519.PrivateKey
+	DesktopPreparation *externalagentprotocol.DesktopPreparation
+}
+
+type Result struct {
+	Binding config.Binding
+}
+
+type ExchangeError struct {
+	StatusCode              int
+	ErrorCode               externalagentprotocol.PairingExchangeErrorCode
+	Message                 string
+	MinimumConnectorVersion string
+	UpdateCommand           string
+}
+
+func (e ExchangeError) Error() string {
+	message := strings.TrimSpace(e.Message)
+	if message == "" {
+		message = "pairing exchange failed"
+	}
+	if e.ErrorCode == "" {
+		return fmt.Sprintf("%s: status=%d", message, e.StatusCode)
+	}
+	if strings.TrimSpace(e.UpdateCommand) != "" {
+		return fmt.Sprintf("%s: %s (update: %s)", e.ErrorCode, message, strings.TrimSpace(e.UpdateCommand))
+	}
+	return fmt.Sprintf("%s: %s", e.ErrorCode, message)
+}
+
+func (c Client) Exchange(ctx context.Context, request Request) (Result, error) {
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	code := strings.TrimSpace(request.Code)
+	if code == "" {
+		return Result{}, fmt.Errorf("pairing code required")
+	}
+	runtimeKind := runtimeKindForAdapter(request.RuntimeKind)
+	privateKey := request.PrivateKey
+	if len(privateKey) != ed25519.PrivateKeySize || request.DesktopPreparation == nil {
+		return Result{}, fmt.Errorf("desktop preparation and existing key required")
+	}
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	if request.DesktopPreparation.DevicePublicKey != base64.StdEncoding.EncodeToString(publicKey) {
+		return Result{}, fmt.Errorf("prepared public key differs")
+	}
+
+	websocketURL, err := externalagentprotocol.ResolveWebsocketURL(c.GatewayBaseURL)
+	if err != nil {
+		return Result{}, err
+	}
+	payload := externalagentprotocol.PairingExchangeRequest{
+		Code:                      code,
+		ClientKind:                externalagentprotocol.ClientKindMacOSApp,
+		ClientVersion:             buildinfo.VersionString(),
+		DesktopPreparation:        request.DesktopPreparation,
+		RuntimeKind:               runtimeKind,
+		ConnectorVersion:          buildinfo.VersionString(),
+		ProtocolVersion:           externalagentprotocol.ProtocolVersionV4,
+		SupportedProtocolVersions: externalagentprotocol.SupportedProtocolVersions(),
+		OS:                        goruntime.GOOS,
+		Arch:                      goruntime.GOARCH,
+		DevicePublicKey:           base64.StdEncoding.EncodeToString(publicKey),
+		Hostname:                  localHostname(),
+		HostnameHash:              hostnameHash(),
+		GatewayWebsocketURL:       websocketURL,
+		ConfigureMCP:              request.ConfigureMCP,
+	}
+	payload.DeviceKeyProof = base64.StdEncoding.EncodeToString(ed25519.Sign(privateKey, []byte(deviceProofMessage(payload))))
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return Result{}, fmt.Errorf("encode pairing exchange: %w", err)
+	}
+	endpoint, err := externalagentprotocol.ResolvePairingExchangeURL(c.GatewayBaseURL)
+	if err != nil {
+		return Result{}, err
+	}
+	httpClient := c.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
+	if err != nil {
+		return Result{}, err
+	}
+	httpRequest.Header.Set("Content-Type", "application/json")
+	response, err := httpClient.Do(httpRequest)
+	if err != nil {
+		return Result{}, fmt.Errorf("pairing exchange: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 300 {
+		var errorResponse externalagentprotocol.PairingExchangeErrorResponse
+		if err := json.NewDecoder(response.Body).Decode(&errorResponse); err != nil {
+			return Result{}, fmt.Errorf("pairing exchange failed: status=%d", response.StatusCode)
+		}
+		return Result{}, ExchangeError{
+			StatusCode:              response.StatusCode,
+			ErrorCode:               errorResponse.ErrorCode,
+			Message:                 errorResponse.Message,
+			MinimumConnectorVersion: errorResponse.MinimumConnectorVersion,
+			UpdateCommand:           errorResponse.UpdateCommand,
+		}
+	}
+	var decoded externalagentprotocol.PairingExchangeResponse
+	if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil {
+		return Result{}, fmt.Errorf("decode pairing response: %w", err)
+	}
+	negotiatedKind := decoded.RuntimeKind
+	if negotiatedKind == "" {
+		if runtimeKind != "" {
+			negotiatedKind = runtimeKind
+		} else {
+			return Result{}, fmt.Errorf("pairing response did not negotiate a runtime kind")
+		}
+	}
+	if runtimeKind != "" && negotiatedKind != runtimeKind {
+		return Result{}, fmt.Errorf("pairing response changed explicitly selected runtime kind")
+	}
+	if negotiatedKind != externalagentprotocol.RuntimeKindHermes && negotiatedKind != externalagentprotocol.RuntimeKindOpenClaw {
+		return Result{}, fmt.Errorf("pairing response negotiated unsupported runtime kind")
+	}
+	negotiatedAdapterKind := adapterKindForExternalRuntime(negotiatedKind)
+	return Result{Binding: config.Binding{
+		ConnectionID:         config.ConnectionID(strings.TrimSpace(decoded.ConnectionID)),
+		PersonaID:            config.PersonaID(strings.TrimSpace(decoded.PersonaID)),
+		ExternalAgentKind:    externalKindForRuntime(negotiatedKind),
+		ConnectionGeneration: decoded.ConnectionGeneration,
+		GatewayWebsocketURL:  strings.TrimSpace(decoded.GatewayWebsocketURL),
+		BridgeCredentialID:   strings.TrimSpace(decoded.CredentialID),
+		BridgePrivateKey:     base64.StdEncoding.EncodeToString(privateKey),
+		BridgePublicKey:      base64.StdEncoding.EncodeToString(publicKey),
+		NativeMCPServer:      strings.TrimSpace(decoded.NativeMCPServerName),
+		NativeMCPNamespace:   strings.TrimSpace(decoded.NativeMCPToolNamespace),
+		PersonaMCPURL:        strings.TrimSpace(decoded.PersonaMCPURL),
+		PersonaMCPToken:      strings.TrimSpace(decoded.PersonaMCPToken),
+		RuntimeKind:          negotiatedAdapterKind,
+		ReadinessState:       runtime.AdapterStateRuntimeMissing,
+		HasBridgeSecret:      true,
+		HasPersonaMCPToken:   strings.TrimSpace(decoded.PersonaMCPToken) != "",
+	}}, nil
+}
+
+func deviceProofMessage(request externalagentprotocol.PairingExchangeRequest) string {
+	return strings.Join([]string{
+		pairingCodeHash(request.Code),
+		string(request.RuntimeKind),
+		strings.TrimSpace(request.DevicePublicKey),
+	}, "\n")
+}
+
+func pairingCodeHash(code string) string {
+	normalized := strings.NewReplacer(" ", "", "-", "").Replace(strings.ToUpper(strings.TrimSpace(code)))
+	sum := sha256.Sum256([]byte(normalized))
+	return hex.EncodeToString(sum[:])
+}
+
+func runtimeKindForAdapter(kind runtime.AdapterKind) externalagentprotocol.RuntimeKind {
+	switch kind {
+	case runtime.AdapterKindAuto:
+		return ""
+	case runtime.AdapterKindOpenClaw:
+		return externalagentprotocol.RuntimeKindOpenClaw
+	default:
+		return externalagentprotocol.RuntimeKindHermes
+	}
+}
+
+func adapterKindForExternalRuntime(kind externalagentprotocol.RuntimeKind) runtime.AdapterKind {
+	if kind == externalagentprotocol.RuntimeKindOpenClaw {
+		return runtime.AdapterKindOpenClaw
+	}
+	return runtime.AdapterKindHermes
+}
+
+func externalKindForRuntime(kind externalagentprotocol.RuntimeKind) config.ExternalAgentKind {
+	if kind == externalagentprotocol.RuntimeKindOpenClaw {
+		return config.ExternalAgentKindOpenClaw
+	}
+	return config.ExternalAgentKindHermes
+}
+
+func hostnameHash() string {
+	hostname := localHostname()
+	if hostname == "" {
+		hostname = "unknown"
+	}
+	sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(hostname))))
+	return hex.EncodeToString(sum[:])
+}
+
+func localHostname() string {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(hostname)
+}
