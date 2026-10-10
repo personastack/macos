@@ -14,6 +14,9 @@ import (
 	"time"
 )
 
+const RequestTimeout = 8 * time.Second
+const ConnectionTimeout = 10 * time.Second
+
 func DefaultDirectory() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -121,13 +124,17 @@ func Serve(ctx context.Context, directory string, controller *Controller) error 
 }
 func handleConnection(ctx context.Context, connection net.Conn, controller *Controller) {
 	defer connection.Close()
-	_ = connection.SetDeadline(time.Now().Add(30 * time.Second))
+	requestContext, cancel := context.WithTimeout(ctx, RequestTimeout)
+	defer cancel()
+	started := time.Now()
+	_ = connection.SetReadDeadline(started.Add(RequestTimeout))
+	_ = connection.SetWriteDeadline(started.Add(ConnectionTimeout))
 	reader := bufio.NewReader(io.LimitReader(connection, MaxBytes+1))
 	line, err := reader.ReadBytes('\n')
 	if err != nil && err != io.EOF {
 		return
 	}
-	response := controller.Dispatch(ctx, line)
+	response := controller.Dispatch(requestContext, line)
 	raw, err := json.Marshal(response)
 	if err != nil || len(raw) > MaxBytes {
 		return

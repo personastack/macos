@@ -1,3 +1,7 @@
 # openclawsetup
 
 Launch only the current user selected OpenClaw profile after native consent. Force state/config paths and the declared native listener port. Runtime process lifetime is independent of a finite readiness probe context.
+
+The login helper does not depend on an interactive shell PATH. Resolve the CLI from the supported home bins, `/opt/homebrew/bin`, `/usr/local/bin`, or absolute inherited PATH entries. Supply a deduplicated child PATH with supported home-local Node directories and system tools. Preserve npm's env-node entrypoint and the official installers' wrappers. The env-node entrypoint requires a supported resolved Node at the front of PATH. Installer wrappers retain their captured absolute interpreter. Pin HOME, USER and LOGNAME to the current selected user. Remove inherited OpenClaw selectors, shell initialization variables and Node loader overrides. Never source shell profiles or install an interpreter.
+
+Source contracts: pinned OpenClaw `8420f82cbbf8bd0114cacc39fa51299f92851a6f` [openclaw.mjs](https://github.com/openclaw/openclaw/blob/8420f82cbbf8bd0114cacc39fa51299f92851a6f/openclaw.mjs), [install.sh](https://github.com/openclaw/openclaw/blob/8420f82cbbf8bd0114cacc39fa51299f92851a6f/scripts/install.sh) and [install-cli.sh](https://github.com/openclaw/openclaw/blob/8420f82cbbf8bd0114cacc39fa51299f92851a6f/scripts/install-cli.sh). Version-manager installations need an exposed absolute PATH or supported wrapper. The helper never runs interactive shell initialization to find them.

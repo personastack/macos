@@ -833,6 +833,7 @@ func hermesToolListCapabilities(ctx context.Context, nativeMCPServerName, profil
 		return nil, err
 	}
 	command := hermesToolsListCommand(ctx, hermesBin, "tools", "list", "--platform", "api_server")
+	command.WaitDelay = 250 * time.Millisecond
 	command.Env = selectedHermesEnvironment(profileHome)
 	raw, err := command.Output()
 	if err != nil {
@@ -859,6 +860,7 @@ func VerifyHermesMCPServerLoadedWithHome(ctx context.Context, nativeMCPServerNam
 		return HermesMCPRegistryCheck{Note: err.Error()}
 	}
 	command := hermesToolsListCommand(ctx, hermesBin, "tools", "list", "--platform", "api_server")
+	command.WaitDelay = 250 * time.Millisecond
 	if strings.TrimSpace(hermesHome) != "" {
 		for _, entry := range os.Environ() {
 			if !strings.HasPrefix(entry, "HERMES_HOME=") {

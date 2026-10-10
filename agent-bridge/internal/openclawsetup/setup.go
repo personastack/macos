@@ -72,6 +72,8 @@ func openClawBinaryForHome(homeDir string) (string, error) {
 		filepath.Join(homeDir, ".local", "bin", "openclaw"),
 		filepath.Join(homeDir, ".npm-global", "bin", "openclaw"),
 		filepath.Join(homeDir, ".openclaw", "bin", "openclaw"),
+		"/opt/homebrew/bin/openclaw",
+		"/usr/local/bin/openclaw",
 	} {
 		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
 			return candidate, nil
@@ -106,14 +108,15 @@ func TryStartGatewayForProfile(ctx context.Context, home, root, config, profile 
 	if identity.UID != os.Geteuid() {
 		return false, fmt.Errorf("runtime_conflict: current-user profile required")
 	}
-	binary, err := openClawBinaryForHome(home)
+	environment := os.Environ()
+	launch, err := resolveNativeLaunch(ctx, home, environment, nativeExecutable, nativeEntrypointNeedsNode, nativeNodeVersion)
 	if err != nil {
-		return false, fmt.Errorf("runtime_unsupported: OpenClaw executable missing: %w", err)
+		return false, fmt.Errorf("runtime_unsupported: OpenClaw launch environment unavailable: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	cmd := profileGatewayCommand(binary, root, config, profile, port, os.Environ())
+	cmd := profileGatewayCommand(launch, home, root, config, profile, identity, port, environment)
 	err = cmd.Start()
 	if err != nil {
 		return false, fmt.Errorf("start selected OpenClaw gateway: %w", err)
@@ -122,19 +125,21 @@ func TryStartGatewayForProfile(ctx context.Context, home, root, config, profile 
 	return true, nil
 }
 
-func profileGatewayCommand(binary, root, config, profile string, port int, environment []string) *exec.Cmd {
+func profileGatewayCommand(launch nativeLaunch, home, root, config, profile string, identity hermessetup.ProcessIdentity, port int, environment []string) *exec.Cmd {
 	args := []string{"gateway", "run", "--port", strconv.Itoa(port), "--bind", "loopback"}
 	if profile != "default" {
 		args = append([]string{"--profile", profile}, args...)
 	}
-	cmd := exec.Command(binary, args...)
+	// Preserve npm's env-node shim and the installer's explicit-Node shell wrapper.
+	cmd := exec.Command(launch.binary, args...)
 	cmd.Dir = root
 	for _, entry := range environment {
-		if !strings.HasPrefix(entry, "OPENCLAW_") {
+		key, _, _ := strings.Cut(entry, "=")
+		if !strings.HasPrefix(key, "OPENCLAW_") && key != "PATH" && key != "HOME" && key != "USER" && key != "LOGNAME" && key != "BASH_ENV" && key != "ENV" && key != "NODE_OPTIONS" && key != "NODE_PATH" {
 			cmd.Env = append(cmd.Env, entry)
 		}
 	}
-	cmd.Env = append(cmd.Env, "OPENCLAW_STATE_DIR="+root, "OPENCLAW_CONFIG_PATH="+config)
+	cmd.Env = append(cmd.Env, "HOME="+home, "USER="+identity.Username, "LOGNAME="+identity.Username, "PATH="+launch.path, "OPENCLAW_STATE_DIR="+root, "OPENCLAW_CONFIG_PATH="+config)
 	cmd.Stdout = ioDiscard{}
 	cmd.Stderr = ioDiscard{}
 	return cmd

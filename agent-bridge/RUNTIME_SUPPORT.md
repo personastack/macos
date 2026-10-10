@@ -9,6 +9,8 @@ Evidence baseline: Connector source a669b296df23. Upstream source and documentat
 
 ## OpenClaw dispatch agent
 
+Login-helper startup resolves the supported home-local CLI bins and both macOS Homebrew prefixes without shell initialization. The pinned npm entrypoint uses `env node`. Its child PATH starts with a supported resolved Node interpreter. Official installer wrappers remain executable wrappers and retain their captured absolute Node. The selected user identity and native profile selectors are set explicitly. Missing or unsupported interpreters remain unavailable. No runtime installation or shell profile mutation occurs. See [startup source contracts](internal/openclawsetup/README.md).
+
 Native discovery reads configured `agents.entries` or the supported `agents.list` shape from the selected profile. A sole agent is selected automatically. Several agents require the native picker. A config with neither roster property exposes the pinned upstream implicit `main` agent. Explicit empty, invalid or ambiguous rosters never fall back to `main`. The selected opaque candidate binds the physical profile and config snapshot. Preparation and enrollment reject stale choices before exchange or persistence. The helper stores the exact selected agent and validates its presence before configuration, effective catalog checks and dispatch. The API continues to select the physical profile. Agents do not create separate persona targets. [OpenClaw agent configuration](https://docs.openclaw.ai/gateway/config-agents)
 
 ## Fixture contract

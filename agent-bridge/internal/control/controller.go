@@ -59,6 +59,8 @@ func strict(raw []byte, destination interface{}) error {
 	return nil
 }
 func (c *Controller) Dispatch(ctx context.Context, raw []byte) Response {
+	ctx, cancel := context.WithTimeout(ctx, RequestTimeout)
+	defer cancel()
 	request := Request{}
 	response := Response{Version: Version}
 	if len(raw) > MaxBytes {
@@ -77,11 +79,17 @@ func (c *Controller) Dispatch(ctx context.Context, raw []byte) Response {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if ctx.Err() != nil {
+		return operationExpired(response)
+	}
 	if c.preparations == nil {
 		c.preparations = map[string]preparation{}
 	}
 	c.expirePreparations()
 	result, err := c.perform(ctx, request)
+	if ctx.Err() != nil {
+		return operationExpired(response)
+	}
 	if err != nil {
 		code := "invalid_request"
 		if classified, ok := err.(*Error); ok {
@@ -96,6 +104,10 @@ func (c *Controller) Dispatch(ctx context.Context, raw []byte) Response {
 		return failed(response, "invalid_request", "response exceeds limit")
 	}
 	return response
+}
+
+func operationExpired(response Response) Response {
+	return failed(response, "operation_timeout", "Local operation timed out or was cancelled. Check this connection before trying again.")
 }
 func failed(response Response, code, message string) Response {
 	response.Error = &Error{Code: code, Message: message}
