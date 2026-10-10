@@ -28,6 +28,7 @@ final class LiveDesktopEnvironmentSettingsLifecycle: DesktopEnvironmentSettingsL
         ChatWindowManager.shared.unregister(view)
         StackWindowManager.shared.unregister(view)
         LocalSessionManager.shared.invalidate(view)
+        AgentBridgeSetupManager.shared.unregister(view)
         DesktopSkillsManager.shared.unregister(view)
         DesktopControlSetupManager.shared.unregister(view)
     }
@@ -56,6 +57,7 @@ final class LiveDesktopEnvironmentSettingsLifecycle: DesktopEnvironmentSettingsL
             ChatWindowManager.shared.register(previousView, appURL: previousAppURL)
             StackWindowManager.shared.register(previousView, appURL: previousAppURL)
             LocalSessionManager.shared.register(previousView, appURL: previousAppURL)
+            AgentBridgeSetupManager.shared.register(previousView, appURL: previousAppURL)
             DesktopSkillsManager.shared.register(previousView, appURL: previousAppURL)
             DesktopControlSetupManager.shared.register(previousView, appURL: previousAppURL)
         }

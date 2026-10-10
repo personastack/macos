@@ -59,6 +59,7 @@ final class DesktopUpdater: NSObject, ObservableObject {
     @Published private(set) var offeredVersion: String?
     @Published private(set) var applicationsInstallInstruction: String?
     @Published private(set) var statusMessage = ""
+    @Published private(set) var waitsForBackgroundAgents = false
     private let updaterFactory: (SPUStandardUserDriver, SPUUpdaterDelegate) -> any DesktopUpdateClient
     private let preferences: UserDefaults
     private let presentAvailableReminder: (@MainActor (String) -> Void)?
@@ -69,12 +70,16 @@ final class DesktopUpdater: NSObject, ObservableObject {
     private let confirmRestart: @MainActor () -> Bool
     private let cancelPermissionRestart: @MainActor () -> Void
     private let presentApplicationsInstallInstruction: @MainActor (String) -> Void
+    private let agentBridgeNeedsHandoff: @MainActor () -> Bool
+    private let prepareAgentBridgeUpdate: @MainActor () async throws -> Void
+    private let cancelAgentBridgeUpdate: @MainActor () async throws -> Void
     private var updater: (any DesktopUpdateClient)?
     private var userDriver: SPUStandardUserDriver?
     private var didStart = false
     private var activeUpdateCheck: SPUUpdateCheck = .updates
     private var immediateInstallHandler: (() -> Void)?
     private var isImmediateInstallRequested = false
+    private var isAgentBridgeReplacementPrepared = false
 
     private override convenience init() {
         self.init(updaterFactory: { SparkleUpdateClient(hostBundle: .main, userDriver: $0, delegate: $1) },
@@ -96,6 +101,9 @@ final class DesktopUpdater: NSObject, ObservableObject {
          },
          confirmRestart: @escaping @MainActor () -> Bool = DesktopUpdater.confirmReadyRestart,
          presentApplicationsInstallInstruction: @escaping @MainActor (String) -> Void = DesktopUpdater.showApplicationsInstallInstruction,
+         agentBridgeNeedsHandoff: @escaping @MainActor () -> Bool = { AgentBridgeUpdateHandoff.shared.needsHandoff },
+         prepareAgentBridgeUpdate: @escaping @MainActor () async throws -> Void = { try await AgentBridgeUpdateHandoff.shared.prepareReplacement() },
+         cancelAgentBridgeUpdate: @escaping @MainActor () async throws -> Void = { try await AgentBridgeUpdateHandoff.shared.cancelReplacement() },
          cancelPermissionRestart: @escaping @MainActor () -> Void = {}) {
         self.updaterFactory = updaterFactory
         self.preferences = preferences
@@ -107,6 +115,9 @@ final class DesktopUpdater: NSObject, ObservableObject {
         self.confirmRestart = confirmRestart
         self.cancelPermissionRestart = cancelPermissionRestart
         self.presentApplicationsInstallInstruction = presentApplicationsInstallInstruction
+        self.agentBridgeNeedsHandoff = agentBridgeNeedsHandoff
+        self.prepareAgentBridgeUpdate = prepareAgentBridgeUpdate
+        self.cancelAgentBridgeUpdate = cancelAgentBridgeUpdate
         super.init()
     }
 
@@ -137,10 +148,17 @@ final class DesktopUpdater: NSObject, ObservableObject {
             self?.requestForegroundRestart()
         }, statusChanged: { [weak self] status in
             self?.projectDownloadProgress(status)
-        }, confirmReady: Self.confirmReadyRestart)
+        }, confirmReady: Self.confirmReadyRestart, prepareReplacement: { [weak self] in
+            await self?.prepareBackgroundAgentsForUpdate() ?? false
+        }, cancelReplacement: { [weak self] in
+            await self?.resumeBackgroundAgentsAfterCanceledUpdate()
+        }, mustCancelDeferredInstallation: agentBridgeNeedsHandoff)
         let updater = updaterFactory(driver, self)
+        // Sparkle's install-on-quit hook does not allow canceling that behavior.
+        // Pause its actual automatic downloads while preserving the preference.
         userDriver = driver
         self.updater = updater
+        if agentBridgeNeedsHandoff() { suspendAutomaticDownloads() }
         do {
             try updater.start()
             didStart = true
@@ -162,10 +180,15 @@ final class DesktopUpdater: NSObject, ObservableObject {
     }
 
     var automaticallyDownloadsUpdates: Bool {
-        get { updater?.automaticallyDownloadsUpdates ?? preferences.bool(forKey: "SUAutomaticallyUpdate") }
+        get { (preferences.object(forKey: Self.savedAutomaticDownloadsKey) as? Bool)
+            ?? updater?.automaticallyDownloadsUpdates ?? preferences.bool(forKey: "SUAutomaticallyUpdate") }
         set {
-            preferences.set(newValue, forKey: "SUAutomaticallyUpdate")
-            updater?.automaticallyDownloadsUpdates = newValue
+            if preferences.object(forKey: Self.savedAutomaticDownloadsKey) != nil {
+                preferences.set(newValue, forKey: Self.savedAutomaticDownloadsKey)
+            } else {
+                preferences.set(newValue, forKey: "SUAutomaticallyUpdate")
+                updater?.automaticallyDownloadsUpdates = newValue
+            }
             objectWillChange.send()
         }
     }
@@ -241,11 +264,77 @@ final class DesktopUpdater: NSObject, ObservableObject {
     }
 
     private func beginImmediateInstallation(_ immediateInstallHandler: () -> Void) {
-        requestForegroundRestart()
-        isReadyToastVisible = false
         guard !isImmediateInstallRequested else { return }
         isImmediateInstallRequested = true
-        immediateInstallHandler()
+        if !agentBridgeNeedsHandoff() { finishImmediateInstallation(immediateInstallHandler); return }
+        Task { @MainActor in
+            guard await prepareBackgroundAgentsForUpdate() else { isImmediateInstallRequested = false; return }
+            finishImmediateInstallation(immediateInstallHandler)
+        }
+    }
+
+    private func finishImmediateInstallation(_ handler: () -> Void) {
+        requestForegroundRestart()
+        isReadyToastVisible = false
+        handler()
+    }
+
+    /// Native setup calls this before enabling a helper. Never enable one under
+    /// an already staged automatic installer that cannot be canceled on Quit.
+    func prepareToEnableBackgroundAgents() throws {
+        guard !isReady, immediateInstallHandler == nil, !isImmediateInstallRequested else { throw AgentBridgeFailure.busy }
+        suspendAutomaticDownloads()
+    }
+
+    private static let savedAutomaticDownloadsKey = "agentBridge.savedAutomaticDownloads"
+    private func suspendAutomaticDownloads() {
+        if preferences.object(forKey: Self.savedAutomaticDownloadsKey) == nil {
+            preferences.set(automaticallyDownloadsUpdates, forKey: Self.savedAutomaticDownloadsKey)
+        }
+        updater?.automaticallyDownloadsUpdates = false
+    }
+    func restoreAutomaticDownloadsAfterAgentsStopped() {
+        guard !agentBridgeNeedsHandoff(), let saved = preferences.object(forKey: Self.savedAutomaticDownloadsKey) as? Bool else { return }
+        preferences.removeObject(forKey: Self.savedAutomaticDownloadsKey)
+        preferences.set(saved, forKey: "SUAutomaticallyUpdate")
+        updater?.automaticallyDownloadsUpdates = saved
+    }
+
+    func prepareBackgroundAgentsForUpdate() async -> Bool {
+        do {
+            try await prepareAgentBridgeUpdate()
+            isAgentBridgeReplacementPrepared = true
+            waitsForBackgroundAgents = false
+            return true
+        } catch {
+            waitsForBackgroundAgents = true
+            statusMessage = error as? AgentBridgeFailure == .busy
+                ? "Finish or Stop assigned persona work, then retry Restart Now. Cancel the update to resume background agents."
+                : "Background agents could not stop safely. Cancel the update and retry."
+            return false
+        }
+    }
+
+    func resumeBackgroundAgentsAfterCanceledUpdate() async {
+        do {
+            try await cancelAgentBridgeUpdate()
+            isAgentBridgeReplacementPrepared = false
+            waitsForBackgroundAgents = false
+        } catch {
+            statusMessage = "Background agents could not resume. Retry background setup."
+        }
+    }
+
+    func cancelBackgroundUpdate() {
+        Task { @MainActor in await resumeBackgroundAgentsAfterCanceledUpdate() }
+    }
+
+    /// An unexpected old staged installer must not replace a live helper on Quit.
+    /// Normal Quit with no staged installation never sends a helper operation.
+    func allowsTermination() -> Bool {
+        guard isReady, agentBridgeNeedsHandoff(), !isAgentBridgeReplacementPrepared else { return true }
+        statusMessage = "A staged update cannot replace active background agents on Quit. Use Restart Now to finish the update."
+        return false
     }
 
     func applicationWillTerminate() {
@@ -344,6 +433,9 @@ final class DesktopUpdateUserDriver: SPUStandardUserDriver {
     private let restartRequested: @MainActor () -> Void
     private let statusChanged: @MainActor (String) -> Void
     private let confirmReady: @MainActor () -> Bool
+    private let prepareReplacement: @MainActor () async -> Bool
+    private let cancelReplacement: @MainActor () async -> Void
+    private let mustCancelDeferredInstallation: @MainActor () -> Bool
     private var expectedDownloadBytes: UInt64 = 0
     private var downloadedBytes: UInt64 = 0
 
@@ -352,11 +444,17 @@ final class DesktopUpdateUserDriver: SPUStandardUserDriver {
          updateReady: @escaping @MainActor () -> Void,
          restartRequested: @escaping @MainActor () -> Void,
          statusChanged: @escaping @MainActor (String) -> Void,
-         confirmReady: @escaping @MainActor () -> Bool) {
+         confirmReady: @escaping @MainActor () -> Bool,
+         prepareReplacement: @escaping @MainActor () async -> Bool = { true },
+         cancelReplacement: @escaping @MainActor () async -> Void = {},
+         mustCancelDeferredInstallation: @escaping @MainActor () -> Bool = { false }) {
         self.updateReady = updateReady
         self.restartRequested = restartRequested
         self.statusChanged = statusChanged
         self.confirmReady = confirmReady
+        self.prepareReplacement = prepareReplacement
+        self.cancelReplacement = cancelReplacement
+        self.mustCancelDeferredInstallation = mustCancelDeferredInstallation
         super.init(hostBundle: hostBundle, delegate: delegate)
     }
 
@@ -405,7 +503,13 @@ final class DesktopUpdateUserDriver: SPUStandardUserDriver {
     override func showReadyToInstallAndRelaunch() async -> SPUUserUpdateChoice {
         super.dismissUpdateInstallation()
         updateReady()
-        guard confirmReady() else { return .dismiss }
+        guard confirmReady() else {
+            await cancelReplacement()
+            // At this stage Skip cancels the installation without skipping the
+            // version forever. Dismiss may still install automatically on Quit.
+            return mustCancelDeferredInstallation() ? .skip : .dismiss
+        }
+        guard await prepareReplacement() else { return .dismiss }
         restartRequested()
         return .install
     }
@@ -424,7 +528,7 @@ extension DesktopUpdater: SPUUpdaterDelegate {
         isChecking = false
         offeredVersion = version
         isInformationalUpdate = isInformational
-        isAutomaticallyDownloading = isScheduled && automaticallyDownloadsUpdates && !isInformational
+        isAutomaticallyDownloading = isScheduled && (updater?.automaticallyDownloadsUpdates ?? false) && !isInformational
         isWaitingForApproval = false
         updateAvailable = !isAutomaticallyDownloading
         if isAutomaticallyDownloading {
@@ -547,6 +651,7 @@ extension DesktopUpdater: SPUUpdaterDelegate {
     }
 
     func handleUpdateFailure(domain: String, code: Int) {
+        Task { @MainActor in await resumeBackgroundAgentsAfterCanceledUpdate() }
         isChecking = false
         isAutomaticallyDownloading = false
         isWaitingForApproval = false
@@ -677,6 +782,9 @@ struct DesktopUpdatesMenuSection: View {
             Button("Restart Now") { updater.restartToInstall() }
             Button("Later") { updater.dismissReadyToast() }
         }
+        if updater.waitsForBackgroundAgents {
+            Button("Cancel Update and Resume Background Agents") { updater.cancelBackgroundUpdate() }
+        }
         Button("Check for Updates…") { updater.checkForUpdates() }
             .disabled(!updater.isAvailable || !updater.canCheckForUpdates || updater.isChecking)
         if updater.updateAvailable && !updater.isReady {
@@ -706,6 +814,9 @@ struct DesktopAutomaticUpdatesMenuItem: View {
     private var automaticDownloadsHelp: String {
         if updater.applicationsInstallInstruction != nil {
             return "Updates are paused in this location. Your saved preference resumes when you open PersonaStack from Applications."
+        }
+        if AgentBridgeUpdateHandoff.shared.needsHandoff {
+            return "Your preference is saved. Background agents require explicit Restart Now so assigned work can finish before replacement."
         }
         return "Downloads updates in the background and installs them when PersonaStack quits. It never restarts the app automatically."
     }

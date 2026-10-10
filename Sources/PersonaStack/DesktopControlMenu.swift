@@ -70,6 +70,7 @@ struct DesktopControlMenu: View {
             Button("Upload to Workspace…") { openDesktopFlow(path: "/user/desktop/skills", query: ["direction": "upload"]) }
             Button("Download from Workspace…") { openDesktopFlow(path: "/user/desktop/skills", query: ["direction": "download"]) }
         }
+        AgentBridgeMenu()
         Divider()
         connectionStatus
         if let activity = presentation.snapshot.activity {

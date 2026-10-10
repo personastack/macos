@@ -177,6 +177,7 @@ final class MainWebViewHost {
         configuration.userContentController.addScriptMessageHandler(ChatWindowManager.shared, contentWorld: .page, name: "personastackChat")
         configuration.userContentController.addScriptMessageHandler(StackWindowManager.shared, contentWorld: .page, name: "personastackStack")
         configuration.userContentController.addScriptMessageHandler(LocalSessionManager.shared, contentWorld: .page, name: "personastackLocalSession")
+        configuration.userContentController.addScriptMessageHandler(AgentBridgeSetupManager.shared, contentWorld: .page, name: "personastackAgentBridge")
         configuration.userContentController.addScriptMessageHandler(DesktopSkillsManager.shared, contentWorld: .page, name: "personastackSkills")
         configuration.userContentController.addScriptMessageHandler(DesktopControlSetupManager.shared, contentWorld: .page, name: "personastackDesktopControl")
 
@@ -188,6 +189,7 @@ final class MainWebViewHost {
         ChatWindowManager.shared.register(webView, appURL: appURL)
         StackWindowManager.shared.register(webView, appURL: appURL)
         LocalSessionManager.shared.register(webView, appURL: appURL)
+        AgentBridgeSetupManager.shared.register(webView, appURL: appURL)
         DesktopSkillsManager.shared.register(webView, appURL: appURL)
         DesktopControlSetupManager.shared.register(webView, appURL: appURL)
 
@@ -248,13 +250,14 @@ final class MainWebViewHost {
         ChatWindowManager.shared.unregister(webView)
         StackWindowManager.shared.unregister(webView)
         LocalSessionManager.shared.invalidate(webView)
+        AgentBridgeSetupManager.shared.unregister(webView)
         DesktopSkillsManager.shared.unregister(webView)
         DesktopControlSetupManager.shared.unregister(webView)
         coordinator.retire()
         webView.stopLoading()
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
-        for name in ["personastackConcern", "personastackChat", "personastackStack", "personastackLocalSession", "personastackSkills", "personastackDesktopControl"] {
+        for name in ["personastackConcern", "personastackChat", "personastackStack", "personastackLocalSession", "personastackAgentBridge", "personastackSkills", "personastackDesktopControl"] {
             webView.configuration.userContentController.removeScriptMessageHandler(forName: name)
         }
         webView.removeFromSuperview()
@@ -464,12 +467,16 @@ struct PersonaStackWebView: NSViewRepresentable {
                ChatWindowCommand.sameOrigin(url, appURL) {
                 DesktopControlSetupManager.shared.invalidate(webView)
             }
+            if webView === self.webView, navigationAction.targetFrame?.isMainFrame == true {
+                AgentBridgeSetupManager.shared.invalidate(webView)
+            }
 
             if webView === self.webView, navigationAction.targetFrame?.isMainFrame == true,
                ["/login", "/logout"].contains(url.path) {
                 ChatWindowManager.shared.invalidateSession()
                 StackWindowManager.shared.invalidateSession()
                 LocalSessionManager.shared.invalidateSession()
+                AgentBridgeSetupManager.shared.invalidateSession()
             }
 
             if navigationAction.targetFrame == nil {
@@ -542,7 +549,7 @@ struct PersonaStackWebView: NSViewRepresentable {
                     popup.stopLoading()
                     popup.navigationDelegate = nil
                     popup.uiDelegate = nil
-                    for name in ["personastackConcern", "personastackChat", "personastackStack", "personastackLocalSession", "personastackDesktopControl"] {
+                    for name in ["personastackConcern", "personastackChat", "personastackStack", "personastackLocalSession", "personastackAgentBridge", "personastackDesktopControl"] {
                         popup.configuration.userContentController.removeScriptMessageHandler(forName: name)
                     }
                 }

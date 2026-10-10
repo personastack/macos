@@ -53,6 +53,13 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         // enrollment or the visible main window.
         _ = MainWebViewHost.shared
         DesktopUpdater.shared.start()
+        Task { @MainActor in
+            do { try await AgentBridgeUpdateHandoff.shared.restoreAtLaunch() }
+            catch {
+                UserDefaults.standard.set("Background agents could not resume after the update. Review Login Items and retry setup.",
+                                          forKey: AgentBridgeService.errorKey)
+            }
+        }
         guard UserDefaults.standard.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
                 || DesktopApplicationRestart.resumesPermissionSetup else { return }
         UserDefaults.standard.removeObject(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
@@ -134,6 +141,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if phase == .admitted { return .terminateNow }
         guard phase == .idle else { return .terminateCancel }
+        guard DesktopUpdater.shared.allowsTermination() else { return .terminateCancel }
         DesktopUpdater.shared.applicationWillTerminate()
         phase = .cleaning
         Task { @MainActor in

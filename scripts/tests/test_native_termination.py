@@ -42,7 +42,13 @@ import AppKit
     static let foregroundUpdateRelaunchKey = "probe-update"
     func start() {}
     func applicationWillTerminate() {}
+    func allowsTermination() -> Bool { true }
 }
+@MainActor final class AgentBridgeUpdateHandoff {
+    static let shared = AgentBridgeUpdateHandoff()
+    func restoreAtLaunch() async throws {}
+}
+@MainActor enum AgentBridgeService { static let errorKey = "probe-background-error" }
 @MainActor final class DesktopApplicationRestart {
     static let foregroundArgument = "probe-relaunch"
     static let resumesPermissionSetup = false

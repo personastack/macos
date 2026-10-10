@@ -14,6 +14,7 @@ staging_dir="$root_dir/build/dmg-root"
 rw_dmg="$root_dir/build/PersonaStack-$version-rw.dmg"
 arm64_build_dir="$root_dir/build/swift-arm64"
 x86_64_build_dir="$root_dir/build/swift-x86_64"
+agent_bridge_build_dir="$root_dir/build/agent-bridge"
 
 case "$configuration" in
   release) product_configuration=Release ;;
@@ -45,6 +46,7 @@ if [ "${CLEAN_BUILD:-1}" = 1 ]; then
 fi
 swift build --package-path "$root_dir" --scratch-path "$arm64_build_dir" --triple arm64-apple-macosx14.0 -c "$configuration"
 swift build --package-path "$root_dir" --scratch-path "$x86_64_build_dir" --triple x86_64-apple-macosx14.0 -c "$configuration"
+sh "$root_dir/scripts/build-agent-bridge.sh" "$agent_bridge_build_dir" "$version"
 arm64_binary=$(find "$arm64_build_dir" -type f -name PersonaStack -perm -111 -print -quit)
 x86_64_binary=$(find "$x86_64_build_dir" -type f -name PersonaStack -perm -111 -print -quit)
 test -n "$arm64_binary"
@@ -62,6 +64,7 @@ lipo -create \
   "$(dirname "$x86_64_binary")/PersonaStackHarnessHook" \
   -output "$bundle_dir/Contents/MacOS/PersonaStackHarnessHook"
 chmod 755 "$bundle_dir/Contents/MacOS/PersonaStackHarnessHook"
+cp "$agent_bridge_build_dir/PersonaStackAgentBridge" "$bundle_dir/Contents/MacOS/PersonaStackAgentBridge"
 if [ "$configuration" = release ]; then
   : "${PERSONASTACK_INSTALLER_SIGNING_IDENTITY:?Developer ID Installer identity is required for the main installer}"
 fi
@@ -73,6 +76,8 @@ ditto "$(dirname "$arm64_binary")/PersonaStackDesktop_PersonaStackCore.bundle" \
   "$bundle_dir/Contents/Resources/PersonaStackDesktop_PersonaStackCore.bundle"
 cp "$root_dir/Resources/LaunchAgents/ai.personastack.desktop.crash-recovery.plist" \
   "$bundle_dir/Contents/Library/LaunchAgents/ai.personastack.desktop.crash-recovery.plist"
+cp "$root_dir/Resources/LaunchAgents/ai.personastack.desktop.agent-bridge.plist" \
+  "$bundle_dir/Contents/Library/LaunchAgents/ai.personastack.desktop.agent-bridge.plist"
 cp "$root_dir/.build/checkouts/Sparkle/LICENSE" "$bundle_dir/Contents/Resources/Sparkle-LICENSE.txt"
 sparkle_framework="$root_dir/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
 if [ ! -d "$sparkle_framework" ]; then

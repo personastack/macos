@@ -24,3 +24,13 @@ expected_requirement="identifier \"$signing_id\" and anchor apple generic and ce
 actual_requirement=$(codesign --display -r- "$bundle" 2>&1 | sed -n 's/^designated => //p')
 test "$actual_requirement" = "$expected_requirement"
 codesign --verify --strict -R "=$expected_requirement" "$bundle"
+
+helper="$bundle/Contents/MacOS/PersonaStackAgentBridge"
+codesign --verify --strict "$helper"
+codesign --display --verbose=4 "$helper" > "$verification_dir/helper-details" 2>&1
+codesign --display --extract-certificates="$verification_dir/helper-certificate" "$helper" >/dev/null 2>&1
+cmp "$certificate" "$verification_dir/helper-certificate0"
+grep -Fxq 'Identifier=ai.personastack.desktop.agent-bridge' "$verification_dir/helper-details"
+grep -Fxq 'TeamIdentifier=5T2T8KL852' "$verification_dir/helper-details"
+grep -Fq '(runtime)' "$verification_dir/helper-details"
+grep -q '^Timestamp=' "$verification_dir/helper-details"

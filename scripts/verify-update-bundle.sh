@@ -13,6 +13,11 @@ root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 test -d "$bundle/Contents/MacOS"
 test -x "$bundle/Contents/MacOS/PersonaStack"
 test -x "$bundle/Contents/MacOS/PersonaStackHarnessHook"
+test -x "$bundle/Contents/MacOS/PersonaStackAgentBridge"
+agent_plist="$bundle/Contents/Library/LaunchAgents/ai.personastack.desktop.agent-bridge.plist"
+test "$(/usr/libexec/PlistBuddy -c 'Print :Label' "$agent_plist")" = 'ai.personastack.desktop.agent-bridge'
+test "$(/usr/libexec/PlistBuddy -c 'Print :BundleProgram' "$agent_plist")" = 'Contents/MacOS/PersonaStackAgentBridge'
+test "$("$bundle/Contents/MacOS/PersonaStackAgentBridge" --version)" = "$version"
 test -s "$bundle/Contents/Resources/AppIcon.icns"
 test -s "$bundle/Contents/Resources/MenuBarIcon.png"
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" = "$version"
@@ -23,6 +28,7 @@ lipo "$bundle/Contents/MacOS/PersonaStack" -verify_arch arm64
 lipo "$bundle/Contents/MacOS/PersonaStack" -verify_arch x86_64
 lipo "$bundle/Contents/MacOS/PersonaStackHarnessHook" -verify_arch arm64
 lipo "$bundle/Contents/MacOS/PersonaStackHarnessHook" -verify_arch x86_64
+lipo "$bundle/Contents/MacOS/PersonaStackAgentBridge" -verify_arch arm64 x86_64
 test -x "$framework/Versions/B/Autoupdate"
 test -x "$framework/Versions/B/Updater.app/Contents/MacOS/Updater"
 test -x "$framework/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"
