@@ -34,6 +34,8 @@ Primary references: [Hermes API](https://hermes-agent.nousresearch.com/docs/user
 
 Read directly from the identified immutable Git revisions. These are source contract evidence. No installed-runtime or signed-app interoperability is claimed.
 
+Hermes `/v1/runs` does not consume a `conversation` body field. Its supported declared-conversation owner is `X-Hermes-Session-Key`. The helper hashes the exact API conversation ID and issued MCP namespace into this bounded header. It omits `session_id` for those assignments because an explicit native session overrides the header. Hermes resolves and binds its own current transcript. Assignments without an API conversation keep the existing per-run session fallback. The API remains the durable conversation and composed-prompt owner. The existing assignment ID is sent as `Idempotency-Key`.
+
 | Source | Evidence used |
 | --- | --- |
 | [Hermes api_server.py at0d3b0348](https://github.com/NousResearch/hermes-agent/blob/0d3b0348f5aab2bc263c81b660d761a76ded14fe/gateway/platforms/api_server.py) | capabilities features include run_submission, run_status, run_events_sse, run_stop. API_SERVER_HOST/PORT is selected profile environment. |

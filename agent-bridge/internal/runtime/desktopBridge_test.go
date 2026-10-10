@@ -31,15 +31,14 @@ func TestDesktopAgentBridgeHermesLifecycle(t *testing.T) {
 		switch r.Method + " " + r.URL.Path {
 		case "POST /v1/runs":
 			var body struct {
-				Input        string `json:"input"`
-				Session      string `json:"session_id"`
-				Conversation string `json:"conversation"`
-				Server       string `json:"native_mcp_server"`
+				Input   string `json:"input"`
+				Session string `json:"session_id"`
+				Server  string `json:"native_mcp_server"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
-			if body.Input != "composed wake" || body.Session != "run-a" || body.Conversation != "assignment-a" || body.Server != "issued-server" {
+			if body.Input != "composed wake" || body.Session != "run-a" || body.Server != "issued-server" || r.Header.Get("X-Hermes-Session-Key") != "" {
 				t.Fatalf("bad run body %+v", body)
 			}
 			return nativeResponse(r, `{"run_id":"native-a"}`), nil

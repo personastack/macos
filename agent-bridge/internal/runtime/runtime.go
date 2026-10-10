@@ -221,6 +221,7 @@ func (state *runEventState) emitStarted(handle RunEventHandler, startedAt time.T
 type RunRequest struct {
 	RunID                  string
 	AssignmentID           string
+	ConversationID         string
 	FullyComposedPrompt    string
 	NativeMCPServerName    string
 	NativeMCPToolNamespace string

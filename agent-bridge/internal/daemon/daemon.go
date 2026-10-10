@@ -900,14 +900,7 @@ func (r Runner) runBindingSession(ctx context.Context, binding config.Binding, s
 				}
 				continue
 			}
-			nativeRunID, err := runAdapter.StartRun(runtime.RunRequest{
-				RunID:                  frame.RunID,
-				AssignmentID:           frame.AssignmentID,
-				FullyComposedPrompt:    frame.RunStart.FullyComposedPrompt,
-				NativeMCPServerName:    frame.RunStart.NativeMCPServerName,
-				NativeMCPToolNamespace: frame.RunStart.NativeMCPToolNamespace,
-				Metadata:               frame.RunStart.Metadata,
-			})
+			nativeRunID, err := runAdapter.StartRun(assignedRunRequest(frame))
 			if err != nil {
 				failed := session.RunTerminalFrame(frame, externalagentprotocol.RunStatusFailed, externalagentprotocol.TerminalReasonFailed, safeDiagnosticNote(err.Error()))
 				commandCache.storeReply(frame, failed)
@@ -1362,6 +1355,18 @@ func (r Runner) revokeBinding(binding config.Binding, adapter runtime.Adapter, r
 		latest.ReadinessState = runtime.AdapterStateAuthMissing
 		return nil
 	})
+}
+
+func assignedRunRequest(frame externalagentprotocol.Frame) runtime.RunRequest {
+	return runtime.RunRequest{
+		RunID:                  frame.RunID,
+		AssignmentID:           frame.AssignmentID,
+		ConversationID:         frame.RunStart.ConversationID,
+		FullyComposedPrompt:    frame.RunStart.FullyComposedPrompt,
+		NativeMCPServerName:    frame.RunStart.NativeMCPServerName,
+		NativeMCPToolNamespace: frame.RunStart.NativeMCPToolNamespace,
+		Metadata:               frame.RunStart.Metadata,
+	}
 }
 
 func (r Runner) activateRun(binding config.Binding, frame externalagentprotocol.Frame) error {

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"github.com/google/uuid"
@@ -207,6 +208,78 @@ func TestDesktopAgentBridgeRunCancelUsesSelectedAdapterAndKeepsFailedObservation
 type credentialTransport func(*http.Request) (*http.Response, error)
 
 func (f credentialTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestDesktopAgentBridgeHermesCanonicalConversationDispatch(t *testing.T) {
+	t.Parallel()
+	binding, _, runner := freshSelectedFixture(t)
+	env := "API_SERVER_PORT=26422\nAPI_SERVER_KEY=selected-profile-key\n"
+	if err := os.WriteFile(filepath.Join(binding.HermesHome, ".env"), []byte(env), 0600); err != nil {
+		t.Fatal(err)
+	}
+	native, _, err := runner.targetAdapter(binding, targetForBinding(binding))
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := native.(runtime.HermesAdapter)
+	sequence := []struct{ conversation, namespace, assignment string }{
+		{"api-conversation-a", "mcp_issued", "assignment-1"},
+		{"api-conversation-a", "mcp_issued", "assignment-2"},
+		{"api-conversation-b", "mcp_issued", "assignment-3"},
+		{"api-conversation-a", "mcp_other", "assignment-4"},
+		{"", "mcp_issued", "assignment-5"},
+	}
+	index := 0
+	keys := []string{}
+	adapter.Client = &http.Client{Transport: credentialTransport(func(req *http.Request) (*http.Response, error) {
+		if index >= len(sequence) {
+			t.Fatal("unplanned native request")
+		}
+		step := sequence[index]
+		if req.Method != http.MethodPost || req.URL.String() != "http://127.0.0.1:26422/v1/runs" || req.Header.Get("Authorization") != "Bearer selected-profile-key" || req.Header.Get("Content-Type") != "application/json" || req.Header.Get("Idempotency-Key") != step.assignment {
+			t.Fatal("native endpoint, profile auth, content type, or assignment idempotency changed")
+		}
+		var body struct {
+			Input        string            `json:"input"`
+			SessionID    *string           `json:"session_id"`
+			Server       string            `json:"native_mcp_server"`
+			Namespace    string            `json:"native_mcp_namespace"`
+			IncludeTools bool              `json:"include_native_tools"`
+			Metadata     map[string]string `json:"metadata"`
+		}
+		decoder := json.NewDecoder(req.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Input != "API fully composed prompt" || body.Server != "issued" || body.Namespace != step.namespace || !body.IncludeTools || body.Metadata["personastack_assignment_id"] != step.assignment {
+			t.Fatal("canonical prompt or issued MCP scope changed")
+		}
+		key := req.Header.Get("X-Hermes-Session-Key")
+		if step.conversation == "" {
+			if key != "" || body.SessionID == nil || *body.SessionID != "api-run-5" {
+				t.Fatal("absent conversation lost existing isolated run fallback")
+			}
+		} else {
+			expected := fmt.Sprintf("personastack:%x", sha256.Sum256([]byte(fmt.Sprintf(`["%s","%s"]`, step.namespace, step.conversation))))
+			if key != expected || len(key) > 256 || body.SessionID != nil {
+				t.Fatal("declared native conversation was shadowed or lost its exact scoped identity")
+			}
+		}
+		keys = append(keys, key)
+		index++
+		return &http.Response{StatusCode: http.StatusAccepted, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(fmt.Sprintf(`{"run_id":"native-%d"}`, index))), Request: req}, nil
+	})}
+	for n, step := range sequence {
+		frame := externalagentprotocol.Frame{RunID: fmt.Sprintf("api-run-%d", n+1), AssignmentID: step.assignment, RunStart: &externalagentprotocol.RunStartPayload{ConversationID: step.conversation, FullyComposedPrompt: "API fully composed prompt", NativeMCPServerName: "issued", NativeMCPToolNamespace: step.namespace}}
+		id, err := adapter.StartRun(assignedRunRequest(frame))
+		if err != nil || id != fmt.Sprintf("native-%d", n+1) {
+			t.Fatalf("canonical assignment dispatch failed: %s %v", id, err)
+		}
+	}
+	if index != len(sequence) || keys[0] != keys[1] || keys[0] == keys[2] || keys[0] == keys[3] {
+		t.Fatal("conversation continuity or issued-namespace isolation failed")
+	}
+}
 
 func TestDesktopAgentBridgeRepairRejectedMCPCredentialHasNoRuntimeMutation(t *testing.T) {
 	t.Parallel()

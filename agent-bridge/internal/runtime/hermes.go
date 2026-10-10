@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -254,7 +255,11 @@ func (adapter HermesAdapter) StartRun(request RunRequest) (string, error) {
 }
 
 func (adapter HermesAdapter) startHermesRun(request RunRequest) (string, error) {
-	body := hermesRunSubmission{Input: strings.TrimSpace(request.FullyComposedPrompt), SessionID: boundedRunMetadataText(firstNonEmpty(request.RunID, request.AssignmentID), maxRunMetadataValueRunes), Conversation: boundedRunMetadataText(request.AssignmentID, maxRunMetadataValueRunes), NativeMCPServer: boundedRunMetadataText(request.NativeMCPServerName, maxRunMetadataValueRunes), NativeMCPNamespace: boundedRunMetadataText(request.NativeMCPToolNamespace, maxRunMetadataValueRunes), IncludeNativeTools: true, Metadata: runMetadata(request)}
+	body := hermesRunSubmission{Input: strings.TrimSpace(request.FullyComposedPrompt), NativeMCPServer: boundedRunMetadataText(request.NativeMCPServerName, maxRunMetadataValueRunes), NativeMCPNamespace: boundedRunMetadataText(request.NativeMCPToolNamespace, maxRunMetadataValueRunes), IncludeNativeTools: true, Metadata: runMetadata(request)}
+	conversationKey := hermesConversationKey(request)
+	if conversationKey == "" {
+		body.SessionID = boundedRunMetadataText(firstNonEmpty(request.RunID, request.AssignmentID), maxRunMetadataValueRunes)
+	}
 
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -263,6 +268,12 @@ func (adapter HermesAdapter) startHermesRun(request RunRequest) (string, error) 
 	req, err := http.NewRequest(http.MethodPost, adapter.BaseURL+"/v1/runs", bytes.NewReader(raw))
 	if err != nil {
 		return "", err
+	}
+	if conversationKey != "" {
+		req.Header.Set("X-Hermes-Session-Key", conversationKey)
+	}
+	if request.AssignmentID != "" {
+		req.Header.Set("Idempotency-Key", request.AssignmentID)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if adapter.APIKey != "" {
@@ -1083,10 +1094,20 @@ func selectedHermesEnvironment(home string) []string {
 	return env
 }
 
+// The native declared-conversation owner resolves its current transcript, including
+// compression rotations. Never treat a PersonaStack ID as a native session ID.
+func hermesConversationKey(request RunRequest) string {
+	if request.ConversationID == "" {
+		return ""
+	}
+	parts := []string{request.NativeMCPToolNamespace, request.ConversationID}
+	raw, _ := json.Marshal(parts)
+	return fmt.Sprintf("personastack:%x", sha256.Sum256(raw))
+}
+
 type hermesRunSubmission struct {
 	Input              string            `json:"input"`
-	SessionID          string            `json:"session_id"`
-	Conversation       string            `json:"conversation"`
+	SessionID          string            `json:"session_id,omitempty"`
 	NativeMCPServer    string            `json:"native_mcp_server"`
 	NativeMCPNamespace string            `json:"native_mcp_namespace"`
 	IncludeNativeTools bool              `json:"include_native_tools"`
