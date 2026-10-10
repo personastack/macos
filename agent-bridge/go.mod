@@ -7,7 +7,9 @@ require github.com/google/uuid v1.6.0
 require github.com/personastack/agent-gateway v1.0.4-0.20261010111436-c50cf9c4510d
 
 require (
-	github.com/gorilla/websocket v1.5.0
+	github.com/gorilla/websocket v1.5.4-0.20240701034025-d67f41855da4
 	golang.org/x/sys v0.41.0
 	gopkg.in/yaml.v3 v3.0.1
 )
+
+require golang.org/x/net v0.48.0 // indirect
