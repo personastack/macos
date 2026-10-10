@@ -498,10 +498,19 @@ func TestDesktopAgentBridgeActualOpenClawProfileSelectedAgentDispatch(t *testing
 	if err != nil || candidate == "" {
 		t.Fatalf("native opaque choice rejected: %v", err)
 	}
-	b := config.Binding{EnvironmentID: "https://app.example", PersonaID: "persona", ConnectionID: "connection", ConnectionGeneration: 3, RuntimeKind: runtime.AdapterKindOpenClaw, AccountCandidateID: profile.AccountCandidateID, ProfileCandidateID: profile.CandidateID, NativeStateRoot: profile.Resolved.StateRoot, NativeConfigPath: profile.Resolved.ConfigPath, SelectedOpenClawAgentID: profile.Resolved.OpenClawAgentID, InventorySeed: "seed"}
-	store := config.NewMemoryStore(config.State{Bindings: []config.Binding{b}})
-	runner := Runner{Store: &store, ResolveTarget: func(binding config.Binding, target *externalagentprotocol.RuntimeTarget) (targetinventory.ResolvedTarget, error) {
-		return targetinventory.ResolveProfiles(binding.RuntimeKind, target, profiles, binding.SelectedOpenClawAgentID)
+	b := config.Binding{EnvironmentID: "https://app.example", PersonaID: "persona", ConnectionID: "connection", ConnectionGeneration: 3, RuntimeKind: runtime.AdapterKindOpenClaw, AccountCandidateID: profile.AccountCandidateID, ProfileCandidateID: profile.CandidateID, NativeStateRoot: profile.Resolved.StateRoot, NativeConfigPath: profile.Resolved.ConfigPath, OpenClawAgentID: profile.Resolved.OpenClawAgentID, InventorySeed: "seed"}
+	statePath := filepath.Join(t.TempDir(), "private", "state.json")
+	initial := config.NewFileStoreWithSecrets(statePath, selectedProfileFixtureSecrets{}).WithInventorySeed("seed")
+	if err := initial.SaveBinding(b); err != nil {
+		t.Fatal(err)
+	}
+	store := config.NewFileStoreWithSecrets(statePath, selectedProfileFixtureSecrets{}).WithInventorySeed("seed")
+	b, ok := config.BindingFor(store, b)
+	if !ok || b.OpenClawAgentID != "research" {
+		t.Fatal("canonical selected agent lost across helper store reload")
+	}
+	runner := Runner{Store: store, ResolveTarget: func(binding config.Binding, target *externalagentprotocol.RuntimeTarget) (targetinventory.ResolvedTarget, error) {
+		return targetinventory.ResolveProfiles(binding.RuntimeKind, target, profiles, binding.OpenClawAgentID)
 	}}
 	adapter, resolved, err := runner.targetAdapter(b, targetForBinding(b))
 	if err != nil || resolved.OpenClawAgentID != "research" {
@@ -727,3 +736,11 @@ func TestDesktopAgentBridgeQuiescedAcceptedAssignmentRestoresSelectedControlAdap
 		t.Fatal("accepted control restoration changed admission/config")
 	}
 }
+
+// This fixture binding has no helper-custodied secrets. Native auth belongs to
+// its selected OpenClaw config and is exercised by targetAdapter.
+type selectedProfileFixtureSecrets struct{}
+
+func (selectedProfileFixtureSecrets) Get(string) (string, error) { return "", nil }
+func (selectedProfileFixtureSecrets) Set(string, string) error   { return nil }
+func (selectedProfileFixtureSecrets) Delete(string) error        { return nil }

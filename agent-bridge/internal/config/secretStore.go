@@ -52,9 +52,6 @@ func loadBridgePrivateKeySecretWith(store SecretStore, key, publicKey string) st
 	return value
 }
 func storeBindingSecretsWith(secrets SecretStore, binding Binding) (Binding, error) {
-	// Target choice belongs to PersonaStack. These former pair-time fields may
-	// appear in legacy state, but must never survive another local write.
-
 	connectionID := binding.Key().String()
 	if connectionID == "" {
 		return binding, nil

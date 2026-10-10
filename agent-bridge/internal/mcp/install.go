@@ -370,6 +370,10 @@ func verifyBindingWithNative(ctx context.Context, home string, b config.Binding,
 	if !ok {
 		r.Note = note
 		r.DiagnosticCode = "native_mcp_unreachable"
+		if b.RuntimeKind == runtime.AdapterKindOpenClaw {
+			r.State = runtime.AdapterStateCapabilityMissing
+			r.DiagnosticCode = "runtime_unsupported"
+		}
 		return r
 	}
 	live := VerifyBindingLive(ctx, b, client)
@@ -396,7 +400,10 @@ func nativeCatalog(ctx context.Context, b config.Binding, runtimeURL string) (bo
 		if err != nil {
 			return false, "selected OpenClaw credential unavailable"
 		}
-		native := runtime.NewOpenClawAdapterWithAuth(runtimeURL, auth.Auth, b.OpenClawAgentID).VerifyMCPCatalog(ctx, b.NativeMCPServer)
+		adapter := runtime.NewOpenClawAdapterWithAuth(runtimeURL, auth.Auth, b.OpenClawAgentID)
+		adapter.StateRoot = b.NativeStateRoot
+		adapter.ConfigPath = b.NativeConfigPath
+		native := adapter.VerifyMCPCatalog(ctx, b.NativeMCPServer)
 		return native.OK, native.Note
 	}
 	native := runtime.VerifyHermesMCPServerLoadedWithHome(ctx, b.NativeMCPServer, b.HermesHome)

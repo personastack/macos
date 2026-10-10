@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+
+	"github.com/gorilla/websocket"
 	"strings"
 	"testing"
 	"time"
@@ -219,6 +222,29 @@ func TestDesktopAgentBridgeOpenClawPartialProgressDeadlineCancelAndTransportErro
 			}
 			if mode == "cancel" && !errors.Is(err, context.Canceled) {
 				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestDesktopAgentBridgeOpenClawColdMCPVerificationFailsClosed(t *testing.T) {
+	t.Parallel()
+	for _, server := range []string{"issued", ""} {
+		t.Run(server, func(t *testing.T) {
+			t.Parallel()
+			adapter := OpenClawAdapter{AgentID: "writer", Token: "selected-profile-key", GatewayURL: "ws://127.0.0.1:25907",
+				CallNative: func(context.Context, openClawRequest) (openClawResponse, error) {
+					t.Fatal("readiness tried a static catalog, model run or guessed discovery RPC")
+					return openClawResponse{}, nil
+				},
+				Dialer: &websocket.Dialer{NetDialContext: func(context.Context, string, string) (net.Conn, error) {
+					t.Fatal("unsupported cold verification dialed a native runtime")
+					return nil, nil
+				}},
+			}
+			result := adapter.VerifyMCPCatalog(context.Background(), server)
+			if result.OK || !strings.Contains(result.Note, "unsupported") || !strings.Contains(result.Note, "cold session discovery") {
+				t.Fatalf("unproven cold native MCP became Ready: %+v", result)
 			}
 		})
 	}

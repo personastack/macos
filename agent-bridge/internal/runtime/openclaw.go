@@ -177,21 +177,11 @@ type OpenClawMCPVerificationResult struct {
 }
 
 func (adapter OpenClawAdapter) VerifyMCPCatalog(ctx context.Context, serverName string) OpenClawMCPVerificationResult {
-	expectedServerName := strings.TrimSpace(serverName)
-	if expectedServerName == "" {
-		return OpenClawMCPVerificationResult{Note: "OpenClaw native MCP server name required"}
-	}
-	catalog, err := adapter.fetchOpenClawToolsCatalog(ctx, "verify-mcp-catalog-1")
-	if err != nil {
-		return OpenClawMCPVerificationResult{Note: err.Error()}
-	}
-	if !catalog.hasNativeMCPServer(expectedServerName) {
-		return OpenClawMCPVerificationResult{Note: "OpenClaw tools.catalog missing configured MCP server " + expectedServerName}
-	}
-	return OpenClawMCPVerificationResult{
-		OK:   true,
-		Note: "OpenClaw effective tool catalog visible for " + expectedServerName,
-	}
+	// tools.catalog is a static core/plugin catalog. tools.effective reads an
+	// already-warm persisted session and cannot initialize its MCP runtime.
+	// This helper has no supported cold discovery operation for its assigned
+	// session. Never substitute a plugin-name match or direct MCP reachability.
+	return OpenClawMCPVerificationResult{Note: "OpenClaw native MCP verification is unsupported: no supported cold session discovery operation"}
 }
 
 func (adapter OpenClawAdapter) DescribeNativeCapabilities(ctx context.Context, nativeMCPServerName string) ([]NativeCapability, error) {
@@ -737,22 +727,6 @@ func firstOpenClawSkillList(values ...*[]openClawSkillStatus) ([]openClawSkillSt
 		}
 	}
 	return nil, false
-}
-
-func (catalog openClawToolsCatalogResult) hasNativeMCPServer(expectedServerName string) bool {
-	target := strings.TrimSpace(expectedServerName)
-	if target == "" {
-		return false
-	}
-	for _, group := range catalog.Groups {
-		if strings.TrimSpace(group.PluginID) != target && strings.TrimSpace(group.Label) != target && strings.TrimSpace(group.ID) != "plugin:"+target {
-			continue
-		}
-		if len(group.Tools) > 0 {
-			return true
-		}
-	}
-	return false
 }
 
 func (catalog openClawToolsCatalogResult) nativeCapabilitySummaries(nativeMCPServerName string) []NativeCapability {

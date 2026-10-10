@@ -366,3 +366,30 @@ func TestDesktopAgentBridgeInstallerAdmissionGuardPreservesAssignedWork(t *testi
 		})
 	}
 }
+
+func TestDesktopAgentBridgeOpenClawUnsupportedNativeCatalogBlocksDirectMCP(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "openclaw.json")
+	if err := os.WriteFile(path, []byte(`{"agents":{"entries":{"writer":{}}},"gateway":{"auth":{"mode":"token","token":"profile-key"}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	binding := config.Binding{EnvironmentID: "https://app.test", ConnectionID: "connection", RuntimeKind: runtime.AdapterKindOpenClaw, OpenClawAgentID: "writer", NativeConfigPath: path, NativeStateRoot: filepath.Dir(path), NativeMCPServer: "issued", PersonaMCPURL: "https://mcp.test/mcp", PersonaMCPToken: "secret", InventorySeed: "seed"}
+	store := config.NewMemoryStore(config.State{Bindings: []config.Binding{binding}})
+	if _, err := (Installer{Store: &store}).InstallBinding(binding); err != nil {
+		t.Fatal(err)
+	}
+	binding, _ = config.BindingFor(&store, binding)
+	before, _ := os.ReadFile(path)
+	client := &http.Client{Transport: verifyContractRoundTripper(func(*http.Request) (*http.Response, error) {
+		t.Fatal("direct MCP reachability was substituted for effective native readiness")
+		return nil, nil
+	})}
+	result := VerifyBindingWithLiveAt(context.Background(), "", binding, client, "ws://127.0.0.1:25907")
+	if result.State != runtime.AdapterStateCapabilityMissing || result.DiagnosticCode != "runtime_unsupported" || !strings.Contains(result.Note, "cold session discovery") {
+		t.Fatalf("unsupported native capability was hidden: %+v", result)
+	}
+	after, _ := os.ReadFile(path)
+	if string(after) != string(before) {
+		t.Fatal("native refusal changed profile configuration")
+	}
+}

@@ -272,7 +272,7 @@ func (c *Controller) discover(p DiscoverPayload) (Result, error) {
 		if bound, occupied := c.boundProfile(profile); occupied {
 			row.ConflictCode = "profile_in_use"
 			for _, agent := range profile.OpenClawAgents {
-				if agent.ID == bound.SelectedOpenClawAgentID {
+				if agent.ID == bound.OpenClawAgentID {
 					row.SelectedAgentCandidateID = agent.CandidateID
 				}
 			}
@@ -333,7 +333,7 @@ func (c *Controller) prepare(p PreparePayload) (Result, error) {
 		}
 		if bound, exists := c.boundProfile(profile); exists {
 			if bound.EnvironmentID == p.EnvironmentID && string(bound.PersonaID) == p.PersonaID && bound.WorkspaceID == p.WorkspaceID {
-				if k == runtime.AdapterKindOpenClaw && bound.SelectedOpenClawAgentID != profile.Resolved.OpenClawAgentID {
+				if k == runtime.AdapterKindOpenClaw && bound.OpenClawAgentID != profile.Resolved.OpenClawAgentID {
 					return Result{}, issue("scope_changed", "This profile already has a different native dispatch agent.")
 				}
 				key := bound.Key()
@@ -436,7 +436,7 @@ func (c *Controller) enroll(ctx context.Context, p EnrollPayload) (Result, error
 	binding.NativeConfigPath = prepared.Profile.Resolved.ConfigPath
 	binding.NativeProfileName = prepared.Profile.Resolved.ProfileName
 	binding.HermesHome = prepared.Profile.Resolved.HermesHome
-	binding.SelectedOpenClawAgentID = prepared.Profile.Resolved.OpenClawAgentID
+	binding.OpenClawAgentID = prepared.Profile.Resolved.OpenClawAgentID
 
 	binding.Migration = captured
 	err = c.Store.SaveBinding(binding)

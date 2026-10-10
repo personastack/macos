@@ -95,8 +95,12 @@ func TestNativeOpenClawActualProfileChoiceEnrollmentAndResolution(t *testing.T) 
 	}
 	reloaded := config.NewFileStoreWithSecrets(statePath, nativeAgentFixtureSecrets{})
 	bindings := reloaded.ListBindings()
-	if len(bindings) != 1 || bindings[0].SelectedOpenClawAgentID != "writer" {
+	if len(bindings) != 1 || bindings[0].OpenClawAgentID != "writer" {
 		t.Fatalf("native choice lost %+v", bindings)
+	}
+	stored, err := os.ReadFile(statePath)
+	if err != nil || !strings.Contains(string(stored), `"OpenClawAgentID": "writer"`) || strings.Contains(string(stored), "SelectedOpenClawAgentID") {
+		t.Fatalf("persisted native selection lacks one canonical authority: %v", err)
 	}
 	status := request(t, c, "status", `{"binding_key":{"environment_id":"https://app.test","connection_id":"eac_connection"}}`)
 	if status.Error != nil || len(status.Result.Connections) != 1 {
@@ -108,7 +112,7 @@ func TestNativeOpenClawActualProfileChoiceEnrollmentAndResolution(t *testing.T) 
 	}
 	nativeProfiles, _ := targetinventory.DiscoverAt(home, "fixture", 501, 20, runtime.AdapterKindOpenClaw, "seed")
 	target := &externalagentprotocol.RuntimeTarget{RuntimeKind: externalagentprotocol.RuntimeKindOpenClaw, AccountCandidateID: bindings[0].AccountCandidateID, ProfileCandidateID: bindings[0].ProfileCandidateID}
-	resolved, err := targetinventory.ResolveProfiles(runtime.AdapterKindOpenClaw, target, nativeProfiles, bindings[0].SelectedOpenClawAgentID)
+	resolved, err := targetinventory.ResolveProfiles(runtime.AdapterKindOpenClaw, target, nativeProfiles, bindings[0].OpenClawAgentID)
 	if err != nil || resolved.OpenClawAgentID != "writer" {
 		t.Fatalf("dispatch resolution %s %v", resolved.OpenClawAgentID, err)
 	}
@@ -128,7 +132,7 @@ func TestNativeOpenClawActualProfileChoiceEnrollmentAndResolution(t *testing.T) 
 func TestNativeRetainedTargetStatusIsScopedRedactedAndReadOnly(t *testing.T) {
 	t.Parallel()
 	c, store, _ := fixture(t)
-	owner := config.Binding{EnvironmentID: "https://app.test", ConnectionID: "eac_owner", ConnectionGeneration: 7, PersonaID: "persona", WorkspaceID: "ws_" + strings.Repeat("a", 32), RuntimeKind: runtime.AdapterKindOpenClaw, AccountCandidateID: "rt_account_a", ProfileCandidateID: "rt_profile_a", SelectedOpenClawAgentID: "research", NativeStateRoot: "/private/owner", NativeConfigPath: "/private/owner/config", PersonaMCPToken: "private-mcp-secret", BridgePrivateKey: "private-bridge-secret"}
+	owner := config.Binding{EnvironmentID: "https://app.test", ConnectionID: "eac_owner", ConnectionGeneration: 7, PersonaID: "persona", WorkspaceID: "ws_" + strings.Repeat("a", 32), RuntimeKind: runtime.AdapterKindOpenClaw, AccountCandidateID: "rt_account_a", ProfileCandidateID: "rt_profile_a", OpenClawAgentID: "research", NativeStateRoot: "/private/owner", NativeConfigPath: "/private/owner/config", PersonaMCPToken: "private-mcp-secret", BridgePrivateKey: "private-bridge-secret"}
 	sibling := owner
 	sibling.ConnectionID = "eac_sibling"
 	sibling.PersonaID = "other"
@@ -153,7 +157,7 @@ func TestNativeRetainedTargetStatusIsScopedRedactedAndReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, secret := range []string{"/private/owner", "/private/sibling", "private-mcp-secret", "private-bridge-secret", "SelectedOpenClawAgentID"} {
+	for _, secret := range []string{"/private/owner", "/private/sibling", "private-mcp-secret", "private-bridge-secret", "OpenClawAgentID"} {
 		if strings.Contains(string(raw), secret) {
 			t.Fatal("private path or credential leaked into retry DTO")
 		}

@@ -78,7 +78,6 @@ type Binding struct {
 	NativeMCPNamespace      string
 	HermesHome              string
 	OpenClawAgentID         string
-	SelectedOpenClawAgentID string
 	OpenClawGatewayToken    string
 	OpenClawPassword        string
 	OpenClawDeviceToken     string

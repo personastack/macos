@@ -880,7 +880,6 @@ func (r Runner) runBindingSession(ctx context.Context, binding config.Binding, s
 					continue
 				}
 				runAdapter = snapshot.Adapter
-				binding.OpenClawAgentID = snapshot.Resolved.OpenClawAgentID
 				readiness = snapshot.Detection
 			} else {
 				readiness = r.bindingReadiness(runAdapter, binding)
@@ -1028,9 +1027,6 @@ func (r Runner) refreshMCPConfig(binding config.Binding, targets ...*externalage
 		return err
 	}
 
-	// This resolved agent belongs to this operation. Native configuration writes
-	// preserve the stored explicit selection rather than saving this local copy.
-	latest.OpenClawAgentID = resolved.OpenClawAgentID
 	if target.ProfileCandidateID != latest.ProfileCandidateID {
 		return fmt.Errorf("scope_changed: selected profile differs from prepared profile")
 	}
@@ -1900,7 +1896,7 @@ func (r Runner) resolveTarget(binding config.Binding, target *externalagentproto
 	if r.ResolveTarget != nil {
 		return r.ResolveTarget(binding, target)
 	}
-	return targetinventory.Resolve(binding.RuntimeKind, target, binding.InventorySeed, binding.SelectedOpenClawAgentID)
+	return targetinventory.Resolve(binding.RuntimeKind, target, binding.InventorySeed, binding.OpenClawAgentID)
 }
 func (r Runner) verifyRuntimeEndpoint(ctx context.Context, endpoint string, resolved targetinventory.ResolvedTarget, kind runtime.AdapterKind) (bool, error) {
 	if r.VerifyRuntimeEndpoint != nil {
