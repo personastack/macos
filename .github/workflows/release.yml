@@ -17,6 +17,10 @@ permissions:
 jobs:
   release:
     runs-on: macos-26
+    concurrency:
+      group: macos-release-${{ github.event_name == 'push' && 'publication' || github.run_id }}
+      cancel-in-progress: false
+      queue: max
     steps:
       - uses: actions/checkout@v4
       - name: Select release version

@@ -111,7 +111,7 @@ else:
         return self.command("git", "--git-dir", str(self.remote), "show", f"{revision}:{path}").stdout
 
     def test_each_release_updates_cask_assets_and_feed_without_rebuilding(self):
-        for version in ("1.2.3", "1.2.4"):
+        for version in ("1.2.9", "1.2.10"):
             with self.subTest(version=version):
                 result, archive, notes = self.publish(version)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -134,13 +134,33 @@ else:
                 self.assertEqual(item.findtext("description"), notes.read_text().strip())
                 self.assertIn(f"/{tag}/Downloads/{archive.name}", item.find("enclosure").get("url"))
         self.assertEqual([i.findtext(f"{{{SPARKLE}}}version") for i in feed.findall("channel/item")],
-                         ["1.2.4", "1.2.3"])
-        self.assertEqual(self.remote_file("desktop-v1.2.3", "Downloads/PersonaStack-1.2.3-developerid.dmg"),
-                         "finalized CI archive 1.2.3")
+                         ["1.2.10", "1.2.9"])
+        self.assertEqual(self.remote_file("desktop-v1.2.9", "Downloads/PersonaStack-1.2.9-developerid.dmg"),
+                         "finalized CI archive 1.2.9")
         self.assertEqual(self.remote_file("main", "README.md"), "Unrelated tap contents\n")
         signing = [c for c in self.calls() if c["tool"] == "sign_update"]
         self.assertEqual(len(signing), 8)
         self.assertEqual(sum("--verify" in c["args"] for c in signing), 4)
+
+    def test_older_or_equal_release_cannot_replace_current_publication(self):
+        result, _, _ = self.publish("1.2.4")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        head = self.git("rev-parse", "HEAD").stdout
+        cask = self.remote_file("main", "Casks/personastack.rb")
+        feed = self.remote_file("main", "appcast.xml")
+        calls = self.calls()
+        for version in ("1.2.3", "1.2.4"):
+            with self.subTest(version=version):
+                result, _, _ = self.publish(version)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("must be newer than current cask 1.2.4", result.stderr)
+                self.assertEqual(self.calls(), calls)
+                self.assertEqual(self.git("rev-parse", "HEAD").stdout, head)
+                self.assertEqual(self.git("status", "--porcelain").stdout, "")
+                self.assertEqual(self.remote_file("main", "Casks/personastack.rb"), cask)
+                self.assertEqual(self.remote_file("main", "appcast.xml"), feed)
+        tags = self.command("git", "--git-dir", str(self.remote), "tag", "--list").stdout.splitlines()
+        self.assertEqual(tags, ["desktop-v1.2.4"])
 
     def test_existing_tag_or_release_is_rejected_before_tap_changes(self):
         for existing in ("tag", "release"):
@@ -204,6 +224,19 @@ else:
 
 
 class HomebrewWorkflowTests(unittest.TestCase):
+    def test_all_release_tags_share_a_non_cancelling_job_queue(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        # The whole job owns the queue, from tap checkout through the final feed
+        # push. Tag-specific groups would let older --latest calls race newer ones.
+        self.assertIn("""  release:
+    runs-on: macos-26
+    concurrency:
+      group: macos-release-${{ github.event_name == 'push' && 'publication' || github.run_id }}
+      cancel-in-progress: false
+      queue: max
+    steps:
+""", workflow)
+
     def test_tap_publication_is_mandatory_for_tags_and_excluded_from_validation(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
         steps = workflow.split("      - name: ")

@@ -21,6 +21,21 @@ test "$(basename "$dmg")" = "PersonaStack-$version-developerid.dmg"
 test -x "$sparkle_dir/bin/sign_update"
 tap_tag="desktop-v$version"
 cd "$tap_dir"
+python3 - "$version" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+cask = Path("Casks/personastack.rb")
+if cask.exists():
+    match = re.search(r'^\s*version "([0-9]+\.[0-9]+\.[0-9]+)"\s*$', cask.read_text(), re.MULTILINE)
+    if match is None:
+        raise SystemExit("Current Homebrew cask must have a numeric release version")
+    current = match.group(1)
+    numeric = lambda version: tuple(map(int, version.split(".")))
+    if numeric(sys.argv[1]) <= numeric(current):
+        raise SystemExit(f"Homebrew release {sys.argv[1]} must be newer than current cask {current}")
+PY
 if git rev-parse -q --verify "refs/tags/$tap_tag" >/dev/null; then
   echo "Homebrew installer tag $tap_tag already exists." >&2
   exit 1
