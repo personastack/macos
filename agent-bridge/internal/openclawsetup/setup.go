@@ -16,7 +16,7 @@ import (
 var lookPath = exec.LookPath
 
 var startGateway = func(homeDir string, identity hermessetup.ProcessIdentity, binary string, port int) error {
-	cmd := exec.Command(binary, "gateway", "run", "--port", strconv.Itoa(port))
+	cmd := exec.Command(binary, "gateway", "run", "--port", strconv.Itoa(port), "--bind", "loopback")
 	cmd.Env = processEnv(homeDir, identity)
 	cmd.Dir = strings.TrimSpace(homeDir)
 	cmd.Stdout = ioDiscard{}
@@ -110,16 +110,26 @@ func TryStartGatewayForProfile(ctx context.Context, home, root, config, profile 
 	if err != nil {
 		return false, fmt.Errorf("runtime_unsupported: OpenClaw executable missing: %w", err)
 	}
-	args := []string{"gateway", "run", "--port", strconv.Itoa(port)}
-	if profile != "default" {
-		args = append([]string{"--profile", profile}, args...)
-	}
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	cmd := profileGatewayCommand(binary, root, config, profile, port, os.Environ())
+	err = cmd.Start()
+	if err != nil {
+		return false, fmt.Errorf("start selected OpenClaw gateway: %w", err)
+	}
+	go func() { _ = cmd.Wait() }()
+	return true, nil
+}
+
+func profileGatewayCommand(binary, root, config, profile string, port int, environment []string) *exec.Cmd {
+	args := []string{"gateway", "run", "--port", strconv.Itoa(port), "--bind", "loopback"}
+	if profile != "default" {
+		args = append([]string{"--profile", profile}, args...)
+	}
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = root
-	for _, entry := range os.Environ() {
+	for _, entry := range environment {
 		if !strings.HasPrefix(entry, "OPENCLAW_") {
 			cmd.Env = append(cmd.Env, entry)
 		}
@@ -127,10 +137,5 @@ func TryStartGatewayForProfile(ctx context.Context, home, root, config, profile 
 	cmd.Env = append(cmd.Env, "OPENCLAW_STATE_DIR="+root, "OPENCLAW_CONFIG_PATH="+config)
 	cmd.Stdout = ioDiscard{}
 	cmd.Stderr = ioDiscard{}
-	err = cmd.Start()
-	if err != nil {
-		return false, fmt.Errorf("start selected OpenClaw gateway: %w", err)
-	}
-	go func() { _ = cmd.Wait() }()
-	return true, nil
+	return cmd
 }

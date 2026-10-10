@@ -88,6 +88,19 @@ func (r Runner) RepairBinding(ctx context.Context, b config.Binding, restartConf
 		return fmt.Errorf("reconnect_required: Disconnect and reconnect to renew PersonaStack MCP authorization")
 	}
 	if latest.RuntimeKind == runtime.AdapterKindOpenClaw {
+		resolved, err := r.resolveTarget(latest, targetForBinding(latest))
+		if err != nil {
+			return err
+		}
+		endpoint, err := r.targetRuntimeURL(latest, targetForBinding(latest))
+		if err != nil {
+			return err
+		}
+		// No listener means consented startup may proceed. A running selected
+		// gateway must prove its actual loopback bind before enabling Apps.
+		if _, err = r.verifyRuntimeEndpoint(ctx, endpoint, resolved, latest.RuntimeKind); err != nil {
+			return err
+		}
 		enabled, err := mcp.OpenClawAppsEnabled(latest.NativeConfigPath)
 		if err != nil {
 			return err

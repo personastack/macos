@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // EndpointEvidence keeps attribution independent of native health responses.
@@ -35,26 +36,29 @@ func MatchEndpoint(e EndpointEvidence, uid int, kind, root, config string) (bool
 	return true, nil
 }
 func VerifyEndpoint(ctx context.Context, endpoint, root, config, kind string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	parsed, err := url.Parse(endpoint)
 	if err != nil || parsed.Port() == "" {
 		return false, fmt.Errorf("runtime_conflict: selected loopback endpoint required")
 	}
 	// lsof identifies the listener first. A health response never authorizes attachment.
-	command := exec.CommandContext(ctx, "/usr/sbin/lsof", "-nP", "-iTCP:"+parsed.Port(), "-sTCP:LISTEN", "-t")
-	raw, err := command.Output()
+	raw, err := nativeCommandOutput(ctx, "/usr/sbin/lsof", "-nP", "-iTCP:"+parsed.Port(), "-sTCP:LISTEN", "-Fpn")
 	if err != nil {
 		var exit *exec.ExitError
 		if errors.As(err, &exit) && exit.ExitCode() == 1 {
+			if kind == "openclaw" {
+				return false, verifyNoOtherOpenClawListener(ctx, root, config, os.Geteuid(), nativeCommandOutput, nativeProfileEnvironment)
+			}
 			return false, nil
 		}
 		return false, fmt.Errorf("runtime_conflict: cannot attribute gateway listener")
 	}
-	pids := strings.Fields(string(raw))
-	if len(pids) != 1 {
-		return false, fmt.Errorf("runtime_conflict: gateway listener owner is ambiguous")
+	listenerPID, err := ListenerPID(raw, parsed.Port())
+	if err != nil {
+		return false, err
 	}
-	process := exec.CommandContext(ctx, "/bin/ps", "eww", "-p", pids[0], "-o", "uid=,command=")
-	raw, err = process.Output()
+	raw, err = nativeCommandOutput(ctx, "/bin/ps", "eww", "-p", listenerPID, "-o", "uid=,command=")
 	if err != nil {
 		return false, fmt.Errorf("runtime_conflict: cannot inspect gateway owner")
 	}
@@ -73,7 +77,7 @@ func VerifyEndpoint(ctx context.Context, endpoint, root, config, kind string) (b
 	e := ProcessEvidence(text, kind, root, config)
 	e.UID = uid
 	if isOpenClawGatewayTitle(fields, kind) {
-		pid, parseErr := strconv.Atoi(pids[0])
+		pid, parseErr := strconv.Atoi(listenerPID)
 		if parseErr != nil || pid <= 0 {
 			return false, fmt.Errorf("runtime_conflict: gateway PID unavailable")
 		}

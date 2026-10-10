@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/personastack/macos/agent-bridge/internal/config"
+	"github.com/personastack/macos/agent-bridge/internal/targetruntime"
 )
 
 func TestDesktopAgentBridgeRepairReceiptScopeFence(t *testing.T) {
@@ -49,5 +50,22 @@ func TestDesktopAgentBridgeRepairReceiptScopeFence(t *testing.T) {
 				t.Fatal("stale consent repaired successor binding/selection")
 			}
 		})
+	}
+}
+
+func TestDesktopAgentBridgeRepairUnverifiedListenerScopeUsesNativeHelp(t *testing.T) {
+	t.Parallel()
+	c, store, _ := fixture(t)
+	b := config.Binding{EnvironmentID: "https://app.test", ConnectionID: "connection", ConnectionGeneration: 7, TargetSelectionRevision: 9, PersonaMCPToken: "fixture"}
+	if err := store.SaveBinding(b); err != nil {
+		t.Fatal(err)
+	}
+	c.Repair = func(context.Context, config.Binding, bool, bool) error {
+		return targetruntime.ErrProfileScopeUnverified
+	}
+	raw, _ := json.Marshal(RepairPayload{BindingKey: b.Key(), ConnectionGeneration: 7, TargetSelectionRevision: 9, RestartConfirmed: true, OpenClawAppsConfirmed: true})
+	result := request(t, c, "repair", string(raw))
+	if result.Error == nil || result.Error.Code != "runtime_conflict" || result.Error.Message != targetruntime.ProfileScopeUnverifiedMessage {
+		t.Fatal("approved consent turned unverified listener into misleading consent prompt")
 	}
 }

@@ -548,6 +548,9 @@ func (c *Controller) repair(ctx context.Context, p RepairPayload) (Result, error
 	}
 	err = c.Repair(ctx, b, p.RestartConfirmed, p.OpenClawAppsConfirmed)
 	if err != nil {
+		if errors.Is(err, targetruntime.ErrProfileScopeUnverified) {
+			return Result{}, issue("runtime_conflict", targetruntime.ProfileScopeUnverifiedMessage)
+		}
 		if strings.HasPrefix(err.Error(), "mcp_apps_disabled:") {
 			return Result{}, issue("mcp_apps_disabled", "Enable MCP Apps for this OpenClaw profile to verify its PersonaStack tools.")
 		}
