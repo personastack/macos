@@ -60,8 +60,23 @@ func VerifyEndpoint(ctx context.Context, endpoint, root, config, kind string) (b
 	if err != nil {
 		return false, fmt.Errorf("runtime_conflict: gateway UID unavailable")
 	}
+	if uid != os.Geteuid() {
+		return false, fmt.Errorf("runtime_conflict: listener ownership does not match selected profile")
+	}
 	e := ProcessEvidence(text, kind, root, config)
 	e.UID = uid
+	if isOpenClawGatewayTitle(fields, kind) {
+		pid, parseErr := strconv.Atoi(pids[0])
+		if parseErr != nil || pid <= 0 {
+			return false, fmt.Errorf("runtime_conflict: gateway PID unavailable")
+		}
+		// macOS ps loses environment attribution after Node changes process.title.
+		// Read the same listener's original kernel environment after checking UID.
+		e.StateRoot, e.ConfigPath, err = nativeProfileEnvironment(pid)
+		if err != nil {
+			return false, fmt.Errorf("runtime_conflict: cannot inspect gateway profile")
+		}
+	}
 	return MatchEndpoint(e, os.Geteuid(), kind, root, config)
 }
 
@@ -71,6 +86,9 @@ func ProcessEvidence(text, kind, root, config string) EndpointEvidence {
 	e := EndpointEvidence{Listening: true}
 	fields := strings.Fields(text)
 	runtimeFound, gatewayFound, rootFound, configFound := false, false, false, false
+	if isOpenClawGatewayTitle(fields, kind) {
+		runtimeFound, gatewayFound = true, true
+	}
 	for _, field := range fields {
 		if field == kind || strings.HasSuffix(field, "/"+kind) {
 			runtimeFound = true
@@ -99,4 +117,8 @@ func ProcessEvidence(text, kind, root, config string) EndpointEvidence {
 		e.ConfigPath = config
 	}
 	return e
+}
+
+func isOpenClawGatewayTitle(fields []string, kind string) bool {
+	return kind == "openclaw" && len(fields) >= 2 && fields[1] == "openclaw-gateway"
 }
