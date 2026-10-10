@@ -104,7 +104,7 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
             let manager = manager(fixture, confirmRepair: { _ in Issue.record("Credential renewal must not grant gateway restart"); return true })
             let issuingView = WKWebView()
             let actual = try await self.command("repair", manager: manager, view: issuingView)
-            await #expect(throws: AgentBridgeFailure.reconnectRequired) { try await manager.apply(actual, view: issuingView) }
+            await #expect(throws: AgentBridgeFailure.reconnectRequired) { _ = try await manager.apply(actual, view: issuingView) }
             #expect(await fixture.performed == ["GET /user/personas/external-runtime", "check"])
         }
     }
@@ -115,7 +115,7 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
         let fixture = AgentBridgeManagementFixture([.init(operation: "GET /user/personas/external-runtime", json: busy), .init(operation: "status", json: active)])
         let manager = manager(fixture), view = WKWebView()
         let command = try await command("disconnect", manager: manager, view: view)
-        await #expect(throws: AgentBridgeFailure.busy) { try await manager.apply(command, view: view) }
+        await #expect(throws: AgentBridgeFailure.busy) { _ = try await manager.apply(command, view: view) }
         #expect(await fixture.performed == ["GET /user/personas/external-runtime", "status"])
     }
 
@@ -162,7 +162,7 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
         ]
         let fixture = AgentBridgeManagementFixture(steps), manager = manager(fixture, confirmStop: { _ in true }), view = WKWebView()
         let command = try await command("disconnect", manager: manager, view: view)
-        await #expect(throws: AgentBridgeFailure.scopeChanged) { try await manager.apply(command, view: view) }
+        await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(command, view: view) }
         #expect(await fixture.performed == steps.map(\.operation))
     }
 }

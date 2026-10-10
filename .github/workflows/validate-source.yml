@@ -38,8 +38,9 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 30
     env:
-      GOPRIVATE: github.com/personastack/*
-      PERSONASTACK_MODULES_TOKEN: ${{ secrets.PERSONASTACK_MODULES_TOKEN || github.token }}
+      GOFLAGS: -mod=vendor
+      GOPROXY: off
+      GOSUMDB: off
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,10 +49,6 @@ jobs:
         with:
           go-version-file: agent-bridge/go.mod
           cache-dependency-path: agent-bridge/go.sum
-      - name: Resolve independent private modules
-        run: |
-          git config --global credential.https://github.com.helper '!f() { printf "username=x-access-token\npassword=%s\n" "$PERSONASTACK_MODULES_TOKEN"; }; f'
-          (cd agent-bridge && go mod download)
       - name: Test helper source and Darwin Keychain boundary
         run: cd agent-bridge && go test -parallel "$(sysctl -n hw.logicalcpu)" ./...
       - name: Build universal helper without signing

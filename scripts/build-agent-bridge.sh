@@ -16,7 +16,8 @@ for architecture in arm64 amd64; do
   if [ "$architecture" = amd64 ]; then native_architecture=x86_64; fi
   (
     cd "$source_module"
-    GOOS=darwin GOARCH="$architecture" CGO_ENABLED=1 \
+    GOFLAGS=-mod=vendor GOPROXY=off GOSUMDB=off \
+      GOOS=darwin GOARCH="$architecture" CGO_ENABLED=1 \
       CC="clang -arch $native_architecture" \
       CGO_CFLAGS="-isysroot $sdk_path -mmacosx-version-min=14.0" \
       CGO_LDFLAGS="-isysroot $sdk_path -mmacosx-version-min=14.0" \

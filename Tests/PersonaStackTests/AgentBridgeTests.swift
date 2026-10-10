@@ -185,10 +185,10 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
         let scope = try #require(response["scope"] as? String)
         #expect(UUID(uuidString: scope) != nil)
         let discover = try AgentBridgePageCommand.parse(["version": "1", "action": "discover", "scope": scope, "runtime_kind": "hermes"])
-        await #expect(throws: AgentBridgeFailure.scopeChanged) { try await manager.apply(discover, view: second) }
+        await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(discover, view: second) }
         #expect(await transport.operations.isEmpty)
         manager.invalidate(first)
-        await #expect(throws: AgentBridgeFailure.scopeChanged) { try await manager.apply(discover, view: first) }
+        await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(discover, view: first) }
     }
 
     @Test @MainActor func registeredDocumentDiscoveryPreparationAndEnrollmentAreOrderedAndRedacted() async throws {
@@ -222,7 +222,7 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
         let enroll = try command("enroll", scope: scope, fields: ["preparation_id": id.uuidString, "code": "fixture-one-use-proof"])
         let result = try await manager.apply(enroll, view: view)
         #expect(Set(result.keys) == ["ok", "connection_id", "persona_id"])
-        await #expect(throws: AgentBridgeFailure.scopeChanged) { try await manager.apply(enroll, view: view) }
+        await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(enroll, view: view) }
         #expect(await transport.operations == ["status", "discover", "status", "prepare", "enroll"])
         #expect(registration.calls == ["register"])
     }
