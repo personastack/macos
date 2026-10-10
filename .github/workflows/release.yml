@@ -110,84 +110,35 @@ jobs:
           fi
           gh release create "$GITHUB_REF_NAME" "artifacts/PersonaStack-$RELEASE_VERSION-developerid.dmg" \
             --notes-file "release-notes/${GITHUB_REF_NAME#v}.md" --title "PersonaStack $GITHUB_REF_NAME"
-      - name: Publish Homebrew cask
+      - name: Check out Homebrew tap
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          SPARKLE_PRIVATE_KEY: ${{ secrets.PERSONASTACK_SPARKLE_PRIVATE_ED_KEY }}
-          GH_TOKEN: ${{ github.token }}
+        uses: actions/checkout@v4
+        with:
+          repository: personastack/homebrew-tap
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: build/homebrew-tap
+      - name: Download pinned Sparkle release tools
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         run: |
-          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
-            echo "HOMEBREW_TAP_TOKEN is required to publish the Homebrew cask." >&2
-            exit 1
-          fi
-          version="${GITHUB_REF_NAME#v}"
-          tap_tag="desktop-v$version"
-          tap_dir=$(mktemp -d)
-          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/personastack/homebrew-tap.git" "$tap_dir"
-          cd "$tap_dir"
-          if git rev-parse -q --verify "refs/tags/$tap_tag" >/dev/null; then
-            echo "Homebrew installer tag $tap_tag already exists." >&2
-            exit 1
-          fi
-          if GH_TOKEN="$HOMEBREW_TAP_TOKEN" gh release view --repo personastack/homebrew-tap "$tap_tag" >/dev/null 2>&1; then
-            echo "Homebrew release $tap_tag already exists." >&2
-            exit 1
-          fi
-          mkdir -p Casks Downloads
-          cp "$GITHUB_WORKSPACE/artifacts/PersonaStack-$version-developerid.dmg" Downloads/
-          current_dmg="Downloads/PersonaStack-$version-developerid.dmg"
-          test -f "$current_dmg"
-          "$GITHUB_WORKSPACE"/scripts/render-homebrew-cask.sh "$version" "$current_dmg" Casks/personastack.rb
-          grep -q '^  auto_updates true$' Casks/personastack.rb
-          git add Casks/personastack.rb Downloads/
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "feat: publish PersonaStack cask $version"
-          git tag -a "$tap_tag" -m "PersonaStack $version"
-          git push origin HEAD:main "refs/tags/$tap_tag"
-          latest_dmg="$RUNNER_TEMP/PersonaStack-latest.dmg"
-          cp "$current_dmg" "$latest_dmg"
-          GH_TOKEN="$HOMEBREW_TAP_TOKEN" gh release create \
-            --repo personastack/homebrew-tap \
-            "$tap_tag" "$current_dmg" "$latest_dmg" \
-            --title "PersonaStack $version" \
-            --notes-file "$GITHUB_WORKSPACE/release-notes/$version.md" \
-            --latest
-          gh release view -R "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" --json body -q .body \
-            >"$tap_dir/Downloads/PersonaStack-$version-developerid.md"
-          sparkle_zip=$(mktemp)
-          sparkle_dir=$(mktemp -d)
+          set -euo pipefail
+          sparkle_zip="$RUNNER_TEMP/Sparkle.zip"
+          sparkle_dir="$RUNNER_TEMP/personastack-sparkle"
           curl -fsSL https://github.com/sparkle-project/Sparkle/releases/download/2.10.0/Sparkle-for-Swift-Package-Manager.zip -o "$sparkle_zip"
           echo "17e28312b8e18ab7cdbbe09a6fb28cc55a5479ec6c371dbc07cdecd2a14fd959  $sparkle_zip" | shasum -a 256 -c -
           unzip -q "$sparkle_zip" -d "$sparkle_dir"
-          chmod 755 "$sparkle_dir/bin/generate_appcast"
           chmod 755 "$sparkle_dir/bin/sign_update"
-          archive_dir="$sparkle_dir/archives"
-          mkdir -p "$archive_dir"
-          if [ -f appcast.xml ]; then cp appcast.xml "$archive_dir/appcast.xml"; fi
-          archive_signature=$(printf '%s' "$SPARKLE_PRIVATE_KEY" | "$sparkle_dir/bin/sign_update" \
-            --ed-key-file - -p "$GITHUB_WORKSPACE/artifacts/PersonaStack-$version-developerid.dmg")
-          python3 "$GITHUB_WORKSPACE/scripts/render-package-appcast.py" \
-            "$version" "$GITHUB_WORKSPACE/artifacts/PersonaStack-$version-developerid.dmg" \
-            "$GITHUB_WORKSPACE/release-notes/$version.md" "$archive_signature" "$archive_dir/appcast.xml"
-          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$sparkle_dir/bin/sign_update" \
-            --ed-key-file - "$archive_dir/appcast.xml"
-          cp "$archive_dir/appcast.xml" "$tap_dir/appcast.xml"
-          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$sparkle_dir/bin/sign_update" \
-            --ed-key-file - --verify "$GITHUB_WORKSPACE/artifacts/PersonaStack-$version-developerid.dmg" "$archive_signature"
-          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$sparkle_dir/bin/sign_update" \
-            --ed-key-file - --verify "$tap_dir/appcast.xml"
-          python3 "$GITHUB_WORKSPACE/scripts/validate-appcast.py" \
-            "$tap_dir/appcast.xml" "$version" "$tap_tag" \
-            "$GITHUB_WORKSPACE/artifacts/PersonaStack-$version-developerid.dmg" "$tap_dir/Casks/personastack.rb" \
-            "$GITHUB_WORKSPACE/release-notes/$version.md"
-          cd "$tap_dir"
-          git add appcast.xml
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "feat: publish signed PersonaStack appcast $version"
-          git push origin HEAD:main
+      - name: Publish Homebrew release and signed appcast
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.PERSONASTACK_SPARKLE_PRIVATE_ED_KEY }}
+        run: |
+          ./scripts/publish-homebrew-release.sh "$RELEASE_VERSION" \
+            "$GITHUB_WORKSPACE/artifacts/PersonaStack-$RELEASE_VERSION-developerid.dmg" \
+            "$GITHUB_WORKSPACE/build/homebrew-tap" "$RUNNER_TEMP/personastack-sparkle" \
+            "$GITHUB_WORKSPACE/release-notes/$RELEASE_VERSION.md"
       - name: Remove temporary signing keychain
         if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         run: |
