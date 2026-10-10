@@ -62,12 +62,20 @@ final class AgentBridgeService {
             return
         }
         guard registration.status == .enabled else { return }
+        let pendingMigration = try await hasPendingMigrationCapture()
+        guard !pendingMigration else { throw AgentBridgeFailure.migrationIncomplete }
         let admission = try await quiesce()
         guard admission.activeRunIDs.isEmpty else { throw AgentBridgeFailure.busy }
         let result = try await client.send(AgentBridgeRequest(operation: "stop_background", payload: [:]), returning: AgentBridgeAcknowledgement.self)
         guard result.disabled == true else { throw AgentBridgeFailure.serviceUnavailable }
         try await retireForReplacement()
         preferences.set(true, forKey: Self.disabledKey)
+    }
+
+    func hasPendingMigrationCapture() async throws -> Bool {
+        let result = try await client.send(AgentBridgeRequest(operation: "status", payload: [:]), returning: AgentBridgeConnections.self)
+        guard let count = result.pendingMigrationCount, count >= 0 else { throw AgentBridgeFailure.unsupportedVersion }
+        return count > 0
     }
 
     func quiesce() async throws -> AgentBridgeAdmission {

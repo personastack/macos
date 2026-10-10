@@ -308,9 +308,14 @@ final class DesktopUpdater: NSObject, ObservableObject {
             return true
         } catch {
             waitsForBackgroundAgents = true
-            statusMessage = error as? AgentBridgeFailure == .busy
-                ? "Finish or Stop assigned persona work, then retry Restart Now. Cancel the update to resume background agents."
-                : "Background agents could not stop safely. Cancel the update and retry."
+            switch error as? AgentBridgeFailure {
+            case .busy:
+                statusMessage = "Finish or Stop assigned persona work, then retry Restart Now. Cancel the update to resume background agents."
+            case .migrationIncomplete:
+                statusMessage = "Finish the interrupted profile migration before installing this update. Connect the same persona and profile to resume."
+            default:
+                statusMessage = "Background agents could not stop safely. Cancel the update and retry."
+            }
             return false
         }
     }

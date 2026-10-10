@@ -40,6 +40,7 @@ private final class AgentBridgeMigrationFixture {
                 return try JSONDecoder().decode(AgentBridgeMigrationCapture.self, from: data)
             },
             stopSupervisor: { scope in #expect(scope == "user_launch_agent"); #expect(self.idle && self.paused); try self.record("stop-supervisor") },
+            cancelCapture: { _ in try self.record("cancel-capture") },
             revoke: { try self.record("revoke") },
             validateScope: { self.scopes += 1 },
             readiness: { _ in try self.record("ready") },

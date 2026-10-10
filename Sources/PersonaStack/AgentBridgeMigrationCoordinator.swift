@@ -14,6 +14,7 @@ final class AgentBridgeMigrationCoordinator {
         var setPause: @MainActor (Bool, Int) async throws -> Int
         var capture: @MainActor (Bool, Int) async throws -> AgentBridgeMigrationCapture = { _, _ in throw AgentBridgeFailure.migrationRequired }
         var stopSupervisor: @MainActor (String) async throws -> Void = { _ in throw AgentBridgeFailure.migrationRequired }
+        var cancelCapture: @MainActor (AgentBridgeMigrationCapture) async throws -> Void = { _ in throw AgentBridgeFailure.migrationRequired }
         var revoke: @MainActor () async throws -> Void = { throw AgentBridgeFailure.migrationRequired }
         var validateScope: @MainActor () async throws -> Void
         var readiness: @MainActor (AgentBridgeBindingKey) async throws -> Void
@@ -52,6 +53,7 @@ final class AgentBridgeMigrationCoordinator {
         }
         var pauseVersion = original.pauseVersion
         var pauseChanged = false
+        var capturedBeforeRevoke: AgentBridgeMigrationCapture?
         do {
             try await dependencies.validateScope()
             if !original.userPaused {
@@ -62,6 +64,7 @@ final class AgentBridgeMigrationCoordinator {
             try await dependencies.validateScope()
             let capture = try await dependencies.capture(original.userPaused, pauseVersion)
             guard capture.legacyServiceScope == "user_launch_agent" else { throw AgentBridgeFailure.migrationRequired }
+            capturedBeforeRevoke = capture
             // The caller has proven the lane is idle after the consented Pause.
             try await dependencies.stopSupervisor(capture.legacyServiceScope)
             try await dependencies.validateScope()
@@ -74,6 +77,9 @@ final class AgentBridgeMigrationCoordinator {
             resumeVersion = pauseVersion
             return cutover
         } catch {
+            if !revoked, let capture = capturedBeforeRevoke {
+                try? await dependencies.cancelCapture(capture)
+            }
             if pauseChanged && !revoked {
                 do {
                     try await dependencies.validateScope()

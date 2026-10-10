@@ -73,6 +73,16 @@ public struct AgentBridgeConnection: Codable, Sendable {
         case diagnosticCode = "diagnostic_code", diagnosticMessage = "diagnostic_message"
     }
 }
+public struct AgentBridgeMigrationHelp: Codable, Sendable {
+    public let profileLabel: String
+    public let profileConfigPath: String
+    public let legacyEntryKey: String
+    public let backupDirectory: String
+    enum CodingKeys: String, CodingKey {
+        case profileLabel = "profile_label", profileConfigPath = "profile_config_path"
+        case legacyEntryKey = "legacy_entry_key", backupDirectory = "backup_directory"
+    }
+}
 public struct AgentBridgeMigrationCapture: Codable, Sendable {
     public let migrationID: UUID
     public let wasPaused: Bool?
@@ -84,7 +94,11 @@ public struct AgentBridgeMigrationCapture: Codable, Sendable {
         case migrationID = "migration_id", legacyServiceScope = "legacy_service_scope", profileCandidateID = "profile_candidate_id"
     }
 }
-public struct AgentBridgeConnections: Codable, Sendable { public let connections: [AgentBridgeConnection] }
+public struct AgentBridgeConnections: Codable, Sendable {
+    public let connections: [AgentBridgeConnection]
+    public let pendingMigrationCount: Int?
+    enum CodingKeys: String, CodingKey { case connections, pendingMigrationCount = "pending_migration_count" }
+}
 public struct AgentBridgeEnrollment: Codable, Sendable {
     public let bindingKey: AgentBridgeBindingKey
     public let personaID: String
@@ -96,6 +110,7 @@ public struct AgentBridgeAdmission: Codable, Sendable {
     enum CodingKeys: String, CodingKey { case activeRunIDs = "active_run_ids", quiesced }
 }
 public struct AgentBridgeAcknowledgement: Codable, Sendable {
+    public let cancelled: Bool?
     public let disabled: Bool?
     public let disconnected: Bool?
 }
@@ -107,7 +122,7 @@ public struct AgentBridgeRequest: Encodable, Sendable {
     public let operation: String
     private let payload: [String: AgentBridgeValue]
     public init(requestID: UUID = UUID(), operation: String, payload: [String: AgentBridgeValue]) throws {
-        guard ["discover", "prepare", "enroll", "status", "check", "repair", "disconnect", "quiesce", "resume", "stop_background", "migration_prepare", "migration_repair"].contains(operation) else {
+        guard ["discover", "prepare", "enroll", "status", "check", "repair", "disconnect", "quiesce", "resume", "stop_background", "migration_prepare", "migration_repair", "migration_cancel", "migration_help"].contains(operation) else {
             throw AgentBridgeFailure.invalidRequest
         }
         self.requestID = requestID; self.operation = operation; self.payload = payload

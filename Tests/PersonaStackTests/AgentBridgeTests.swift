@@ -36,6 +36,8 @@ private final class AgentBridgeFixtureRegistration: AgentBridgeServiceRegistrati
 private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
     var hasRegisteredService = true
     var busy = true
+    var pendingMigration = false
+    func hasPendingMigrationCapture() async throws -> Bool { pendingMigration }
     var log: [String] = []
     func quiesce() async throws -> AgentBridgeAdmission {
         log.append("quiesce")
@@ -57,7 +59,7 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
             var input = valid; input[extra] = "untrusted"
             #expect(throws: AgentBridgeFailure.invalidRequest) { try AgentBridgePageCommand.parse(input) }
         }
-        for action in ["quiesce", "resume", "stop_background", "register", "execute"] {
+        for action in ["quiesce", "resume", "stop_background", "register", "execute", "migration_help", "migration_repair", "migration_cancel"] {
             #expect(throws: AgentBridgeFailure.invalidRequest) {
                 try AgentBridgePageCommand.parse(["version": "1", "action": action, "scope": "native-document"])
             }
@@ -153,6 +155,20 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
         try await handoff.restoreAtLaunch()
         #expect(lifecycle.log.suffix(2) == ["restore-readback", "resume"])
         #expect(!preferences.bool(forKey: AgentBridgeUpdateHandoff.restoreKey))
+    }
+
+    @Test @MainActor func retainedMigrationBlocksReplacementBeforeQuiesceOrUnregister() async throws {
+        let lifecycle = AgentBridgeFixtureLifecycle()
+        lifecycle.busy = false; lifecycle.pendingMigration = true
+        let preferences = UserDefaults(suiteName: "AgentBridgeTests." + UUID().uuidString)!
+        let handoff = AgentBridgeUpdateHandoff(service: lifecycle, preferences: preferences, pendingNativeMigration: { false })
+        await #expect(throws: AgentBridgeFailure.migrationIncomplete) { try await handoff.prepareReplacement() }
+        #expect(lifecycle.log.isEmpty)
+        #expect(!preferences.bool(forKey: AgentBridgeUpdateHandoff.restoreKey))
+        lifecycle.pendingMigration = false
+        let nativeCutover = AgentBridgeUpdateHandoff(service: lifecycle, preferences: preferences, pendingNativeMigration: { true })
+        await #expect(throws: AgentBridgeFailure.migrationIncomplete) { try await nativeCutover.prepareReplacement() }
+        #expect(lifecycle.log.isEmpty)
     }
 
     @Test @MainActor func nativeStateIssuesScopeAndForeignDocumentHasNoHelperCalls() async throws {
