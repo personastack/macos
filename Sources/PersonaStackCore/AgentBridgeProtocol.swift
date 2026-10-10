@@ -12,6 +12,7 @@ public enum AgentBridgeFailure: String, Error, Sendable {
     case busy
     case cleanupRequired = "cleanup_required"
     case migrationRequired = "migration_required"
+    case migrationIncomplete = "migration_incomplete"
     case backgroundApprovalRequired = "background_approval_required"
     case serviceUnavailable = "service_unavailable"
 }

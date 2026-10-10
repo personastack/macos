@@ -76,7 +76,10 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
             let command = try AgentBridgePageCommand.parse(message.body)
             Task {
                 do { replyHandler(try await apply(command, page: page, view: view), nil) }
-                catch { replyHandler(nil, (error as? AgentBridgeFailure ?? .serviceUnavailable).rawValue) }
+                catch {
+                    let failure: AgentBridgeFailure = page.pendingMigration == nil ? (error as? AgentBridgeFailure ?? .serviceUnavailable) : .migrationIncomplete
+                    replyHandler(nil, failure.rawValue)
+                }
             }
         } catch { replyHandler(nil, AgentBridgeFailure.invalidRequest.rawValue) }
     }
@@ -251,7 +254,9 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
             },
             test: { try await validate(); try await authority.test(configuration: page.configuration, cookies: cookies, csrf: csrf, persona: persona) }
         ))
-        let cutover = try await coordinator.begin()
+        let cutover: AgentBridgeMigrationCoordinator.Cutover
+        do { cutover = try await coordinator.begin() }
+        catch { throw coordinator.revoked ? AgentBridgeFailure.migrationIncomplete : error }
         guard cutover.capture.profileCandidateID == profile else { throw AgentBridgeFailure.scopeChanged }
         page.pendingMigration = (persona, profile, coordinator, cutover)
         let preparation = try await prepare(command, page: page, document: document)

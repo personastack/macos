@@ -6,19 +6,19 @@ import PersonaStackCore
 final class AgentBridgeMigrationCoordinator {
     enum WorkChoice { case wait, stop, cancel }
     struct Dependencies {
-        var verifyReplacement: () async throws -> Void
-        var readState: () async throws -> AgentBridgeMigrationState
-        var stopAssignedRun: () async throws -> Void
-        var confirmWork: () -> WorkChoice
-        var confirmCutover: () -> Bool
-        var setPause: (Bool, Int) async throws -> Int
-        var capture: () async throws -> AgentBridgeMigrationCapture
-        var stopSupervisor: (String) async throws -> Void
-        var revoke: () async throws -> Void
-        var validateScope: () async throws -> Void
-        var readiness: (AgentBridgeBindingKey) async throws -> Void
-        var test: () async throws -> Void
-        var wait: () async throws -> Void = { try await Task.sleep(for: .milliseconds(250)) }
+        var verifyReplacement: @MainActor () async throws -> Void
+        var readState: @MainActor () async throws -> AgentBridgeMigrationState
+        var stopAssignedRun: @MainActor () async throws -> Void
+        var confirmWork: @MainActor () -> WorkChoice
+        var confirmCutover: @MainActor () -> Bool
+        var setPause: @MainActor (Bool, Int) async throws -> Int
+        var capture: @MainActor () async throws -> AgentBridgeMigrationCapture
+        var stopSupervisor: @MainActor (String) async throws -> Void
+        var revoke: @MainActor () async throws -> Void
+        var validateScope: @MainActor () async throws -> Void
+        var readiness: @MainActor (AgentBridgeBindingKey) async throws -> Void
+        var test: @MainActor () async throws -> Void
+        var wait: @MainActor () async throws -> Void = { try await Task.sleep(for: .milliseconds(250)) }
     }
     struct Cutover {
         let capture: AgentBridgeMigrationCapture
