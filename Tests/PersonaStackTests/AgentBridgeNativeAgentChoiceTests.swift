@@ -16,9 +16,10 @@ import Testing
     }
     @Test func ambiguousChoiceRequiresNativePickerAndDeniesCancelledOrForeignChoice() throws {
         let multiple = try profile(#"[{"agent_candidate_id":"rt_research","label":"Research"},{"agent_candidate_id":"rt_writer","label":"Writer"}]"#)
-        #expect(try AgentBridgeSetupManager.selectNativeAgent(multiple, picker: { label, agents in
+        let selected = try AgentBridgeSetupManager.selectNativeAgent(multiple, picker: { label, agents in
             #expect(label == "Work profile"); #expect(agents.count == 2); return "rt_writer"
-        }) == "rt_writer")
+        })
+        #expect(selected == "rt_writer")
         for choice in [nil, "main", "rt_other"] as [String?] {
             #expect(throws: AgentBridgeFailure.runtimeConflict) { _ = try AgentBridgeSetupManager.selectNativeAgent(multiple, picker: { _, _ in choice }) }
         }
