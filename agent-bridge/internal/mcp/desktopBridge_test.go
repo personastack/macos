@@ -188,7 +188,7 @@ func TestDesktopAgentBridgeNativeMCPFailureBlocksDirectProbe(t *testing.T) {
 		}
 		return false, "selected catalog rejected"
 	})
-	if calls != 1 || result.State == runtime.AdapterStateMCPVerified || result.DiagnosticCode != "native_mcp_unreachable" {
+	if calls != 1 || result.State == runtime.AdapterStateMCPVerified || result.DiagnosticCode != "capability_missing" {
 		t.Fatalf("false readiness %+v calls%d", result, calls)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/personastack/agent-gateway/pkg/externalagentprotocol"
+	"github.com/personastack/macos/agent-bridge/internal/hermessetup"
 	connectorruntime "github.com/personastack/macos/agent-bridge/internal/runtime"
 )
 
@@ -140,6 +141,13 @@ func DiscoverAt(home, username string, uid, gid int, kind connectorruntime.Adapt
 			label = "Default"
 		}
 		profile := Profile{CandidateID: physical, AccountCandidateID: opaqueID(seed, "account", strconv.Itoa(uid)), Label: label, Kind: kind, Resolved: resolved}
+		if kind == connectorruntime.AdapterKindHermes {
+			err = hermessetup.SharedProfileEligible(hermessetup.ResolvePaths(home, root), pair[0])
+			if err != nil {
+				warnings = append(warnings, err)
+				profile.ConflictCode = "native_config_unsupported"
+			}
+		}
 		if kind == connectorruntime.AdapterKindOpenClaw {
 			profile.OpenClawAgents, err = openClawAgents(configPath, physical, seed)
 			if err != nil {
@@ -194,6 +202,9 @@ func ResolveProfiles(kind connectorruntime.AdapterKind, target *externalagentpro
 	}
 	for _, p := range profiles {
 		if p.Kind == kind && p.CandidateID == target.ProfileCandidateID && p.AccountCandidateID == target.AccountCandidateID {
+			if p.ConflictCode != "" {
+				return ResolvedTarget{}, fmt.Errorf("selected runtime profile configuration unsupported")
+			}
 			if kind == connectorruntime.AdapterKindOpenClaw {
 				return selectStoredOpenClawAgent(p, selected)
 			}

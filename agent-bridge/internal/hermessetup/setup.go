@@ -26,12 +26,8 @@ const (
 var (
 	lookPath     = exec.LookPath
 	startGateway = func(paths Paths, identity ProcessIdentity, binary string) error {
-		cmd := exec.Command(binary, "gateway")
-		cmd.Env = processEnv(paths, identity)
-		cmd.Dir = strings.TrimSpace(paths.HermesHome)
-		cmd.Stdout = ioDiscard{}
-		cmd.Stderr = ioDiscard{}
-		if err := ApplyProcessIdentity(cmd, identity); err != nil {
+		cmd, err := gatewayCommand(paths, identity, binary)
+		if err != nil {
 			return err
 		}
 		return cmd.Start()
@@ -208,17 +204,14 @@ func TryStartGatewayForPaths(paths Paths) (bool, error) {
 	return TryStartGatewayForPathsAs(paths, ProcessIdentity{HomeDir: paths.HomeDir})
 }
 
-// TryStartGatewayForPathsAs starts Hermes with the selected account identity.
-// A root Connector may switch to a discovered account. An unprivileged
-// Connector can only start its own account and receives an explicit error for
-// another target instead of falling back to its own profile.
+// TryStartGatewayForPathsAs starts the native default shared host under the
+// current account. Named profiles attach through its native profile routes.
 func TryStartGatewayForPathsAs(paths Paths, identity ProcessIdentity) (bool, error) {
 	return tryStartGatewayForPathsAt(paths, identity, defaultHermesBase)
 }
 
-// TryStartGatewayForPathsAt starts Hermes on a target-specific loopback URL.
-// It lets one root-scoped Connector keep separately selected profiles from
-// sharing the default API listener.
+// TryStartGatewayForPathsAt starts the shared host using its configured loopback
+// endpoint. The native gateway parser does not accept a port argument.
 func TryStartGatewayForPathsAt(paths Paths, identity ProcessIdentity, baseURL string) (bool, error) {
 	return TryStartGatewayForPathsAtContext(context.Background(), paths, identity, baseURL)
 }
@@ -226,7 +219,7 @@ func TryStartGatewayForPathsAt(paths Paths, identity ProcessIdentity, baseURL st
 // TryStartGatewayForPathsAtContext starts Hermes without allowing setup
 // polling to outlive the session reconciliation attempt.
 func TryStartGatewayForPathsAtContext(ctx context.Context, paths Paths, identity ProcessIdentity, baseURL string) (bool, error) {
-	port, err := loopbackPort(baseURL)
+	_, err := loopbackPort(baseURL)
 	if err != nil {
 		return false, err
 	}
@@ -240,11 +233,8 @@ func TryStartGatewayForPathsAtContext(ctx context.Context, paths Paths, identity
 	if err != nil {
 		return false, nil
 	}
-	if port == defaultHermesPort {
-		if err := startGateway(paths, identity, binary); err != nil {
-			return false, fmt.Errorf("start Hermes gateway: %w", err)
-		}
-	} else if err := startGatewayWithArgs(paths, identity, binary, []string{"gateway", "--port", port}); err != nil {
+	err = startGateway(paths, identity, binary)
+	if err != nil {
 		return false, fmt.Errorf("start Hermes gateway: %w", err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -267,16 +257,19 @@ func tryStartGatewayForPathsAt(paths Paths, identity ProcessIdentity, baseURL st
 	return TryStartGatewayForPathsAtContext(context.Background(), paths, identity, baseURL)
 }
 
-func startGatewayWithArgs(paths Paths, identity ProcessIdentity, binary string, args []string) error {
-	cmd := exec.Command(binary, args...)
+// Gateway port is configured by the native profile config/environment. The
+// pinned Hermes gateway parser has no --port argument.
+func gatewayCommand(paths Paths, identity ProcessIdentity, binary string) (*exec.Cmd, error) {
+	cmd := exec.Command(binary, "--profile", "default", "gateway", "run")
 	cmd.Env = processEnv(paths, identity)
 	cmd.Dir = strings.TrimSpace(paths.HermesHome)
 	cmd.Stdout = ioDiscard{}
 	cmd.Stderr = ioDiscard{}
-	if err := ApplyProcessIdentity(cmd, identity); err != nil {
-		return err
+	err := ApplyProcessIdentity(cmd, identity)
+	if err != nil {
+		return nil, err
 	}
-	return cmd.Start()
+	return cmd, nil
 }
 
 func loopbackPort(baseURL string) (string, error) {
@@ -317,14 +310,17 @@ func hermesBinaryForPaths(paths Paths) (string, error) {
 }
 
 func processEnv(paths Paths, identity ProcessIdentity) []string {
+	return processEnvFor(paths, identity, os.Environ())
+}
+func processEnvFor(paths Paths, identity ProcessIdentity, inherited []string) []string {
 	homeDir := strings.TrimSpace(identity.HomeDir)
 	if homeDir == "" {
 		homeDir = strings.TrimSpace(paths.HomeDir)
 	}
 	username := strings.TrimSpace(identity.Username)
-	env := make([]string, 0, len(os.Environ())+4)
-	for _, item := range os.Environ() {
-		if strings.HasPrefix(item, "HOME=") || strings.HasPrefix(item, "USER=") || strings.HasPrefix(item, "LOGNAME=") || strings.HasPrefix(item, "HERMES_HOME=") {
+	env := make([]string, 0, len(inherited)+4)
+	for _, item := range inherited {
+		if strings.HasPrefix(item, "HOME=") || strings.HasPrefix(item, "USER=") || strings.HasPrefix(item, "LOGNAME=") || strings.HasPrefix(item, "HERMES_HOME=") || strings.HasPrefix(item, "HERMES_PROFILE=") || strings.HasPrefix(item, "HERMES_PROFILE_NAME=") || strings.HasPrefix(item, "API_SERVER_") {
 			continue
 		}
 		env = append(env, item)
@@ -349,6 +345,13 @@ func ApplyProcessIdentity(cmd *exec.Cmd, identity ProcessIdentity) error {
 }
 
 func ensureEnvFile(path string, values map[string]string) (bool, error) {
+	info, err := os.Lstat(path)
+	if err == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
+		return false, fmt.Errorf("runtime_conflict: unsupported Hermes environment file")
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
 	state, err := loadEnvState(path)
 	if err != nil {
 		return false, err

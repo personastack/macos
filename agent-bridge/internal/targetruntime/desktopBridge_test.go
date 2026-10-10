@@ -22,7 +22,10 @@ func TestDesktopAgentBridgeEndpointOwnership(t *testing.T) {
 func TestDesktopAgentBridgeConfiguredProfileEndpoints(t *testing.T) {
 	t.Parallel()
 	home := t.TempDir()
-	if err := os.WriteFile(filepath.Join(home, ".env"), []byte("API_SERVER_PORT=25001\nAPI_SERVER_HOST=127.0.0.1\n"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".env"), []byte("API_SERVER_KEY=existing-profile-key\nAPI_SERVER_PORT=25001\nAPI_SERVER_HOST=127.0.0.1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "config.yaml"), []byte("user_key: keep\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	got, err := ProfileEndpoint("hermes", home, "")

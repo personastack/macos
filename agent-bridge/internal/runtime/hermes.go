@@ -850,33 +850,10 @@ func VerifyHermesMCPServerLoaded(ctx context.Context, nativeMCPServerName string
 	return VerifyHermesMCPServerLoadedWithHome(ctx, nativeMCPServerName, "")
 }
 
+// The pinned `tools list` command prints configured server names. It does not
+// inspect the running gateway's MCP registry. Never grant readiness from it.
 func VerifyHermesMCPServerLoadedWithHome(ctx context.Context, nativeMCPServerName string, hermesHome string) HermesMCPRegistryCheck {
-	serverName := strings.TrimSpace(nativeMCPServerName)
-	if serverName == "" {
-		return HermesMCPRegistryCheck{Note: "Hermes MCP server name missing"}
-	}
-	hermesBin, err := resolveHermesBinary()
-	if err != nil {
-		return HermesMCPRegistryCheck{Note: err.Error()}
-	}
-	command := hermesToolsListCommand(ctx, hermesBin, "tools", "list", "--platform", "api_server")
-	command.WaitDelay = 250 * time.Millisecond
-	if strings.TrimSpace(hermesHome) != "" {
-		for _, entry := range os.Environ() {
-			if !strings.HasPrefix(entry, "HERMES_HOME=") {
-				command.Env = append(command.Env, entry)
-			}
-		}
-		command.Env = append(command.Env, "HERMES_HOME="+strings.TrimSpace(hermesHome))
-	}
-	raw, err := command.Output()
-	if err != nil {
-		return HermesMCPRegistryCheck{Note: fmt.Sprintf("Hermes tools list: %v", err)}
-	}
-	if hermesMCPServerLoaded(string(raw), serverName) {
-		return HermesMCPRegistryCheck{OK: true, Note: "Hermes MCP server loaded in api_server tool registry"}
-	}
-	return HermesMCPRegistryCheck{Note: "Hermes MCP server not loaded in api_server tool registry"}
+	return HermesMCPRegistryCheck{Note: "Hermes does not expose a supported live MCP catalog for this profile."}
 }
 
 func resolveHermesBinary() (string, error) {
@@ -973,35 +950,6 @@ func parseHermesToolsList(raw string, nativeMCPServerName string) []NativeCapabi
 		}
 	}
 	return out
-}
-
-func hermesMCPServerLoaded(raw string, nativeMCPServerName string) bool {
-	serverName := strings.TrimSpace(nativeMCPServerName)
-	if serverName == "" {
-		return false
-	}
-	toolPrefix := hermesNativeMCPToolPrefix(serverName)
-	inMCPSection := false
-	for _, line := range strings.Split(raw, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		if strings.EqualFold(trimmed, "MCP servers:") {
-			inMCPSection = true
-			continue
-		}
-		if strings.Contains(trimmed, toolPrefix) {
-			return true
-		}
-		if inMCPSection {
-			fields := strings.Fields(trimmed)
-			if len(fields) > 0 && fields[0] == serverName {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func hermesNativeMCPToolPrefix(nativeMCPServerName string) string {

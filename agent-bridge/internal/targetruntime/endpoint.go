@@ -1,13 +1,11 @@
 package targetruntime
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
+	"github.com/personastack/macos/agent-bridge/internal/hermessetup"
 	"os"
-	"path/filepath"
 	"strconv"
-	"strings"
 )
 
 // ProfileEndpoint reads only the selected profile's native listener configuration.
@@ -34,33 +32,7 @@ func ProfileEndpoint(kind, root, configPath string) (string, error) {
 			port = *config.Gateway.Port
 		}
 	} else if kind == "hermes" {
-		file, err := os.Open(filepath.Join(root, ".env"))
-		if err != nil && !os.IsNotExist(err) {
-			return "", fmt.Errorf("read selected Hermes endpoint: %w", err)
-		}
-		if err == nil {
-			defer file.Close()
-			scan := bufio.NewScanner(file)
-			for scan.Scan() {
-				key, value, ok := strings.Cut(strings.TrimPrefix(strings.TrimSpace(scan.Text()), "export "), "=")
-				if !ok {
-					continue
-				}
-				value = strings.Trim(strings.TrimSpace(value), "\"'")
-				if strings.TrimSpace(key) == "API_SERVER_PORT" {
-					port, err = strconv.Atoi(value)
-					if err != nil {
-						return "", fmt.Errorf("selected Hermes port invalid")
-					}
-				}
-				if strings.TrimSpace(key) == "API_SERVER_HOST" && value != "127.0.0.1" && value != "localhost" && value != "::1" {
-					return "", fmt.Errorf("runtime_conflict: selected Hermes listener is not loopback")
-				}
-			}
-			if err = scan.Err(); err != nil {
-				return "", err
-			}
-		}
+		return hermessetup.APIEndpoint(hermessetup.ResolvePaths("", root))
 	} else {
 		return "", fmt.Errorf("runtime_unsupported")
 	}

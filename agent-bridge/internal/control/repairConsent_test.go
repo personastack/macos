@@ -19,7 +19,7 @@ func TestDesktopAgentBridgeRepairReceiptScopeFence(t *testing.T) {
 			if err := store.SaveBinding(b); err != nil {
 				t.Fatal(err)
 			}
-			p := RepairPayload{BindingKey: b.Key(), ConnectionGeneration: 7, TargetSelectionRevision: 9, RestartConfirmed: true, OpenClawAppsConfirmed: true}
+			p := RepairPayload{BindingKey: b.Key(), ConnectionGeneration: 7, TargetSelectionRevision: 9, RestartConfirmed: true, OpenClawAppsConfirmed: true, HermesHostConfirmed: true}
 			switch change {
 			case "missing generation":
 				p.ConnectionGeneration = 0
@@ -31,9 +31,9 @@ func TestDesktopAgentBridgeRepairReceiptScopeFence(t *testing.T) {
 				p.TargetSelectionRevision = 8
 			}
 			calls := 0
-			c.Repair = func(_ context.Context, current config.Binding, restart, apps bool) error {
+			c.Repair = func(_ context.Context, current config.Binding, restart, apps, host bool) error {
 				calls++
-				if current.ConnectionGeneration != 7 || current.TargetSelectionRevision != 9 || !restart || !apps {
+				if current.ConnectionGeneration != 7 || current.TargetSelectionRevision != 9 || !restart || !apps || !host {
 					t.Fatal("native consent scope lost")
 				}
 				return nil
@@ -60,7 +60,7 @@ func TestDesktopAgentBridgeRepairUnverifiedListenerScopeUsesNativeHelp(t *testin
 	if err := store.SaveBinding(b); err != nil {
 		t.Fatal(err)
 	}
-	c.Repair = func(context.Context, config.Binding, bool, bool) error {
+	c.Repair = func(context.Context, config.Binding, bool, bool, bool) error {
 		return targetruntime.ErrProfileScopeUnverified
 	}
 	raw, _ := json.Marshal(RepairPayload{BindingKey: b.Key(), ConnectionGeneration: 7, TargetSelectionRevision: 9, RestartConfirmed: true, OpenClawAppsConfirmed: true})

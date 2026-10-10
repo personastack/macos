@@ -235,7 +235,7 @@ func TestDesktopAgentBridgeHermesCanonicalConversationDispatch(t *testing.T) {
 			t.Fatal("unplanned native request")
 		}
 		step := sequence[index]
-		if req.Method != http.MethodPost || req.URL.String() != "http://127.0.0.1:26422/v1/runs" || req.Header.Get("Authorization") != "Bearer selected-profile-key" || req.Header.Get("Content-Type") != "application/json" || req.Header.Get("Idempotency-Key") != step.assignment {
+		if req.Method != http.MethodPost || req.URL.String() != "http://127.0.0.1:26422/p/default/v1/runs" || req.Header.Get("Authorization") != "Bearer selected-profile-key" || req.Header.Get("Content-Type") != "application/json" || req.Header.Get("Idempotency-Key") != step.assignment {
 			t.Fatal("native endpoint, profile auth, content type, or assignment idempotency changed")
 		}
 		var body struct {
@@ -309,7 +309,7 @@ func TestDesktopAgentBridgeRepairRejectedMCPCredentialHasNoRuntimeMutation(t *te
 				}
 				return &http.Response{StatusCode: http.StatusUnauthorized, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("denied")), Request: req}, nil
 			})}}
-			err := runner.RepairBinding(context.Background(), b, true, false)
+			err := runner.RepairBinding(context.Background(), b, true, false, false)
 			if err == nil || !strings.HasPrefix(err.Error(), "reconnect_required:") {
 				t.Fatalf("credential repair claimed success: %v", err)
 			}
@@ -415,7 +415,7 @@ func TestDesktopAgentBridgeFreshTargetStoppedRuntimeCanBeRepaired(t *testing.T) 
 	result.Detection = detectionForReconcileError(b.RuntimeKind, err)
 	reconciler.publish(snapshot, result)
 	selected, _ = config.BindingFor(store, b)
-	if err := runner.RepairBinding(context.Background(), selected, true, false); err != nil {
+	if err := runner.RepairBinding(context.Background(), selected, true, false, true); err != nil {
 		t.Fatal(err)
 	}
 	repaired, _ := config.BindingFor(store, b)
@@ -530,7 +530,7 @@ func TestDesktopAgentBridgeRepairDeniedNativeConsentHasNoMutation(t *testing.T) 
 		t.Fatal("denied native consent performed protected credential read")
 		return nil, nil
 	})}
-	err := runner.RepairBinding(context.Background(), b, false, false)
+	err := runner.RepairBinding(context.Background(), b, false, false, false)
 	if err == nil || !strings.HasPrefix(err.Error(), "runtime_conflict:") {
 		t.Fatalf("denied native consent accepted: %v", err)
 	}
@@ -767,7 +767,7 @@ func TestDesktopAgentBridgeRepairConcurrentAdmissionDoesNotOverwriteState(t *tes
 					t.Fatal(err)
 				}
 			})
-			if err := runner.RepairBinding(context.Background(), b, true, false); err == nil {
+			if err := runner.RepairBinding(context.Background(), b, true, false, false); err == nil {
 				t.Fatal("stale Repair admission accepted")
 			}
 			current, _ := config.BindingFor(store, b)

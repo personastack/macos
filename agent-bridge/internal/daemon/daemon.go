@@ -1579,6 +1579,10 @@ func (r Runner) targetAdapter(binding config.Binding, target *externalagentproto
 			return nil, targetinventory.ResolvedTarget{}, err
 		}
 		adapter := runtime.NewHermesAdapterForHome(runtimeURL, resolvedTarget.HermesHome)
+		adapter.APIKey, err = hermessetup.LoadProfileAPIKey(hermessetup.ResolvePaths(resolvedTarget.HomeDir, resolvedTarget.HermesHome), resolvedTarget.ProfileName)
+		if err != nil {
+			return nil, resolvedTarget, err
+		}
 		return adapter, resolvedTarget, nil
 	case runtime.AdapterKindOpenClaw:
 		resolved, err := openclawauth.Resolve(openclawauth.Options{
@@ -1622,6 +1626,21 @@ func (r Runner) targetAdapter(binding config.Binding, target *externalagentproto
 func (r Runner) targetRuntimeURL(binding config.Binding, target *externalagentprotocol.RuntimeTarget) (string, error) {
 	if target == nil || target.ProfileCandidateID != binding.ProfileCandidateID {
 		return "", fmt.Errorf("selected profile differs from prepared profile")
+	}
+	if binding.RuntimeKind == runtime.AdapterKindHermes {
+		resolved, err := r.resolveTarget(binding, target)
+		if err != nil {
+			return "", err
+		}
+		paths, err := hermessetup.HostPaths(hermessetup.ResolvePaths(resolved.HomeDir, resolved.HermesHome), resolved.ProfileName)
+		if err != nil {
+			return "", err
+		}
+		endpoint, err := hermessetup.APIEndpoint(paths)
+		if err != nil {
+			return "", err
+		}
+		return targetruntime.HermesProfileURL(endpoint, resolved.ProfileName)
 	}
 	return targetruntime.ProfileEndpoint(binding.RuntimeKind.String(), binding.NativeStateRoot, binding.NativeConfigPath)
 }
@@ -1917,10 +1936,18 @@ func (r Runner) resolveTarget(binding config.Binding, target *externalagentproto
 	return targetinventory.Resolve(binding.RuntimeKind, target, binding.InventorySeed, binding.OpenClawAgentID)
 }
 func (r Runner) verifyRuntimeEndpoint(ctx context.Context, endpoint string, resolved targetinventory.ResolvedTarget, kind runtime.AdapterKind) (bool, error) {
-	if r.VerifyRuntimeEndpoint != nil {
-		return r.VerifyRuntimeEndpoint(ctx, endpoint, resolved.StateRoot, resolved.ConfigPath, kind.String())
+	root, configPath := resolved.StateRoot, resolved.ConfigPath
+	if kind == runtime.AdapterKindHermes {
+		paths, err := hermessetup.HostPaths(hermessetup.ResolvePaths(resolved.HomeDir, resolved.HermesHome), resolved.ProfileName)
+		if err != nil {
+			return false, err
+		}
+		root, configPath = paths.HermesHome, paths.ConfigPath
 	}
-	return targetruntime.VerifyEndpoint(ctx, endpoint, resolved.StateRoot, resolved.ConfigPath, kind.String())
+	if r.VerifyRuntimeEndpoint != nil {
+		return r.VerifyRuntimeEndpoint(ctx, endpoint, root, configPath, kind.String())
+	}
+	return targetruntime.VerifyEndpoint(ctx, endpoint, root, configPath, kind.String())
 }
 func (r Runner) validateSelectedTarget(binding config.Binding, target *externalagentprotocol.RuntimeTarget) error {
 	if target == nil || target.SelectionRevision <= 0 || target.AccountCandidateID != binding.AccountCandidateID || target.ProfileCandidateID != binding.ProfileCandidateID || target.RuntimeKind != targetForBinding(binding).RuntimeKind {

@@ -76,7 +76,7 @@ func TestDesktopAgentBridgeAppsRepairActualBindAndScopeFence(t *testing.T) {
 				t.Fatal("rejected ownership started native work")
 				return runtime.OpenClawResponse{}, nil
 			}
-			if err := runner.RepairBinding(context.Background(), b, true, true); err == nil {
+			if err := runner.RepairBinding(context.Background(), b, true, true, false); err == nil {
 				t.Fatal("actual bind or changed admission accepted")
 			}
 			after, _ := os.ReadFile(b.NativeConfigPath)

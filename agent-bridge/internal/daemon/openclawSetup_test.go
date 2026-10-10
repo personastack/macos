@@ -44,7 +44,7 @@ func TestDesktopAgentBridgeOpenClawConsentedSetupAndReadOnlyCheck(t *testing.T) 
 			if err != nil || detection.DiagnosticCode != "mcp_apps_disabled" {
 				t.Fatalf("stopped profile omitted Apps diagnosis: %+v %v", detection, err)
 			}
-			if err := runner.RepairBinding(context.Background(), b, true, false); err == nil {
+			if err := runner.RepairBinding(context.Background(), b, true, false, false); err == nil {
 				t.Fatal("restart consent silently granted Apps")
 			}
 			unchanged, _ := os.ReadFile(b.NativeConfigPath)
@@ -54,14 +54,14 @@ func TestDesktopAgentBridgeOpenClawConsentedSetupAndReadOnlyCheck(t *testing.T) 
 			// A newer selection cannot inherit the previously validated native receipt.
 			stale := b
 			stale.TargetSelectionRevision--
-			if err := runner.RepairBinding(context.Background(), stale, true, true); err == nil {
+			if err := runner.RepairBinding(context.Background(), stale, true, true, false); err == nil {
 				t.Fatal("stale native target consent was accepted")
 			}
 			stillUnchanged, _ := os.ReadFile(b.NativeConfigPath)
 			if string(stillUnchanged) != original {
 				t.Fatal("stale target receipt mutated profile")
 			}
-			if err := runner.RepairBinding(context.Background(), b, true, true); err != nil {
+			if err := runner.RepairBinding(context.Background(), b, true, true, false); err != nil {
 				t.Fatal(err)
 			}
 			current, _ := config.BindingFor(store, b)

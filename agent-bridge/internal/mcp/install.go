@@ -387,6 +387,10 @@ func verifyBindingWithNative(ctx context.Context, home string, b config.Binding,
 	if !ok {
 		r.Note = note
 		r.DiagnosticCode = "native_mcp_unreachable"
+		if b.RuntimeKind == runtime.AdapterKindHermes {
+			r.State = runtime.AdapterStateCapabilityMissing
+			r.DiagnosticCode = "capability_missing"
+		}
 		if b.RuntimeKind == runtime.AdapterKindOpenClaw {
 			r.State = runtime.AdapterStateCapabilityMissing
 			r.DiagnosticCode = "runtime_unsupported"

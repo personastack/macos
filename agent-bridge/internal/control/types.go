@@ -118,6 +118,7 @@ type RepairPayload struct {
 	PreparationID           string            `json:"preparation_id,omitempty"`
 	RestartConfirmed        bool              `json:"restart_confirmed"`
 	OpenClawAppsConfirmed   bool              `json:"openclaw_apps_confirmed"`
+	HermesHostConfirmed     bool              `json:"hermes_host_confirmed"`
 }
 type RevocationReadback struct {
 	EnvironmentID        string              `json:"environment_id"`

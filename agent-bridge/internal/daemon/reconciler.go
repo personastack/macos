@@ -16,6 +16,7 @@ import (
 	"github.com/personastack/macos/agent-bridge/internal/openclawsetup"
 	"github.com/personastack/macos/agent-bridge/internal/runtime"
 	"github.com/personastack/macos/agent-bridge/internal/targetinventory"
+	"github.com/personastack/macos/agent-bridge/internal/targetruntime"
 )
 
 type runtimeSnapshot struct {
@@ -371,6 +372,9 @@ func (r Runner) reconcileTarget(ctx context.Context, binding config.Binding, sna
 	}
 	detection := safeDetection(runtime.DetectContext(ctx, adapter))
 	if detection.State == runtime.AdapterStateRuntimeMissing || detection.State == runtime.AdapterStateRuntimeStopped {
+		if owned && binding.RuntimeKind == runtime.AdapterKindHermes {
+			return reconcileResult{Adapter: adapter, Resolved: resolved, RuntimeURL: runtimeURL, Detection: detection}, targetruntime.ErrHermesHostConflict
+		}
 		if startErr := r.startTargetRuntime(ctx, binding, snapshot.Target, resolved, runtimeURL); startErr != nil {
 			return reconcileResult{Adapter: adapter, Resolved: resolved, RuntimeURL: runtimeURL, Detection: detection}, startErr
 		}
@@ -442,8 +446,23 @@ func (r Runner) startTargetRuntime(ctx context.Context, binding config.Binding, 
 	identity := hermessetup.ProcessIdentity{Username: resolved.Username, HomeDir: resolved.HomeDir, UID: resolved.UID, GID: resolved.GID, GroupIDs: resolved.GroupIDs}
 	switch binding.RuntimeKind {
 	case runtime.AdapterKindHermes:
-		paths := hermessetup.ResolvePaths(resolved.HomeDir, resolved.HermesHome)
-		_, err := hermessetup.TryStartGatewayForPathsAtContext(ctx, paths, identity, runtimeURL)
+		latest, ok := config.BindingFor(r.Store, binding)
+		if !ok || latest.ConnectionGeneration != binding.ConnectionGeneration || latest.TargetSelectionRevision != binding.TargetSelectionRevision || latest.Quiesced || latest.ActiveRunID != "" || !latest.RuntimeLaunchAllowed {
+			return fmt.Errorf("scope_changed: Hermes host startup admission changed")
+		}
+		owned, err := r.verifyRuntimeEndpoint(ctx, runtimeURL, resolved, binding.RuntimeKind)
+		if err != nil || owned {
+			return err
+		}
+		paths, err := hermessetup.HostPaths(hermessetup.ResolvePaths(resolved.HomeDir, resolved.HermesHome), resolved.ProfileName)
+		if err != nil {
+			return err
+		}
+		endpoint, err := hermessetup.APIEndpoint(paths)
+		if err != nil {
+			return err
+		}
+		_, err = hermessetup.TryStartGatewayForPathsAtContext(ctx, paths, identity, endpoint)
 		return err
 	case runtime.AdapterKindOpenClaw:
 		parsed, err := url.Parse(runtimeURL)

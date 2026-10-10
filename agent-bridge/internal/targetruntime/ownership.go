@@ -36,6 +36,9 @@ func MatchEndpoint(e EndpointEvidence, uid int, kind, root, config string) (bool
 	return true, nil
 }
 func VerifyEndpoint(ctx context.Context, endpoint, root, config, kind string) (bool, error) {
+	if kind == "hermes" {
+		return VerifyHermesHost(ctx, endpoint, root)
+	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	parsed, err := url.Parse(endpoint)
@@ -106,6 +109,9 @@ func ProcessEvidence(text, kind, root, config string) EndpointEvidence {
 		}
 		if field == "gateway" {
 			gatewayFound = true
+		}
+		if kind == "hermes" && (field == "gateway.run" || strings.HasSuffix(field, "/gateway/run.py")) {
+			runtimeFound, gatewayFound = true, true
 		}
 		if field == "HERMES_HOME="+root && kind == "hermes" {
 			rootFound = true

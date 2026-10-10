@@ -63,11 +63,14 @@ func (r Runner) CheckBinding(ctx context.Context, b config.Binding) (runtime.Det
 		}
 	}
 	if !owned {
+		if b.RuntimeKind == runtime.AdapterKindHermes {
+			return runtime.Detection{Kind: b.RuntimeKind, State: runtime.AdapterStateRuntimeStopped, DiagnosticCode: "hermes_host_consent_required", Note: "Confirm shared Hermes gateway startup before changing its host API configuration."}, nil
+		}
 		return runtime.Detection{Kind: b.RuntimeKind, State: runtime.AdapterStateRuntimeStopped}, nil
 	}
 	return r.bindingReadinessAtHomeContext(ctx, adapter, b, resolved.HomeDir, resolved.HermesHome, endpoint), nil
 }
-func (r Runner) RepairBinding(ctx context.Context, b config.Binding, restartConfirmed, openClawAppsConfirmed bool) error {
+func (r Runner) RepairBinding(ctx context.Context, b config.Binding, restartConfirmed, openClawAppsConfirmed, hermesHostConfirmed bool) error {
 	if !restartConfirmed {
 		return fmt.Errorf("runtime_conflict: native consent required before profile repair")
 	}
@@ -114,6 +117,25 @@ func (r Runner) RepairBinding(ctx context.Context, b config.Binding, restartConf
 	} else if required {
 		return fmt.Errorf("reconnect_required: Disconnect and reconnect to renew PersonaStack MCP authorization")
 	}
+	hermesHostStopped := false
+	if latest.RuntimeKind == runtime.AdapterKindHermes {
+		resolved, err := r.resolveTarget(latest, targetForBinding(latest))
+		if err != nil {
+			return err
+		}
+		endpoint, err := r.targetRuntimeURL(latest, targetForBinding(latest))
+		if err != nil {
+			return err
+		}
+		owned, err := r.verifyRuntimeEndpoint(ctx, endpoint, resolved, latest.RuntimeKind)
+		if err != nil {
+			return err
+		}
+		hermesHostStopped = !owned
+		if hermesHostStopped && !hermesHostConfirmed {
+			return fmt.Errorf("hermes_host_consent_required: explicit shared gateway consent required")
+		}
+	}
 	return config.UpdateBinding(r.Store, b, func(current *config.Binding) error {
 		if current.ConnectionGeneration != latest.ConnectionGeneration || current.TargetSelectionRevision != latest.TargetSelectionRevision || current.PersonaMCPToken != latest.PersonaMCPToken {
 			return fmt.Errorf("scope_changed: binding changed during repair")
@@ -122,11 +144,26 @@ func (r Runner) RepairBinding(ctx context.Context, b config.Binding, restartConf
 			return fmt.Errorf("busy: assigned run or quiesce prevents repair")
 		}
 		if current.RuntimeKind == runtime.AdapterKindHermes {
-			endpoint, err := r.targetRuntimeURL(*current, targetForBinding(*current))
+			resolved, err := r.resolveTarget(*current, targetForBinding(*current))
 			if err != nil {
 				return err
 			}
-			_, err = hermessetup.EnsureAPISetupForPathsAt(hermessetup.ResolvePaths("", current.HermesHome), endpoint)
+			selected := hermessetup.ResolvePaths(resolved.HomeDir, resolved.HermesHome)
+			if hermesHostStopped {
+				host, err := hermessetup.HostPaths(selected, resolved.ProfileName)
+				if err != nil {
+					return err
+				}
+				endpoint, err := hermessetup.APIEndpoint(host)
+				if err != nil {
+					return err
+				}
+				err = hermessetup.EnsureHostAPI(host, endpoint)
+				if err != nil {
+					return err
+				}
+			}
+			err = hermessetup.EnsureProfileAPIKey(selected, resolved.ProfileName)
 			if err != nil {
 				return err
 			}
@@ -135,6 +172,11 @@ func (r Runner) RepairBinding(ctx context.Context, b config.Binding, restartConf
 			return err
 		}
 		current.RuntimeLaunchAllowed = restartConfirmed
+		if current.RuntimeKind == runtime.AdapterKindHermes {
+			current.RuntimeLaunchAllowed = hermesHostConfirmed
+			current.ReadinessState = runtime.AdapterStateCapabilityMissing
+			current.ReadinessDiagnosticCode = "capability_missing"
+		}
 		if current.RuntimeKind == runtime.AdapterKindOpenClaw {
 			current.OpenClawSetupPending = true
 			current.OpenClawReadinessSession = runtime.OpenClawSessionIdentity{}

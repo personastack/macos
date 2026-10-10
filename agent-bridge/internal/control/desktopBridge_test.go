@@ -512,7 +512,7 @@ func TestDesktopAgentBridgeNativeStatusAndRepairExposeReconnectRequired(t *testi
 				checks++
 				return runtime.Detection{State: runtime.AdapterStateAuthMissing, DiagnosticCode: "credential_unavailable"}, nil
 			}
-			c.Repair = func(context.Context, config.Binding, bool, bool) error { repairs++; return nil }
+			c.Repair = func(context.Context, config.Binding, bool, bool, bool) error { repairs++; return nil }
 			key := b.Key()
 			payload, _ := json.Marshal(BindingPayload{BindingKey: &key})
 			for _, operation := range []string{"status", "check"} {
@@ -602,7 +602,7 @@ func TestDesktopAgentBridgeRepairReportsAdmissionAndSelectionConflict(t *testing
 				t.Fatal(err)
 			}
 			calls := 0
-			c.Repair = func(context.Context, config.Binding, bool, bool) error {
+			c.Repair = func(context.Context, config.Binding, bool, bool, bool) error {
 				calls++
 				return fmt.Errorf("%s: current state changed", code)
 			}

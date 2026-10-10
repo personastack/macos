@@ -31,7 +31,7 @@ type Controller struct {
 	Discover           func(runtime.AdapterKind, string) ([]targetinventory.Profile, []error)
 	Exchange           func(context.Context, Environment, pairing.Request) (pairing.Result, error)
 	Check              func(context.Context, config.Binding) (runtime.Detection, error)
-	Repair             func(context.Context, config.Binding, bool, bool) error
+	Repair             func(context.Context, config.Binding, bool, bool, bool) error
 	Cleanup            func(config.Binding) error
 	Now                func() time.Time
 	Stop               func() error
@@ -324,6 +324,9 @@ func (c *Controller) prepare(p PreparePayload) (Result, error) {
 		if profile.CandidateID != p.ProfileCandidateID {
 			continue
 		}
+		if profile.ConflictCode != "" {
+			return Result{}, issue("runtime_conflict", "Selected native profile configuration is unsupported.")
+		}
 		profile, err = targetinventory.SelectOpenClawAgent(profile, p.OpenClawAgentCandidateID)
 		if err != nil {
 			return Result{}, issue("scope_changed", "Selected native OpenClaw agent is unavailable or ambiguous.")
@@ -397,7 +400,7 @@ func (c *Controller) enroll(ctx context.Context, p EnrollPayload) (Result, error
 	fresh, _ := c.profiles(prepared.Profile.Kind)
 	valid := false
 	for _, profile := range fresh {
-		if profile.CandidateID != prepared.Profile.CandidateID || !targetinventory.SharedPhysicalTarget(profile.Resolved, prepared.Profile.Resolved) {
+		if profile.ConflictCode != "" || profile.CandidateID != prepared.Profile.CandidateID || !targetinventory.SharedPhysicalTarget(profile.Resolved, prepared.Profile.Resolved) {
 			continue
 		}
 		chosen, choiceError := targetinventory.SelectOpenClawAgent(profile, prepared.Scope.OpenClawAgentCandidateID)
@@ -451,6 +454,8 @@ func (c *Controller) enroll(ctx context.Context, p EnrollPayload) (Result, error
 	binding.NativeProfileName = prepared.Profile.Resolved.ProfileName
 	binding.HermesHome = prepared.Profile.Resolved.HermesHome
 	binding.OpenClawAgentID = prepared.Profile.Resolved.OpenClawAgentID
+	// Pairing and legacy migration never grant native shared-host startup.
+	binding.RuntimeLaunchAllowed = false
 
 	binding.Migration = captured
 	err = c.Store.SaveBinding(binding)
@@ -519,12 +524,18 @@ func (c *Controller) status(ctx context.Context, p BindingPayload, probe bool) (
 				if err != nil {
 					row.ReadinessState = "unavailable"
 					row.DiagnosticCode = "runtime_conflict"
+					if errors.Is(err, targetruntime.ErrHermesHostConflict) {
+						row.DiagnosticMessage = targetruntime.HermesHostConflictMessage
+					}
 					if errors.Is(err, targetruntime.ErrProfileScopeUnverified) {
 						row.DiagnosticMessage = targetruntime.ProfileScopeUnverifiedMessage
 					}
 				} else {
 					row.ReadinessState = detection.State.String()
 					row.DiagnosticCode = detection.DiagnosticCode
+					if row.DiagnosticCode == "hermes_host_consent_required" {
+						row.DiagnosticMessage = "Confirm shared Hermes gateway startup before changing its host API configuration."
+					}
 					if row.DiagnosticCode == "mcp_apps_disabled" {
 						row.DiagnosticMessage = "Enable MCP Apps for this OpenClaw profile to verify its PersonaStack tools."
 					}
@@ -558,8 +569,14 @@ func (c *Controller) repair(ctx context.Context, p RepairPayload) (Result, error
 	if c.Repair == nil {
 		return Result{}, issue("runtime_unsupported", "Repair is not available.")
 	}
-	err = c.Repair(ctx, b, p.RestartConfirmed, p.OpenClawAppsConfirmed)
+	err = c.Repair(ctx, b, p.RestartConfirmed, p.OpenClawAppsConfirmed, p.HermesHostConfirmed)
 	if err != nil {
+		if errors.Is(err, targetruntime.ErrHermesHostConflict) {
+			return Result{}, issue("runtime_conflict", targetruntime.HermesHostConflictMessage)
+		}
+		if strings.HasPrefix(err.Error(), "hermes_host_consent_required:") {
+			return Result{}, issue("hermes_host_consent_required", "Confirm shared Hermes gateway startup before changing its host API configuration.")
+		}
 		if errors.Is(err, targetruntime.ErrProfileScopeUnverified) {
 			return Result{}, issue("runtime_conflict", targetruntime.ProfileScopeUnverifiedMessage)
 		}
