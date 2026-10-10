@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"github.com/personastack/macos/agent-bridge/internal/pairing"
 	"github.com/personastack/macos/agent-bridge/internal/runtime"
 	"github.com/personastack/macos/agent-bridge/internal/targetinventory"
+	"github.com/personastack/macos/agent-bridge/internal/targetruntime"
 )
 
 func request(t *testing.T, c *Controller, operation string, payload string) Response {
@@ -538,6 +540,52 @@ func TestDesktopAgentBridgeNativeStatusAndRepairExposeReconnectRequired(t *testi
 				}
 			} else if result.Error != nil || checks != 1 || repairs != 1 {
 				t.Fatal("runtime repair incorrectly blocked by MCP custody")
+			}
+		})
+	}
+}
+
+func TestNativeProfileScopeDiagnosticIsFixedAndCheckDoesNotMutate(t *testing.T) {
+	t.Parallel()
+	for _, sentinel := range []bool{true, false} {
+		t.Run(fmt.Sprint(sentinel), func(t *testing.T) {
+			t.Parallel()
+			c, store, _ := fixture(t)
+			binding := config.Binding{EnvironmentID: "https://app.test", PersonaID: "persona", ConnectionID: "connection",
+				ConnectionGeneration: 2, PersonaMCPToken: "present", RuntimeKind: runtime.AdapterKindOpenClaw}
+			err := store.SaveBinding(binding)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := store.ListBindings()
+			c.Check = func(context.Context, config.Binding) (runtime.Detection, error) {
+				if sentinel {
+					return runtime.Detection{}, fmt.Errorf("native profile: %w", targetruntime.ErrProfileScopeUnverified)
+				}
+				return runtime.Detection{}, fmt.Errorf("runtime_conflict: /private/local/path token=private-value")
+			}
+			key := binding.Key()
+			payload, err := json.Marshal(BindingPayload{BindingKey: &key})
+			if err != nil {
+				t.Fatal(err)
+			}
+			reply := request(t, c, "check", string(payload))
+			if reply.Error != nil || len(reply.Result.Connections) != 1 {
+				t.Fatal("missing scoped check result")
+			}
+			row := reply.Result.Connections[0]
+			if row.DiagnosticCode != "runtime_conflict" || row.ReadinessState != "unavailable" {
+				t.Fatal("scope refusal diagnostic lost")
+			}
+			want := ""
+			if sentinel {
+				want = targetruntime.ProfileScopeUnverifiedMessage
+			}
+			if row.DiagnosticMessage != want {
+				t.Fatal("unsafe diagnostic text was exposed")
+			}
+			if !reflect.DeepEqual(before, store.ListBindings()) {
+				t.Fatal("profile check mutated binding")
 			}
 		})
 	}

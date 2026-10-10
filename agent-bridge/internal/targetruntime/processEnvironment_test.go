@@ -2,6 +2,7 @@ package targetruntime
 
 import (
 	"encoding/binary"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -103,5 +104,28 @@ func TestProcessEnvironmentIgnoresArgumentsAndRejectsAmbiguousBuffers(t *testing
 				t.Fatal("error exposed process values")
 			}
 		})
+	}
+}
+
+func TestOpenClawStandardDefaultServiceWithoutProfileSelectorsIsRefused(t *testing.T) {
+	t.Parallel()
+	root := "/Users/user/.openclaw"
+	config := root + "/openclaw.json"
+	// Pinned plain `openclaw gateway install` copies HOME but does not synthesize
+	// state/config selectors. Native startup may load further global dotenv values.
+	raw := processArgumentsFixture([]string{"openclaw-gateway", "", ""}, []string{
+		"HOME=/Users/user", "OPENCLAW_LAUNCHD_LABEL=ai.openclaw.gateway",
+		"OPENCLAW_SERVICE_MARKER=openclaw", "OPENCLAW_SERVICE_KIND=gateway",
+	})
+	proof := ProcessEvidence("501 openclaw-gateway", "openclaw", root, config)
+	proof.UID = 501
+	var err error
+	proof.StateRoot, proof.ConfigPath, err = profileEnvironment(raw)
+	if err != nil || proof.RuntimeKind != "openclaw" || proof.StateRoot != "" || proof.ConfigPath != "" {
+		t.Fatal("default producer evidence was guessed or malformed")
+	}
+	ok, err := MatchEndpoint(proof, 501, "openclaw", root, config)
+	if ok || !errors.Is(err, ErrProfileScopeUnverified) || err.Error() != "runtime_conflict: "+ProfileScopeUnverifiedMessage {
+		t.Fatal("default service without exact profile evidence authorized attachment")
 	}
 }

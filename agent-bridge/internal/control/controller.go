@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	"github.com/personastack/macos/agent-bridge/internal/pairing"
 	"github.com/personastack/macos/agent-bridge/internal/runtime"
 	"github.com/personastack/macos/agent-bridge/internal/targetinventory"
+	"github.com/personastack/macos/agent-bridge/internal/targetruntime"
 )
 
 type Controller struct {
@@ -505,6 +507,9 @@ func (c *Controller) status(ctx context.Context, p BindingPayload, probe bool) (
 				if err != nil {
 					row.ReadinessState = "unavailable"
 					row.DiagnosticCode = "runtime_conflict"
+					if errors.Is(err, targetruntime.ErrProfileScopeUnverified) {
+						row.DiagnosticMessage = targetruntime.ProfileScopeUnverifiedMessage
+					}
 				} else {
 					row.ReadinessState = detection.State.String()
 					row.DiagnosticCode = detection.DiagnosticCode

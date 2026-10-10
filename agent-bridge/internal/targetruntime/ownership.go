@@ -18,9 +18,16 @@ type EndpointEvidence struct {
 	RuntimeKind, StateRoot, ConfigPath string
 }
 
+const ProfileScopeUnverifiedMessage = "Gateway profile scope cannot be verified. Stop it manually, then Repair."
+
+var ErrProfileScopeUnverified = errors.New("runtime_conflict: " + ProfileScopeUnverifiedMessage)
+
 func MatchEndpoint(e EndpointEvidence, uid int, kind, root, config string) (bool, error) {
 	if !e.Listening {
 		return false, nil
+	}
+	if kind == "openclaw" && e.UID == uid && e.RuntimeKind == kind && (e.StateRoot == "" || e.ConfigPath == "") {
+		return false, ErrProfileScopeUnverified
 	}
 	if e.UID != uid || e.RuntimeKind != kind || e.StateRoot != root || e.ConfigPath != config {
 		return false, fmt.Errorf("runtime_conflict: listener ownership does not match selected profile")

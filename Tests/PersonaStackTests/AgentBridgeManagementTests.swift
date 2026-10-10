@@ -9,6 +9,8 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
     struct Step: Sendable { let operation: String; let json: String }
     private var expected: [Step]
     private(set) var performed: [String] = []
+    private var afterCheck: (@MainActor @Sendable () -> Void)?
+    func setAfterCheck(_ action: @escaping @MainActor @Sendable () -> Void) { afterCheck = action }
     init(_ expected: [Step]) { self.expected = expected }
     private func consume(_ operation: String) throws -> String {
         guard !expected.isEmpty else { throw AgentBridgeFailure.invalidRequest }
@@ -18,7 +20,7 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
         guard operation == step.operation else { throw AgentBridgeFailure.invalidRequest }
         return step.json
     }
-    func exchange(_ request: Data) throws -> Data {
+    func exchange(_ request: Data) async throws -> Data {
         let object = try #require(JSONSerialization.jsonObject(with: request) as? [String: Any])
         let operation = try #require(object["operation"] as? String)
         let payload = try #require(object["payload"] as? [String: Any])
@@ -30,6 +32,7 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
             #expect(proof["connection_generation"] as? Int == 7)
         }
         let result = try JSONSerialization.jsonObject(with: Data(consume(operation).utf8))
+        if operation == "check", let afterCheck { await afterCheck() }
         return try JSONSerialization.data(withJSONObject: ["version": 1, "request_id": object["request_id"]!, "result": result])
     }
     func request(_ request: URLRequest) throws -> (Data, Int) {
@@ -71,13 +74,15 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
     private let local = #"{"connections":[{"binding_key":{"environment_id":"https://my.personastack.ai","connection_id":"conn-a"},"persona_id":"persona-a","runtime_kind":"hermes","connection_generation":7,"readiness_state":"mcp_verified"}]}"#
 
     @MainActor private func manager(_ fixture: AgentBridgeManagementFixture, confirmStop: @escaping @MainActor (String) -> Bool = { _ in false },
-                                   confirmRepair: @escaping @MainActor (String) -> Bool = { _ in false }) -> AgentBridgeSetupManager {
+                                   confirmRepair: @escaping @MainActor (String) -> Bool = { _ in false },
+                                   showScopeHelp: @escaping @MainActor () -> Void = {},
+                                   cookieReader: @escaping @MainActor (WKWebView, DesktopEnvironmentConfiguration) async throws -> String = { _, _ in "personastack_session=fixture" }) -> AgentBridgeSetupManager {
         let client = AgentBridgeControlClient(transport: fixture)
         let service = AgentBridgeService(registration: AgentBridgeManagementRegistration(), client: client,
             preferences: UserDefaults(suiteName: "AgentBridgeManagementTests." + UUID().uuidString)!, requireSignature: {}, clearDisabledPreference: {})
         return AgentBridgeSetupManager(service: service, client: client, hosted: AgentBridgeHostedAuthority(transport: fixture),
             configuration: { _ in .production }, approveEnvironment: { _ in }, prepareBackgroundEnable: {},
-            cookieReader: { _, _ in "personastack_session=fixture" }, confirmRuntimeStart: confirmRepair,
+            cookieReader: cookieReader, confirmRuntimeStart: confirmRepair, showProfileScopeHelp: showScopeHelp,
             confirmDisconnectStop: confirmStop, waitForSettlement: {}, csrfReader: { _ in "csrf-fixture" })
     }
     @MainActor private func command(_ action: String, manager: AgentBridgeSetupManager, view: WKWebView) async throws -> AgentBridgePageCommand {
@@ -107,6 +112,28 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
             await #expect(throws: AgentBridgeFailure.reconnectRequired) { _ = try await manager.apply(actual, view: issuingView) }
             #expect(await fixture.performed == ["GET /user/personas/external-runtime", "check"])
         }
+    }
+
+    @Test(arguments: ["exact", "foreign_persona", "foreign_binding", "stale_generation", "changed_document", "changed_cookie", "foreign_message"]) @MainActor func unverifiedGatewayScopeHelpRequiresCurrentExactOwner(_ fault: String) async throws {
+        var unavailable = local.replacingOccurrences(of: "hermes", with: "openclaw")
+            .replacingOccurrences(of: "\"readiness_state\":\"mcp_verified\"", with: "\"readiness_state\":\"unavailable\",\"diagnostic_code\":\"runtime_conflict\",\"diagnostic_message\":\"" + AgentBridgeSetupManager.profileScopeHelpMessage + "\"")
+        if fault == "foreign_persona" { unavailable = unavailable.replacingOccurrences(of: "persona-a", with: "persona-b") }
+        if fault == "foreign_binding" { unavailable = unavailable.replacingOccurrences(of: "conn-a", with: "conn-b") }
+        if fault == "stale_generation" { unavailable = unavailable.replacingOccurrences(of: "\"connection_generation\":7", with: "\"connection_generation\":6") }
+        if fault == "foreign_message" { unavailable = unavailable.replacingOccurrences(of: AgentBridgeSetupManager.profileScopeHelpMessage, with: "Untrusted profile diagnostic") }
+        let fixture = AgentBridgeManagementFixture([.init(operation: "GET /user/personas/external-runtime", json: current), .init(operation: "check", json: unavailable)])
+        var helpCount = 0, confirmCount = 0
+        var cookie = "personastack_session=fixture"
+        let manager = manager(fixture, confirmRepair: { _ in confirmCount += 1; return false }, showScopeHelp: { helpCount += 1 }, cookieReader: { _, _ in cookie })
+        let view = WKWebView()
+        let command = try await command("repair", manager: manager, view: view)
+        if fault == "changed_document" { await fixture.setAfterCheck { manager.invalidate(view) } }
+        if fault == "changed_cookie" { await fixture.setAfterCheck { cookie = "personastack_session=changed" } }
+        let expected: AgentBridgeFailure = (fault == "exact" || fault == "foreign_message") ? .runtimeConflict : .scopeChanged
+        await #expect(throws: expected) { _ = try await manager.apply(command, view: view) }
+        #expect(helpCount == (fault == "exact" ? 1 : 0))
+        #expect(confirmCount == (fault == "foreign_message" ? 1 : 0))
+        #expect(await fixture.performed == ["GET /user/personas/external-runtime", "check"])
     }
 
     @Test @MainActor func busyDisconnectCancellationHasNoMutation() async throws {

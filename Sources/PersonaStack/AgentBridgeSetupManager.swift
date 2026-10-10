@@ -31,6 +31,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
     private let cookieReader: @MainActor (WKWebView, DesktopEnvironmentConfiguration) async throws -> String
     private let chooseOpenClawAgent: @MainActor (String, [AgentBridgeNativeAgent]) -> String?
     private let confirmRuntimeStart: @MainActor (String) -> Bool
+    private let showProfileScopeHelp: @MainActor () -> Void
     private let confirmDisconnectStop: @MainActor (String) -> Bool
     private let waitForSettlement: @MainActor () async throws -> Void
     private let csrfReader: @MainActor (WKWebView) async throws -> String
@@ -44,6 +45,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
          cookieReader: @escaping @MainActor (WKWebView, DesktopEnvironmentConfiguration) async throws -> String = AgentBridgeSetupManager.readCookies,
          chooseOpenClawAgent: @escaping @MainActor (String, [AgentBridgeNativeAgent]) -> String? = AgentBridgeSetupManager.chooseAgent,
          confirmRuntimeStart: @escaping @MainActor (String) -> Bool = AgentBridgeSetupManager.confirmStart,
+         showProfileScopeHelp: @escaping @MainActor () -> Void = AgentBridgeSetupManager.presentProfileScopeHelp,
          confirmDisconnectStop: @escaping @MainActor (String) -> Bool = AgentBridgeSetupManager.confirmStopForDisconnect,
          waitForSettlement: @escaping @MainActor () async throws -> Void = { try await Task.sleep(for: .milliseconds(250)) },
          csrfReader: @escaping @MainActor (WKWebView) async throws -> String = AgentBridgeSetupManager.readCSRF) {
@@ -51,6 +53,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         self.approveEnvironment = approveEnvironment; self.prepareBackgroundEnable = prepareBackgroundEnable; self.cookieReader = cookieReader
         self.chooseOpenClawAgent = chooseOpenClawAgent
         self.confirmRuntimeStart = confirmRuntimeStart
+        self.showProfileScopeHelp = showProfileScopeHelp
         self.csrfReader = csrfReader
         self.confirmDisconnectStop = confirmDisconnectStop; self.waitForSettlement = waitForSettlement
     }
@@ -306,8 +309,16 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         for _ in 0..<120 {
             try await validate()
             let result = try await client.send(AgentBridgeRequest(operation: "check", payload: ["binding_key": bindingValue(binding)]), returning: AgentBridgeConnections.self)
+            try await validate()
             guard let selected = result.connections.first(where: { $0.bindingKey == binding }), selected.personaID == target.persona, selected.runtimeKind == target.runtime else { throw AgentBridgeFailure.scopeChanged }
             guard !selected.requiresReconnect else { throw AgentBridgeFailure.reconnectRequired }
+            if Self.hasUnverifiedProfileScope(selected) {
+                let owner = try await hosted.read(configuration: page.configuration, cookies: cookies, persona: target.persona)
+                guard let generation = selected.connectionGeneration, generation > 0 else { throw AgentBridgeFailure.scopeChanged }
+                try owner.require(workspace: target.workspace, persona: target.persona, connection: binding.connectionID, generation: generation)
+                try await validate()
+                try refuseUnverifiedProfileScope(selected)
+            }
             if selected.isMCPVerified { return }
             // The helper must receive the API-selected revision before a native Repair can install or launch.
             if selected.readinessState == "target_selection_required" { try await waitForSettlement(); continue }
@@ -573,6 +584,9 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
             guard let generation = selected.connectionGeneration, generation > 0, generation == command.connectionGeneration else { throw AgentBridgeFailure.scopeChanged }
             guard selected.activeRunID == nil || selected.activeRunID == "" else { throw AgentBridgeFailure.busy }
             guard !selected.requiresReconnect else { throw AgentBridgeFailure.reconnectRequired }
+            _ = try await self.cookies(view: view, page: page)
+            try current(page, scope: command.scope, document: document)
+            try refuseUnverifiedProfileScope(selected)
             if selected.readinessState == "target_selection_required" || binding.targetSelection?.isUnselected == true {
                 guard let retained = selected.preparedTarget, retained.workspaceID == command.workspaceID,
                       retained.runtimeKind == selected.runtimeKind, selected.connectionGeneration == command.connectionGeneration,
@@ -710,6 +724,23 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
         if let diagnostic = value.diagnosticCode { result["diagnostic_code"] = diagnostic }
         // Runtime diagnostic text may contain local paths. The hosted API owns safe explanations.
         return result
+    }
+    static let profileScopeHelpMessage = "Gateway profile scope cannot be verified. Stop it manually, then Repair."
+    private static func hasUnverifiedProfileScope(_ connection: AgentBridgeConnection) -> Bool {
+        connection.runtimeKind == .openclaw && connection.diagnosticCode == "runtime_conflict" &&
+            connection.diagnosticMessage == profileScopeHelpMessage
+    }
+    private func refuseUnverifiedProfileScope(_ connection: AgentBridgeConnection) throws {
+        guard Self.hasUnverifiedProfileScope(connection) else { return }
+        showProfileScopeHelp()
+        throw AgentBridgeFailure.runtimeConflict
+    }
+    private static func presentProfileScopeHelp() {
+        let alert = NSAlert()
+        alert.messageText = "OpenClaw profile scope is unavailable."
+        alert.informativeText = profileScopeHelpMessage + "\n\nPersonaStack leaves this gateway untouched. Use OpenClaw to stop the preexisting gateway. Then return to this persona's Repair action and approve starting its selected profile."
+        alert.addButton(withTitle: "Close")
+        alert.runModal()
     }
     private func current(_ page: Page, scope: String, document: UUID) throws {
         guard !page.retired else { throw AgentBridgeFailure.scopeChanged }
