@@ -19,6 +19,11 @@ struct PopoutWindowPresentationTests {
                 transparent: false, kind: kind, loadPage: false, defaults: preferences.defaults) {}
             defer { popout.dispose() }
             let chrome = try #require(popout.presentation)
+            let standardWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 500),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            standardWindow.isReleasedWhenClosed = false
+            defer { standardWindow.close() }
+            let standardTitlebarHeight = standardWindow.frame.height - standardWindow.contentLayoutRect.maxY
             chrome.updateTitle("PersonaStack.ai · \(kind.fallbackTitle)")
             for width in [900.0, 340.0, 390.0, 900.0] {
                 popout.window.setFrame(NSRect(x: 50, y: 100, width: width, height: 500), display: false)
@@ -28,6 +33,14 @@ struct PopoutWindowPresentationTests {
                 let title = try #require(Self.titleField(in: frameView, text: popout.window.title))
                 let titleRect = title.convert(title.bounds, to: nil)
                 #expect(titleRect.width > 0)
+                if kind == .stackStream {
+                    #expect(popout.window.toolbar == nil)
+                    #expect(popout.window.frame.height - popout.window.contentLayoutRect.maxY == standardTitlebarHeight)
+                    #expect(chrome.pinButton.frame.size == NSSize(width: 24, height: 24))
+                    let pinRect = chrome.pinButton.convert(chrome.pinButton.bounds, to: nil)
+                    #expect(pinRect.minY >= popout.window.contentLayoutRect.maxY)
+                    #expect(pinRect.maxY <= popout.window.frame.height)
+                }
                 for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
                     let button = try #require(popout.window.standardWindowButton(type))
                     #expect(!button.isHidden)

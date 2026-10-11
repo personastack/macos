@@ -4,7 +4,7 @@ import WebKit
 enum PopoutWindowKind: String, CaseIterable {
     case chat, stackStream, personaActivity, stackGraph
 
-    var usesTitlebarAccessory: Bool { self == .chat || self == .stackGraph }
+    var usesTitlebarAccessory: Bool { self != .personaActivity }
 
     var fallbackTitle: String {
         switch self {
