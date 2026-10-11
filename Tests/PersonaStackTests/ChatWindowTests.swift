@@ -217,7 +217,7 @@ struct ChatWindowTests {
         #expect(stream.webView.value(forKey: "drawsBackground") as? Bool == true)
         #expect(stream.presentation != nil)
         #expect(stream.window.contentView === stream.webView)
-        #expect(stream.window.toolbar != nil)
+        #expect(stream.window.toolbar == nil)
         stream.window.performClose(nil)
         #expect(manager.window(for: .stream, stackID: "stack-1") == nil)
         manager.apply(.openPersonaActivity("persona-1"), base: base)
