@@ -45,6 +45,33 @@ public struct DesktopOutputChunk: Sendable, Equatable {
     }
 }
 
+/// Byte storage is independent of process IO so cursor loss is deterministic in unit tests.
+struct DesktopShellOutputBuffer {
+    var chunks: [DesktopOutputChunk] = []
+    var bufferedBytes = 0
+    var nextSequence: UInt64 = 0
+    var incompleteOutput = false
+    let maximumBytes: Int
+
+    init(maximumBytes: Int = DesktopShellExecutor.maximumBufferedBytesPerProcess) { self.maximumBytes = maximumBytes }
+
+    mutating func append(_ data: Data, stream: DesktopOutputChunk.Stream) -> Bool {
+        guard !data.isEmpty else { return false }
+        nextSequence += 1
+        chunks.append(DesktopOutputChunk(sequence: nextSequence, stream: stream, data: data))
+        bufferedBytes += data.count
+        var dropped = false
+        while bufferedBytes > maximumBytes, !chunks.isEmpty {
+            bufferedBytes -= chunks.removeFirst().data.count
+            dropped = true
+        }
+        return dropped
+    }
+
+    var earliestCursor: UInt64 { chunks.first?.sequence ?? nextSequence + 1 }
+    func hasGap(after cursor: UInt64) -> Bool { incompleteOutput || cursor < earliestCursor - 1 }
+}
+
 public enum DesktopTerminalMode: String, Sendable { case pipe, pty }
 
 public struct DesktopProcessRead: Sendable {
@@ -109,10 +136,7 @@ public actor DesktopShellExecutor: DesktopShellControlling {
         let stdin: FileHandle
         let inputQueue: DispatchQueue
         let inputCancellation: DesktopShellInputCancellation
-        var chunks: [DesktopOutputChunk] = []
-        var bufferedBytes = 0
-        var totalBytes: UInt64 = 0
-        var nextSequence: UInt64 = 0
+        var output = DesktopShellOutputBuffer()
         var state: DesktopProcessState = .running
         var exitCode: Int32?
         var signal: Int32?
@@ -126,7 +150,6 @@ public actor DesktopShellExecutor: DesktopShellControlling {
         var inputClosed = false
         var readerDrainDeadline: ContinuousClock.Instant?
         var forceCloseReaders = false
-        var incompleteOutput = false
         let startedAt: ContinuousClock.Instant
         var deadlineTask: Task<Void, Never>?
     }
@@ -146,7 +169,7 @@ public actor DesktopShellExecutor: DesktopShellControlling {
         DesktopShellDiagnostics(
             activeProcesses: sessions.values.filter { $0.state == .running }.count,
             openFileHandles: sessions.values.reduce(0) { $0 + $1.outputReaders + ($1.inputClosed ? 0 : 1) },
-            bufferedOutputBytes: sessions.values.reduce(0) { $0 + $1.bufferedBytes },
+            bufferedOutputBytes: sessions.values.reduce(0) { $0 + $1.output.bufferedBytes },
             outputGapsTotal: outputGapsTotal
         )
     }
@@ -207,10 +230,10 @@ public actor DesktopShellExecutor: DesktopShellControlling {
         while true {
             try DesktopControlExecution.check()
             guard let session = sessions[id] else { throw DesktopShellError.missingExecution }
-            guard cursor <= session.nextSequence else { throw DesktopShellError.invalidInput }
-            let earliest = session.chunks.first?.sequence ?? session.nextSequence + 1
-            let gap = session.incompleteOutput || cursor < earliest - 1
-            let selected = session.chunks.filter { $0.sequence > cursor }
+            guard cursor <= session.output.nextSequence else { throw DesktopShellError.invalidInput }
+            let earliest = session.output.earliestCursor
+            let gap = session.output.hasGap(after: cursor)
+            let selected = session.output.chunks.filter { $0.sequence > cursor }
             let chunks = Self.bounded(selected, limit: Self.maximumReadBytes)
             let nextCursor = chunks.last?.sequence ?? cursor
             if !chunks.isEmpty || session.outputReaders == 0 || ContinuousClock.now >= end {
@@ -227,14 +250,14 @@ public actor DesktopShellExecutor: DesktopShellControlling {
         switch input {
         case .data(let data):
             guard !data.isEmpty, data.count <= Self.maximumInputBytes else { throw DesktopShellError.invalidInput }
-            guard var session = sessions[id], session.terminalState == nil, !session.inputClosed,
+            guard var session = sessions[id], session.terminalState == nil, !session.processTerminated, !session.inputClosed,
                   session.queuedInputBytes + data.count <= Self.maximumQueuedInputBytes else { throw DesktopShellError.invalidInput }
             session.queuedInputBytes += data.count
             session.pendingInputOperations += 1
             sessions[id] = session
             try await performQueuedInput(id: id, session: session, data: data)
         case .close:
-            guard var session = sessions[id], session.terminalState == nil, !session.inputClosed else {
+            guard var session = sessions[id], session.terminalState == nil, !session.processTerminated, !session.inputClosed else {
                 throw DesktopShellError.missingExecution
             }
             var eofData: Data?
@@ -250,11 +273,11 @@ public actor DesktopShellExecutor: DesktopShellControlling {
             sessions[id] = session
             try await performQueuedInput(id: id, session: session, data: eofData)
         case .interrupt:
-            guard let session = sessions[id], session.terminalState == nil else { throw DesktopShellError.missingExecution }
+            guard let session = sessions[id], session.terminalState == nil, !session.processTerminated else { throw DesktopShellError.missingExecution }
             let group = session.terminalMode == .pty ? tcgetpgrp(session.stdin.fileDescriptor) : session.processID
             guard group > 0, kill(-group, SIGINT) == 0 else { throw DesktopShellError.missingExecution }
         case .resize(let rows, let columns):
-            guard let session = sessions[id], session.terminalMode == .pty, session.terminalState == nil,
+            guard let session = sessions[id], session.terminalMode == .pty, session.terminalState == nil, !session.processTerminated,
                   rows > 0, rows <= 1000, columns > 0, columns <= 1000 else { throw DesktopShellError.invalidInput }
             var size = winsize(ws_row: rows, ws_col: columns, ws_xpixel: 0, ws_ypixel: 0)
             guard ioctl(session.stdin.fileDescriptor, TIOCSWINSZ, &size) == 0 else { throw DesktopShellError.invalidInput }
@@ -302,9 +325,9 @@ public actor DesktopShellExecutor: DesktopShellControlling {
     public func status(id: UUID) throws -> DesktopProcessRead {
         try DesktopControlExecution.check()
         guard let session = sessions[id] else { throw DesktopShellError.missingExecution }
-        let earliest = session.chunks.first?.sequence ?? session.nextSequence + 1
-        return DesktopProcessRead(executionID: id, chunks: [], nextCursor: session.nextSequence,
-                                  earliestCursor: earliest, outputGap: session.incompleteOutput || earliest > 1, state: session.state,
+        let earliest = session.output.earliestCursor
+        return DesktopProcessRead(executionID: id, chunks: [], nextCursor: session.output.nextSequence,
+                                  earliestCursor: earliest, outputGap: session.output.incompleteOutput || earliest > 1, state: session.state,
                                   exitCode: session.exitCode, signal: session.signal, terminalMode: session.terminalMode, outputComplete: session.outputReaders == 0)
     }
 
@@ -371,17 +394,7 @@ public actor DesktopShellExecutor: DesktopShellControlling {
 
     private func append(_ data: Data, stream: DesktopOutputChunk.Stream, id: UUID) {
         guard var session = sessions[id], !data.isEmpty else { return }
-        session.nextSequence += 1
-        let chunk = DesktopOutputChunk(sequence: session.nextSequence, stream: stream, data: data)
-        session.totalBytes += UInt64(data.count)
-        session.bufferedBytes += data.count
-        session.chunks.append(chunk)
-        var droppedOutput = false
-        while session.bufferedBytes > Self.maximumBufferedBytesPerProcess, !session.chunks.isEmpty {
-            session.bufferedBytes -= session.chunks.removeFirst().data.count
-            droppedOutput = true
-        }
-        if droppedOutput { outputGapsTotal += 1 }
+        if session.output.append(data, stream: stream) { outputGapsTotal += 1 }
         sessions[id] = session
     }
 
@@ -424,7 +437,7 @@ public actor DesktopShellExecutor: DesktopShellControlling {
     private func shouldStopReader(_ id: UUID) -> Bool {
         guard var session = sessions[id] else { return true }
         guard session.forceCloseReaders || session.readerDrainDeadline.map({ ContinuousClock.now >= $0 }) == true else { return false }
-        session.incompleteOutput = true
+        session.output.incompleteOutput = true
         sessions[id] = session
         return true
     }
@@ -500,26 +513,25 @@ public actor DesktopShellExecutor: DesktopShellControlling {
     private static func spawn(command: String, workingDirectory: String, mode: DesktopTerminalMode,
                               rows: UInt16, columns: UInt16) throws -> (pid: pid_t, stdin: Int32, stdout: Int32, stderr: Int32) {
         // Resolve the desktop account shell, rather than a WebView or remote-selected executable.
-        var account = passwd()
-        var resolved: UnsafeMutablePointer<passwd>?
         var buffer = [CChar](repeating: 0, count: 16384)
-        let lookup = buffer.withUnsafeMutableBufferPointer {
-            getpwuid_r(getuid(), &account, $0.baseAddress, $0.count, &resolved)
+        let identity = try buffer.withUnsafeMutableBufferPointer { storage -> (shell: String, home: String, user: String) in
+            var account = passwd()
+            var resolved: UnsafeMutablePointer<passwd>?
+            guard getpwuid_r(getuid(), &account, storage.baseAddress, storage.count, &resolved) == 0,
+                  resolved != nil, let shell = account.pw_shell, let home = account.pw_dir, let user = account.pw_name else {
+                throw DesktopShellError.invalidCommand
+            }
+            return (String(cString: shell), String(cString: home), String(cString: user))
         }
-        guard lookup == 0, resolved != nil, let shellPointer = account.pw_shell else {
-            throw DesktopShellError.invalidCommand
-        }
-        let shell = String(cString: shellPointer)
+        let shell = identity.shell
         guard shell.hasPrefix("/"), !shell.isEmpty else { throw DesktopShellError.invalidCommand }
         // Command is intentionally shell code. Cwd stays a chdir argument, never shell source.
-        let arguments = [shell, "-lc", command]
+        let arguments = ["-" + (shell as NSString).lastPathComponent, "-c", command]
         var environment = ProcessInfo.processInfo.environment
         environment["SHELL"] = shell
-        if let home = account.pw_dir { environment["HOME"] = String(cString: home) }
-        if let name = account.pw_name {
-            environment["USER"] = String(cString: name)
-            environment["LOGNAME"] = String(cString: name)
-        }
+        environment["HOME"] = identity.home
+        environment["USER"] = identity.user
+        environment["LOGNAME"] = identity.user
         if mode == .pty { environment["TERM"] = environment["TERM"] ?? "xterm-256color" }
         let argumentPointers = arguments.map { strdup($0) }
         let environmentPointers = environment.map { strdup("\($0.key)=\($0.value)") }

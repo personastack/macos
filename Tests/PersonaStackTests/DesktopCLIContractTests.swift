@@ -69,6 +69,24 @@ private actor DesktopCLIFake: DesktopShellControlling {
         var invalid = values; invalid["interrupt"] = .bool(true)
         #expect(throws: DesktopShellError.self) { try DesktopCLIArguments(operation: "desktop_control_exec_write", arguments: .object(invalid)) }
     }
+    @Test func bufferPreservesSplitUTF8AndBinaryBytesWithExplicitCursorGaps() {
+        var buffer = DesktopShellOutputBuffer(maximumBytes: 4)
+        #expect(!buffer.append(Data([0xC3]), stream: .stdout))
+        #expect(!buffer.append(Data([0xA9, 0xFF, 0]), stream: .stderr))
+        #expect(buffer.chunks.flatMap { $0.data } == [0xC3, 0xA9, 0xFF, 0])
+        #expect(!buffer.hasGap(after: 0))
+        #expect(buffer.append(Data([1, 2]), stream: .stdout))
+        #expect(buffer.earliestCursor == 3)
+        #expect(buffer.hasGap(after: 0))
+        #expect(!buffer.hasGap(after: 2))
+        #expect(buffer.bufferedBytes == 2)
+        let bounded = DesktopShellExecutor.bounded(buffer.chunks, limit: 1)
+        #expect(bounded.isEmpty)
+        #expect(DesktopShellExecutor.bounded(buffer.chunks, limit: 2).count == 1)
+        buffer.incompleteOutput = true
+        #expect(buffer.hasGap(after: 3))
+    }
+
     @Test func resultIsByteSafeAndPinsOutputCompletion() throws {
         let value = DesktopProcessRead(executionID: UUID(), chunks: [.init(sequence: 1, stream: .stdout, data: Data([0, 255, 195]))],
             nextCursor: 1, earliestCursor: 1, outputGap: true, state: .exited, exitCode: 7, signal: nil, terminalMode: .pty, outputComplete: false)

@@ -29,21 +29,9 @@ public struct DesktopCLIArguments: Sendable {
         guard Set(values.keys).isSubset(of: keys) else { throw DesktopShellError.invalidInput }
         self.operation = operation
         command = try Self.string(values, "command")
-        let directory = try Self.string(values, "working_directory")
-        if operation == "desktop_control_execute" {
-            guard let directory, directory.hasPrefix("/"), !directory.contains("\0"), directory.utf8.count <= 4096 else {
-                throw DesktopShellError.invalidWorkingDirectory
-            }
-        }
-        workingDirectory = directory ?? ""
-        if let value = values["timeout_seconds"] {
-            guard case .number(let number) = value, number.isFinite, number >= 1, number <= 1800 else { throw DesktopShellError.invalidInput }
-            timeout = number
-        } else { timeout = 300 }
-        mode = try Self.string(values, "terminal_mode").flatMap(DesktopTerminalMode.init(rawValue:)) ?? .pipe
-        if let rawMode = try Self.string(values, "terminal_mode"), DesktopTerminalMode(rawValue: rawMode) == nil {
-            throw DesktopShellError.invalidInput
-        }
+        workingDirectory = try Self.directory(values, operation: operation)
+        timeout = try Self.timeout(values)
+        mode = try Self.mode(values)
         let rawID = try Self.string(values, "execution_id")
         executionID = rawID.flatMap(UUID.init(uuidString:))
         cursor = try Self.integer(values, "cursor", default: 0, maximum: 9_007_199_254_740_991)
@@ -52,20 +40,8 @@ public struct DesktopCLIArguments: Sendable {
         let columns = try Self.integer(values, "terminal_columns", default: 0, maximum: 1000)
         let dimensions = values["terminal_rows"] != nil || values["terminal_columns"] != nil
         guard !dimensions || (rows > 0 && columns > 0) else { throw DesktopShellError.invalidInput }
-        let encoded = try Self.string(values, "data_base64")
-        let close = try Self.flag(values, "close_stdin")
-        let interrupt = try Self.flag(values, "interrupt")
-        guard !interrupt || (encoded == nil && !close && !dimensions) else { throw DesktopShellError.invalidInput }
-        var actions: [DesktopProcessInput] = []
-        if dimensions && operation == "desktop_control_exec_write" { actions.append(.resize(rows: UInt16(rows), columns: UInt16(columns))) }
-        if let encoded {
-            guard let bytes = Data(base64Encoded: encoded), !bytes.isEmpty,
-                  bytes.count <= DesktopShellExecutor.maximumInputBytes else { throw DesktopShellError.invalidInput }
-            actions.append(.data(bytes))
-        }
-        if close { actions.append(.close) }
-        if interrupt { actions.append(.interrupt) }
-        inputs = actions
+        inputs = try Self.inputs(values, dimensions: dimensions && operation == "desktop_control_exec_write",
+                                 rows: UInt16(rows), columns: UInt16(columns))
         self.rows = dimensions ? UInt16(rows) : 24
         self.columns = dimensions ? UInt16(columns) : 80
         if operation == "desktop_control_execute" {
@@ -79,6 +55,45 @@ public struct DesktopCLIArguments: Sendable {
     }
 
     public var terminalSize: (UInt16, UInt16) { (rows, columns) }
+
+    private static func directory(_ values: [String: DesktopControlJSONValue], operation: String) throws -> String {
+        let directory = try Self.string(values, "working_directory")
+        guard operation == "desktop_control_execute" else { return directory ?? "" }
+        guard let directory, directory.hasPrefix("/"), !directory.contains("\0"), directory.utf8.count <= 4096 else {
+            throw DesktopShellError.invalidWorkingDirectory
+        }
+        return directory
+    }
+
+    private static func timeout(_ values: [String: DesktopControlJSONValue]) throws -> TimeInterval {
+        guard let value = values["timeout_seconds"] else { return 300 }
+        guard case .number(let number) = value, number.isFinite, number >= 1, number <= 1800 else { throw DesktopShellError.invalidInput }
+        return number
+    }
+
+    private static func mode(_ values: [String: DesktopControlJSONValue]) throws -> DesktopTerminalMode {
+        guard let text = try Self.string(values, "terminal_mode") else { return .pipe }
+        guard let mode = DesktopTerminalMode(rawValue: text) else { throw DesktopShellError.invalidInput }
+        return mode
+    }
+
+    private static func inputs(_ values: [String: DesktopControlJSONValue], dimensions: Bool,
+                               rows: UInt16, columns: UInt16) throws -> [DesktopProcessInput] {
+        let encoded = try Self.string(values, "data_base64")
+        let close = try Self.flag(values, "close_stdin")
+        let interrupt = try Self.flag(values, "interrupt")
+        guard !interrupt || (encoded == nil && !close && !dimensions) else { throw DesktopShellError.invalidInput }
+        var actions: [DesktopProcessInput] = []
+        if dimensions { actions.append(.resize(rows: rows, columns: columns)) }
+        if let encoded {
+            guard let bytes = Data(base64Encoded: encoded), !bytes.isEmpty,
+                  bytes.count <= DesktopShellExecutor.maximumInputBytes else { throw DesktopShellError.invalidInput }
+            actions.append(.data(bytes))
+        }
+        if close { actions.append(.close) }
+        if interrupt { actions.append(.interrupt) }
+        return actions
+    }
 
     private static func string(_ values: [String: DesktopControlJSONValue], _ key: String) throws -> String? {
         guard let value = values[key] else { return nil }

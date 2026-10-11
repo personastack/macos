@@ -420,18 +420,18 @@ final class DesktopControlCommandExecutor {
         } == true
         if matches {
             guard await cleanupLeaseAndResources(lease) else {
-                return Self.failure(frame, "desktop_control_revoke_incomplete", "CUA could not confirm that this PersonaStack session stopped.")
+                return Self.failure(frame, "desktop_control_revoke_incomplete", "The app could not confirm that this PersonaStack control session stopped.")
             }
         } else if cleanupMatches {
             // Join the same cleanup used by direct revoke, release, and expiry.
             guard await waitForLeaseCleanup() else {
                 unavailable = true
-                return Self.failure(frame, "desktop_control_revoke_incomplete", "CUA could not confirm that this PersonaStack session stopped.")
+                return Self.failure(frame, "desktop_control_revoke_incomplete", "The app could not confirm that this PersonaStack control session stopped.")
             }
         } else if failedCleanupMatches {
             // A prior cleanup failed. Retry that same lease before acknowledging.
             guard await cleanupLeaseAndResources(failedCleanupLease) else {
-                return Self.failure(frame, "desktop_control_revoke_incomplete", "CUA could not confirm that this PersonaStack session stopped.")
+                return Self.failure(frame, "desktop_control_revoke_incomplete", "The app could not confirm that this PersonaStack control session stopped.")
             }
         }
         return DesktopControlFrame(type: "result", requestID: frame.requestID,
