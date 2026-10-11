@@ -80,6 +80,11 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.assertIn("needs: prepare", publish)
         self.assertIn("environment: macos-release-publication", publish)
         self.assertIn("artifact-ids: ${{ needs.prepare.outputs.artifact_id }}", publish)
+        download = publish.split("      - name: Download the accepted installer", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("uses: actions/download-artifact@v4", download)
+        self.assertIn("artifact-ids: ${{ needs.prepare.outputs.artifact_id }}", download)
+        self.assertIn("path: artifacts", download)
+        self.assertIn("merge-multiple: true", download)
         self.assertIn("--expected-sha256", publish)
         self.assertIn("cmp artifacts/release-notes.md", publish)
         self.assertNotIn("package-macos.sh", publish)

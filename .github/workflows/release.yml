@@ -194,6 +194,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.prepare.outputs.artifact_id }}
           path: artifacts
+          merge-multiple: true
       - name: Verify exact accepted candidate bytes and notes
         env:
           EXPECTED_SHA256: ${{ needs.prepare.outputs.installer_sha256 }}
