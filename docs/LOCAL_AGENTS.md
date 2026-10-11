@@ -18,7 +18,7 @@ The connection controls require the macOS app. A connection on another Mac is sh
 
 ## Background work and status
 
-Closing app windows or choosing Quit leaves enabled background agents running. Use the app's **Background Agents** menu to stop them. Finish assigned work or use the persona's existing **Stop** action first. **Review Login Items…** opens the macOS approval settings.
+Closing app windows or choosing Quit leaves enabled background agents running. Open the menu-bar icon's **Hermes/OpenClaw** menu and choose **Stop Background Agents** to stop them. Finish assigned work or use the persona's existing **Stop** action first. If macOS blocks background permission, allow PersonaStack in **System Settings → General → Login Items & Extensions**, then retry.
 
 Connection status reports readiness and work assigned by PersonaStack. It does not report other work started inside your runtime. A ready connection does not prove the entire native profile is idle. Sleep and sign-out make the Mac unavailable for new work.
 
