@@ -1260,10 +1260,14 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private func heartbeatReadiness() async -> String? {
         guard !Task.isCancelled else { return nil }
         sessionLock.reconcile()
+        let generation = lifecycleGeneration
+        if executorCleanupFailed && !executorCleanupInProgress {
+            await cleanupExecutor()
+            guard generation == lifecycleGeneration, !Task.isCancelled else { return nil }
+        }
         if paused { return "paused" }
         if executorCleanupInProgress || executorCleanupFailed { return "cua_unavailable" }
         if !controlSessionIsUsable { return sessionLock.readiness }
-        let generation = lifecycleGeneration
         guard !executor.nativeVerificationInProgress else { return nil }
         let observedProxy = proxy
         let proxyRunning = await observedProxy?.isProcessRunning() ?? false

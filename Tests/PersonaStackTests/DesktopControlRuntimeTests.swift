@@ -993,6 +993,46 @@ private actor PausedReconnectAuthority: DesktopControlRelayStateReading {
     func finishRead() { read?.resume(returning: true); read = nil }
 }
 
+private actor DelayedCuaDaemonExit: CuaToolCalling {
+    private var exited = false
+    private(set) var endCalls = 0
+    func setExited() { exited = true }
+    func sessionOwnerHasExited() -> Bool { exited }
+    func callTool(name: String, argumentsJSON: Data, timeout: Int32) async throws -> Data {
+        if name == "end_session" { endCalls += 1; throw CuaMCPProxyError.notStarted }
+        #expect(name == "get_cursor_position")
+        return Data(#"{"jsonrpc":"2.0","id":1,"result":{"content":[]}}"#.utf8)
+    }
+}
+
+@Test @MainActor func desktopHeartbeatRetriesOwnedCleanupAfterTheDaemonFinallyExits() async throws {
+    let proxy = DelayedCuaDaemonExit()
+    let executor = DesktopControlCommandExecutor()
+    let target = DesktopControlTarget(installationID: "i", workspaceID: "w", configID: "c", personaID: "p", runID: "r", generation: 1)
+    let acquire = DesktopControlFrame(type: "command", requestID: "acquire", target: target,
+        operation: "desktop_control_acquire", arguments: .object([:]), deadlineAt: .distantFuture)
+    let acquired = await executor.handle(acquire, proxy: proxy)
+    guard case .object(let result)? = acquired.result, case .string(let token)? = result["control_token"] else {
+        Issue.record("Missing pending cleanup lease"); return
+    }
+    let observe = DesktopControlFrame(type: "command", requestID: "observe", target: target,
+        operation: "desktop_control_cua", arguments: .object(["control_token": .string(token),
+            "tool": .string("get_cursor_position"), "arguments": .object([:])]), deadlineAt: .distantFuture)
+    #expect(await executor.handle(observe, proxy: proxy).type == "result")
+    let runtime = DesktopControlRuntime.makeForTesting(installer: DesktopControlInstallerFixture(errors: []),
+        credentials: EmptyDesktopControlCredentialStore(), executor: executor, sessionLockState: .unlocked)
+    await runtime.pause()
+    #expect(runtime.executorCleanupFailedForTesting)
+    #expect(!runtime.permissionSetupAvailable)
+    await proxy.setExited()
+    #expect(await runtime.heartbeatReadinessForTesting() == "paused")
+    #expect(!runtime.executorCleanupFailedForTesting)
+    #expect(runtime.permissionSetupAvailable)
+    #expect(await proxy.endCalls == 1)
+    #expect(runtime.paused)
+    await runtime.shutdownForQuit()
+}
+
 @Test @MainActor func desktopPauseDuringAuthorityReadDoesNotKillReconnectLoop() async throws {
     let profile = DesktopEnvironmentConfiguration.production
     let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: JSONSerialization.data(withJSONObject: [
