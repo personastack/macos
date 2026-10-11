@@ -56,7 +56,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in
             do { try await AgentBridgeUpdateHandoff.shared.restoreAtLaunch() }
             catch {
-                UserDefaults.standard.set("Background agents could not resume after the update. Review Login Items and retry setup.",
+                UserDefaults.standard.set("Background agents could not resume after the update. Try Enable Background Agents again.",
                                           forKey: AgentBridgeService.errorKey)
             }
         }

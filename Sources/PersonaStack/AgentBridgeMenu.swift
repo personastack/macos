@@ -1,6 +1,5 @@
 import AppKit
 import PersonaStackCore
-import ServiceManagement
 import SwiftUI
 
 struct AgentBridgeMenu: View {
@@ -19,7 +18,6 @@ struct AgentBridgeMenu: View {
             if admissionPaused {
                 Button("Resume Background Agents") { resume() }.disabled(working)
             }
-            Button("Review Login Items…") { SMAppService.openSystemSettingsLoginItems() }
         }
     }
 
@@ -68,7 +66,7 @@ struct AgentBridgeMenu: View {
         case .migrationIncomplete: "Finish the interrupted profile migration before stopping Background Agents. Select the same persona and profile to resume setup."
         case .backgroundApprovalRequired: "Allow PersonaStack in General → Login Items & Extensions, then retry."
         case .credentialUnavailable: "Unlock or authorize the saved Keychain credential, then retry setup."
-        default: "Background agents are unavailable. Review Login Items and retry setup."
+        default: "Background agents are unavailable. Try Enable Background Agents again."
         }
     }
 }
