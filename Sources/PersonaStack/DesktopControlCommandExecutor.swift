@@ -529,19 +529,25 @@ final class DesktopControlCommandExecutor {
         }
 #endif
         if let proxy = leaseCuaProxy, let closingLease {
-            do {
-                let args = try JSONEncoder().encode(DesktopControlJSONValue.object(["session": .string(closingLease.cuaSession)]))
-                let response = try await DesktopControlExecution.$deadline.withValue(Date().addingTimeInterval(5)) {
-                    try await proxy.callTool(name: "end_session", argumentsJSON: args, timeout: 5)
-                }
-                guard case .object(let envelope) = try JSONDecoder().decode(DesktopControlJSONValue.self, from: response),
-                      case .object(let result)? = envelope["result"], envelope["error"] == nil,
-                      result["isError"] == nil || result["isError"] == .bool(false),
-                      case .object(let confirmation)? = result["structuredContent"],
-                      confirmation["session"] == .string(closingLease.cuaSession),
-                      confirmation["active"] == .bool(false) else { return false }
+            if await proxy.sessionOwnerHasExited() {
+                // Kernel-confirmed daemon exit ends its sessions. A client exit
+                // alone cannot release this fence.
                 leaseCuaProxy = nil
-            } catch { return false }
+            } else {
+                do {
+                    let args = try JSONEncoder().encode(DesktopControlJSONValue.object(["session": .string(closingLease.cuaSession)]))
+                    let response = try await DesktopControlExecution.$deadline.withValue(Date().addingTimeInterval(5)) {
+                        try await proxy.callTool(name: "end_session", argumentsJSON: args, timeout: 5)
+                    }
+                    guard case .object(let envelope) = try JSONDecoder().decode(DesktopControlJSONValue.self, from: response),
+                          case .object(let result)? = envelope["result"], envelope["error"] == nil,
+                          result["isError"] == nil || result["isError"] == .bool(false),
+                          case .object(let confirmation)? = result["structuredContent"],
+                          confirmation["session"] == .string(closingLease.cuaSession),
+                          confirmation["active"] == .bool(false) else { return false }
+                    leaseCuaProxy = nil
+                } catch { return false }
+            }
         }
 #if DEBUG
         if cleanupFailuresForTesting > 0 {

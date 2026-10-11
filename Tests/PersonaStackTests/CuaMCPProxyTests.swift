@@ -474,6 +474,61 @@ struct CuaMCPProxyTests {
         }
     }
 
+    @Test(arguments: [false, true])
+    func cleanupReconnectsOnlyForOwnedSessionTermination(interrupted: Bool) async throws {
+        let script = #"""
+        #!/usr/bin/python3
+        import json, sys
+        for line in sys.stdin:
+            request = json.loads(line)
+            method = request.get("method")
+            if method == "notifications/initialized": continue
+            if method == "initialize":
+                result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.29.1"}}
+            elif method == "tools/call" and request["params"]["name"] == "end_session":
+                assert request["params"]["arguments"] == {"session":"owned-session"}
+                result = {"structuredContent":{"session":"owned-session","active":False}}
+            else: sys.exit(2)
+            print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
+        """#
+        let executable = try executableScript(script)
+        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
+        let proxy = CuaMCPProxy(executableURL: executable)
+        _ = try await proxy.start()
+        if interrupted { proxy.interrupt() }
+        else { await proxy.stop() }
+        #expect(!(await proxy.sessionOwnerHasExited()))
+        let response = try await proxy.callTool(name: "end_session", argumentsJSON: Data(#"{"session":"owned-session"}"#.utf8), timeout: 5)
+        #expect(String(decoding: response, as: UTF8.self).contains("owned-session"))
+        #expect(await proxy.isProcessRunning())
+        await proxy.stop()
+        await #expect(throws: CuaMCPProxyError.notStarted) {
+            _ = try await proxy.callTool(name: "get_cursor_position", argumentsJSON: Data("{}".utf8))
+        }
+    }
+
+    @Test func cleanupCannotReconnectToAnUnverifiedDaemon() async {
+        let proxy = CuaMCPProxy(executableURL: URL(fileURLWithPath: "/must-not-launch"),
+            socketURL: URL(fileURLWithPath: "/missing/cua.sock"), expectedDaemonPID: Darwin.getpid())
+        #expect(!(await proxy.sessionOwnerHasExited()))
+        await #expect(throws: CuaMCPProxyError.serviceMismatch) {
+            _ = try await proxy.callTool(name: "end_session", argumentsJSON: Data(#"{"session":"owned-session"}"#.utf8), timeout: 5)
+        }
+        #expect(!(await proxy.isProcessRunning()))
+    }
+
+    @Test func daemonExitProofRequiresKernelConfirmedAbsence() async throws {
+        let live = CuaMCPProxy(executableURL: URL(fileURLWithPath: "/unused"), expectedDaemonPID: Darwin.getpid())
+        #expect(!(await live.sessionOwnerHasExited()))
+        let owner = Process()
+        owner.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try owner.run()
+        let pid = owner.processIdentifier
+        owner.waitUntilExit()
+        let exited = CuaMCPProxy(executableURL: URL(fileURLWithPath: "/unused"), expectedDaemonPID: pid)
+        #expect(await exited.sessionOwnerHasExited())
+    }
+
     private func executableScript(_ body: String) throws -> URL {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("cua-mcp-proxy-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)

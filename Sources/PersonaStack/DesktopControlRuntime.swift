@@ -725,6 +725,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let loopID = UUID()
         reconnectLoopID = loopID
         reconnectTask = Task { @MainActor [weak self] in
+            defer {
+                if let self, self.reconnectLoopID == loopID {
+                    self.reconnectTask = nil
+                    self.reconnectDelayTask = nil
+                }
+            }
             while !Task.isCancelled {
                 guard let self else { return }
                 if self.connectionRecoveryRequested {
@@ -754,7 +760,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         if !setupMayRunUnconfigured {
             do {
                 let hasActiveConfig = try await hasActiveConfig(for: installation)
-                guard !Task.isCancelled, generation == lifecycleGeneration else { return false }
+                guard !Task.isCancelled, reconnectLoopID == loopID, !disconnecting else { return false }
+                guard generation == lifecycleGeneration else { return true }
                 if !hasActiveConfig {
                     try? await stopIdleRelay(expectedLifecycle: generation)
                     return false
@@ -763,10 +770,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                 // Preserve retries when configuration authority is temporarily unreachable.
             }
         }
-        guard !Task.isCancelled, generation == lifecycleGeneration else { return false }
+        guard !Task.isCancelled, reconnectLoopID == loopID, !disconnecting else { return false }
+        guard generation == lifecycleGeneration else { return true }
         do {
             try await establishConnection(installation, generation: generation)
         } catch {
+            guard generation == lifecycleGeneration else { return true }
             let failure = error as NSError
             logger.error("gateway reconnect failed: \(failure.domain, privacy: .public) code \(failure.code, privacy: .public)")
             if Self.readiness(for: error) == "upgrade_required" { readiness = "upgrade_required" }
@@ -1290,6 +1299,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         guard let activeInstallation, frame.target?.installationID == activeInstallation.installationID else {
             return Self.failure(for: frame, code: "desktop_executor_unavailable")
         }
+        guard let deadline = frame.deadlineAt, deadline > Date(), !Task.isCancelled else {
+            return Self.failure(for: frame, code: "desktop_command_expired",
+                                message: "The command expired before execution. No new action was started.")
+        }
         sessionLock.reconcile()
         let isStatus = frame.operation == "desktop_control_status"
         let cleanup = ["desktop_control_release", "desktop_control_revoke_config", "desktop_control_revoke_binding"].contains(frame.operation ?? "")
@@ -1418,8 +1431,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         return runtime
     }
     func startReconnectLoopForTesting(installation: DesktopControlInstallation,
+                                      allowUnconfigured: Bool = true,
                                       attempt: @escaping () async throws -> Void) {
-        setupMayRunUnconfigured = true
+        setupMayRunUnconfigured = allowUnconfigured
         reconnectAttemptForTesting = attempt
         beginReconnectLoop(for: installation)
     }

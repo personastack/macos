@@ -972,3 +972,56 @@ func desktopFirstEnrollmentCheckReconnectsOnlyItsIdleClientAfterStandaloneRestar
     await Task.yield()
     #expect(attempts == 2 && !runtime.hasPendingRelayReconnectForTesting)
 }
+
+private actor PausedReconnectAuthority: DesktopControlRelayStateReading {
+    private var read: CheckedContinuation<Bool, Never>?
+    private var entered: CheckedContinuation<Void, Never>?
+    private(set) var reads = 0
+    func hasActiveConfig(installation: DesktopControlInstallation, appURL: URL) async throws -> Bool {
+        reads += 1
+        guard reads == 1 else { return true }
+        return await withCheckedContinuation {
+            read = $0
+            entered?.resume()
+            entered = nil
+        }
+    }
+    func waitForRead() async {
+        if read != nil { return }
+        await withCheckedContinuation { entered = $0 }
+    }
+    func finishRead() { read?.resume(returning: true); read = nil }
+}
+
+@Test @MainActor func desktopPauseDuringAuthorityReadDoesNotKillReconnectLoop() async throws {
+    let profile = DesktopEnvironmentConfiguration.production
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: JSONSerialization.data(withJSONObject: [
+        "installation_id": "fixture", "machine_credential": String(repeating: "A", count: 43),
+        "gateway_websocket_url": profile.gatewayWebsocketURL.absoluteString, "environment_origin": profile.appOrigin,
+    ]))
+    let authority = PausedReconnectAuthority()
+    let runtime = DesktopControlRuntime.makeForTesting(installer: DesktopControlInstallerFixture(errors: []),
+        credentials: EmptyDesktopControlCredentialStore(), relayStateReader: authority)
+    var attempts = 0
+    runtime.startReconnectLoopForTesting(installation: installation, allowUnconfigured: false) { attempts += 1 }
+    await authority.waitForRead()
+    await runtime.pause()
+    await authority.finishRead()
+    for _ in 0..<1000 {
+        if runtime.reconnectDelayPendingForTesting || !runtime.hasPendingRelayReconnectForTesting { break }
+        await Task.yield()
+    }
+    #expect(runtime.hasPendingRelayReconnectForTesting)
+    #expect(runtime.reconnectDelayPendingForTesting)
+    #expect(attempts == 0)
+    runtime.requestConnectionRecoveryForTesting()
+    for _ in 0..<1000 {
+        if attempts == 1 && runtime.reconnectDelayPendingForTesting { break }
+        await Task.yield()
+    }
+    #expect(attempts == 1)
+    #expect(await authority.reads == 2)
+    #expect(runtime.paused)
+    await runtime.shutdownForQuit()
+    #expect(!runtime.hasPendingRelayReconnectForTesting)
+}

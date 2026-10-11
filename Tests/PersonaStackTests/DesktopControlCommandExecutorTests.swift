@@ -14,6 +14,18 @@ private actor DesktopControlFrameCollector {
     func frames() -> [DesktopControlFrame] { stored }
 }
 
+private actor CuaSessionExitFixture: CuaToolCalling {
+    private var exited = false
+    private(set) var endCalls = 0
+    func setExited(_ value: Bool) { exited = value }
+    func sessionOwnerHasExited() -> Bool { exited }
+    func callTool(name: String, argumentsJSON: Data, timeout: Int32) async throws -> Data {
+        if name == "end_session" { endCalls += 1; throw CuaMCPProxyError.notStarted }
+        #expect(name == "get_cursor_position")
+        return Data(#"{"jsonrpc":"2.0","id":1,"result":{"content":[]}}"#.utf8)
+    }
+}
+
 private actor DesktopControlCallbackGate {
     private var enteredContinuation: CheckedContinuation<Void, Never>?
     private var releaseContinuation: CheckedContinuation<Void, Never>?
@@ -264,19 +276,36 @@ struct DesktopControlCommandExecutorTests {
         #expect(await proxy.isProcessRunning() == !crash)
         let released = await executor.handle(command("desktop_control_release", owner, requestID: "release",
             arguments: .object(["control_token": .string(token)])), proxy: proxy)
-        if crash {
-            #expect(released.type == "failure")
-            #expect(executor.needsSessionCleanup)
-            #expect(await executor.handle(command("desktop_control_acquire", owner, requestID: "still-blocked"), proxy: proxy).type == "failure")
-            #expect(try String(contentsOf: calls, encoding: .utf8) == "click\n")
-        } else {
-            #expect(released.type == "result")
-            #expect(!executor.needsSessionCleanup)
-            #expect(await executor.handle(command("desktop_control_acquire", owner, requestID: "next"), proxy: proxy).type == "result")
-            #expect(try String(contentsOf: calls, encoding: .utf8) == "click\nend_session\n")
-        }
+        #expect(released.type == "result")
+        #expect(!executor.needsSessionCleanup)
+        #expect(await executor.handle(command("desktop_control_acquire", owner, requestID: "next"), proxy: proxy).type == "result")
+        #expect(try String(contentsOf: calls, encoding: .utf8) == "click\nend_session\n")
         _ = await executor.close()
         await proxy.stop()
+    }
+
+    @Test(arguments: [false, true])
+    func daemonExitClearsOnlyTheConfirmedDeadOwnersCleanupFence(exited: Bool) async throws {
+        let proxy = CuaSessionExitFixture()
+        let executor = DesktopControlCommandExecutor()
+        let owner = target(persona: "daemon-owner")
+        let acquired = await executor.handle(command("desktop_control_acquire", owner, requestID: "acquire"), proxy: proxy)
+        guard case .object(let fields)? = acquired.result, case .string(let token)? = fields["control_token"] else {
+            Issue.record("Missing daemon-owner lease"); return
+        }
+        let observed = await executor.handle(command("desktop_control_cua", owner, requestID: "observe",
+            arguments: .object(["control_token": .string(token), "tool": .string("get_cursor_position"), "arguments": .object([:])])), proxy: proxy)
+        #expect(observed.type == "result")
+        await proxy.setExited(exited)
+        #expect(await executor.close() == exited)
+        #expect(await proxy.endCalls == (exited ? 0 : 1))
+        #expect(executor.needsSessionCleanup == !exited)
+        if !exited {
+            await proxy.setExited(true)
+            #expect(await executor.close())
+            #expect(!executor.needsSessionCleanup)
+            #expect(await proxy.endCalls == 1)
+        }
     }
 
     private func target(persona: String, workspace: String = "workspace-1", config: String = "config-1", configVersion: Int64? = nil,

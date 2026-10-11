@@ -16,6 +16,16 @@ enum DesktopControlGatewayConnectionError: Error, Equatable {
     case socketUnavailable
 }
 
+protocol DesktopControlSocket: AnyObject, Sendable {
+    func resume()
+    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?)
+    func receive() async throws -> URLSessionWebSocketTask.Message
+    func send(_ message: URLSessionWebSocketTask.Message) async throws
+    func sendPing(pongReceiveHandler: @escaping @Sendable (Error?) -> Void)
+}
+
+extension URLSessionWebSocketTask: DesktopControlSocket {}
+
 actor DesktopControlGatewayConnection {
     private static let maximumInFlightCommands = 32
     private static let reservedRevocationCommands = 2
@@ -27,9 +37,14 @@ actor DesktopControlGatewayConnection {
     private let readinessProvider: DesktopControlReadinessProvider
     private let afterConfigRevocation: DesktopControlConfigRevocationHandler
     private let session: URLSession
-    private var socket: URLSessionWebSocketTask?
+    private let socketOverride: (any DesktopControlSocket)?
+    private let handshakeTimeout: Duration
+    private let now: @Sendable () -> ContinuousClock.Instant
+    private var socket: (any DesktopControlSocket)?
     private var reader: Task<Void, Never>?
     private var heartbeats: Task<Void, Never>?
+    private var heartbeatSendTask: Task<Void, Never>?
+    private var lastGatewayHeartbeat: ContinuousClock.Instant?
     private var commandTasks: [String: Task<Void, Never>] = [:]
     private var connected = false
     private var readiness = "unknown"
@@ -47,6 +62,9 @@ actor DesktopControlGatewayConnection {
 
     init(installation: DesktopControlInstallation,
          session: URLSession? = nil,
+         socket: (any DesktopControlSocket)? = nil,
+         handshakeTimeout: Duration = .seconds(15),
+         now: @escaping @Sendable () -> ContinuousClock.Instant = { ContinuousClock.now },
          onDisconnect: @escaping DesktopControlDisconnectHandler = { _ in },
          diagnosticsProvider: @escaping DesktopControlDiagnosticsProvider = { DesktopControlDiagnostics(activeProcesses: 0, openFileHandles: 0, bufferedOutputBytes: 0, outputGapsTotal: 0) },
          readinessProvider: @escaping DesktopControlReadinessProvider = { nil },
@@ -54,6 +72,9 @@ actor DesktopControlGatewayConnection {
          handler: @escaping DesktopControlCommandHandler) {
         self.installation = installation
         self.session = session ?? DesktopControlNetworkSession.makeWithoutRedirects()
+        self.socketOverride = socket
+        self.handshakeTimeout = handshakeTimeout
+        self.now = now
         self.onDisconnect = onDisconnect
         self.diagnosticsProvider = diagnosticsProvider
         self.readinessProvider = readinessProvider
@@ -63,20 +84,32 @@ actor DesktopControlGatewayConnection {
 
     func connect() async throws {
         guard !connected, socket == nil else { throw DesktopControlGatewayConnectionError.alreadyConnected }
-        let task = try makeSocket()
+        let task: any DesktopControlSocket
+        if let socketOverride { task = socketOverride }
+        else { task = try makeSocket() }
         socket = task
         task.resume()
+        let timeout = handshakeTimeout
+        let handshakeTimer = Task {
+            do { try await Task.sleep(for: timeout) } catch { return }
+            task.cancel(with: .goingAway, reason: nil)
+        }
+        defer { handshakeTimer.cancel() }
         do {
             let first = try await task.receive()
+            guard !Task.isCancelled, socket === task else {
+                throw DesktopControlGatewayConnectionError.socketUnavailable
+            }
             let ready = try DesktopControlFrameCodec.decode(Self.data(from: first))
             if let error = Self.handshakeError(for: ready) { throw error }
             diagnosticsSupported = ready.diagnosticsSupported == true
             connected = true
+            lastGatewayHeartbeat = now()
             reader = Task { await receiveLoop() }
             heartbeats = Task { await heartbeatLoop() }
         } catch {
-            stop()
-            throw error
+            if socket === task { stop() }
+            throw (error as? DesktopControlGatewayConnectionError) ?? .socketUnavailable
         }
     }
 
@@ -150,6 +183,9 @@ actor DesktopControlGatewayConnection {
         recoveryProbeTimeout = nil
         reader?.cancel()
         heartbeats?.cancel()
+        heartbeatSendTask?.cancel()
+        heartbeatSendTask = nil
+        lastGatewayHeartbeat = nil
         snapshotTask?.cancel()
         snapshotTask = nil
         snapshotGeneration = UUID()
@@ -168,6 +204,7 @@ actor DesktopControlGatewayConnection {
             do {
                 guard let socket else { throw DesktopControlGatewayConnectionError.socketUnavailable }
                 let message = try await socket.receive()
+                guard !Task.isCancelled, self.socket === socket else { return }
                 let frame = try DesktopControlFrameCodec.decode(Self.data(from: message))
                 if frame.version != 1 {
                     await disconnected(error: .upgradeRequired)
@@ -175,6 +212,7 @@ actor DesktopControlGatewayConnection {
                 }
                 switch frame.type {
                 case "heartbeat":
+                    lastGatewayHeartbeat = now()
                     continue
                 case "failure" where frame.errorCode == "upgrade_required":
                     await disconnected(error: .upgradeRequired)
@@ -200,6 +238,7 @@ actor DesktopControlGatewayConnection {
                     throw DesktopControlGatewayConnectionError.invalidFrame
                 }
             } catch {
+                guard !Task.isCancelled else { return }
                 await disconnected(error: error as? DesktopControlGatewayConnectionError)
                 return
             }
@@ -238,10 +277,31 @@ actor DesktopControlGatewayConnection {
         while !Task.isCancelled, connected {
             do {
                 try await Task.sleep(for: .seconds(15))
-                try await send(heartbeatFrame())
+                await heartbeatTick()
             } catch {
+                guard !Task.isCancelled else { return }
                 await disconnected()
                 return
+            }
+        }
+    }
+
+    private func heartbeatTick() async {
+        guard connected else { return }
+        // Match the gateway's 45-second presence TTL. A successful local send
+        // does not prove that a half-open TCP path reached the gateway.
+        guard let lastGatewayHeartbeat, lastGatewayHeartbeat.duration(to: now()) < .seconds(45) else {
+            await disconnected(error: .socketUnavailable)
+            return
+        }
+        guard heartbeatSendTask == nil else { return }
+        let generation = snapshotGeneration
+        heartbeatSendTask = Task {
+            defer { if generation == snapshotGeneration { heartbeatSendTask = nil } }
+            do { try await send(heartbeatFrame()) }
+            catch {
+                guard !Task.isCancelled, generation == snapshotGeneration else { return }
+                await disconnected()
             }
         }
     }
@@ -298,6 +358,7 @@ actor DesktopControlGatewayConnection {
     }
 
 #if DEBUG
+    func heartbeatTickForTesting() async { await heartbeatTick() }
     func configureRecoveryProbeForTesting(timeout: Duration = .seconds(5),
         ping: @escaping @Sendable (@escaping @Sendable (Bool) -> Void) -> Void) {
         connected = true
@@ -347,7 +408,7 @@ actor DesktopControlGatewayConnection {
         guard let target = frame.target, let requestID = frame.requestID, !requestID.isEmpty,
               target.installationID == installationID,
               !target.workspaceID.isEmpty, !target.configID.isEmpty, frame.arguments != nil,
-              let deadline = frame.deadlineAt, deadline > Date() else { return false }
+              frame.deadlineAt != nil else { return false }
         if frame.operation == "desktop_control_revoke_config" {
             return (target.configVersion ?? 0) > 0 && target.personaID.isEmpty && target.runID.isEmpty && target.generation == 0
         }

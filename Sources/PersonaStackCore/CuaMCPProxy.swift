@@ -47,6 +47,11 @@ extension CuaMCPProxyError: LocalizedError {
 
 public protocol CuaToolCalling: Sendable {
     func callTool(name: String, argumentsJSON: Data, timeout: Int32) async throws -> Data
+    func sessionOwnerHasExited() async -> Bool
+}
+
+extension CuaToolCalling {
+    public func sessionOwnerHasExited() async -> Bool { false }
 }
 
 /// Owns one Cua stdio MCP proxy process. Only reviewed Cua tool names can be called.
@@ -57,9 +62,9 @@ public actor CuaMCPProxy: CuaToolCalling {
     private let executableURL: URL
     private let socketURL: URL?
     private let expectedDaemonPID: Int32?
-    private let process = Process()
-    private let input = Pipe()
-    private let output = Pipe()
+    private var process = Process()
+    private var input = Pipe()
+    private var output = Pipe()
     private var bufferedOutput = Data()
     private var scannedOutputBytes = 0
     private var requestID: Int64 = 0
@@ -75,6 +80,13 @@ public actor CuaMCPProxy: CuaToolCalling {
     public func start() throws -> Data {
         guard !started else { throw CuaMCPProxyError.alreadyStarted }
         try verifyDaemonIdentity()
+        try DesktopControlExecution.check()
+        process = Process()
+        input = Pipe()
+        output = Pipe()
+        interruption.reset()
+        bufferedOutput.removeAll(keepingCapacity: false)
+        scannedOutputBytes = 0
         process.executableURL = executableURL
         // Upstream 0.29.1 calls its no-autolaunch client guard "embedded".
         // This applies only to the proxy, never the independent daemon or its TCC identity.
@@ -129,7 +141,18 @@ public actor CuaMCPProxy: CuaToolCalling {
 
     public func callTool(name: String, argumentsJSON: Data, timeout: Int32 = 60) throws -> Data {
         guard CuaDriverCompatibility.requiredTools.contains(name) else { throw CuaMCPProxyError.invalidToolName }
+        if name == "end_session", !isProcessRunning() {
+            // Cleanup may reconnect our client to the same verified daemon.
+            // Remote actions are never replayed and the daemon is never started.
+            stop()
+            _ = try start()
+        }
         return try invokeTool(name: name, argumentsJSON: argumentsJSON, timeout: timeout)
+    }
+
+    public func sessionOwnerHasExited() -> Bool {
+        guard let expectedDaemonPID, expectedDaemonPID > 0 else { return false }
+        return Darwin.kill(expectedDaemonPID, 0) == -1 && errno == ESRCH
     }
 
     /// Native-only diagnostic. Remote callers cannot select a health surface.
@@ -212,7 +235,7 @@ public actor CuaMCPProxy: CuaToolCalling {
         guard started, process.isRunning else { throw CuaMCPProxyError.notStarted }
         try verifyDaemonIdentity()
         let wire = "{\"jsonrpc\":\"2.0\",\"method\":\"\(method)\"}\n"
-        try writeInput(Data(wire.utf8), deadline: Date().addingTimeInterval(15))
+        try writeInput(Data(wire.utf8), deadline: DesktopControlExecution.boundedDeadline(timeout: 15))
     }
 
     private func writeInput(_ bytes: Data, deadline: Date) throws {
@@ -338,6 +361,7 @@ private final class CuaProxyInterruption: @unchecked Sendable {
 
     init() {
         _ = Darwin.fcntl(wake.fileHandleForWriting.fileDescriptor, F_SETFL, O_NONBLOCK)
+        _ = Darwin.fcntl(wake.fileHandleForReading.fileDescriptor, F_SETFL, O_NONBLOCK)
     }
 
     var readDescriptor: Int32 { wake.fileHandleForReading.fileDescriptor }
@@ -348,12 +372,20 @@ private final class CuaProxyInterruption: @unchecked Sendable {
         return interrupted
     }
 
+    func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard interrupted else { return }
+        var byte: UInt8 = 0
+        while Darwin.read(wake.fileHandleForReading.fileDescriptor, &byte, 1) > 0 {}
+        interrupted = false
+    }
+
     func interrupt() {
         lock.lock()
-        let shouldWake = !interrupted
+        defer { lock.unlock() }
+        guard !interrupted else { return }
         interrupted = true
-        lock.unlock()
-        guard shouldWake else { return }
         var byte: UInt8 = 1
         _ = Darwin.write(wake.fileHandleForWriting.fileDescriptor, &byte, 1)
     }

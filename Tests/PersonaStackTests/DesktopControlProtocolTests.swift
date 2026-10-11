@@ -74,7 +74,7 @@ import Testing
     let expired = DesktopControlFrame(type: "command", requestID: "request-1", target: target,
                                       operation: "desktop_control_status", arguments: .object([:]),
                                       deadlineAt: Date(timeIntervalSince1970: 1))
-    #expect(!DesktopControlGatewayConnection.validCommand(expired, installationID: "install-1"))
+    #expect(DesktopControlGatewayConnection.validCommand(expired, installationID: "install-1"))
     let incomplete = DesktopControlFrame(type: "command", requestID: "request-1", target: target,
                                          operation: "desktop_control_status", arguments: nil,
                                          deadlineAt: Date().addingTimeInterval(30))

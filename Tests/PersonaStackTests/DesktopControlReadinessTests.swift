@@ -282,6 +282,20 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
     #expect(monitor.isAwakeAndActive)
 }
 
+@Test @MainActor func desktopExpiredCommandDoesNotProbeCuaOrChangeReadiness() async throws {
+    let connection = UUID()
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: Data(#"{"installation_id":"install-expired","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://gateway.test/v1/desktop-control/ws"}"#.utf8))
+    let runtime = DesktopControlRuntime.makeForTesting(installer: ReadinessInstaller(), credentials: ReadinessCredentials(),
+        connectionID: connection, installation: installation, connected: true, readiness: "ready")
+    let target = DesktopControlTarget(installationID: installation.installationID, workspaceID: "w", configID: "c", personaID: "p", runID: "r", generation: 1)
+    let expired = DesktopControlFrame(type: "command", requestID: "expired", target: target,
+        operation: "desktop_control_acquire", arguments: .object([:]), deadlineAt: .distantPast)
+    #expect(await runtime.handleForTesting(expired, connectionID: connection).errorCode == "desktop_command_expired")
+    #expect(runtime.readiness == "ready")
+    #expect(runtime.gatewayConnected)
+    #expect(await runtime.diagnosticReport().lastCuaCheck == nil)
+}
+
 private actor ReadinessInstaller: DesktopControlDriverInstalling {
     func discoverExisting() async throws -> CuaDriverInstallation? { nil }
     func install() async throws -> CuaDriverInstallation { throw CuaDriverInstallError.invalidLayout }
