@@ -10,6 +10,7 @@ final class StackWindowManager: NSObject, WKScriptMessageHandlerWithReply {
     private let defaults: UserDefaults
     private let presentWindows: Bool
     private let mainViews = NSMapTable<WKWebView, NSURL>.weakToStrongObjects()
+    var navigateMainWindow: (URL) -> Void = { _ in }
 
     init(loadPages: Bool = true, defaults: UserDefaults = .standard, presentWindows: Bool = true) {
         self.loadPages = loadPages
@@ -65,7 +66,8 @@ final class StackWindowManager: NSObject, WKScriptMessageHandlerWithReply {
             transparent: transparent,
             kind: kind,
             loadPage: loadPages,
-            defaults: defaults
+            defaults: defaults,
+            navigateMainWindow: { [weak self] in self?.navigateMainWindow($0) }
         ) { [weak self] in
             self?.windows.removeValue(forKey: windowKey)
         }
@@ -89,6 +91,8 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     private(set) var presentation: PopoutWindowPresentation?
     private let url: URL
     private let onClose: () -> Void
+    private let navigateMainWindow: (URL) -> Void
+    private let openExternalURL: (URL) -> Void
     private var disposed = false
 
     init(
@@ -97,10 +101,14 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         kind: PopoutWindowKind? = nil,
         loadPage: Bool = true,
         defaults: UserDefaults = .standard,
+        navigateMainWindow: @escaping (URL) -> Void = { _ in },
+        openExternalURL: @escaping (URL) -> Void = { NSWorkspace.shared.open($0) },
         onClose: @escaping () -> Void
     ) {
         self.url = url
         self.onClose = onClose
+        self.navigateMainWindow = navigateMainWindow
+        self.openExternalURL = openExternalURL
         let configuration = WKWebViewConfiguration()
         if let kind, kind != .stackGraph { PopoutWindowPresentation.advertise(in: configuration) }
         configuration.websiteDataStore = .default()
@@ -181,10 +189,20 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
 
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction) async -> WKNavigationActionPolicy {
         guard let destination = action.request.url else { return .cancel }
-        if destination == url && action.targetFrame?.isMainFrame == true { return .allow }
-        if action.navigationType == .linkActivated, NavigationPolicy.canOpenExternally(destination) {
-            NSWorkspace.shared.open(destination)
-        } else if action.targetFrame?.isMainFrame == true {
+        return navigationPolicy(for: destination, userActivated: action.navigationType == .linkActivated,
+                                mainFrame: action.targetFrame?.isMainFrame == true)
+    }
+
+    func navigationPolicy(for destination: URL, userActivated: Bool, mainFrame: Bool) -> WKNavigationActionPolicy {
+        guard !disposed else { return .cancel }
+        if destination == url && mainFrame { return .allow }
+        if userActivated {
+            if NavigationPolicy.keepsInApp(destination, appURL: url) {
+                navigateMainWindow(destination)
+            } else if NavigationPolicy.canOpenExternally(destination) {
+                openExternalURL(destination)
+            }
+        } else if mainFrame {
             dispose()
         }
         return .cancel

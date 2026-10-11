@@ -49,6 +49,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         DesktopNotificationCoordinator.shared.install()
         DesktopNotificationCoordinator.shared.installConcernNavigation { [weak self] in self?.openMainPage($0) }
         ChatWindowManager.shared.navigateMainWindow = { [weak self] in self?.openMainPage($0) }
+        StackWindowManager.shared.navigateMainWindow = { [weak self] in self?.openMainPage($0) }
         // The authenticated receiver belongs to the app, not Desktop Control
         // enrollment or the visible main window.
         _ = MainWebViewHost.shared

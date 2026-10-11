@@ -32,6 +32,10 @@ import AppKit
     static let shared = ChatWindowManager()
     var navigateMainWindow: (URL) -> Void = { _ in }
 }
+@MainActor final class StackWindowManager {
+    static let shared = StackWindowManager()
+    var navigateMainWindow: (URL) -> Void = { _ in }
+}
 @MainActor final class MainWebViewHost {
     static let shared = MainWebViewHost()
     let coordinator = NavigationProbe()
