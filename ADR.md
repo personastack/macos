@@ -1,3 +1,7 @@
+# 2026-10-11 - Desktop Control includes CLI input and output
+
+- Decision: Eric requires personas with Desktop Control to execute CLI commands and receive results through the existing PersonaStack app relay. CLI access shares the Desktop Control assignment and lease. It needs no separate enrollment, command policy, or approval. Pipe and interactive terminal modes use the desktop account and OS permissions. PersonaStack must not forbid commands or typing into Terminal. CUA remains the independent GUI executor. This supersedes the shell-removal portion of the 2026-10-06 CUA-only decision. Dedicated filesystem tools and the locked-screen helper remain retired.
+
 # 2026-09-28 - Exclusive Desktop Control installation
 
 - 2026-10-06: Eric selects CUA-only macOS Desktop Control. PersonaStack installs or reuses the official standalone Cua Driver and forwards authenticated cloud commands. CUA owns its service, local policy, and desktop permissions and survives PersonaStack removal. Remove PersonaStack's desktop permission wizard, native remote filesystem/shell tools, and locked-screen helper. Keep unrelated PersonaStack features. This supersedes prior embedded-driver and native full-control ownership decisions.

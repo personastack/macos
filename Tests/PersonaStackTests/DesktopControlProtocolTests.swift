@@ -105,8 +105,10 @@ import Testing
 }
 
 @Test func desktopControlGatewayReservesOneCommandSlotForConfigRevocation() {
-    #expect(DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_status", activeCount: 30))
-    #expect(!DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_status", activeCount: 31))
+    #expect(DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_status", activeCount: 29))
+    #expect(!DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_status", activeCount: 30))
+    #expect(DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_exec_cancel", activeCount: 30))
+    #expect(!DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_exec_cancel", activeCount: 31))
     #expect(DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_revoke_config", activeCount: 31))
     #expect(!DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_revoke_config", activeCount: 32))
     #expect(!DesktopControlGatewayConnection.hasCapacity(for: "desktop_control_revoke_config", activeCount: -1))

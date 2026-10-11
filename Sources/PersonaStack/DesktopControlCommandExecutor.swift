@@ -38,6 +38,8 @@ final class DesktopControlCommandExecutor {
     }
 
     private var leaseCuaProxy: (any CuaToolCalling)?
+    private let shell: any DesktopShellControlling
+    private var executionOwners: [UUID: String] = [:]
     private var lease: Lease? { didSet { leaseStateChanged?() } }
     /// Native-only lifecycle signal. This never crosses the WebView bridge.
     var leaseStateChanged: (@MainActor () -> Void)?
@@ -98,8 +100,9 @@ final class DesktopControlCommandExecutor {
     private var leaseGrantBarrierForTesting: (@Sendable () async -> Void)?
 #endif
 
-    init(now: @escaping () -> ContinuousClock.Instant = { .now }) {
+    init(now: @escaping () -> ContinuousClock.Instant = { .now }, shell: any DesktopShellControlling = DesktopShellExecutor()) {
         self.now = now
+        self.shell = shell
         expiryTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(5))
@@ -110,8 +113,9 @@ final class DesktopControlCommandExecutor {
     }
 
     func diagnostics() async -> DesktopControlDiagnostics {
-        DesktopControlDiagnostics(activeProcesses: 0, openFileHandles: 0,
-                                  bufferedOutputBytes: 0, outputGapsTotal: 0)
+        let state = await shell.diagnostics()
+        return DesktopControlDiagnostics(activeProcesses: state.activeProcesses, openFileHandles: state.openFileHandles,
+                                         bufferedOutputBytes: state.bufferedOutputBytes, outputGapsTotal: state.outputGapsTotal)
     }
 
     var presentationActivity: DesktopControlActivity? {
@@ -319,6 +323,10 @@ final class DesktopControlCommandExecutor {
                  "desktop_control_window", "desktop_control_clipboard", "desktop_control_browser", "desktop_control_cua":
                 try requireLease(owner, arguments: frame.arguments)
                 result = try await callCua(frame, proxy: proxy)
+            case "desktop_control_execute", "desktop_control_exec_read", "desktop_control_exec_write",
+                 "desktop_control_exec_status", "desktop_control_exec_cancel":
+                try requireLease(owner, arguments: frame.arguments)
+                result = try await callShell(frame)
             default:
                 throw CommandError.invalidArguments
             }
@@ -337,6 +345,8 @@ final class DesktopControlCommandExecutor {
             fenceUncertainSession()
             return Self.failure(frame, "outcome_unknown", "Cua stopped answering after dispatch. Check the desktop before repeating an action.")
         } catch let error as DesktopCuaFailure {
+            return Self.failure(frame, error.code, error.message)
+        } catch let error as DesktopShellError {
             return Self.failure(frame, error.code, error.message)
         } catch let error as CommandError {
             return Self.failure(frame, error.code, error.localizedDescription)
@@ -507,7 +517,10 @@ final class DesktopControlCommandExecutor {
         // until admitted CUA calls and the owned session have drained.
         leaseEpoch &+= 1
         lease = nil
+        await shell.requestStopAll()
         guard await settleOperations() else { unavailable = true; return false }
+        guard await shell.closeAll() else { unavailable = true; return false }
+        executionOwners.removeAll()
 #if DEBUG
         if let cleanupResourceBarrierForTesting {
             self.cleanupResourceBarrierForTesting = nil
@@ -559,6 +572,31 @@ final class DesktopControlCommandExecutor {
         guard !closed, !revocationInProgress, lease != nil else { return }
         guard validLease() == nil else { return }
         if !(await clearExpiredLease()) { unavailable = true }
+    }
+
+    private func callShell(_ frame: DesktopControlFrame) async throws -> [String: Any] {
+        let args = try DesktopCLIArguments(operation: frame.operation ?? "", arguments: frame.arguments)
+        guard let token = validLease()?.token else { throw CommandError.controlRequired }
+        if args.operation == "desktop_control_execute" {
+            let (rows, columns) = args.terminalSize
+            let started = try await shell.start(command: args.command ?? "", workingDirectory: args.workingDirectory,
+                                                timeout: args.timeout, terminalMode: args.mode, rows: rows, columns: columns)
+            let retained = await shell.retainedExecutionIDs()
+            executionOwners = executionOwners.filter { retained.contains($0.key) }
+            executionOwners[started.executionID] = token
+            return started.resultObject
+        }
+        guard let id = args.executionID, executionOwners[id] == token else { throw DesktopShellError.missingExecution }
+        switch args.operation {
+        case "desktop_control_exec_read":
+            return try await shell.read(id: id, after: args.cursor, wait: .milliseconds(args.waitMilliseconds)).resultObject
+        case "desktop_control_exec_write":
+            for input in args.inputs { try await shell.write(id: id, input: input) }
+        case "desktop_control_exec_cancel": try await shell.cancel(id: id)
+        case "desktop_control_exec_status": break
+        default: throw CommandError.invalidArguments
+        }
+        return try await shell.status(id: id).resultObject
     }
 
     private func callCua(_ frame: DesktopControlFrame, proxy: (any CuaToolCalling)?) async throws -> Any {

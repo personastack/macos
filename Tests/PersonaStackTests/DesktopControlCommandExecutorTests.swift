@@ -195,7 +195,7 @@ struct DesktopControlCommandExecutorTests {
         await executor.close()
     }
 
-    @Test(arguments: ["desktop_control_file", "desktop_control_execute", "desktop_control_exec_read", "desktop_control_exec_write", "desktop_control_exec_status", "desktop_control_exec_cancel"])
+    @Test(arguments: ["desktop_control_file"])
     func nativeOperationsAreRejectedWithoutSideEffects(operation: String) async throws {
         let executor = DesktopControlCommandExecutor()
         let owner = target(persona: "persona-1")

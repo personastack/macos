@@ -9,13 +9,13 @@ PersonaStack uses official Cua Driver 0.29.1 as a separate application and login
 - PersonaStack's explicit local setup may install the app, establish its upstream login service, and invoke `permissions grant`.
 - Passive connection checks cannot install, launch, restart, reconfigure, or request permission.
 - A ready connection requires the signed live daemon, reviewed version/schema, standalone permission attribution, Accessibility and Screen Recording grants, and upstream direct-capture setup evidence. Action-specific refusals still come from CUA.
-- Cloud agents cannot request permissions, install extensions, change CUA configuration, or choose another client's session.
+- CUA-forwarding tools cannot invoke upstream permission/setup actions or choose another client's session. The native CLI tools use ordinary desktop-account commands and OS consent.
 
 ## Independent lifetime
 
 The CUA LaunchAgent and application live outside PersonaStack. PersonaStack quit, pause, disconnect, and uninstall end only PersonaStack access and its own CUA sessions. CUA and other clients remain independent. The PersonaStack relay must run for its cloud agents to reach CUA.
 
-No PersonaStack filesystem/shell executor, browser permission adapter, locked-screen helper, or keep-awake subsystem participates in Desktop Control. Chat microphone and notifications remain independent app features.
+The app owns bounded CLI process sessions alongside independent CUA GUI execution. Both use the same Desktop Control lease and relay lifecycle. Native CLI access has no command blacklist or separate approval. Dedicated filesystem tools, the browser permission adapter, the locked-screen helper, and the keep-awake subsystem remain retired. Chat microphone and notifications remain independent app features.
 
 ## Versioned evidence
 

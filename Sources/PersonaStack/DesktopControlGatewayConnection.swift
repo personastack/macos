@@ -18,7 +18,7 @@ enum DesktopControlGatewayConnectionError: Error, Equatable {
 
 actor DesktopControlGatewayConnection {
     private static let maximumInFlightCommands = 32
-    private static let reservedRevocationCommands = 1
+    private static let reservedRevocationCommands = 2
 
     private let installation: DesktopControlInstallation
     private let handler: DesktopControlCommandHandler
@@ -363,6 +363,9 @@ actor DesktopControlGatewayConnection {
     static func hasCapacity(for operation: String?, activeCount: Int) -> Bool {
         guard activeCount >= 0, activeCount < maximumInFlightCommands else { return false }
         if operation == "desktop_control_revoke_config" || operation == "desktop_control_revoke_binding" { return true }
+        if operation == "desktop_control_exec_cancel" || operation == "desktop_control_release" {
+            return activeCount < maximumInFlightCommands - 1
+        }
         return activeCount < maximumInFlightCommands - reservedRevocationCommands
     }
 }

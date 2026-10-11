@@ -39,7 +39,7 @@ CUA controls this Mac. PersonaStack connects your authorized agents to CUA. CUA 
 
 PersonaStack no longer asks for desktop Accessibility, Screen Recording, Full Disk Access, or browser Automation permissions. Chat microphone and notification permissions remain separate. CUA must receive its own grants. Old PersonaStack grants are not transferred or reset automatically.
 
-Native remote filesystem/shell tools and PersonaStack's locked-screen helper are retired. CUA's actual capabilities and local policy govern available actions. Running a service does not guarantee locked-screen or closed-lid GUI control.
+Desktop Control includes same-account CLI execution with pipe or interactive PTY input and output through the PersonaStack relay. CLI and GUI tools share the existing assignment and control lease. CUA owns GUI capabilities and local GUI policy. Dedicated filesystem tools and PersonaStack's locked-screen helper remain retired. Running a service does not guarantee locked-screen or closed-lid GUI control.
 
 ## Updates
 
