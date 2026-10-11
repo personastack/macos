@@ -1250,6 +1250,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     private func heartbeatReadiness() async -> String? {
         guard !Task.isCancelled else { return nil }
+        sessionLock.reconcile()
         if paused { return "paused" }
         if executorCleanupInProgress || executorCleanupFailed { return "cua_unavailable" }
         if !controlSessionIsUsable { return sessionLock.readiness }
@@ -1289,6 +1290,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         guard let activeInstallation, frame.target?.installationID == activeInstallation.installationID else {
             return Self.failure(for: frame, code: "desktop_executor_unavailable")
         }
+        sessionLock.reconcile()
         let isStatus = frame.operation == "desktop_control_status"
         let cleanup = ["desktop_control_release", "desktop_control_revoke_config", "desktop_control_revoke_binding"].contains(frame.operation ?? "")
         if !isStatus && !cleanup {
@@ -1392,11 +1394,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                                connected: Bool = false,
                                readiness: String = "unknown", paused: Bool = false,
                                sessionLockState: DesktopControlSessionLock.State? = nil,
+                               sessionMonitor: DesktopControlSessionLock? = nil,
                                cleanupInProgress: Bool = false, cleanupFailed: Bool = false,
                                relayStateReader: (any DesktopControlRelayStateReading)? = nil,
                                preferences: UserDefaults = .standard,
                                configurationProvider: @escaping () throws -> DesktopEnvironmentConfiguration = { .production }) -> DesktopControlRuntime {
-        let monitor = DesktopControlSessionLock(observeSystem: false, snapshotReader: { .unknown })
+        let monitor = sessionMonitor ?? DesktopControlSessionLock(observeSystem: false, snapshotReader: { .unknown })
         let runtime = DesktopControlRuntime(installer: installer, cuaService: cuaService, credentials: credentials,
             relayStateReader: relayStateReader, preferences: preferences,
             configurationProvider: configurationProvider, sessionLock: monitor)

@@ -5,7 +5,8 @@ import Network
 @MainActor
 final class DesktopControlSessionLock {
     enum State: Equatable { case unknown, locked, unlocked }
-    enum Snapshot: Equatable { case unknown, locked, unlocked, inactive }
+    // An active console session can omit the undocumented screen-lock key.
+    enum Snapshot: Equatable { case unknown, active, locked, unlocked, inactive }
     private(set) var state: State = .unknown
     var onChange: ((State) -> Void)?
     private var observers: [NSObjectProtocol] = []
@@ -91,7 +92,7 @@ final class DesktopControlSessionLock {
               let onConsole = boolean(dictionary[kCGSessionOnConsoleKey as String]),
               let loggedIn = boolean(dictionary[kCGSessionLoginDoneKey as String]) else { return .unknown }
         guard uid.uint32Value == userID, onConsole, loggedIn else { return .inactive }
-        guard let locked = boolean(dictionary["CGSSessionScreenIsLocked"]) else { return .unknown }
+        guard let locked = boolean(dictionary["CGSSessionScreenIsLocked"]) else { return .active }
         return locked ? .locked : .unlocked
     }
 
@@ -103,25 +104,36 @@ final class DesktopControlSessionLock {
     func reconcile() {
         switch snapshotReader() {
         case .locked:
+            inactive = false
             observedLock = true
             publish(.locked)
         case .inactive:
             inactive = true
             publish(.locked)
         case .unlocked:
+            inactive = false
             guard !sleeping else { return }
             observedLock = false
-            inactive = false
             publish(.unlocked)
+        case .active:
+            inactive = false
+            reconcileUnknownLock()
         case .unknown:
-            if observedLock || sleeping || inactive { publish(.locked) }
-            else if state != .unlocked { publish(.unknown) }
+            reconcileUnknownLock()
         }
+    }
+
+    private func reconcileUnknownLock() {
+        if observedLock || sleeping || inactive { publish(.locked) }
+        else if state != .unlocked { publish(.unknown) }
     }
 
     func receive(_ value: State) {
         if value == .locked { observedLock = true }
         if value == .unlocked {
+            // Recheck this user's console activity before applying a distributed
+            // unlock event. A missed activation event must not leave it fenced.
+            reconcile()
             observedLock = false
             guard !sleeping, !inactive else { return }
         }

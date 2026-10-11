@@ -55,11 +55,11 @@ private actor SuspendedReadiness {
     #expect(DesktopControlSessionLock.classify(nil, userID: uid) == .unknown)
     var missing = valid
     missing.removeValue(forKey: "CGSSessionScreenIsLocked")
-    #expect(DesktopControlSessionLock.classify(missing, userID: uid) == .unknown)
+    #expect(DesktopControlSessionLock.classify(missing, userID: uid) == .active)
     for malformed in ["false", 0, 2] as [Any] {
         var invalid = valid
         invalid["CGSSessionScreenIsLocked"] = malformed
-        #expect(DesktopControlSessionLock.classify(invalid, userID: uid) == .unknown)
+        #expect(DesktopControlSessionLock.classify(invalid, userID: uid) == .active)
     }
     var locked = valid
     locked["CGSSessionScreenIsLocked"] = true
@@ -67,6 +67,41 @@ private actor SuspendedReadiness {
     var inactive = valid
     inactive[kCGSessionOnConsoleKey as String] = false
     #expect(DesktopControlSessionLock.classify(inactive, userID: uid) == .inactive)
+}
+
+@Test @MainActor func desktopActiveSessionRecoversWithoutScreenLockKeyOrActivationEvent() {
+    var snapshot = DesktopControlSessionLock.Snapshot.inactive
+    let monitor = DesktopControlSessionLock(observeSystem: false, snapshotReader: { snapshot })
+    monitor.reconcile()
+    #expect(!monitor.isAwakeAndActive && monitor.state == .locked)
+    snapshot = .active
+    monitor.reconcile()
+    #expect(monitor.isAwakeAndActive && monitor.state == .unknown)
+    monitor.receive(.locked)
+    snapshot = .inactive
+    monitor.reconcile()
+    snapshot = .active
+    monitor.receive(.unlocked)
+    #expect(monitor.isAwakeAndActive && monitor.state == .unlocked)
+}
+
+@Test @MainActor func desktopUnlockCannotClearSleepOrAnotherUsersSessionFence() {
+    let workspace = NotificationCenter()
+    var snapshot = DesktopControlSessionLock.Snapshot.inactive
+    let monitor = DesktopControlSessionLock(workspaceCenter: workspace, activationCenter: NotificationCenter(),
+                                           observeNetwork: false, snapshotReader: { snapshot })
+    monitor.receive(.unlocked)
+    #expect(!monitor.isAwakeAndActive && monitor.state == .locked)
+    snapshot = .unknown
+    monitor.receive(.unlocked)
+    #expect(!monitor.isAwakeAndActive && monitor.state == .locked)
+    snapshot = .active
+    monitor.reconcile()
+    workspace.post(name: NSWorkspace.willSleepNotification, object: nil)
+    monitor.receive(.unlocked)
+    #expect(!monitor.isAwakeAndActive && monitor.state == .locked)
+    workspace.post(name: NSWorkspace.didWakeNotification, object: nil)
+    #expect(monitor.isAwakeAndActive && monitor.state == .unknown)
 }
 
 @Test @MainActor func desktopSessionSleepAndObservedLockHaveDifferentRecovery() {

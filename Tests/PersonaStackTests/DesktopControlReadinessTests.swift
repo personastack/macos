@@ -243,6 +243,42 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
     #expect(values["control_available"] == .bool(false))
 }
 
+@Test @MainActor func desktopStatusAndHeartbeatRecheckActivityAfterMissedSessionActivation() async throws {
+    var snapshot = DesktopControlSessionLock.Snapshot.inactive
+    let monitor = DesktopControlSessionLock(observeSystem: false, snapshotReader: { snapshot })
+    monitor.reconcile()
+    let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: Data(#"{"installation_id":"install-recovery","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://gateway.test/v1/desktop-control/ws"}"#.utf8))
+    let connection = UUID()
+    let preferences = try #require(UserDefaults(suiteName: "DesktopSessionRecovery.\(UUID().uuidString)"))
+    let runtime = DesktopControlRuntime.makeForTesting(
+        installer: ReadinessInstaller(), credentials: ReadinessCredentials(),
+        connectionID: connection, installation: installation, connected: true,
+        readiness: "locked", sessionMonitor: monitor, preferences: preferences)
+    let target = DesktopControlTarget(installationID: installation.installationID, workspaceID: "w", configID: "c",
+                                      personaID: "p", runID: "r", generation: 1)
+    let status = DesktopControlFrame(type: "command", requestID: "recovery-status", target: target,
+        operation: "desktop_control_status", arguments: .object([:]), deadlineAt: .distantFuture)
+    let inactive = await runtime.handleForTesting(status, connectionID: connection)
+    guard case .object(let inactiveResult)? = inactive.result else { Issue.record("Missing inactive status"); return }
+    #expect(inactiveResult["locked"] == .bool(true))
+    snapshot = .active
+    let recovered = await runtime.handleForTesting(status, connectionID: connection)
+    #expect(monitor.isAwakeAndActive)
+    guard case .object(let recoveredResult)? = recovered.result else { Issue.record("Missing recovered status"); return }
+    #expect(recoveredResult["connected"] == .bool(true))
+    #expect(recoveredResult["locked"] == .bool(false))
+    // CUA is deliberately absent. Recovery must reach its check, never invent readiness.
+    #expect(recoveredResult["gui_readiness"] == .string("cua_unavailable"))
+    snapshot = .inactive
+    monitor.reconcile()
+    snapshot = .active
+    #expect(await runtime.heartbeatReadinessForTesting() == "cua_unavailable")
+    #expect(monitor.isAwakeAndActive)
+    let acquire = DesktopControlFrame(type: "command", requestID: "recovery-acquire", target: target,
+        operation: "desktop_control_acquire", arguments: .object([:]), deadlineAt: .distantFuture)
+    #expect(await runtime.handleForTesting(acquire, connectionID: connection).errorCode == "cua_unavailable")
+}
+
 private actor ReadinessInstaller: DesktopControlDriverInstalling {
     func discoverExisting() async throws -> CuaDriverInstallation? { nil }
     func install() async throws -> CuaDriverInstallation { throw CuaDriverInstallError.invalidLayout }
