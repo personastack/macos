@@ -28,6 +28,6 @@ for architecture in arm64 amd64; do
 done
 lipo -create "$destination/PersonaStackAgentBridge-arm64" "$destination/PersonaStackAgentBridge-amd64" \
   -output "$destination/PersonaStackAgentBridge"
-lipo -verify_arch arm64 "$destination/PersonaStackAgentBridge"
-lipo -verify_arch x86_64 "$destination/PersonaStackAgentBridge"
+lipo "$destination/PersonaStackAgentBridge" -verify_arch arm64
+lipo "$destination/PersonaStackAgentBridge" -verify_arch x86_64
 chmod 755 "$destination/PersonaStackAgentBridge"
