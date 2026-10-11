@@ -38,6 +38,22 @@ import Testing
         } catch { _ = await shell.closeAll(); throw error }
     }
 
+    @Test func closedOutputStreamsCanBeCompleteWhileProcessStillRuns() async throws {
+        let shell = DesktopShellExecutor()
+        do {
+            let started = try await shell.start(command: python("import os,time; os.close(1); os.close(2); time.sleep(30)"), workingDirectory: "/tmp")
+            let observed = try await shell.read(id: started.executionID, after: 0, wait: .seconds(3))
+            #expect(observed.state == .running)
+            #expect(observed.outputComplete)
+            let status = try await shell.status(id: started.executionID)
+            #expect(status.state == .running)
+            #expect(status.outputComplete)
+            #expect(status.exitCode == nil)
+            try await shell.cancel(id: started.executionID)
+            #expect(await shell.closeAll())
+        } catch { _ = await shell.closeAll(); throw error }
+    }
+
     @Test func pipePartialPromptBinaryStreamsInputAndTrailingOutput() async throws {
         let shell = DesktopShellExecutor()
         do {
