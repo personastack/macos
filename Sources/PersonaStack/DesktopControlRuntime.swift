@@ -1261,7 +1261,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         guard !Task.isCancelled else { return nil }
         sessionLock.reconcile()
         let generation = lifecycleGeneration
-        if executorCleanupFailed && !executorCleanupInProgress {
+        if (executorCleanupFailed || executor.needsSessionCleanup) && !executorCleanupInProgress {
             if paused { await stopLocalControl(generation: generation) }
             else { await cleanupExecutor() }
             guard generation == lifecycleGeneration, !Task.isCancelled else { return nil }

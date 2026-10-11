@@ -1005,9 +1005,11 @@ private actor DelayedCuaDaemonExit: CuaToolCalling {
     }
 }
 
-@Test @MainActor func desktopHeartbeatRetriesOwnedCleanupAfterTheDaemonFinallyExits() async throws {
+@Test(arguments: ["pause", "expiry"]) @MainActor
+func desktopHeartbeatRetriesOwnedCleanupAfterTheDaemonFinallyExits(reason: String) async throws {
     let proxy = DelayedCuaDaemonExit()
-    let executor = DesktopControlCommandExecutor()
+    var now = ContinuousClock.now
+    let executor = DesktopControlCommandExecutor(now: { now })
     let target = DesktopControlTarget(installationID: "i", workspaceID: "w", configID: "c", personaID: "p", runID: "r", generation: 1)
     let acquire = DesktopControlFrame(type: "command", requestID: "acquire", target: target,
         operation: "desktop_control_acquire", arguments: .object([:]), deadlineAt: .distantFuture)
@@ -1021,15 +1023,23 @@ private actor DelayedCuaDaemonExit: CuaToolCalling {
     #expect(await executor.handle(observe, proxy: proxy).type == "result")
     let runtime = DesktopControlRuntime.makeForTesting(installer: DesktopControlInstallerFixture(errors: []),
         credentials: EmptyDesktopControlCredentialStore(), executor: executor, sessionLockState: .unlocked)
-    await runtime.pause()
-    #expect(runtime.executorCleanupFailedForTesting)
+    if reason == "pause" {
+        await runtime.pause()
+        #expect(runtime.executorCleanupFailedForTesting)
+    } else {
+        now += .seconds(91)
+        await executor.expireLeaseIfNeeded()
+        #expect(executor.currentLease == nil)
+        #expect(executor.needsSessionCleanup)
+        #expect(!runtime.executorCleanupFailedForTesting)
+    }
     #expect(!runtime.permissionSetupAvailable)
     await proxy.setExited()
-    #expect(await runtime.heartbeatReadinessForTesting() == "paused")
+    #expect(await runtime.heartbeatReadinessForTesting() == (reason == "pause" ? "paused" : "cua_unavailable"))
     #expect(!runtime.executorCleanupFailedForTesting)
     #expect(runtime.permissionSetupAvailable)
     #expect(await proxy.endCalls == 1)
-    #expect(runtime.paused)
+    #expect(runtime.paused == (reason == "pause"))
     await runtime.shutdownForQuit()
 }
 
