@@ -642,7 +642,7 @@ public actor DesktopShellExecutor: DesktopShellControlling {
         guard required > 0, required < 16_256 else { return nil }
         var ids = [pid_t](repeating: 0, count: max(256, required + 128))
         let count = ids.withUnsafeMutableBytes { proc_listallpids($0.baseAddress, Int32($0.count)) }
-        guard count >= 0, count < ids.count else { return nil }
+        guard count > 0, count < ids.count else { return nil }
         var result: [OwnedProcess] = []
         for pid in ids.prefix(Int(count)) where pid > 0 && getsid(pid) == leader {
             guard let info = processIdentity(pid) else {
