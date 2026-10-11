@@ -71,11 +71,14 @@ private actor DesktopCLIFake: DesktopShellControlling {
     }
     @Test func bufferPreservesSplitUTF8AndBinaryBytesWithExplicitCursorGaps() {
         var buffer = DesktopShellOutputBuffer(maximumBytes: 4)
-        #expect(!buffer.append(Data([0xC3]), stream: .stdout))
-        #expect(!buffer.append(Data([0xA9, 0xFF, 0]), stream: .stderr))
+        let firstDropped = buffer.append(Data([0xC3]), stream: .stdout)
+        let secondDropped = buffer.append(Data([0xA9, 0xFF, 0]), stream: .stderr)
+        #expect(!firstDropped)
+        #expect(!secondDropped)
         #expect(buffer.chunks.flatMap { $0.data } == [0xC3, 0xA9, 0xFF, 0])
         #expect(!buffer.hasGap(after: 0))
-        #expect(buffer.append(Data([1, 2]), stream: .stdout))
+        let thirdDropped = buffer.append(Data([1, 2]), stream: .stdout)
+        #expect(thirdDropped)
         #expect(buffer.earliestCursor == 3)
         #expect(buffer.hasGap(after: 0))
         #expect(!buffer.hasGap(after: 2))

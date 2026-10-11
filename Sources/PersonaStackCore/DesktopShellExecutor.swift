@@ -152,6 +152,9 @@ public actor DesktopShellExecutor: DesktopShellControlling {
         var forceCloseReaders = false
         let startedAt: ContinuousClock.Instant
         var deadlineTask: Task<Void, Never>?
+        var isSettled: Bool {
+            state != .running && outputReaders == 0 && (!processTerminated || processGroupCleanupConfirmed)
+        }
     }
 
     private var sessions: [UUID: Session] = [:]
@@ -177,22 +180,11 @@ public actor DesktopShellExecutor: DesktopShellControlling {
     public func start(command: String, workingDirectory: String, timeout: TimeInterval = 300,
                       terminalMode: DesktopTerminalMode = .pipe, rows: UInt16 = 24, columns: UInt16 = 80) async throws -> DesktopProcessRead {
         try DesktopControlExecution.check()
-        guard !command.isEmpty, !command.contains("\0"), command.utf8.count <= Self.maximumCommandBytes else { throw DesktopShellError.invalidCommand }
-        guard workingDirectory.hasPrefix("/"), !workingDirectory.contains("\0"), workingDirectory.utf8.count <= 4096 else {
-            throw DesktopShellError.invalidWorkingDirectory
-        }
-        let accessResult = workingDirectory.withCString { Darwin.access($0, X_OK) }
-        guard accessResult == 0 else { throw Self.directoryError(errno: errno) }
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: workingDirectory, isDirectory: &isDirectory), isDirectory.boolValue else {
-            throw DesktopShellError.invalidWorkingDirectory
-        }
+        try Self.validateStart(command: command, workingDirectory: workingDirectory, timeout: timeout, rows: rows, columns: columns)
         pruneCompletedSessions()
         guard sessions.values.filter({ $0.state == .running || $0.outputReaders > 0 }).count < Self.maximumProcesses else {
             throw DesktopShellError.tooManyProcesses
         }
-        guard timeout.isFinite, timeout >= 1, timeout <= Self.maximumTimeout,
-              rows > 0, rows <= 1000, columns > 0, columns <= 1000 else { throw DesktopShellError.invalidInput }
         let boundedTimeout = timeout
         let id = UUID()
         let child = try Self.spawn(command: command, workingDirectory: workingDirectory, mode: terminalMode, rows: rows, columns: columns)
@@ -217,6 +209,22 @@ public actor DesktopShellExecutor: DesktopShellControlling {
             await cancelAfterFailure(id: id)
             throw error
         }
+    }
+
+    private static func validateStart(command: String, workingDirectory: String, timeout: TimeInterval,
+                                      rows: UInt16, columns: UInt16) throws {
+        guard !command.isEmpty, !command.contains("\0"), command.utf8.count <= Self.maximumCommandBytes else { throw DesktopShellError.invalidCommand }
+        guard workingDirectory.hasPrefix("/"), !workingDirectory.contains("\0"), workingDirectory.utf8.count <= 4096 else {
+            throw DesktopShellError.invalidWorkingDirectory
+        }
+        let accessResult = workingDirectory.withCString { Darwin.access($0, X_OK) }
+        guard accessResult == 0 else { throw Self.directoryError(errno: errno) }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: workingDirectory, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw DesktopShellError.invalidWorkingDirectory
+        }
+        guard timeout.isFinite, timeout >= 1, timeout <= Self.maximumTimeout,
+              rows > 0, rows <= 1000, columns > 0, columns <= 1000 else { throw DesktopShellError.invalidInput }
     }
 
     func cancelAfterFailure(id: UUID) async {
@@ -248,40 +256,52 @@ public actor DesktopShellExecutor: DesktopShellControlling {
     public func write(id: UUID, input: DesktopProcessInput) async throws {
         try DesktopControlExecution.check()
         switch input {
-        case .data(let data):
-            guard !data.isEmpty, data.count <= Self.maximumInputBytes else { throw DesktopShellError.invalidInput }
-            guard var session = sessions[id], session.terminalState == nil, !session.processTerminated, !session.inputClosed,
-                  session.queuedInputBytes + data.count <= Self.maximumQueuedInputBytes else { throw DesktopShellError.invalidInput }
-            session.queuedInputBytes += data.count
-            session.pendingInputOperations += 1
-            sessions[id] = session
-            try await performQueuedInput(id: id, session: session, data: data)
-        case .close:
-            guard var session = sessions[id], session.terminalState == nil, !session.processTerminated, !session.inputClosed else {
-                throw DesktopShellError.missingExecution
-            }
-            var eofData: Data?
-            if session.terminalMode == .pty {
-                var settings = termios()
-                guard tcgetattr(session.stdin.fileDescriptor, &settings) == 0 else { throw DesktopShellError.invalidInput }
-                let eof = withUnsafeBytes(of: settings.c_cc) { $0[Int(VEOF)] }
-                // Two EOF characters flush a pending canonical line, then signal EOF without closing output.
-                eofData = Data([eof, eof])
-            }
-            session.inputClosed = true
-            session.pendingInputOperations += 1
-            sessions[id] = session
-            try await performQueuedInput(id: id, session: session, data: eofData)
-        case .interrupt:
-            guard let session = sessions[id], session.terminalState == nil, !session.processTerminated else { throw DesktopShellError.missingExecution }
-            let group = session.terminalMode == .pty ? tcgetpgrp(session.stdin.fileDescriptor) : session.processID
-            guard group > 0, kill(-group, SIGINT) == 0 else { throw DesktopShellError.missingExecution }
-        case .resize(let rows, let columns):
-            guard let session = sessions[id], session.terminalMode == .pty, session.terminalState == nil, !session.processTerminated,
-                  rows > 0, rows <= 1000, columns > 0, columns <= 1000 else { throw DesktopShellError.invalidInput }
-            var size = winsize(ws_row: rows, ws_col: columns, ws_xpixel: 0, ws_ypixel: 0)
-            guard ioctl(session.stdin.fileDescriptor, TIOCSWINSZ, &size) == 0 else { throw DesktopShellError.invalidInput }
+        case .data(let data): try await sendData(data, id: id)
+        case .close: try await sendEOF(id: id)
+        case .interrupt: try interrupt(id: id)
+        case .resize(let rows, let columns): try resize(id: id, rows: rows, columns: columns)
         }
+    }
+
+    private func sendData(_ data: Data, id: UUID) async throws {
+        guard !data.isEmpty, data.count <= Self.maximumInputBytes else { throw DesktopShellError.invalidInput }
+        guard var session = sessions[id], session.terminalState == nil, !session.processTerminated, !session.inputClosed,
+              session.queuedInputBytes + data.count <= Self.maximumQueuedInputBytes else { throw DesktopShellError.invalidInput }
+        session.queuedInputBytes += data.count
+        session.pendingInputOperations += 1
+        sessions[id] = session
+        try await performQueuedInput(id: id, session: session, data: data)
+    }
+
+    private func sendEOF(id: UUID) async throws {
+        guard var session = sessions[id], session.terminalState == nil, !session.processTerminated, !session.inputClosed else {
+            throw DesktopShellError.missingExecution
+        }
+        var eofData: Data?
+        if session.terminalMode == .pty {
+            var settings = termios()
+            guard tcgetattr(session.stdin.fileDescriptor, &settings) == 0 else { throw DesktopShellError.invalidInput }
+            let eof = withUnsafeBytes(of: settings.c_cc) { $0[Int(VEOF)] }
+            // Two EOF characters flush a pending canonical line, then signal EOF without closing output.
+            eofData = Data([eof, eof])
+        }
+        session.inputClosed = true
+        session.pendingInputOperations += 1
+        sessions[id] = session
+        try await performQueuedInput(id: id, session: session, data: eofData)
+    }
+
+    private func interrupt(id: UUID) throws {
+        guard let session = sessions[id], session.terminalState == nil, !session.processTerminated else { throw DesktopShellError.missingExecution }
+        let group = session.terminalMode == .pty ? tcgetpgrp(session.stdin.fileDescriptor) : session.processID
+        guard group > 0, kill(-group, SIGINT) == 0 else { throw DesktopShellError.missingExecution }
+    }
+
+    private func resize(id: UUID, rows: UInt16, columns: UInt16) throws {
+        guard let session = sessions[id], session.terminalMode == .pty, session.terminalState == nil, !session.processTerminated,
+              rows > 0, rows <= 1000, columns > 0, columns <= 1000 else { throw DesktopShellError.invalidInput }
+        var size = winsize(ws_row: rows, ws_col: columns, ws_xpixel: 0, ws_ypixel: 0)
+        guard ioctl(session.stdin.fileDescriptor, TIOCSWINSZ, &size) == 0 else { throw DesktopShellError.invalidInput }
     }
 
     public func cancel(id: UUID) async throws {
@@ -345,16 +365,10 @@ public actor DesktopShellExecutor: DesktopShellControlling {
             sessions[id] = session
         }
         for _ in 0..<40 {
-            let unsettled = sessions.values.contains {
-                $0.state == .running || $0.outputReaders > 0 || ($0.processTerminated && !$0.processGroupCleanupConfirmed)
-            }
-            if !unsettled { break }
+            if sessions.values.allSatisfy(\.isSettled) { break }
             try? await Task.sleep(for: .milliseconds(100))
         }
-        let unsettled = sessions.values.filter {
-            $0.state == .running || $0.outputReaders > 0 || ($0.processTerminated && !$0.processGroupCleanupConfirmed)
-        }
-        guard unsettled.isEmpty else {
+        guard sessions.values.allSatisfy(\.isSettled) else {
             return false
         }
         for (id, session) in Array(sessions) {
