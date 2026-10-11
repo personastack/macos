@@ -475,43 +475,71 @@ struct CuaMCPProxyTests {
     }
 
     @Test(arguments: [false, true])
-    func cleanupReconnectsOnlyForOwnedSessionTermination(interrupted: Bool) async throws {
+    func interruptedResponseKeepsOriginalCleanupTransport(cancelled: Bool) async throws {
         let script = #"""
         #!/usr/bin/python3
-        import json, sys
+        import json, pathlib, sys, time
+        directory = pathlib.Path(__file__).parent
         for line in sys.stdin:
             request = json.loads(line)
             method = request.get("method")
             if method == "notifications/initialized": continue
             if method == "initialize":
+                with (directory / "starts").open("a") as out: out.write("start\n")
                 result = {"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cua","version":"0.29.1"}}
-            elif method == "tools/call" and request["params"]["name"] == "end_session":
-                assert request["params"]["arguments"] == {"session":"owned-session"}
-                result = {"structuredContent":{"session":"owned-session","active":False}}
+            elif method == "tools/call":
+                name = request["params"]["name"]
+                with (directory / "calls").open("a") as out: out.write(name + "\n")
+                if name == "get_cursor_position":
+                    (directory / "entered").write_text("ready")
+                    while not (directory / "release").exists(): time.sleep(0.01)
+                    result = {"content":[]}
+                elif name == "end_session":
+                    assert request["params"]["arguments"] == {"session":"owned-session"}
+                    result = {"structuredContent":{"session":"owned-session","active":False}}
+                else: sys.exit(2)
             else: sys.exit(2)
             print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
         """#
         let executable = try executableScript(script)
-        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
+        let directory = executable.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: directory) }
         let proxy = CuaMCPProxy(executableURL: executable)
         _ = try await proxy.start()
-        if interrupted { proxy.interrupt() }
-        else { await proxy.stop() }
+        let call = Task {
+            try await proxy.callTool(name: "get_cursor_position", argumentsJSON: Data("{}".utf8), timeout: 5)
+        }
+        let entered = directory.appendingPathComponent("entered")
+        let deadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: entered.path), Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try #require(FileManager.default.fileExists(atPath: entered.path))
+        if cancelled {
+            call.cancel()
+            await #expect(throws: CancellationError.self) { try await call.value }
+        } else {
+            proxy.interrupt()
+            await #expect(throws: CuaMCPProxyError.interrupted) { try await call.value }
+        }
         #expect(!(await proxy.sessionOwnerHasExited()))
+        try Data().write(to: directory.appendingPathComponent("release"))
         let response = try await proxy.callTool(name: "end_session", argumentsJSON: Data(#"{"session":"owned-session"}"#.utf8), timeout: 5)
         #expect(String(decoding: response, as: UTF8.self).contains("owned-session"))
         #expect(await proxy.isProcessRunning())
+        #expect(try String(contentsOf: directory.appendingPathComponent("starts"), encoding: .utf8) == "start\n")
+        #expect(try String(contentsOf: directory.appendingPathComponent("calls"), encoding: .utf8) == "get_cursor_position\nend_session\n")
         await proxy.stop()
         await #expect(throws: CuaMCPProxyError.notStarted) {
-            _ = try await proxy.callTool(name: "get_cursor_position", argumentsJSON: Data("{}".utf8))
+            _ = try await proxy.callTool(name: "end_session", argumentsJSON: Data(#"{"session":"owned-session"}"#.utf8))
         }
     }
 
-    @Test func cleanupCannotReconnectToAnUnverifiedDaemon() async {
+    @Test func cleanupDoesNotCreateAFreshUnownedTransport() async {
         let proxy = CuaMCPProxy(executableURL: URL(fileURLWithPath: "/must-not-launch"),
             socketURL: URL(fileURLWithPath: "/missing/cua.sock"), expectedDaemonPID: Darwin.getpid())
         #expect(!(await proxy.sessionOwnerHasExited()))
-        await #expect(throws: CuaMCPProxyError.serviceMismatch) {
+        await #expect(throws: CuaMCPProxyError.notStarted) {
             _ = try await proxy.callTool(name: "end_session", argumentsJSON: Data(#"{"session":"owned-session"}"#.utf8), timeout: 5)
         }
         #expect(!(await proxy.isProcessRunning()))

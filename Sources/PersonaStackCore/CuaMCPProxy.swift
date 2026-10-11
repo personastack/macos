@@ -62,9 +62,9 @@ public actor CuaMCPProxy: CuaToolCalling {
     private let executableURL: URL
     private let socketURL: URL?
     private let expectedDaemonPID: Int32?
-    private var process = Process()
-    private var input = Pipe()
-    private var output = Pipe()
+    private let process = Process()
+    private let input = Pipe()
+    private let output = Pipe()
     private var bufferedOutput = Data()
     private var scannedOutputBytes = 0
     private var requestID: Int64 = 0
@@ -81,12 +81,6 @@ public actor CuaMCPProxy: CuaToolCalling {
         guard !started else { throw CuaMCPProxyError.alreadyStarted }
         try verifyDaemonIdentity()
         try DesktopControlExecution.check()
-        process = Process()
-        input = Pipe()
-        output = Pipe()
-        interruption.reset()
-        bufferedOutput.removeAll(keepingCapacity: false)
-        scannedOutputBytes = 0
         process.executableURL = executableURL
         // Upstream 0.29.1 calls its no-autolaunch client guard "embedded".
         // This applies only to the proxy, never the independent daemon or its TCC identity.
@@ -141,11 +135,10 @@ public actor CuaMCPProxy: CuaToolCalling {
 
     public func callTool(name: String, argumentsJSON: Data, timeout: Int32 = 60) throws -> Data {
         guard CuaDriverCompatibility.requiredTools.contains(name) else { throw CuaMCPProxyError.invalidToolName }
-        if name == "end_session", !isProcessRunning() {
-            // Cleanup may reconnect our client to the same verified daemon.
-            // Remote actions are never replayed and the daemon is never started.
-            stop()
-            _ = try start()
+        if name == "end_session", started, process.isRunning {
+            // Only the original transport can confirm its owned session cleanup.
+            // Reset the wait interruption, without replaying the interrupted request.
+            interruption.reset()
         }
         return try invokeTool(name: name, argumentsJSON: argumentsJSON, timeout: timeout)
     }
@@ -172,7 +165,7 @@ public actor CuaMCPProxy: CuaToolCalling {
     }
 
     /// Wake a blocked tool call without waiting for this actor's synchronous read.
-    /// This only stops our stdio proxy. It never signals the Cua service.
+    /// Keep the original proxy and its session authority for native cleanup.
     nonisolated public func interrupt() {
         interruption.interrupt()
     }
@@ -221,11 +214,13 @@ public actor CuaMCPProxy: CuaToolCalling {
             throw error
         }
         do { return try readResponse(id: id, deadline: deadline) }
-        catch CuaMCPProxyError.timeout {
-            // Keep this transport's session authority for end_session cleanup.
-            // The request is not replayed. readResponse discards its late ID.
-            throw CuaMCPProxyError.timeout
-        } catch {
+        catch {
+            // These read-side exits leave a complete request on the original
+            // transport. Keep its ownership for cleanup and discard late IDs.
+            if error is CancellationError || error as? CuaMCPProxyError == .timeout ||
+                error as? CuaMCPProxyError == .interrupted {
+                throw error
+            }
             stop()
             throw error
         }

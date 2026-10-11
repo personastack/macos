@@ -276,10 +276,10 @@ struct DesktopControlCommandExecutorTests {
         #expect(await proxy.isProcessRunning() == !crash)
         let released = await executor.handle(command("desktop_control_release", owner, requestID: "release",
             arguments: .object(["control_token": .string(token)])), proxy: proxy)
-        #expect(released.type == "result")
-        #expect(!executor.needsSessionCleanup)
-        #expect(await executor.handle(command("desktop_control_acquire", owner, requestID: "next"), proxy: proxy).type == "result")
-        #expect(try String(contentsOf: calls, encoding: .utf8) == "click\nend_session\n")
+        #expect(released.type == (crash ? "failure" : "result"))
+        #expect(executor.needsSessionCleanup == crash)
+        #expect(await executor.handle(command("desktop_control_acquire", owner, requestID: "next"), proxy: proxy).type == (crash ? "failure" : "result"))
+        #expect(try String(contentsOf: calls, encoding: .utf8) == (crash ? "click\n" : "click\nend_session\n"))
         _ = await executor.close()
         await proxy.stop()
     }
