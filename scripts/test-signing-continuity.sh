@@ -22,6 +22,7 @@ make_bundle() {
   mkdir -p "$fixture_bundle/Contents/MacOS" "$fixture_bundle/Contents/Resources"
   cp "$2" "$fixture_bundle/Contents/MacOS/PersonaStack"
   cp "$2" "$fixture_bundle/Contents/MacOS/PersonaStackHarnessHook"
+  cp "$2" "$fixture_bundle/Contents/MacOS/PersonaStackAgentBridge"
   printf '%s\n' "$1" > "$fixture_bundle/Contents/Resources/probe.txt"
   cat > "$fixture_bundle/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
