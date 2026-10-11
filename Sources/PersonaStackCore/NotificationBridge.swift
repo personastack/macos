@@ -33,7 +33,7 @@ public enum NotificationBridge {
     private static func validText(_ value: String, limit: Int) -> Bool {
         !value.isEmpty && value.unicodeScalars.count <= limit
             && value.trimmingCharacters(in: .whitespacesAndNewlines) == value
-            && !value.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
+            && !value.unicodeScalars.contains(where: { $0.value < 0x20 || (0x7f...0x9f).contains($0.value) })
     }
 
     public static func notificationInfo(_ body: Any, appURL: URL) -> [String: String]? {

@@ -9,6 +9,9 @@ import PersonaStackCore
     #expect(presentation.title == "Planner raised a concern")
     #expect(presentation.preview == "The build needs attention…")
     #expect(NotificationBridge.isNewConcernEvent(body))
+    var unicode = body
+    unicode["preview"] = "👩‍💻 Zoë needs a review."
+    #expect(NotificationBridge.isNewConcernEvent(unicode))
     let appURL = try #require(URL(string: "https://my.personastack.ai"))
     #expect(NotificationBridge.notificationInfo(body, appURL: appURL) == ["app_origin": "https://my.personastack.ai", "concern_id": "c1", "workspace_id": "ws_b"])
     for (key, value) in [("persona_name", ""), ("persona_name", "a\nname"), ("persona_name", String(repeating: "a", count: 257)),
