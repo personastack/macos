@@ -2,6 +2,24 @@ import Foundation
 import Testing
 import PersonaStackCore
 
+@Test func concernPresentationAcceptsOnlyBoundedFieldsAndKeepsNavigationPrivate() throws {
+    let body = ["version": "3", "event": "created", "concern_id": "c1", "workspace_id": "ws_b",
+                "persona_id": "p1", "persona_name": "Planner", "preview": "The build needs attention…", "avatar_png": ""]
+    let presentation = try #require(NotificationBridge.presentation(body))
+    #expect(presentation.title == "Planner raised a concern")
+    #expect(presentation.preview == "The build needs attention…")
+    #expect(NotificationBridge.isNewConcernEvent(body))
+    let appURL = try #require(URL(string: "https://my.personastack.ai"))
+    #expect(NotificationBridge.notificationInfo(body, appURL: appURL) == ["app_origin": "https://my.personastack.ai", "concern_id": "c1", "workspace_id": "ws_b"])
+    for (key, value) in [("persona_name", ""), ("persona_name", "a\nname"), ("persona_name", String(repeating: "a", count: 257)),
+                         ("preview", String(repeating: "🙂", count: 181)), ("avatar_png", "invalid!"),
+                         ("avatar_png", String(repeating: "a", count: 131_073)), ("persona_id", "bad/id"), ("user_id", "private")] {
+        var invalid = body
+        invalid[key] = value
+        #expect(!NotificationBridge.isNewConcernEvent(invalid))
+    }
+}
+
 @Test func newConcernNotificationRequiresTheExactCreatedEvent() {
     #expect(NotificationBridge.isNewConcernEvent(["version": "1", "event": "created"]))
     #expect(!NotificationBridge.isNewConcernEvent(["version": "1", "event": "resolved"]))

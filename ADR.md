@@ -1,3 +1,7 @@
+# 2026-10-11 - Persona concern notification presentation
+
+- Decision: Eric requests the persona picture as the notification icon, `<Persona name> raised a concern` as the title, and truncated concern content as the body. This supersedes the generic-content restriction in the 2026-09-15 notification decision. The hosted app projects bounded API-owned content and artwork to the origin-checked native bridge. Notification navigation retains the current authorization checks. This request does not authorize a release.
+
 # 2026-10-11 - Desktop Control includes CLI input and output
 
 - Decision: Eric requires personas with Desktop Control to execute CLI commands and receive results through the existing PersonaStack app relay. CLI access shares the Desktop Control assignment and lease. It needs no separate enrollment, command policy, or approval. Pipe and interactive terminal modes use the desktop account and OS permissions. PersonaStack must not forbid commands or typing into Terminal. CUA remains the independent GUI executor. This supersedes the shell-removal portion of the 2026-10-06 CUA-only decision. Dedicated filesystem tools and the locked-screen helper remain retired.

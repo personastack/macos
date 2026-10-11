@@ -171,7 +171,7 @@ final class MainWebViewHost {
         configuration.preferences.isFraudulentWebsiteWarningEnabled = true
         configuration.userContentController.add(coordinator, name: "personastackConcern")
         configuration.userContentController.addUserScript(WKUserScript(
-            source: "window.personastackConcernNavigation = true;",
+            source: "window.personastackConcernNavigation = true; window.personastackConcernPresentation = true;",
             injectionTime: .atDocumentStart, forMainFrameOnly: true))
         configuration.userContentController.addScriptMessageHandler(coordinator, contentWorld: .page, name: DesktopMediaCapturePermission.bridgeName)
         configuration.userContentController.addScriptMessageHandler(ChatWindowManager.shared, contentWorld: .page, name: "personastackChat")
@@ -449,7 +449,8 @@ struct PersonaStackWebView: NSViewRepresentable {
             content.body = "A new concern needs attention."
             content.sound = .default
             content.userInfo = info
-            let request = UNNotificationRequest(identifier: "personastack-concern-\(UUID().uuidString)", content: content, trigger: nil)
+            let presented = ConcernNotificationContent.present(content, body: body)
+            let request = UNNotificationRequest(identifier: "personastack-concern-\(UUID().uuidString)", content: presented, trigger: nil)
             scheduleNotification(request)
         }
 

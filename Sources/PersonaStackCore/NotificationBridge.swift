@@ -1,10 +1,39 @@
 import Foundation
 
 public enum NotificationBridge {
+    public struct Presentation {
+        public let personaID: String
+        public let personaName: String
+        public let preview: String
+        public let avatarPNG: Data?
+
+        public var title: String { "\(personaName) raised a concern" }
+    }
+
     public static func isNewConcernEvent(_ body: Any) -> Bool {
         guard let payload = body as? [String: Any], payload["event"] as? String == "created" else { return false }
         if payload["version"] as? String == "1" { return payload.count == 2 }
+        if payload["version"] as? String == "3" { return presentation(body) != nil }
         return payload["version"] as? String == "2" && payload.count == 4 && navigationIDs(payload) != nil
+    }
+
+    public static func presentation(_ body: Any) -> Presentation? {
+        guard let payload = body as? [String: Any], payload.count == 8,
+              payload["version"] as? String == "3", payload["event"] as? String == "created",
+              navigationIDs(payload) != nil,
+              let personaID = payload["persona_id"] as? String, ChatWindowCommand.validPersonaID(personaID),
+              let name = payload["persona_name"] as? String, validText(name, limit: 256),
+              let preview = payload["preview"] as? String, validText(preview, limit: 180),
+              let encoded = payload["avatar_png"] as? String, encoded.utf8.count <= 131_072 else { return nil }
+        let image = encoded.isEmpty ? nil : Data(base64Encoded: encoded)
+        guard encoded.isEmpty || image != nil else { return nil }
+        return Presentation(personaID: personaID, personaName: name, preview: preview, avatarPNG: image)
+    }
+
+    private static func validText(_ value: String, limit: Int) -> Bool {
+        !value.isEmpty && value.unicodeScalars.count <= limit
+            && value.trimmingCharacters(in: .whitespacesAndNewlines) == value
+            && !value.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
     }
 
     public static func notificationInfo(_ body: Any, appURL: URL) -> [String: String]? {

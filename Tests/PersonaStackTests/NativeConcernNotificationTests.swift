@@ -7,6 +7,35 @@ import PersonaStackCore
 @testable import PersonaStack
 
 struct NativeConcernNotificationTests {
+    @MainActor @Test
+    func personalizedConcernPreservesNavigationAndNotificationPreference() throws {
+        let appURL = try #require(URL(string: "https://my.personastack.ai"))
+        var requests: [UNNotificationRequest] = []
+        var enabled = true
+        let coordinator = PersonaStackWebView.Coordinator(appURL: appURL,
+            notificationCoordinator: nil, configureNotificationCenter: { _ in },
+            scheduleNotification: { requests.append($0) }, concernNotificationsEnabled: { enabled })
+        let bitmap = try #require(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 128, pixelsHigh: 128,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+            bytesPerRow: 0, bitsPerPixel: 0))
+        let png = try #require(bitmap.representation(using: .png, properties: [:]))
+        #expect(ConcernNotificationContent.validAvatar(png))
+        #expect(!ConcernNotificationContent.validAvatar(Data("not an image".utf8)))
+        let body = ["version": "3", "event": "created", "concern_id": "specific", "workspace_id": "ws_b",
+                    "persona_id": "p1", "persona_name": "Planner", "preview": "Review the failed build…", "avatar_png": png.base64EncodedString()]
+        coordinator.handleConcernMessage(name: "personastackConcern", isMainFrame: true, host: appURL.host, body: body, appURL: appURL)
+        let request = try #require(requests.first)
+        #expect(request.content.title == "Planner raised a concern")
+        #expect(request.content.body == "Review the failed build…")
+        #expect(request.content.userInfo.count == 3)
+        #expect(NotificationBridge.concernDestination(request.content.userInfo, appURL: appURL)?.absoluteString == "https://my.personastack.ai/user/concerns?workspace_id=ws_b&concern_id=specific")
+        enabled = false
+        coordinator.handleConcernMessage(name: "personastackConcern", isMainFrame: true, host: appURL.host, body: body, appURL: appURL)
+        enabled = true
+        coordinator.handleConcernMessage(name: "personastackConcern", isMainFrame: false, host: appURL.host, body: body, appURL: appURL)
+        coordinator.handleConcernMessage(name: "personastackConcern", isMainFrame: true, host: appURL.host, body: body, appURL: URL(string: "https://my.personastack.ai:444"))
+        #expect(requests.count == 1)
+    }
     @Test @MainActor
     func clickingCreatedConcernNavigatesAndReopensTheMainWindow() throws {
         let appURL = try #require(URL(string: "https://my.personastack.ai/user/personas"))

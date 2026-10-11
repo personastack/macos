@@ -26,7 +26,7 @@ jobs:
             scheduling=(--no-parallel)
           fi
           swift test --disable-xctest --skip-update -j 2 "${scheduling[@]}" \
-            --filter '(AgentBridge|LocalSession|[Cc]ua|[Dd]esktop|Termination|Quit|MainWebView|ServerSettings|[Hh]arness)'
+            --filter '(AgentBridge|LocalSession|[Cc]ua|[Dd]esktop|Termination|Quit|[Cc]oncern|[Nn]otification|MainWebView|ServerSettings|[Hh]arness)'
       - name: Build both app architectures without signing
         run: |
           for architecture in arm64 x86_64; do
