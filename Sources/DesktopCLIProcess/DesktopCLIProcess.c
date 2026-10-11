@@ -36,6 +36,8 @@ static int prepare_io(ChildIO *io, int terminal, uint16_t rows, uint16_t columns
     struct winsize size = {.ws_row = rows, .ws_col = columns};
     if (openpty(&io->master, &io->slave, NULL, NULL, &size)) return -1;
     if (fcntl(io->master, F_SETFD, FD_CLOEXEC) == -1 || fcntl(io->slave, F_SETFD, FD_CLOEXEC) == -1) return -1;
+    io->input[1] = dup(io->master);
+    if (io->input[1] == -1 || fcntl(io->input[1], F_SETFD, FD_CLOEXEC) == -1) return -1;
     return 0;
 }
 
@@ -83,7 +85,8 @@ static _Noreturn void child_exec(const ChildIO *io, int descriptor_limit, int te
 }
 
 static void terminate_launch(pid_t pid) {
-    kill(-pid, SIGKILL);
+    // Launch failures precede exec. This unreaped direct child cannot be a reused foreign PID.
+    kill(pid, SIGKILL);
     while (waitpid(pid, NULL, 0) == -1 && errno == EINTR) {}
 }
 
@@ -100,14 +103,8 @@ static int publish_io(ChildIO *io, int terminal, pid_t pid, PSDesktopCLIChild *c
     child->pid = pid;
     if (terminal) {
         child->output = io->master; io->master = -1;
-        child->input = dup(child->output);
+        child->input = io->input[1]; io->input[1] = -1;
         child->error = -1;
-        if (child->input == -1) {
-            int error = errno;
-            close(child->output);
-            return error;
-        }
-        fcntl(child->input, F_SETFD, FD_CLOEXEC);
     } else {
         child->input = io->input[1]; io->input[1] = -1;
         child->output = io->output[0]; io->output[0] = -1;
