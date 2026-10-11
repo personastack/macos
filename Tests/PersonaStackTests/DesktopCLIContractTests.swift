@@ -127,6 +127,30 @@ private actor DesktopCLIFake: DesktopShellControlling {
         #expect(await executor.handle(frame("desktop_control_exec_status", target: owner, args: args), proxy: nil).errorCode == "desktop_control_required")
         #expect(await executor.close())
     }
+    @Test func staleVersionAndRevokedConfigCannotReadOrResumeOwnedCLI() async throws {
+        let fake = DesktopCLIFake()
+        let executor = DesktopControlCommandExecutor(shell: fake)
+        let owner = target()
+        let acquired = await executor.handle(frame("desktop_control_acquire", target: owner), proxy: nil)
+        guard case .object(let lease)? = acquired.result, let token = lease["control_token"] else { Issue.record("missing token"); return }
+        let start = await executor.handle(frame("desktop_control_execute", target: owner, args: ["control_token": token,
+            "command": .string("command with ' shell syntax; $(code)"), "working_directory": .string("/tmp")]), proxy: nil)
+        guard case .object(let result)? = start.result, let id = result["execution_id"] else { Issue.record("missing id"); return }
+        let args = ["control_token": token, "execution_id": id]
+        let stale = DesktopControlTarget(installationID: "installation", workspaceID: "workspace", configID: "config",
+                                       personaID: "persona", runID: "run", generation: 1, configVersion: 0)
+        let before = await fake.history()
+        #expect(await executor.handle(frame("desktop_control_exec_read", target: stale, args: args), proxy: nil).errorCode == "desktop_control_config_revoked")
+        #expect(await fake.history() == before)
+        let revoke = DesktopControlTarget(installationID: "installation", workspaceID: "workspace", configID: "config",
+                                        personaID: "", runID: "", generation: 0, configVersion: 1)
+        #expect(await executor.handle(frame("desktop_control_revoke_config", target: revoke), proxy: nil).type == "result")
+        #expect(await fake.history().suffix(2) == ["stop", "close"])
+        #expect(await executor.handle(frame("desktop_control_exec_read", target: owner, args: args), proxy: nil).errorCode == "desktop_control_config_revoked")
+        #expect(await executor.handle(frame("desktop_control_acquire", target: owner), proxy: nil).errorCode == "desktop_control_config_revoked")
+        #expect(await executor.close())
+    }
+
     @Test func expiryAndCloseStopCommandsBeforeAnotherOwnerAcquires() async {
         let fake = DesktopCLIFake()
         var clock = ContinuousClock.now

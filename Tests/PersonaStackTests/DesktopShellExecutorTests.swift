@@ -22,6 +22,22 @@ import Testing
         }
         throw FixtureError.timeout
     }
+    @Test func cwdShellSyntaxIsAPathAndLaunchFailureHasNoSession() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("desktop-cli-\(UUID().uuidString)'$()", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let shell = DesktopShellExecutor()
+        do {
+            let started = try await shell.start(command: "printf '%s' \"$PWD\"", workingDirectory: directory.path)
+            let final = try await drain(shell, started.executionID)
+            #expect(String(decoding: final.chunks.flatMap { $0.data }, as: UTF8.self).contains(directory.lastPathComponent))
+            await #expect(throws: DesktopShellError.invalidWorkingDirectory) {
+                try await shell.start(command: "printf should-not-start", workingDirectory: directory.appendingPathComponent("absent").path)
+            }
+            #expect(await shell.closeAll())
+        } catch { _ = await shell.closeAll(); throw error }
+    }
+
     @Test func pipePartialPromptBinaryStreamsInputAndTrailingOutput() async throws {
         let shell = DesktopShellExecutor()
         do {

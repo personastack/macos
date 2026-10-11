@@ -205,6 +205,7 @@ public actor DesktopShellExecutor: DesktopShellControlling {
         try DesktopControlExecution.check()
         let end = ContinuousClock.now + min(max(wait, .zero), .seconds(10))
         while true {
+            try DesktopControlExecution.check()
             guard let session = sessions[id] else { throw DesktopShellError.missingExecution }
             guard cursor <= session.nextSequence else { throw DesktopShellError.invalidInput }
             let earliest = session.chunks.first?.sequence ?? session.nextSequence + 1
@@ -236,10 +237,18 @@ public actor DesktopShellExecutor: DesktopShellControlling {
             guard var session = sessions[id], session.terminalState == nil, !session.inputClosed else {
                 throw DesktopShellError.missingExecution
             }
+            var eofData: Data?
+            if session.terminalMode == .pty {
+                var settings = termios()
+                guard tcgetattr(session.stdin.fileDescriptor, &settings) == 0 else { throw DesktopShellError.invalidInput }
+                let eof = withUnsafeBytes(of: settings.c_cc) { $0[Int(VEOF)] }
+                // Two EOF characters flush a pending canonical line, then signal EOF without closing output.
+                eofData = Data([eof, eof])
+            }
             session.inputClosed = true
             session.pendingInputOperations += 1
             sessions[id] = session
-            try await performQueuedInput(id: id, session: session, data: session.terminalMode == .pty ? Data([4, 4]) : nil)
+            try await performQueuedInput(id: id, session: session, data: eofData)
         case .interrupt:
             guard let session = sessions[id], session.terminalState == nil else { throw DesktopShellError.missingExecution }
             let group = session.terminalMode == .pty ? tcgetpgrp(session.stdin.fileDescriptor) : session.processID
@@ -295,7 +304,7 @@ public actor DesktopShellExecutor: DesktopShellControlling {
         guard let session = sessions[id] else { throw DesktopShellError.missingExecution }
         let earliest = session.chunks.first?.sequence ?? session.nextSequence + 1
         return DesktopProcessRead(executionID: id, chunks: [], nextCursor: session.nextSequence,
-                                  earliestCursor: earliest, outputGap: false, state: session.state,
+                                  earliestCursor: earliest, outputGap: session.incompleteOutput || earliest > 1, state: session.state,
                                   exitCode: session.exitCode, signal: session.signal, terminalMode: session.terminalMode, outputComplete: session.outputReaders == 0)
     }
 
@@ -308,19 +317,19 @@ public actor DesktopShellExecutor: DesktopShellControlling {
             do { try await stopProcess(id: id) }
             catch { /* The process-group check below is authoritative. */ }
         }
-        for (id, var session) in Array(sessions) where session.state == .running {
+        for (id, var session) in Array(sessions) where session.outputReaders > 0 {
             session.forceCloseReaders = true
             sessions[id] = session
         }
         for _ in 0..<40 {
             let unsettled = sessions.values.contains {
-                $0.state == .running || ($0.processTerminated && !$0.processGroupCleanupConfirmed)
+                $0.state == .running || $0.outputReaders > 0 || ($0.processTerminated && !$0.processGroupCleanupConfirmed)
             }
             if !unsettled { break }
             try? await Task.sleep(for: .milliseconds(100))
         }
         let unsettled = sessions.values.filter {
-            $0.state == .running || ($0.processTerminated && !$0.processGroupCleanupConfirmed)
+            $0.state == .running || $0.outputReaders > 0 || ($0.processTerminated && !$0.processGroupCleanupConfirmed)
         }
         guard unsettled.isEmpty else {
             return false

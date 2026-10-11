@@ -326,6 +326,7 @@ final class DesktopControlCommandExecutor {
             case "desktop_control_execute", "desktop_control_exec_read", "desktop_control_exec_write",
                  "desktop_control_exec_status", "desktop_control_exec_cancel":
                 try requireLease(owner, arguments: frame.arguments)
+                guard lease?.configVersion == configVersion else { throw CommandError.configurationRevoked }
                 result = try await callShell(frame)
             default:
                 throw CommandError.invalidArguments

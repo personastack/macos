@@ -3,7 +3,9 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
@@ -33,6 +35,9 @@ int ps_desktop_cli_spawn(const char *shell, char *const argv[], char *const env[
                          PSDesktopCLIChild *child) {
     int input[2] = {-1, -1}, output[2] = {-1, -1}, error[2] = {-1, -1};
     int launch[2] = {-1, -1}, master = -1, slave = -1, result = 0;
+    struct rlimit descriptors;
+    if (getrlimit(RLIMIT_NOFILE, &descriptors)) return errno;
+    int descriptor_limit = descriptors.rlim_cur > INT_MAX ? INT_MAX : (int)descriptors.rlim_cur;
     struct winsize size = {.ws_row = rows, .ws_col = columns};
     if (cloexec_pipe(launch)) { result = errno; goto done; }
     if (terminal) {
@@ -56,7 +61,7 @@ int ps_desktop_cli_spawn(const char *shell, char *const argv[], char *const env[
             dup2(terminal ? slave : error[1], STDERR_FILENO) == -1) child_fail(launch[1]);
         if (dup2(launch[1], 3) == -1) child_fail(launch[1]);
         if (fcntl(3, F_SETFD, FD_CLOEXEC) == -1) child_fail(3);
-        closefrom(4);
+        for (int descriptor = 4; descriptor < descriptor_limit; descriptor++) close(descriptor);
         // The app ignores SIGPIPE. Restore ordinary child signal semantics.
         struct sigaction action = {0};
         action.sa_handler = SIG_DFL;
