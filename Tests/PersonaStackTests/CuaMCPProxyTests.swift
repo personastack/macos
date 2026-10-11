@@ -526,6 +526,11 @@ struct CuaMCPProxyTests {
         let pid = owner.processIdentifier
         owner.waitUntilExit()
         let exited = CuaMCPProxy(executableURL: URL(fileURLWithPath: "/unused"), expectedDaemonPID: pid)
+        // Foundation's termination observation can precede kernel reaping.
+        let deadline = ContinuousClock.now + .seconds(2)
+        while !(await exited.sessionOwnerHasExited()), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         #expect(await exited.sessionOwnerHasExited())
     }
 
