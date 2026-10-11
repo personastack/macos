@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <key>com.apple.application-identifier</key>
+  <string>5T2T8KL852.ai.personastack.desktop</string>
+  <key>com.apple.developer.team-identifier</key>
+  <string>5T2T8KL852</string>
   <key>com.apple.developer.usernotifications.communication</key>
   <true/>
   <key>com.apple.security.device.audio-input</key>

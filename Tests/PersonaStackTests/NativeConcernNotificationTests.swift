@@ -23,6 +23,17 @@ struct NativeConcernNotificationTests {
         #expect(!ConcernNotificationContent.validAvatar(Data("not an image".utf8)))
         let body = ["version": "3", "event": "created", "concern_id": "specific", "workspace_id": "ws_b",
                     "persona_id": "p1", "persona_name": "Planner", "preview": "Review the failed build…", "avatar_png": png.base64EncodedString()]
+        var decorated: UNNotificationContent?
+        let original = UNMutableNotificationContent()
+        let result = ConcernNotificationContent.present(original, body: body) { content, intent in
+            #expect(intent.sender?.image != nil)
+            #expect(intent.sender?.displayName == "Planner raised a concern")
+            let updated = try content.updating(from: intent)
+            decorated = updated
+            return updated
+        }
+        #expect(decorated != nil)
+        #expect(result === decorated)
         coordinator.handleConcernMessage(name: "personastackConcern", isMainFrame: true, host: appURL.host, body: body, appURL: appURL)
         let request = try #require(requests.first)
         #expect(request.content.title == "Planner raised a concern")

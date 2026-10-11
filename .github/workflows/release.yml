@@ -59,6 +59,11 @@ jobs:
         run: |
           gh api "repos/$GITHUB_REPOSITORY/environments/macos-release-publication" > "$RUNNER_TEMP/publication-environment.json"
           python3 scripts/release_candidate.py environment "$RUNNER_TEMP/publication-environment.json"
+      - name: Prepare communication notification profile
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          PERSONASTACK_COMMUNICATION_PROFILE_BASE64: ${{ secrets.PERSONASTACK_COMMUNICATION_PROFILE_BASE64 }}
+        run: python3 scripts/communication_profile.py prepare
       - name: Import pinned release signing identity
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:

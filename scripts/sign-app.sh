@@ -6,6 +6,9 @@ bundle=${1:?usage: sign-app.sh APP_BUNDLE}
 : "${PERSONASTACK_CODESIGN_IDENTITY:?Developer ID Application identity is required}"
 : "${PERSONASTACK_CODESIGN_KEYCHAIN:?signing keychain is required}"
 
+# This restricted entitlement must be authorized before signing any code.
+python3 "$root_dir/scripts/communication_profile.py" embed "$bundle"
+
 # Validate dependency lookup before signing any nested code.
 sh "$root_dir/scripts/verify-sparkle-runtime.sh" "$bundle"
 

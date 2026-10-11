@@ -5,7 +5,10 @@ import PersonaStackCore
 import UserNotifications
 
 enum ConcernNotificationContent {
-    static func present(_ content: UNMutableNotificationContent, body: Any) -> UNNotificationContent {
+    static func present(_ content: UNMutableNotificationContent, body: Any,
+                        update: (UNMutableNotificationContent, INSendMessageIntent) throws -> UNNotificationContent = {
+                            try $0.updating(from: $1)
+                        }) -> UNNotificationContent {
         guard let presentation = NotificationBridge.presentation(body) else { return content }
         content.title = presentation.title
         content.body = presentation.preview
@@ -21,12 +24,7 @@ enum ConcernNotificationContent {
         )
         // The intent supplies the sender icon. Navigation remains in our private
         // metadata. Do not donate concern contents to Siri's interaction history.
-        guard let updated = try? content.updating(from: intent).mutableCopy() as? UNMutableNotificationContent else { return content }
-        updated.title = presentation.title
-        updated.body = presentation.preview
-        updated.userInfo = content.userInfo
-        updated.sound = content.sound
-        return updated
+        return (try? update(content, intent)) ?? content
     }
 
     static func validAvatar(_ data: Data) -> Bool {
