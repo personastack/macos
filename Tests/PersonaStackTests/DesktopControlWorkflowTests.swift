@@ -69,33 +69,38 @@ private actor SuspendedReadiness {
     #expect(DesktopControlSessionLock.classify(inactive, userID: uid) == .inactive)
 }
 
+@MainActor final class DesktopSessionSnapshotFixture {
+    var value: DesktopControlSessionLock.Snapshot
+    init(_ value: DesktopControlSessionLock.Snapshot) { self.value = value }
+}
+
 @Test @MainActor func desktopActiveSessionRecoversWithoutScreenLockKeyOrActivationEvent() {
-    var snapshot = DesktopControlSessionLock.Snapshot.inactive
-    let monitor = DesktopControlSessionLock(observeSystem: false, snapshotReader: { snapshot })
+    let snapshot = DesktopSessionSnapshotFixture(.inactive)
+    let monitor = DesktopControlSessionLock(observeSystem: false, snapshotReader: { snapshot.value })
     monitor.reconcile()
     #expect(!monitor.isAwakeAndActive && monitor.state == .locked)
-    snapshot = .active
+    snapshot.value = .active
     monitor.reconcile()
     #expect(monitor.isAwakeAndActive && monitor.state == .unknown)
     monitor.receive(.locked)
-    snapshot = .inactive
+    snapshot.value = .inactive
     monitor.reconcile()
-    snapshot = .active
+    snapshot.value = .active
     monitor.receive(.unlocked)
     #expect(monitor.isAwakeAndActive && monitor.state == .unlocked)
 }
 
 @Test @MainActor func desktopUnlockCannotClearSleepOrAnotherUsersSessionFence() {
     let workspace = NotificationCenter()
-    var snapshot = DesktopControlSessionLock.Snapshot.inactive
+    let snapshot = DesktopSessionSnapshotFixture(.inactive)
     let monitor = DesktopControlSessionLock(workspaceCenter: workspace, activationCenter: NotificationCenter(),
-                                           observeNetwork: false, snapshotReader: { snapshot })
+                                           observeNetwork: false, snapshotReader: { snapshot.value })
     monitor.receive(.unlocked)
     #expect(!monitor.isAwakeAndActive && monitor.state == .locked)
-    snapshot = .unknown
+    snapshot.value = .unknown
     monitor.receive(.unlocked)
     #expect(!monitor.isAwakeAndActive && monitor.state == .locked)
-    snapshot = .active
+    snapshot.value = .active
     monitor.reconcile()
     workspace.post(name: NSWorkspace.willSleepNotification, object: nil)
     monitor.receive(.unlocked)
