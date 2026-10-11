@@ -331,7 +331,7 @@ struct CuaMCPProxyTests {
             }
         }
         #expect(bound == 0)
-        #expect(Darwin.listen(listener, 2) == 0)
+        #expect(Darwin.listen(listener, 16) == 0)
         #expect(CuaSocketIdentity.peerPID(at: socketURL) == Darwin.getpid())
 
         let proxy = CuaMCPProxy(
@@ -340,6 +340,41 @@ struct CuaMCPProxyTests {
             expectedDaemonPID: Darwin.getpid() + 1
         )
         await #expect(throws: CuaMCPProxyError.serviceMismatch) { try await proxy.start() }
+
+        let script = #"""
+        #!/usr/bin/python3
+        import json, pathlib, sys
+        directory = pathlib.Path(__file__).parent
+        for line in sys.stdin:
+            request = json.loads(line)
+            method = request.get("method")
+            if method == "notifications/initialized": continue
+            if method == "initialize":
+                with (directory / "starts").open("a") as out: out.write("start\n")
+                result = {"capabilities":{}}
+            elif method == "tools/call" and request["params"] == {"name":"end_session","arguments":{"session":"owned-session"}}:
+                with (directory / "calls").open("a") as out: out.write("end_session\n")
+                result = {"structuredContent":{"session":"owned-session","active":False}}
+            else: sys.exit(2)
+            print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
+        """#
+        let executable = try executableScript(script)
+        let directory = executable.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let owned = CuaMCPProxy(executableURL: executable, socketURL: socketURL, expectedDaemonPID: Darwin.getpid())
+        _ = try await owned.start()
+        let hidden = socketURL.appendingPathExtension("hidden")
+        try FileManager.default.moveItem(at: socketURL, to: hidden)
+        defer { _ = Darwin.unlink(hidden.path) }
+        await #expect(throws: CuaMCPProxyError.serviceMismatch) { try await owned.listTools() }
+        #expect(await owned.isProcessRunning())
+        #expect(!(await owned.sessionOwnerHasExited()))
+        try FileManager.default.moveItem(at: hidden, to: socketURL)
+        _ = try await owned.callTool(name: "end_session", argumentsJSON: Data(#"{"session":"owned-session"}"#.utf8), timeout: 5)
+        #expect(try String(contentsOf: directory.appendingPathComponent("starts"), encoding: .utf8) == "start\n")
+        #expect(try String(contentsOf: directory.appendingPathComponent("calls"), encoding: .utf8) == "end_session\n")
+        await owned.stop()
+
     }
 
     @Test

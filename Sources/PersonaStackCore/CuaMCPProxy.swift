@@ -197,11 +197,9 @@ public actor CuaMCPProxy: CuaToolCalling {
         try DesktopControlExecution.check()
         if interruption.isInterrupted { throw CuaMCPProxyError.interrupted }
         guard started, process.isRunning else { throw CuaMCPProxyError.notStarted }
-        do { try verifyDaemonIdentity() }
-        catch {
-            stop()
-            throw error
-        }
+        // A failed preflight sends no request. Preserve the original client's
+        // cleanup authority in case the same verified peer becomes reachable.
+        try verifyDaemonIdentity()
         requestID += 1
         let id = requestID
         let wire = "{\"jsonrpc\":\"2.0\",\"id\":\(id),\"method\":\"\(method)\",\"params\":\(parameters)}\n"
