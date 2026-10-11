@@ -52,8 +52,13 @@ struct DesktopShellOutputBuffer {
     var nextSequence: UInt64 = 0
     var incompleteOutput = false
     let maximumBytes: Int
+    let maximumChunks: Int
 
-    init(maximumBytes: Int = DesktopShellExecutor.maximumBufferedBytesPerProcess) { self.maximumBytes = maximumBytes }
+    init(maximumBytes: Int = DesktopShellExecutor.maximumBufferedBytesPerProcess,
+         maximumChunks: Int = DesktopShellExecutor.maximumBufferedChunksPerProcess) {
+        self.maximumBytes = maximumBytes
+        self.maximumChunks = maximumChunks
+    }
 
     mutating func append(_ data: Data, stream: DesktopOutputChunk.Stream) -> Bool {
         guard !data.isEmpty else { return false }
@@ -61,7 +66,7 @@ struct DesktopShellOutputBuffer {
         chunks.append(DesktopOutputChunk(sequence: nextSequence, stream: stream, data: data))
         bufferedBytes += data.count
         var dropped = false
-        while bufferedBytes > maximumBytes, !chunks.isEmpty {
+        while bufferedBytes > maximumBytes || chunks.count > maximumChunks, !chunks.isEmpty {
             bufferedBytes -= chunks.removeFirst().data.count
             dropped = true
         }
@@ -124,7 +129,9 @@ public actor DesktopShellExecutor: DesktopShellControlling {
     public static let maximumCommandBytes = 64 * 1024
     public static let maximumInputBytes = 32 * 1024
     public static let maximumReadBytes = 1024 * 1024
+    public static let maximumReadChunks = 256
     public static let maximumBufferedBytesPerProcess = 4 * 1024 * 1024
+    public static let maximumBufferedChunksPerProcess = 4096
     public static let maximumQueuedInputBytes = 128 * 1024
     public static let maximumProcesses = 4
     public static let maximumRetainedSessions = 16
@@ -513,11 +520,12 @@ public actor DesktopShellExecutor: DesktopShellControlling {
         }
     }
 
-    static func bounded(_ chunks: [DesktopOutputChunk], limit: Int) -> [DesktopOutputChunk] {
+    static func bounded(_ chunks: [DesktopOutputChunk], limit: Int,
+                        maximumChunks: Int = DesktopShellExecutor.maximumReadChunks) -> [DesktopOutputChunk] {
         var result: [DesktopOutputChunk] = []
         var size = 0
         for chunk in chunks {
-            if size + chunk.data.count > limit { break }
+            if size + chunk.data.count > limit || result.count >= maximumChunks { break }
             result.append(chunk)
             size += chunk.data.count
         }

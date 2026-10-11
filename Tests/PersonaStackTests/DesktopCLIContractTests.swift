@@ -90,6 +90,27 @@ private actor DesktopCLIFake: DesktopShellControlling {
         #expect(buffer.hasGap(after: 3))
     }
 
+    @Test func tinyChunksHaveMetadataBoundsAndCursorPagination() {
+        var buffer = DesktopShellOutputBuffer(maximumBytes: 1024, maximumChunks: 3)
+        for byte in 0..<3 { _ = buffer.append(Data([UInt8(byte)]), stream: .stdout) }
+        let dropped = buffer.append(Data([3]), stream: .stderr)
+        #expect(dropped)
+        #expect(buffer.chunks.count == 3)
+        #expect(buffer.bufferedBytes == 3)
+        #expect(buffer.earliestCursor == 2)
+        #expect(buffer.hasGap(after: 0))
+        let first = DesktopShellExecutor.bounded(buffer.chunks, limit: 1024, maximumChunks: 2)
+        #expect(first.map(\.sequence) == [2, 3])
+        guard let cursor = first.last?.sequence else { Issue.record("missing first page"); return }
+        let second = DesktopShellExecutor.bounded(buffer.chunks.filter { $0.sequence > cursor }, limit: 1024, maximumChunks: 2)
+        #expect(second.map(\.sequence) == [4])
+        #expect(!buffer.hasGap(after: cursor))
+        let many = (1...257).map { DesktopOutputChunk(sequence: UInt64($0), stream: .stdout, data: Data([0])) }
+        #expect(DesktopShellExecutor.bounded(many, limit: 1024).count == DesktopShellExecutor.maximumReadChunks)
+        #expect(DesktopShellExecutor.maximumReadChunks == 256)
+        #expect(DesktopShellExecutor.maximumBufferedChunksPerProcess == 4096)
+    }
+
     @Test func resultIsByteSafeAndPinsOutputCompletion() throws {
         let value = DesktopProcessRead(executionID: UUID(), chunks: [.init(sequence: 1, stream: .stdout, data: Data([0, 255, 195]))],
             nextCursor: 1, earliestCursor: 1, outputGap: true, state: .exited, exitCode: 7, signal: nil, terminalMode: .pty, outputComplete: false)
