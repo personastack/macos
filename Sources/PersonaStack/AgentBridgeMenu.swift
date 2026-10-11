@@ -9,7 +9,7 @@ struct AgentBridgeMenu: View {
     @State private var admissionPaused = false
 
     var body: some View {
-        Menu("Background Agents") {
+        Menu("Hermes/OpenClaw") {
             Text("Linked Hermes and OpenClaw profiles keep running after Quit.")
             if !message.isEmpty { Text(message).font(.caption) }
             if !backgroundError.isEmpty { Text(backgroundError).font(.caption) }
