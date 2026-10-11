@@ -150,7 +150,7 @@ public actor CuaMCPProxy: CuaToolCalling {
         return try invokeTool(name: name, argumentsJSON: argumentsJSON, timeout: timeout)
     }
 
-    public func sessionOwnerHasExited() -> Bool {
+    public func sessionOwnerHasExited() async -> Bool {
         guard let expectedDaemonPID, expectedDaemonPID > 0 else { return false }
         return Darwin.kill(expectedDaemonPID, 0) == -1 && errno == ESRCH
     }

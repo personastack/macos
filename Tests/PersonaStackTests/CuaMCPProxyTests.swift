@@ -520,18 +520,33 @@ struct CuaMCPProxyTests {
     @Test func daemonExitProofRequiresKernelConfirmedAbsence() async throws {
         let live = CuaMCPProxy(executableURL: URL(fileURLWithPath: "/unused"), expectedDaemonPID: Darwin.getpid())
         #expect(!(await live.sessionOwnerHasExited()))
-        let owner = Process()
-        owner.executableURL = URL(fileURLWithPath: "/usr/bin/true")
-        try owner.run()
-        let pid = owner.processIdentifier
-        owner.waitUntilExit()
-        let exited = CuaMCPProxy(executableURL: URL(fileURLWithPath: "/unused"), expectedDaemonPID: pid)
-        // Foundation's termination observation can precede kernel reaping.
-        let deadline = ContinuousClock.now + .seconds(2)
-        while !(await exited.sessionOwnerHasExited()), ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(10))
+        let liveProtocol: any CuaToolCalling = live
+        #expect(!(await liveProtocol.sessionOwnerHasExited()))
+        let executable = try #require(strdup("/usr/bin/true"))
+        defer { free(executable) }
+        var arguments: [UnsafeMutablePointer<CChar>?] = [executable, nil]
+        var environment: [UnsafeMutablePointer<CChar>?] = [nil]
+        var pid: pid_t = 0
+        let launched = arguments.withUnsafeMutableBufferPointer { argv in
+            environment.withUnsafeMutableBufferPointer { env in
+                posix_spawn(&pid, executable, nil, nil, argv.baseAddress, env.baseAddress)
+            }
         }
+        try #require(launched == 0)
+        try #require(pid > 0)
+        var status: Int32 = 0
+        var reaped = waitpid(pid, &status, 0)
+        while reaped == -1 && errno == EINTR { reaped = waitpid(pid, &status, 0) }
+        try #require(reaped == pid)
+        #expect(status == 0)
+        let absent = Darwin.kill(pid, 0)
+        let absenceError = errno
+        #expect(absent == -1)
+        #expect(absenceError == ESRCH)
+        let exited = CuaMCPProxy(executableURL: URL(fileURLWithPath: "/unused"), expectedDaemonPID: pid)
         #expect(await exited.sessionOwnerHasExited())
+        let exitedProtocol: any CuaToolCalling = exited
+        #expect(await exitedProtocol.sessionOwnerHasExited())
     }
 
     private func executableScript(_ body: String) throws -> URL {
