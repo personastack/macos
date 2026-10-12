@@ -160,6 +160,8 @@ private actor SuspendedReadiness {
 
 @Test func cuaFailuresMapReviewedStructuredReasonLocationsToFixedMessages() {
     let cases: [(result: [String: Any], tool: String, code: String, message: String)] = [
+        (["structuredContent": ["code": "session_unavailable", "detail": "/private/session"]],
+         "start_session", "session_unavailable", "Release Desktop Control, acquire it again"),
         (["structuredContent": ["code": "invalid_arguments", "detail": "/private/input"]],
          "click", "invalid_arguments", "required fields and valid ranges"),
         (["structuredContent": ["code": "window_target_not_found", "pid": 451]],

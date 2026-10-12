@@ -17,6 +17,8 @@ struct DesktopCuaFailure: Error {
         if tool == "parse_visual_regions", let failure = perceptionFailure(code) { return failure }
         let message: String
         switch code {
+        case "session_unavailable":
+            message = "The Cua session is unavailable to this connection. Release Desktop Control, acquire it again, then read fresh desktop state before retrying."
         case "browser_requires_setup", "browser_consent_required":
             message = "This browser needs setup. Use GUI controls for its current profile, or call desktop_control_browser with browser_prepare and arguments {confirm:true} to open a separate isolated Chrome or Edge profile."
         case "browser_route_unavailable":

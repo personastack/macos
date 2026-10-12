@@ -390,11 +390,15 @@ final class DesktopControlCommandExecutor {
         let token = UUID().uuidString.lowercased()
         let now = now()
         let personaName = ownerDisplay?.personaName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sessionID = UUID().uuidString
         // CUA reserves these session labels. Prefix only those names so they
         // still identify the persona without selecting an implicit/private session.
         let cuaSession = personaName.map {
-            $0 == "default" || $0.hasPrefix("__cua_runtime_") ? "Persona: \($0)" : $0
-        } ?? UUID().uuidString
+            let label = $0 == "default" || $0.hasPrefix("__cua_runtime_") ? "Persona: \($0)" : $0
+            // CUA retains the original transport owner even after a named
+            // session ends. A new lease must never reuse that public name.
+            return "\(label) · \(sessionID)"
+        } ?? sessionID
         lease = Lease(owner: owner, configVersion: configVersion, token: token,
                       cuaSession: cuaSession, cuaSessionNeedsStart: personaName != nil,
                       started: now, lastActivity: now)
@@ -618,7 +622,7 @@ final class DesktopControlCommandExecutor {
         guard let currentLease = validLease() else { throw CommandError.controlRequired }
         leaseCuaProxy = proxy
         if currentLease.cuaSessionNeedsStart {
-            // Named sessions need explicit revival after a previous lease ends.
+            // Start this lease's fresh named session on its original transport.
             // No capture policy, permission request, or cursor setting is supplied.
             let started = try await invokeCua(name: "start_session",
                 arguments: .object(["session": .string(currentLease.cuaSession)]), proxy: proxy)
