@@ -39,6 +39,15 @@ private actor AgentBridgeAuthorityFixture: AgentBridgeHostedTransport {
     private let current = #"{"workspace_id":"ws_11111111111111111111111111111111","persona_id":"persona-a","connection_id":"conn-a","connection_generation":7,"client_kind":"macos_app"}"#
     private let absent = #"{"workspace_id":"ws_11111111111111111111111111111111","persona_id":"persona-a"}"#
 
+    @Test(arguments: [401, 403, 503]) func hostedReadbackFailureDoesNotReportKeychainDenial(_ status: Int) async {
+        let fixture = AgentBridgeAuthorityFixture([.init(method: "GET", status: status, json: "{}")])
+        await #expect(throws: status == 503 ? AgentBridgeFailure.serviceUnavailable : AgentBridgeFailure.scopeChanged) {
+            _ = try await AgentBridgeHostedAuthority(transport: fixture).read(configuration: .production,
+                cookies: "personastack_session=fixture", persona: "persona-a")
+        }
+        #expect(await fixture.methods == ["GET"])
+    }
+
     @Test func exactRevokeHeadersAndReadbackAuthorizeCleanup() async throws {
         let fixture = AgentBridgeAuthorityFixture([
             .init(method: "GET", status: 200, json: current),

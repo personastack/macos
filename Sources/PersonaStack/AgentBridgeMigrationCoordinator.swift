@@ -18,7 +18,6 @@ final class AgentBridgeMigrationCoordinator {
         var revoke: @MainActor () async throws -> Void = { throw AgentBridgeFailure.migrationRequired }
         var validateScope: @MainActor () async throws -> Void
         var readiness: @MainActor (AgentBridgeBindingKey) async throws -> Void
-        var test: @MainActor () async throws -> Void
         var wait: @MainActor () async throws -> Void = { try await Task.sleep(for: .milliseconds(250)) }
     }
     struct Cutover {
@@ -30,7 +29,6 @@ final class AgentBridgeMigrationCoordinator {
     private(set) var revoked = false
     private(set) var preparedCutover: Cutover?
     private(set) var revocationVerified = false
-    private var resumeVersion: Int?
     init(_ dependencies: Dependencies) { self.dependencies = dependencies }
 
     func begin() async throws -> Cutover {
@@ -74,7 +72,6 @@ final class AgentBridgeMigrationCoordinator {
             revoked = true
             try await dependencies.revoke()
             revocationVerified = true
-            resumeVersion = pauseVersion
             return cutover
         } catch {
             if !revoked, let capture = capturedBeforeRevoke {
@@ -96,7 +93,7 @@ final class AgentBridgeMigrationCoordinator {
               capture.pauseVersion == pauseVersion, pauseVersion >= 0 else { throw AgentBridgeFailure.scopeChanged }
         let cutover = Cutover(capture: capture, wasPaused: wasPaused, pauseVersion: pauseVersion)
         preparedCutover = cutover
-        revoked = true; revocationVerified = true; resumeVersion = pauseVersion
+        revoked = true; revocationVerified = true
         return cutover
     }
 
@@ -108,27 +105,14 @@ final class AgentBridgeMigrationCoordinator {
         revocationVerified = true
     }
 
-    func finish(_ cutover: Cutover, binding: AgentBridgeBindingKey) async throws -> Bool {
+    func finish(_ cutover: Cutover, binding: AgentBridgeBindingKey) async throws {
         guard revoked, revocationVerified else { throw AgentBridgeFailure.scopeChanged }
         try await dependencies.validateScope()
         try await dependencies.readiness(binding)
         try await dependencies.validateScope()
-        if cutover.wasPaused { return false }
-        var restoredVersion: Int?
-        do {
-            restoredVersion = try await dependencies.setPause(false, resumeVersion ?? cutover.pauseVersion)
-            try await dependencies.validateScope()
-            try await dependencies.test()
-            return true
-        } catch {
-            if let restoredVersion {
-                do {
-                    try await dependencies.validateScope()
-                    resumeVersion = try await dependencies.setPause(true, restoredVersion)
-                } catch { /* Preserve a newer user decision or a changed authentication scope. */ }
-            }
-            throw error
-        }
+        guard !cutover.wasPaused else { return }
+        _ = try await dependencies.setPause(false, cutover.pauseVersion)
+        try await dependencies.validateScope()
     }
 
     private func waitForIdle() async throws {
@@ -156,7 +140,7 @@ final class AgentBridgeMigrationCoordinator {
     static func confirmCutover() -> Bool {
         let alert = NSAlert()
         alert.messageText = "Pause and migrate this persona?"
-        alert.informativeText = "Pause can cancel a new PersonaStack assignment that arrives before the cutover. The app will pause this persona, stop its Connector login service, revoke the old binding, and connect the selected profile through Background Agents. The old profile config is backed up. A failure after revocation leaves the persona paused for Repair."
+        alert.informativeText = "Pause can cancel a new PersonaStack assignment that arrives before the cutover. The app will pause this persona, stop its previous background service, revoke the previous connection, and connect the selected profile through Background Agents. The old profile config is backed up. The original pause setting returns only after readiness. If setup fails before completion, use Repair. Send test wake is a separate action."
         alert.addButton(withTitle: "Pause and Migrate")
         alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn

@@ -44,7 +44,7 @@ struct AgentBridgeHostedAuthority: Sendable {
     func read(configuration: DesktopEnvironmentConfiguration, cookies: String, persona: String) async throws -> AgentBridgeHostedBinding {
         let request = try request(configuration: configuration, cookies: cookies, method: "GET", persona: persona)
         let (data, status) = try await transport.request(request)
-        guard status == 200 else { throw AgentBridgeFailure.credentialUnavailable }
+        guard status == 200 else { throw [401, 403].contains(status) ? AgentBridgeFailure.scopeChanged : AgentBridgeFailure.serviceUnavailable }
         return try JSONDecoder().decode(AgentBridgeHostedBinding.self, from: data)
     }
 
@@ -54,7 +54,7 @@ struct AgentBridgeHostedAuthority: Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.httpShouldHandleCookies = false
         let (data, status) = try await transport.request(request)
-        guard status == 200 else { throw AgentBridgeFailure.credentialUnavailable }
+        guard status == 200 else { throw [401, 403].contains(status) ? AgentBridgeFailure.scopeChanged : AgentBridgeFailure.serviceUnavailable }
         struct Response: Decodable { let connections: [AgentBridgeHostedBinding] }
         return try JSONDecoder().decode(Response.self, from: data).connections
     }

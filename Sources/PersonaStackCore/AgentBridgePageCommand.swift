@@ -23,7 +23,7 @@ public struct AgentBridgePageCommand: Sendable {
             "repair": ["connection_id", "workspace_id", "persona_id", "connection_generation"],
             "disconnect": ["connection_id", "workspace_id", "persona_id", "connection_generation"]
         ]
-        guard let value = body as? [String: Any], value["version"] as? String == "1",
+        guard let value = body as? [String: Any], value["version"] as? String == "2",
               let action = value["action"] as? String, let fields = schemas[action],
               Set(value.keys) == fields.union(["version", "action", "scope"]),
               let scope = value["scope"] as? String, scope.utf8.count <= 512,

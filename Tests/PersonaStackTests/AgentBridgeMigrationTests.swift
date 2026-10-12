@@ -44,7 +44,6 @@ private final class AgentBridgeMigrationFixture {
             revoke: { try self.record("revoke") },
             validateScope: { self.scopes += 1 },
             readiness: { _ in try self.record("ready") },
-            test: { try self.record("test") },
             wait: { try self.record("wait"); self.idle = true }
         ))
     }
@@ -61,8 +60,8 @@ private final class AgentBridgeMigrationFixture {
         #expect(fixture.events == ["replacement", "read", "work-consent", "read", "wait", "read", "cutover-consent", "read", "pause", "read", "capture", "stop-supervisor", "revoke"])
         #expect(fixture.paused)
         #expect(coordinator.revoked)
-        #expect(try await coordinator.finish(cutover, binding: binding))
-        #expect(Array(fixture.events.suffix(3)) == ["ready", "resume", "test"])
+        try await coordinator.finish(cutover, binding: binding)
+        #expect(Array(fixture.events.suffix(2)) == ["ready", "resume"])
         #expect(!fixture.paused)
     }
 
@@ -113,17 +112,23 @@ private final class AgentBridgeMigrationFixture {
         } catch { Issue.record("begin unexpectedly failed: \(error)") }
     }
 
-    @Test func failedBoundedTestRepausesAndPreviouslyPausedDefersTest() async throws {
-        let failedTest = AgentBridgeMigrationFixture(); failedTest.fail = "test"
-        let first = failedTest.coordinator(); let cutover = try await first.begin()
-        await #expect(throws: AgentBridgeFailure.runtimeConflict) { _ = try await first.finish(cutover, binding: binding) }
-        #expect(failedTest.paused)
-        #expect(Array(failedTest.events.suffix(4)) == ["ready", "resume", "test", "pause"])
-        let paused = AgentBridgeMigrationFixture(); paused.paused = true
-        let second = paused.coordinator(); let preserved = try await second.begin()
-        #expect(try await second.finish(preserved, binding: binding) == false)
-        #expect(paused.paused)
-        #expect(!paused.events.contains("pause") && !paused.events.contains("resume") && !paused.events.contains("test"))
+    @Test(arguments: [false, true]) func completionRestoresBothPauseStatesWithoutProviderDispatch(_ wasPaused: Bool) async throws {
+        let fixture = AgentBridgeMigrationFixture(); fixture.paused = wasPaused
+        let coordinator = fixture.coordinator(); let cutover = try await coordinator.begin()
+        try await coordinator.finish(cutover, binding: binding)
+        #expect(fixture.paused == wasPaused)
+        #expect(Array(fixture.events.suffix(wasPaused ? 1 : 2)) == (wasPaused ? ["ready"] : ["ready", "resume"]))
+        #expect(!fixture.events.contains("test"))
+        #expect(fixture.events.filter { $0 == "resume" }.count == (wasPaused ? 0 : 1))
+    }
+
+    @Test func failedResumeStaysPausedForRepair() async throws {
+        let fixture = AgentBridgeMigrationFixture()
+        let coordinator = fixture.coordinator(); let cutover = try await coordinator.begin()
+        fixture.fail = "resume"
+        await #expect(throws: AgentBridgeFailure.runtimeConflict) { try await coordinator.finish(cutover, binding: binding) }
+        #expect(fixture.paused)
+        #expect(Array(fixture.events.suffix(2)) == ["ready", "resume"])
     }
 
     @Test func systemServiceRequiresManualAdminStepBeforeAnySupervisorOrRevoke() async {
@@ -134,7 +139,7 @@ private final class AgentBridgeMigrationFixture {
     }
 
     @Test func pageAcceptsOpaqueMigrationProposalButRejectsMigrationAuthority() throws {
-        let proposal: [String: Any] = ["version": "1", "action": "migration_prepare", "scope": "native-issued", "workspace_id": "ws_11111111111111111111111111111111",
+        let proposal: [String: Any] = ["version": "2", "action": "migration_prepare", "scope": "native-issued", "workspace_id": "ws_11111111111111111111111111111111",
             "persona_id": "persona-a", "connection_id": "legacy-a", "connection_generation": 7, "runtime_kind": "hermes", "profile_candidate_id": "profile-a"]
         #expect(try AgentBridgePageCommand.parse(proposal).action == "migration_prepare")
         var forged = proposal; forged["migration_id"] = UUID().uuidString
@@ -152,7 +157,7 @@ private final class AgentBridgeMigrationFixture {
         #expect(coordinator.revoked && coordinator.revocationVerified)
         await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await coordinator.begin() }
         #expect(fixture.events.isEmpty)
-        #expect(try await coordinator.finish(cutover, binding: binding))
-        #expect(fixture.events == ["ready", "resume", "test"])
+        try await coordinator.finish(cutover, binding: binding)
+        #expect(fixture.events == ["ready", "resume"])
     }
 }

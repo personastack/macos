@@ -68,10 +68,12 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
 
 @Suite struct AgentBridgeTests {
     @Test func finitePageBoundaryRejectsNativeOnlyCommandsAndRawAuthority() throws {
-        let valid: [String: Any] = ["version": "1", "action": "prepare", "scope": "native-document",
+        let valid: [String: Any] = ["version": "2", "action": "prepare", "scope": "native-document",
             "runtime_kind": "hermes", "workspace_id": "ws_11111111111111111111111111111111",
             "persona_id": "persona-a", "profile_candidate_id": "rt_profile_a"]
         _ = try AgentBridgePageCommand.parse(valid)
+        var oldBridge = valid; oldBridge["version"] = "1"
+        #expect(throws: AgentBridgeFailure.invalidRequest) { _ = try AgentBridgePageCommand.parse(oldBridge) }
         for extra in ["gateway_url", "token", "path", "command", "document_id", "restart_confirmed", "openclaw_apps_confirmed", "hermes_host_confirmed", "target_selection_revision", "session_key", "expected_existing_session_id"] {
             var input = valid; input[extra] = "untrusted"
             #expect(throws: AgentBridgeFailure.invalidRequest) { try AgentBridgePageCommand.parse(input) }
@@ -82,7 +84,7 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
         }
         for action in ["quiesce", "resume", "stop_background", "register", "execute", "migration_help", "migration_repair", "migration_cancel"] {
             #expect(throws: AgentBridgeFailure.invalidRequest) {
-                try AgentBridgePageCommand.parse(["version": "1", "action": action, "scope": "native-document"])
+                try AgentBridgePageCommand.parse(["version": "2", "action": action, "scope": "native-document"])
             }
         }
         var path = valid; path["profile_candidate_id"] = "/Users/example/.hermes"
@@ -201,15 +203,52 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
         let first = WKWebView(), second = WKWebView()
         manager.register(first, appURL: DesktopEnvironmentConfiguration.production.appURL)
         manager.register(second, appURL: DesktopEnvironmentConfiguration.production.appURL)
-        let state = try AgentBridgePageCommand.parse(["version": "1", "action": "state", "scope": ""])
+        let state = try AgentBridgePageCommand.parse(["version": "2", "action": "state", "scope": ""])
         let response = try await manager.apply(state, view: first)
         let scope = try #require(response["scope"] as? String)
+        #expect((response["capability"] as? [String: Any])?["version"] as? String == "2")
         #expect(UUID(uuidString: scope) != nil)
-        let discover = try AgentBridgePageCommand.parse(["version": "1", "action": "discover", "scope": scope, "runtime_kind": "hermes"])
+        let discover = try AgentBridgePageCommand.parse(["version": "2", "action": "discover", "scope": scope, "runtime_kind": "hermes"])
         await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(discover, view: second) }
         #expect(await transport.operations.isEmpty)
         manager.invalidate(first)
         await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(discover, view: first) }
+    }
+
+    @Test @MainActor func lateCookieReadCannotSeedOrInvalidateANewerDocument() async throws {
+        let transport = AgentBridgeFixtureTransport([
+            ("status", #"{"connections":[]}"#),
+            ("discover", #"{"profiles":[],"discovery_status":"complete"}"#)
+        ])
+        let client = AgentBridgeControlClient(transport: transport)
+        let service = AgentBridgeService(registration: AgentBridgeFixtureRegistration(), client: client,
+            preferences: UserDefaults(suiteName: "AgentBridgeTests." + UUID().uuidString)!, requireSignature: {}, clearDisabledPreference: {})
+        let view = WKWebView()
+        let state = try AgentBridgePageCommand.parse(["version": "2", "action": "state", "scope": ""])
+        var manager: AgentBridgeSetupManager!
+        var freshScope = "", firstRead = true
+        manager = AgentBridgeSetupManager(service: service, client: client, configuration: { _ in .production },
+            approveEnvironment: { _ in }, prepareBackgroundEnable: {}, cookieReader: { _, _ in
+                if firstRead {
+                    firstRead = false
+                    manager.invalidateSession()
+                    let fresh = try await manager.apply(state, view: view)
+                    freshScope = try #require(fresh["scope"] as? String)
+                    return "personastack_session=previous-account"
+                }
+                return "personastack_session=fixture"
+            })
+        manager.register(view, appURL: DesktopEnvironmentConfiguration.production.appURL)
+        let initial = try await manager.apply(state, view: view)
+        let scope = try #require(initial["scope"] as? String)
+        func discover(_ scope: String) throws -> AgentBridgePageCommand {
+            try AgentBridgePageCommand.parse(["version": "2", "action": "discover", "scope": scope, "runtime_kind": "hermes"])
+        }
+        await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(discover(scope), view: view) }
+        #expect(!freshScope.isEmpty && freshScope != scope)
+        let result = try await manager.apply(discover(freshScope), view: view)
+        #expect(result["discovery_status"] as? String == "complete")
+        #expect(await transport.operations == ["status", "discover"])
     }
 
     @Test(arguments: [false, true], ["hermes", "openclaw"]) @MainActor func registeredDocumentDiscoveryPreparationAndEnrollmentAreOrderedAndRedacted(_ staleInventory: Bool, _ runtimeKind: String) async throws {
@@ -271,7 +310,7 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
         let view = WKWebView()
         manager.register(view, appURL: DesktopEnvironmentConfiguration.production.appURL)
         func command(_ action: String, scope: String = "", fields: [String: Any] = [:]) throws -> AgentBridgePageCommand {
-            var value = fields; value["version"] = "1"; value["action"] = action; value["scope"] = scope
+            var value = fields; value["version"] = "2"; value["action"] = action; value["scope"] = scope
             return try AgentBridgePageCommand.parse(value)
         }
         let state = try await manager.apply(command("state"), view: view)
@@ -317,7 +356,7 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
         #expect(await targetFixture.saves == (staleInventory ? [7, 8] : [7]))
         #expect(registration.calls == ["register"])
     }
-    @Test(arguments: [false, true]) @MainActor func nativeAgentPickerCancelOrDocumentChangeNeverPrepares(_ changedDocument: Bool) async throws {
+    @Test(arguments: ["cancel", "document", "session", "missing_cookie"]) @MainActor func nativeAgentPickerCancelOrScopeChangeNeverPrepares(_ outcome: String) async throws {
         let transport = AgentBridgeFixtureTransport([
             ("status", #"{"connections":[]}"#),
             ("discover", #"{"profiles":[{"profile_candidate_id":"rt_profile_a","account_candidate_id":"rt_account_a","label":"Work","runtime_kind":"openclaw","openclaw_agents":[{"agent_candidate_id":"rt_a","label":"Research"},{"agent_candidate_id":"rt_b","label":"Writer"}]}],"discovery_status":"complete"}"#),
@@ -328,16 +367,23 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
             preferences: UserDefaults(suiteName: "AgentBridgeTests." + UUID().uuidString)!, requireSignature: {}, clearDisabledPreference: {})
         let view = WKWebView()
         var manager: AgentBridgeSetupManager!
+        var cookie = "personastack_session=fixture"
         manager = AgentBridgeSetupManager(service: service, client: client, configuration: { _ in .production },
-            approveEnvironment: { _ in }, prepareBackgroundEnable: {}, cookieReader: { _, _ in "personastack_session=fixture" },
-            chooseOpenClawAgent: { _, _ in if changedDocument { manager.invalidate(view); return "rt_b" }; return nil })
+            approveEnvironment: { _ in }, prepareBackgroundEnable: {}, cookieReader: { _, _ in cookie },
+            chooseOpenClawAgent: { _, _ in
+                if outcome == "cancel" { return nil }
+                if outcome == "document" { manager.invalidate(view) }
+                if outcome == "session" { manager.invalidateSession() }
+                if outcome == "missing_cookie" { cookie = "" }
+                return "rt_b"
+            })
         manager.register(view, appURL: DesktopEnvironmentConfiguration.production.appURL)
-        let state = try await manager.apply(AgentBridgePageCommand.parse(["version": "1", "action": "state", "scope": ""]), view: view)
+        let state = try await manager.apply(AgentBridgePageCommand.parse(["version": "2", "action": "state", "scope": ""]), view: view)
         let scope = try #require(state["scope"] as? String)
-        _ = try await manager.apply(AgentBridgePageCommand.parse(["version": "1", "action": "discover", "scope": scope, "runtime_kind": "openclaw"]), view: view)
-        let command = try AgentBridgePageCommand.parse(["version": "1", "action": "prepare", "scope": scope, "runtime_kind": "openclaw",
+        _ = try await manager.apply(AgentBridgePageCommand.parse(["version": "2", "action": "discover", "scope": scope, "runtime_kind": "openclaw"]), view: view)
+        let command = try AgentBridgePageCommand.parse(["version": "2", "action": "prepare", "scope": scope, "runtime_kind": "openclaw",
             "persona_id": "persona-a", "workspace_id": "ws_11111111111111111111111111111111", "profile_candidate_id": "rt_profile_a"])
-        let expected: AgentBridgeFailure = changedDocument ? .scopeChanged : .runtimeConflict
+        let expected: AgentBridgeFailure = outcome == "cancel" ? .runtimeConflict : .scopeChanged
         await #expect(throws: expected) { _ = try await manager.apply(command, view: view) }
         #expect(await transport.operations == ["status", "discover", "status"])
     }

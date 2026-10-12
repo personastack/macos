@@ -101,9 +101,9 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
     }
     @MainActor private func command(_ action: String, manager: AgentBridgeSetupManager, view: WKWebView) async throws -> AgentBridgePageCommand {
         manager.register(view, appURL: DesktopEnvironmentConfiguration.production.appURL)
-        let state = try AgentBridgePageCommand.parse(["version": "1", "action": "state", "scope": ""])
+        let state = try AgentBridgePageCommand.parse(["version": "2", "action": "state", "scope": ""])
         let response = try await manager.apply(state, view: view)
-        return try AgentBridgePageCommand.parse(["version": "1", "action": action, "scope": response["scope"]!,
+        return try AgentBridgePageCommand.parse(["version": "2", "action": action, "scope": response["scope"]!,
             "workspace_id": "ws_11111111111111111111111111111111", "persona_id": "persona-a", "connection_id": "conn-a", "connection_generation": 7])
     }
 
@@ -126,6 +126,42 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
             await #expect(throws: AgentBridgeFailure.reconnectRequired) { _ = try await manager.apply(actual, view: issuingView) }
             #expect(await fixture.performed == ["GET /user/personas/external-runtime", "check"])
         }
+    }
+
+    @Test(arguments: ["account", "sign_out"]) @MainActor func sessionChangeDuringCheckCannotExposePreviousConnection(_ change: String) async throws {
+        let fixture = AgentBridgeManagementFixture([
+            .init(operation: "GET /user/personas/external-runtime", json: current), .init(operation: "check", json: local)
+        ])
+        var cookie = "personastack_session=fixture"
+        let manager = manager(fixture, cookieReader: { _, _ in cookie })
+        let view = WKWebView()
+        let command = try await command("check", manager: manager, view: view)
+        await fixture.setAfterCheck { cookie = change == "sign_out" ? "" : "personastack_session=other-account" }
+        await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(command, view: view) }
+        // The old page cannot retry after cookies return. It must obtain a fresh scope.
+        cookie = "personastack_session=fixture"
+        await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(command, view: view) }
+        #expect(await fixture.performed == ["GET /user/personas/external-runtime", "check"])
+    }
+
+    @Test @MainActor func keychainDenialRetriesSameBindingWithoutRuntimeConsentOrDisconnect() async throws {
+        let denied = local.replacingOccurrences(of: "\"readiness_state\":\"mcp_verified\"", with: "\"readiness_state\":\"unavailable\",\"diagnostic_code\":\"credential_unavailable\"")
+        let fixture = AgentBridgeManagementFixture([
+            .init(operation: "GET /user/personas/external-runtime", json: current), .init(operation: "check", json: denied),
+            .init(operation: "GET /user/personas/external-runtime", json: current), .init(operation: "check", json: local)
+        ])
+        let manager = manager(fixture, confirmRepair: { _ in Issue.record("Keychain denial must not prompt a runtime restart"); return true })
+        let view = WKWebView()
+        let repair = try await command("repair", manager: manager, view: view)
+        await #expect(throws: AgentBridgeFailure.credentialUnavailable) { _ = try await manager.apply(repair, view: view) }
+        let check = try AgentBridgePageCommand.parse(["version": "2", "action": "check", "scope": repair.scope,
+            "workspace_id": "ws_11111111111111111111111111111111", "persona_id": "persona-a", "connection_id": "conn-a", "connection_generation": 7])
+        let result = try await manager.apply(check, view: view)
+        let connection = try #require((result["connections"] as? [[String: Any]])?.first)
+        #expect(connection["connection_id"] as? String == "conn-a")
+        #expect(connection["readiness_state"] as? String == "mcp_verified")
+        #expect(connection["diagnostic_code"] == nil)
+        #expect(await fixture.performed == ["GET /user/personas/external-runtime", "check", "GET /user/personas/external-runtime", "check"])
     }
 
     @Test(arguments: ["hermes", "openclaw"], ["exact", "foreign_persona", "foreign_binding", "stale_generation", "changed_document", "changed_cookie", "foreign_message"]) @MainActor func unverifiedGatewayScopeHelpRequiresCurrentExactOwner(_ runtimeKind: String, _ fault: String) async throws {
@@ -151,7 +187,7 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
         #expect(await fixture.performed == ["GET /user/personas/external-runtime", "check"])
     }
 
-    @Test(arguments: ["hermes", "openclaw"], ["allow", "already_enabled", "decline_feature", "decline_repair", "changed_document", "changed_cookie", "changed_generation", "changed_account", "changed_profile", "changed_revision", "changed_inventory", "changed_runtime", "changed_after_restart"]) @MainActor func nativeFeatureAndRuntimeRepairRequireSeparateCurrentTargetAuthority(_ runtimeKind: String, _ outcome: String) async throws {
+    @Test(arguments: ["hermes", "openclaw"], ["allow", "already_enabled", "decline_feature", "decline_repair", "changed_document", "changed_cookie", "changed_session", "closed_window", "changed_generation", "changed_account", "changed_profile", "changed_revision", "changed_inventory", "changed_runtime", "changed_after_restart"]) @MainActor func nativeFeatureAndRuntimeRepairRequireSeparateCurrentTargetAuthority(_ runtimeKind: String, _ outcome: String) async throws {
         let target = #", "target_inventory":{"inventory_generation":8,"accounts":[{"candidate_id":"rt_account_a","profiles":[{"candidate_id":"rt_profile_a","runtime_kind":"openclaw"}]}]},"target_selection":{"account_candidate_id":"rt_account_a","profile_candidate_id":"rt_profile_a","runtime_kind":"openclaw","selection_revision":9,"validated_generation":8,"state":"target_selected"}"#
         let owner = (String(current.dropLast()) + target + "}").replacingOccurrences(of: "openclaw", with: runtimeKind)
         let retained = #", "prepared_target":{"workspace_id":"ws_11111111111111111111111111111111","account_candidate_id":"rt_account_a","profile_candidate_id":"rt_profile_a","runtime_kind":"openclaw"}"#
@@ -173,7 +209,7 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
             .init(operation: "GET /user/personas/external-runtime", json: owner), .init(operation: "check", json: needsRepair),
             .init(operation: "GET /user/personas/external-runtime", json: owner)
         ]
-        let featureDialogInvalidates = ["changed_document", "changed_cookie"].contains(outcome)
+        let featureDialogInvalidates = ["changed_document", "changed_cookie", "changed_session", "closed_window"].contains(outcome)
         let featureReadbackDenies = ["changed_generation", "changed_account", "changed_profile", "changed_revision", "changed_inventory", "changed_runtime"].contains(outcome)
         if outcome != "decline_feature" && !featureDialogInvalidates && outcome != "already_enabled" {
             steps.append(.init(operation: "GET /user/personas/external-runtime", json: featureReadbackDenies ? changed : owner))
@@ -192,6 +228,8 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
             dialogs.append(runtimeKind == "hermes" ? "host" : "apps")
             if outcome == "changed_document" { manager.invalidate(view) }
             if outcome == "changed_cookie" { cookie = "personastack_session=changed" }
+            if outcome == "changed_session" { manager.invalidateSession() }
+            if outcome == "closed_window" { manager.unregister(view) }
             return outcome != "decline_feature"
         }
         manager = self.manager(fixture, confirmRepair: { _ in dialogs.append("restart"); return outcome != "decline_repair" },

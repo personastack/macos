@@ -8,7 +8,7 @@ struct AgentBridgeMigrationState: Sendable {
     let laneIdle: Bool
 }
 
-/// Reuses the API-owned settings, Pause, Stop and bounded wake-test routes.
+/// Reuses the API-owned settings, Pause and Stop routes.
 struct AgentBridgeMigrationAuthority: Sendable {
     let transport: any AgentBridgeHostedTransport
     init(transport: any AgentBridgeHostedTransport = AgentBridgeURLTransport()) { self.transport = transport }
@@ -26,7 +26,7 @@ struct AgentBridgeMigrationAuthority: Sendable {
         var request = base(configuration: configuration, cookies: cookies, url: components.url!)
         request.httpMethod = "GET"
         let (data, status) = try await transport.request(request)
-        guard status == 200 else { throw AgentBridgeFailure.credentialUnavailable }
+        guard status == 200 else { throw [401, 403].contains(status) ? AgentBridgeFailure.scopeChanged : AgentBridgeFailure.serviceUnavailable }
         let settings = try JSONDecoder().decode(Settings.self, from: data)
         guard settings.persona.id == persona, settings.persona.user_pause_version >= 0 else { throw AgentBridgeFailure.scopeChanged }
         return AgentBridgeMigrationState(personaID: persona, userPaused: settings.persona.user_paused,
@@ -50,13 +50,6 @@ struct AgentBridgeMigrationAuthority: Sendable {
             path: "user/personas/stop", body: ["persona_id": persona])
         let response = try JSONDecoder().decode(Response.self, from: data)
         guard response.accepted, response.ok else { throw AgentBridgeFailure.busy }
-    }
-
-    func test(configuration: DesktopEnvironmentConfiguration, cookies: String, csrf: String, persona: String) async throws {
-        struct Response: Decodable { let accepted: Bool }
-        let data = try await mutation(configuration: configuration, cookies: cookies, csrf: csrf,
-            path: "user/personas/external-runtime/test-dispatch", body: ["persona_id": persona])
-        guard try JSONDecoder().decode(Response.self, from: data).accepted else { throw AgentBridgeFailure.runtimeConflict }
     }
 
     private func mutation(configuration: DesktopEnvironmentConfiguration, cookies: String, csrf: String,
