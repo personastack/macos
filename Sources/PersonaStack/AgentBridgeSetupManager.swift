@@ -584,6 +584,7 @@ final class AgentBridgeSetupManager: NSObject, WKScriptMessageHandlerWithReply {
             throw AgentBridgeFailure.scopeChanged
         }
         let coordinator = AgentBridgeMigrationCoordinator(.init(
+            readState: { try await validate(); return try await authority.state(configuration: page.configuration, cookies: cookies, persona: persona) },
             setPause: { paused, version in
                 try await validate()
                 return try await authority.pause(configuration: page.configuration, cookies: cookies, csrf: csrf,

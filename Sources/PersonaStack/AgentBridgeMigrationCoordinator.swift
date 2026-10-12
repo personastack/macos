@@ -110,8 +110,19 @@ final class AgentBridgeMigrationCoordinator {
         try await dependencies.validateScope()
         try await dependencies.readiness(binding)
         try await dependencies.validateScope()
-        guard !cutover.wasPaused else { return }
-        _ = try await dependencies.setPause(false, cutover.pauseVersion)
+        let state = try await dependencies.readState()
+        try await dependencies.validateScope()
+        if cutover.wasPaused {
+            guard state.userPaused, state.pauseVersion == cutover.pauseVersion else { throw AgentBridgeFailure.scopeChanged }
+            return
+        }
+        guard cutover.pauseVersion < Int.max else { throw AgentBridgeFailure.scopeChanged }
+        let restoredVersion = cutover.pauseVersion + 1
+        // A committed Resume can outlive its acknowledgment or the old page scope.
+        if !state.userPaused, state.pauseVersion == restoredVersion { return }
+        guard state.userPaused, state.pauseVersion == cutover.pauseVersion else { throw AgentBridgeFailure.scopeChanged }
+        let version = try await dependencies.setPause(false, cutover.pauseVersion)
+        guard version == restoredVersion else { throw AgentBridgeFailure.scopeChanged }
         try await dependencies.validateScope()
     }
 

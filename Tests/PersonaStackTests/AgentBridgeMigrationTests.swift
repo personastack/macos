@@ -14,6 +14,9 @@ private final class AgentBridgeMigrationFixture {
     var work: AgentBridgeMigrationCoordinator.WorkChoice = .wait
     var scopes = 0
     var capturedScope = "user_launch_agent"
+    var loseResumeAck = false
+    var failScopeAfterResume = false
+    var scopeInvalid = false
     func record(_ value: String) throws {
         events.append(value)
         if fail == value { throw AgentBridgeFailure.runtimeConflict }
@@ -32,6 +35,8 @@ private final class AgentBridgeMigrationFixture {
                 try self.record(paused ? "pause" : "resume")
                 #expect(expected == self.version)
                 self.paused = paused; self.version += 1
+                if !paused, self.loseResumeAck { self.loseResumeAck = false; throw AgentBridgeFailure.serviceUnavailable }
+                if !paused, self.failScopeAfterResume { self.failScopeAfterResume = false; self.scopeInvalid = true }
                 return self.version
             },
             capture: { _, _ in
@@ -42,7 +47,7 @@ private final class AgentBridgeMigrationFixture {
             stopSupervisor: { scope in #expect(scope == "user_launch_agent"); #expect(self.idle && self.paused); try self.record("stop-supervisor") },
             cancelCapture: { _ in try self.record("cancel-capture") },
             revoke: { try self.record("revoke") },
-            validateScope: { self.scopes += 1 },
+            validateScope: { self.scopes += 1; if self.scopeInvalid { throw AgentBridgeFailure.scopeChanged } },
             readiness: { _ in try self.record("ready") },
             wait: { try self.record("wait"); self.idle = true }
         ))
@@ -61,7 +66,7 @@ private final class AgentBridgeMigrationFixture {
         #expect(fixture.paused)
         #expect(coordinator.revoked)
         try await coordinator.finish(cutover, binding: binding)
-        #expect(Array(fixture.events.suffix(2)) == ["ready", "resume"])
+        #expect(Array(fixture.events.suffix(3)) == ["ready", "read", "resume"])
         #expect(!fixture.paused)
     }
 
@@ -117,7 +122,7 @@ private final class AgentBridgeMigrationFixture {
         let coordinator = fixture.coordinator(); let cutover = try await coordinator.begin()
         try await coordinator.finish(cutover, binding: binding)
         #expect(fixture.paused == wasPaused)
-        #expect(Array(fixture.events.suffix(wasPaused ? 1 : 2)) == (wasPaused ? ["ready"] : ["ready", "resume"]))
+        #expect(Array(fixture.events.suffix(wasPaused ? 2 : 3)) == (wasPaused ? ["ready", "read"] : ["ready", "read", "resume"]))
         #expect(!fixture.events.contains("test"))
         #expect(fixture.events.filter { $0 == "resume" }.count == (wasPaused ? 0 : 1))
     }
@@ -128,7 +133,33 @@ private final class AgentBridgeMigrationFixture {
         fixture.fail = "resume"
         await #expect(throws: AgentBridgeFailure.runtimeConflict) { try await coordinator.finish(cutover, binding: binding) }
         #expect(fixture.paused)
-        #expect(Array(fixture.events.suffix(2)) == ["ready", "resume"])
+        #expect(Array(fixture.events.suffix(3)) == ["ready", "read", "resume"])
+    }
+
+    @Test(arguments: ["lost_ack", "scope_changed"]) func committedResumeRetryChecksCurrentPauseAndDoesNotResumeTwice(_ failure: String) async throws {
+        let fixture = AgentBridgeMigrationFixture()
+        let coordinator = fixture.coordinator(); let cutover = try await coordinator.begin()
+        fixture.loseResumeAck = failure == "lost_ack"
+        fixture.failScopeAfterResume = failure == "scope_changed"
+        await #expect(throws: failure == "lost_ack" ? AgentBridgeFailure.serviceUnavailable : AgentBridgeFailure.scopeChanged) {
+            try await coordinator.finish(cutover, binding: binding)
+        }
+        #expect(!fixture.paused && fixture.version == cutover.pauseVersion + 1)
+        fixture.scopeInvalid = false
+        try await coordinator.finish(cutover, binding: binding)
+        #expect(!fixture.paused)
+        #expect(fixture.events.filter { $0 == "resume" }.count == 1)
+        #expect(Array(fixture.events.suffix(2)) == ["ready", "read"])
+    }
+
+    @Test(arguments: [false, true]) func laterPauseIntentCannotBeOverwrittenByMigrationRetry(_ wasPaused: Bool) async throws {
+        let fixture = AgentBridgeMigrationFixture(); fixture.paused = wasPaused
+        let coordinator = fixture.coordinator(); let cutover = try await coordinator.begin()
+        fixture.paused = !wasPaused; fixture.version += 2
+        await #expect(throws: AgentBridgeFailure.scopeChanged) { try await coordinator.finish(cutover, binding: binding) }
+        #expect(fixture.paused == !wasPaused)
+        #expect(!fixture.events.contains("resume"))
+        #expect(Array(fixture.events.suffix(2)) == ["ready", "read"])
     }
 
     @Test func systemServiceRequiresManualAdminStepBeforeAnySupervisorOrRevoke() async {
@@ -158,6 +189,6 @@ private final class AgentBridgeMigrationFixture {
         await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await coordinator.begin() }
         #expect(fixture.events.isEmpty)
         try await coordinator.finish(cutover, binding: binding)
-        #expect(fixture.events == ["ready", "resume"])
+        #expect(fixture.events == ["ready", "read", "resume"])
     }
 }
