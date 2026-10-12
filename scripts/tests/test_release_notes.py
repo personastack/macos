@@ -37,6 +37,22 @@ class ReleaseNotesTests(unittest.TestCase):
                                     check=False, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
 
+    def test_tag_renders_version_and_date_from_authored_change_notes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="personastack-notes-test-") as temporary:
+            source, output = Path(temporary) / "next.md", Path(temporary) / "1.2.3.md"
+            source.write_text("## Fixed\n\n- Keep avatar clicks in the app.\n")
+            subprocess.run([sys.executable, str(VALIDATOR), "render", "1.2.3", "2026-10-11", str(source), str(output)], check=True)
+            self.assertEqual(output.read_text(), "# PersonaStack 1.2.3\n\nRelease date: 2026-10-11\n\n## Fixed\n\n- Keep avatar clicks in the app.\n")
+            for body, version, date in [("", "1.2.3", "2026-10-11"),
+                                        ("## Fixed\n- https://example.invalid/compare", "1.2.3", "2026-10-11"),
+                                        ("# PersonaStack 1.2.3\n- Fixed avatar routing.", "1.2.3", "2026-10-11"),
+                                        ("## Fixed\n- Fixed avatar routing.", "../1.2.3", "2026-10-11"),
+                                        ("## Fixed\n- Fixed avatar routing.", "1.2.3", "invalid")]:
+                with self.subTest(body=body, version=version, date=date):
+                    source.write_text(body)
+                    result = subprocess.run([sys.executable, str(VALIDATOR), "render", version, date, str(source), str(output)], capture_output=True)
+                    self.assertNotEqual(result.returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

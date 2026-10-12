@@ -1,35 +1,11 @@
 #!/usr/bin/env python3
-"""Seal a tag-release installer and verify its acceptance handoff."""
+"""Seal a tag-release installer and verify its immutable job handoff."""
 
 import argparse
 import hashlib
 import json
 import re
 from pathlib import Path
-
-
-def validate_environment(environment):
-    if not isinstance(environment, dict) or environment.get("can_admins_bypass") is not False:
-        raise ValueError("Publication environment must disable administrator bypass")
-    rules = environment.get("protection_rules")
-    if not isinstance(rules, list):
-        raise ValueError("Publication environment must require a release-owner reviewer")
-    for rule in rules:
-        if not isinstance(rule, dict) or rule.get("type") != "required_reviewers":
-            continue
-        reviewers = rule.get("reviewers")
-        if not isinstance(reviewers, list) or not reviewers:
-            continue
-        if all(
-            isinstance(entry, dict)
-            and entry.get("type") in ("User", "Team")
-            and isinstance(entry.get("reviewer"), dict)
-            and type(entry["reviewer"].get("id")) is int
-            and entry["reviewer"]["id"] > 0
-            for entry in reviewers
-        ):
-            return
-    raise ValueError("Publication environment must require a release-owner reviewer")
 
 
 def candidate_manifest(directory, version, source_sha):
@@ -72,15 +48,12 @@ def verify_candidate(directory, version, source_sha, expected_sha256):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("environment", "seal", "verify"))
+    parser.add_argument("operation", choices=("seal", "verify"))
     parser.add_argument("path", type=Path)
     parser.add_argument("--version")
     parser.add_argument("--source-sha")
     parser.add_argument("--expected-sha256")
     args = parser.parse_args()
-    if args.operation == "environment":
-        validate_environment(json.loads(args.path.read_text()))
-        return
     if not args.version or not args.source_sha:
         parser.error("Candidate version and source SHA are required")
     if args.operation == "seal":

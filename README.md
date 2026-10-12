@@ -45,6 +45,26 @@ Desktop Control includes same-account CLI execution with pipe or interactive PTY
 
 PersonaStack checks for updates while it is running. Open the menu-bar dropdown or the **PersonaStack** menu and choose **Check for Updates…** to check now. You can opt into background downloads in the menu-bar dropdown. Prepared updates install when you quit PersonaStack. The app does not restart without your action.
 
+## Publish a release
+
+Keep the authored user changes in `release-notes/next.md`. Commit code and notes to `main`, then push an annotated version tag:
+
+```sh
+git tag -a v0.11.0 -m "PersonaStack 0.11.0"
+git push origin refs/tags/v0.11.0
+```
+
+The tag workflow runs tests and universal builds, signs and notarizes the installer, then automatically publishes the source Release, Homebrew cask and signed Sparkle feed. Actions fills the changelog version and date from the tag/run. It verifies the served public installer bytes and retains a delivery receipt. There is no local packaging or manual publication approval step. `workflow_dispatch` remains an optional unsigned development check.
+
+Configure these repository settings once before the first tag. Renew expiring Apple credentials and provisioning profiles as needed:
+
+- Variable `PERSONASTACK_SPARKLE_PUBLIC_ED_KEY` and secret `PERSONASTACK_SPARKLE_PRIVATE_ED_KEY`.
+- Secret `HOMEBREW_TAP_TOKEN` with write access to `personastack/homebrew-tap`.
+- Secrets `PERSONASTACK_DEVELOPER_ID_P12_BASE64` and `PERSONASTACK_DEVELOPER_ID_PASSWORD` for the pinned Application identity.
+- Secrets `PERSONASTACK_DEVELOPER_ID_INSTALLER_P12_BASE64` and `PERSONASTACK_DEVELOPER_ID_INSTALLER_PASSWORD` for the Installer identity.
+- Secrets `PERSONASTACK_NOTARY_KEY_P8_BASE64`, `PERSONASTACK_NOTARY_KEY_ID` and `PERSONASTACK_NOTARY_ISSUER_ID`.
+- Secret `PERSONASTACK_COMMUNICATION_PROFILE_BASE64` containing the base64-encoded Apple Developer ID provisioning profile for `ai.personastack.desktop`, team `5T2T8KL852`, the pinned Application certificate and Communication Notifications capability.
+
 ## Installer packaging
 
 The main package installs PersonaStack.app only. `scripts/package-desktop-installer.sh APP OUTPUT_PKG` builds it without installing it. For unsigned local validation, set `PERSONASTACK_SIGN_INSTALLER=0`. Release packaging retains Developer ID signing, notarization, and Sparkle verification.

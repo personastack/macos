@@ -1,6 +1,5 @@
-"""Offline acceptance/publication handoff fixtures. No signing or GitHub calls."""
+"""Offline immutable publication handoff fixtures. No signing or GitHub calls."""
 
-import copy
 import importlib.util
 import json
 from pathlib import Path
@@ -15,27 +14,7 @@ SPEC.loader.exec_module(CANDIDATE)
 
 
 class ReleaseCandidateTests(unittest.TestCase):
-    def test_only_protected_release_owner_review_allows_signing(self):
-        valid = {
-            "can_admins_bypass": False,
-            "protection_rules": [{"type": "required_reviewers", "reviewers": [
-                {"type": "User", "reviewer": {"id": 42}}
-            ]}],
-        }
-        CANDIDATE.validate_environment(valid)
-        invalid = [None, {}, {**valid, "can_admins_bypass": True},
-                   {**valid, "protection_rules": []}]
-        for reviewers in ([], None, [None], [{"type": "User", "reviewer": {"id": 0}}],
-                          [{"type": "User", "reviewer": {"id": True}}],
-                          [{"type": "Unknown", "reviewer": {"id": 42}}]):
-            value = copy.deepcopy(valid)
-            value["protection_rules"][0]["reviewers"] = reviewers
-            invalid.append(value)
-        for value in invalid:
-            with self.subTest(environment=value), self.assertRaises(ValueError):
-                CANDIDATE.validate_environment(value)
-
-    def test_exact_signed_bytes_survive_acceptance_handoff(self):
+    def test_exact_signed_bytes_survive_job_handoff(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             installer = directory / "PersonaStack-1.2.3-developerid.dmg"
@@ -78,9 +57,14 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.assertIn("concurrency:\n  group:", prepare)
         self.assertIn("queue: max", prepare)
         self.assertIn("needs: prepare", publish)
-        self.assertIn("environment: macos-release-publication", publish)
+        self.assertNotIn("environment:", publish)
+        self.assertNotIn("macos-release-publication", workflow)
+        self.assertNotIn("installed acceptance", workflow)
+        self.assertIn("release-notes/next.md", prepare)
+        self.assertIn("release-notes/next.md", publish)
+        self.assertIn("needs.prepare.outputs.release_date", publish)
         self.assertIn("artifact-ids: ${{ needs.prepare.outputs.artifact_id }}", publish)
-        download = publish.split("      - name: Download the accepted installer", 1)[1].split("      - name:", 1)[0]
+        download = publish.split("      - name: Download the signed installer", 1)[1].split("      - name:", 1)[0]
         self.assertIn("uses: actions/download-artifact@v4", download)
         self.assertIn("artifact-ids: ${{ needs.prepare.outputs.artifact_id }}", download)
         self.assertIn("path: artifacts", download)
@@ -89,12 +73,13 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.assertIn("cmp artifacts/release-notes.md", publish)
         self.assertNotIn("package-macos.sh", publish)
         self.assertNotIn("import-release-signing.sh", publish)
-        self.assertLess(prepare.index("Require protected publication handoff"),
-                        prepare.index("Import pinned release signing identity"))
-        self.assertLess(publish.index("Verify exact accepted candidate"), publish.index("Publish GitHub release"))
+        self.assertLess(publish.index("Verify exact signed installer"), publish.index("Publish GitHub release"))
+        self.assertLess(publish.index("Publish Homebrew release and signed appcast"), publish.index("Verify public installer"))
+        self.assertIn("verify-published-release.py", publish)
+        self.assertIn("macos-publication-receipt-", publish)
         tag_gate = "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
         for name in ("Import pinned release signing identity", "Configure Apple notarization",
-                     "Build certificate-signed installer", "Retain immutable signed candidate"):
+                     "Build certificate-signed installer", "Retain immutable signed installer"):
             section = prepare.split("      - name: " + name, 1)[1].split("      - name:", 1)[0]
             self.assertIn(tag_gate, section)
         self.assertIn(tag_gate, publish)

@@ -25,6 +25,7 @@ jobs:
     runs-on: macos-26
     outputs:
       version: ${{ steps.version.outputs.version }}
+      release_date: ${{ steps.version.outputs.release_date }}
       installer_sha256: ${{ steps.candidate.outputs.sha256 }}
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
@@ -48,17 +49,13 @@ jobs:
         run: |
           printf 'RELEASE_VERSION=%s\n' "${REQUESTED_VERSION#v}" >> "$GITHUB_ENV"
           printf 'version=%s\n' "${REQUESTED_VERSION#v}" >> "$GITHUB_OUTPUT"
+          release_date=$(date -u +%F)
+          printf 'RELEASE_DATE=%s\n' "$release_date" >> "$GITHUB_ENV"
+          printf 'release_date=%s\n' "$release_date" >> "$GITHUB_OUTPUT"
       - name: Test appcast validation fixtures
         run: python3 -m unittest discover -s scripts/tests
-      - name: Validate authored release notes
-        run: python3 scripts/release_notes.py "$RELEASE_VERSION" "release-notes/$RELEASE_VERSION.md"
-      - name: Require protected publication handoff before signing
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api "repos/$GITHUB_REPOSITORY/environments/macos-release-publication" > "$RUNNER_TEMP/publication-environment.json"
-          python3 scripts/release_candidate.py environment "$RUNNER_TEMP/publication-environment.json"
+      - name: Render and validate authored release notes
+        run: python3 scripts/release_notes.py render "$RELEASE_VERSION" "$RELEASE_DATE" release-notes/next.md "release-notes/$RELEASE_VERSION.md"
       - name: Prepare communication notification profile
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
@@ -144,7 +141,7 @@ jobs:
           candidate_sha256=$(python3 scripts/release_candidate.py seal artifacts --version "$RELEASE_VERSION" --source-sha "$GITHUB_SHA")
           printf 'sha256=%s\n' "$candidate_sha256" >> "$GITHUB_OUTPUT"
           cp "release-notes/$RELEASE_VERSION.md" artifacts/release-notes.md
-      - name: Retain immutable signed candidate for installed acceptance
+      - name: Retain immutable signed installer
         id: upload
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
@@ -157,7 +154,7 @@ jobs:
           if-no-files-found: error
           overwrite: false
           retention-days: 30
-      - name: Record candidate acceptance identity
+      - name: Record signed installer identity
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           CANDIDATE_ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
@@ -165,7 +162,7 @@ jobs:
           CANDIDATE_SHA256: ${{ steps.candidate.outputs.sha256 }}
         run: |
           printf 'Signed candidate: version %s, source %s, run %s attempt %s, artifact %s, archive digest %s, DMG SHA-256 %s.\n\n' "$RELEASE_VERSION" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$CANDIDATE_ARTIFACT_ID" "$CANDIDATE_ARCHIVE_DIGEST" "$CANDIDATE_SHA256" >> "$GITHUB_STEP_SUMMARY"
-          printf 'The release owner must record installed acceptance for these exact bytes before approving macos-release-publication. Failed acceptance blocks GitHub Release, Homebrew and Sparkle publication. Actions artifacts remain accessible to repository readers.\n' >> "$GITHUB_STEP_SUMMARY"
+          printf 'Tag publication continues automatically after the native tests, signature, notarization and Gatekeeper gates. The publish job verifies this exact immutable artifact before distribution.\n' >> "$GITHUB_STEP_SUMMARY"
       - name: Remove temporary signing keychain
         if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -175,36 +172,32 @@ jobs:
           fi
           rm -rf "$signing_dir"
           rm -f "$RUNNER_TEMP/personastack-notary.p8"
+          rm -f "$RUNNER_TEMP/communication.provisionprofile"
 
   publish:
     needs: prepare
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-26
-    environment: macos-release-publication
     env:
       RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE_DATE: ${{ needs.prepare.outputs.release_date }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Recheck publication protection
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api "repos/$GITHUB_REPOSITORY/environments/macos-release-publication" > "$RUNNER_TEMP/publication-environment.json"
-          python3 scripts/release_candidate.py environment "$RUNNER_TEMP/publication-environment.json"
-      - name: Download the accepted installer without rebuilding
+      - name: Download the signed installer without rebuilding
         uses: actions/download-artifact@v4
         with:
           artifact-ids: ${{ needs.prepare.outputs.artifact_id }}
           path: artifacts
           merge-multiple: true
-      - name: Verify exact accepted candidate bytes and notes
+      - name: Verify exact signed installer bytes and notes
         env:
           EXPECTED_SHA256: ${{ needs.prepare.outputs.installer_sha256 }}
         run: |
           python3 scripts/release_candidate.py verify artifacts --version "$RELEASE_VERSION" --source-sha "$GITHUB_SHA" --expected-sha256 "$EXPECTED_SHA256"
+          python3 scripts/release_notes.py render "$RELEASE_VERSION" "$RELEASE_DATE" release-notes/next.md "release-notes/$RELEASE_VERSION.md"
           cmp artifacts/release-notes.md "release-notes/$RELEASE_VERSION.md"
           python3 scripts/release_notes.py "$RELEASE_VERSION" "release-notes/$RELEASE_VERSION.md"
       - name: Publish GitHub release
@@ -247,3 +240,18 @@ jobs:
             "$GITHUB_WORKSPACE/artifacts/PersonaStack-$RELEASE_VERSION-developerid.dmg" \
             "$GITHUB_WORKSPACE/build/homebrew-tap" "$RUNNER_TEMP/personastack-sparkle" \
             "$GITHUB_WORKSPACE/release-notes/$RELEASE_VERSION.md"
+      - name: Verify public installer cask and signed update feed
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.PERSONASTACK_SPARKLE_PRIVATE_ED_KEY }}
+        run: |
+          python3 scripts/verify-published-release.py "$RELEASE_VERSION" \
+            "$GITHUB_WORKSPACE/artifacts/PersonaStack-$RELEASE_VERSION-developerid.dmg" \
+            "$GITHUB_WORKSPACE/release-notes/$RELEASE_VERSION.md" \
+            "$RUNNER_TEMP/personastack-sparkle/bin/sign_update" "$RUNNER_TEMP/public-release"
+      - name: Retain public delivery receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-publication-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/public-release/verification.json
+          if-no-files-found: error
+          retention-days: 30
