@@ -56,6 +56,9 @@ class ReleaseCandidateTests(unittest.TestCase):
         prepare, publish = workflow.split("\n  publish:\n", 1)
         self.assertIn("concurrency:\n  group:", prepare)
         self.assertIn("queue: max", prepare)
+        self.assertIn("types: [published]", prepare)
+        self.assertIn("!github.event.release.prerelease", prepare)
+        self.assertIn("publish-source-release.py", publish)
         self.assertIn("needs: prepare", publish)
         self.assertNotIn("environment:", publish)
         self.assertNotIn("macos-release-publication", workflow)
@@ -77,7 +80,7 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.assertLess(publish.index("Publish Homebrew release and signed appcast"), publish.index("Verify public installer"))
         self.assertIn("verify-published-release.py", publish)
         self.assertIn("macos-publication-receipt-", publish)
-        tag_gate = "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
+        tag_gate = "if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')"
         for name in ("Import pinned release signing identity", "Configure Apple notarization",
                      "Build certificate-signed installer", "Retain immutable signed installer"):
             section = prepare.split("      - name: " + name, 1)[1].split("      - name:", 1)[0]

@@ -229,7 +229,7 @@ class HomebrewWorkflowTests(unittest.TestCase):
         # The whole workflow owns preparation, acceptance and final feed push.
         # Tag-specific groups would let older --latest calls race newer ones.
         self.assertIn("""concurrency:
-  group: macos-release-${{ github.event_name == 'push' && 'publication' || github.run_id }}
+  group: macos-release-${{ github.event_name != 'workflow_dispatch' && 'publication' || github.run_id }}
   cancel-in-progress: false
   queue: max
 
@@ -242,7 +242,7 @@ jobs:
         for name in ("Check out Homebrew tap", "Download pinned Sparkle release tools",
                      "Publish Homebrew release and signed appcast"):
             step = next(step for step in steps if step.startswith(name + "\n"))
-            self.assertIn("if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')", step)
+            self.assertIn("if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')", step)
             self.assertNotIn("continue-on-error", step)
         checkout = next(step for step in steps if step.startswith("Check out Homebrew tap\n"))
         self.assertIn("repository: personastack/homebrew-tap", checkout)

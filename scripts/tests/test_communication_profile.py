@@ -46,5 +46,5 @@ class CommunicationProfileTests(unittest.TestCase):
         self.assertLess(signer.index("communication_profile.py"), signer.index("codesign --force"))
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
         step = workflow.split("- name: Prepare communication notification profile", 1)[1].split("- name:", 1)[0]
-        self.assertIn("github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')", step)
+        self.assertIn("github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')", step)
         self.assertIn("secrets.PERSONASTACK_COMMUNICATION_PROFILE_BASE64", step)

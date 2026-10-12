@@ -10,18 +10,21 @@ on:
   push:
     tags:
       - "v*"
+  release:
+    types: [published]
 
 permissions:
   contents: write
   actions: read
 
 concurrency:
-  group: macos-release-${{ github.event_name == 'push' && 'publication' || github.run_id }}
+  group: macos-release-${{ github.event_name != 'workflow_dispatch' && 'publication' || github.run_id }}
   cancel-in-progress: false
   queue: max
 
 jobs:
   prepare:
+    if: github.event_name != 'release' || (startsWith(github.event.release.tag_name, 'v') && !github.event.release.prerelease)
     runs-on: macos-26
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -57,12 +60,12 @@ jobs:
       - name: Render and validate authored release notes
         run: python3 scripts/release_notes.py render "$RELEASE_VERSION" "$RELEASE_DATE" release-notes/next.md "release-notes/$RELEASE_VERSION.md"
       - name: Prepare communication notification profile
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
         env:
           PERSONASTACK_COMMUNICATION_PROFILE_BASE64: ${{ secrets.PERSONASTACK_COMMUNICATION_PROFILE_BASE64 }}
         run: python3 scripts/communication_profile.py prepare
       - name: Import pinned release signing identity
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
         env:
           PERSONASTACK_CODESIGN_CERTIFICATE_P12_BASE64: ${{ secrets.PERSONASTACK_DEVELOPER_ID_P12_BASE64 }}
           PERSONASTACK_CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.PERSONASTACK_DEVELOPER_ID_PASSWORD }}
@@ -70,10 +73,10 @@ jobs:
           PERSONASTACK_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.PERSONASTACK_DEVELOPER_ID_INSTALLER_PASSWORD }}
         run: ./scripts/import-release-signing.sh
       - name: Test signing identity across updates
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
         run: ./scripts/test-signing-continuity.sh
       - name: Configure Apple notarization
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
         env:
           NOTARY_KEY: ${{ secrets.PERSONASTACK_NOTARY_KEY_P8_BASE64 }}
           NOTARY_KEY_ID: ${{ secrets.PERSONASTACK_NOTARY_KEY_ID }}
@@ -91,7 +94,7 @@ jobs:
           printf 'PERSONASTACK_NOTARY_KEY_PATH=%s\nPERSONASTACK_NOTARY_KEY_ID=%s\nPERSONASTACK_NOTARY_ISSUER_ID=%s\n' \
             "$key_path" "$NOTARY_KEY_ID" "$NOTARY_ISSUER_ID" >> "$GITHUB_ENV"
       - name: Validate updater release configuration
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
         env:
           SPARKLE_PUBLIC_KEY: ${{ vars.PERSONASTACK_SPARKLE_PUBLIC_ED_KEY }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.PERSONASTACK_SPARKLE_PRIVATE_ED_KEY }}
@@ -120,7 +123,7 @@ jobs:
             "${test_scheduling[@]}" \
             --filter '(AgentBridge|LocalRun|LocalSession|[Hh]arness|[Ss]kill|[Dd]esktop|[Qq]uit|[Tt]ermination|ChatWindow|Popout|[Nn]avigation|MainWebView|[Pp]ermission|[Pp]rotected|[Vv]olume|[Vv]oice|[Mm]icrophone|[Dd]irectory|[Cc]ua|[Nn]otification|[Cc]oncern|[Kk]eychain|[Cc]redential|[Ll]ogin)'
       - name: Build certificate-signed installer
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
         env:
           PERSONASTACK_DEFAULT_URL: https://my.personastack.ai/user/personas
           PERSONASTACK_SPARKLE_PUBLIC_ED_KEY: ${{ vars.PERSONASTACK_SPARKLE_PUBLIC_ED_KEY }}
@@ -136,14 +139,14 @@ jobs:
           ./scripts/build-agent-bridge.sh build/validation-agent-bridge "$RELEASE_VERSION"
       - name: Seal signed acceptance candidate
         id: candidate
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
         run: |
           candidate_sha256=$(python3 scripts/release_candidate.py seal artifacts --version "$RELEASE_VERSION" --source-sha "$GITHUB_SHA")
           printf 'sha256=%s\n' "$candidate_sha256" >> "$GITHUB_OUTPUT"
           cp "release-notes/$RELEASE_VERSION.md" artifacts/release-notes.md
       - name: Retain immutable signed installer
         id: upload
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
           name: macos-signed-candidate-${{ github.run_id }}-${{ github.run_attempt }}
@@ -155,7 +158,7 @@ jobs:
           overwrite: false
           retention-days: 30
       - name: Record signed installer identity
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
         env:
           CANDIDATE_ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
           CANDIDATE_ARCHIVE_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
@@ -164,7 +167,7 @@ jobs:
           printf 'Signed candidate: version %s, source %s, run %s attempt %s, artifact %s, archive digest %s, DMG SHA-256 %s.\n\n' "$RELEASE_VERSION" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$CANDIDATE_ARTIFACT_ID" "$CANDIDATE_ARCHIVE_DIGEST" "$CANDIDATE_SHA256" >> "$GITHUB_STEP_SUMMARY"
           printf 'Tag publication continues automatically after the native tests, signature, notarization and Gatekeeper gates. The publish job verifies this exact immutable artifact before distribution.\n' >> "$GITHUB_STEP_SUMMARY"
       - name: Remove temporary signing keychain
-        if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: always() && github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
         run: |
           signing_dir="$RUNNER_TEMP/personastack-release-signing"
           if [ -f "$signing_dir/signing.keychain-db" ]; then
@@ -176,7 +179,7 @@ jobs:
 
   publish:
     needs: prepare
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-26
     env:
       RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
@@ -201,18 +204,14 @@ jobs:
           cmp artifacts/release-notes.md "release-notes/$RELEASE_VERSION.md"
           python3 scripts/release_notes.py "$RELEASE_VERSION" "release-notes/$RELEASE_VERSION.md"
       - name: Publish GitHub release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            echo "Release $GITHUB_REF_NAME already exists. Refusing to replace its immutable installer." >&2
-            exit 1
-          fi
-          gh release create "$GITHUB_REF_NAME" "artifacts/PersonaStack-$RELEASE_VERSION-developerid.dmg" \
-            --notes-file "release-notes/${GITHUB_REF_NAME#v}.md" --title "PersonaStack $GITHUB_REF_NAME"
+          python3 scripts/publish-source-release.py "$RELEASE_VERSION" \
+            "artifacts/PersonaStack-$RELEASE_VERSION-developerid.dmg" "release-notes/$RELEASE_VERSION.md"
       - name: Check out Homebrew tap
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/checkout@v4
         with:
           repository: personastack/homebrew-tap
@@ -221,7 +220,7 @@ jobs:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: build/homebrew-tap
       - name: Download pinned Sparkle release tools
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
         run: |
           set -euo pipefail
           sparkle_zip="$RUNNER_TEMP/Sparkle.zip"
@@ -231,7 +230,7 @@ jobs:
           unzip -q "$sparkle_zip" -d "$sparkle_dir"
           chmod 755 "$sparkle_dir/bin/sign_update"
       - name: Publish Homebrew release and signed appcast
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.PERSONASTACK_SPARKLE_PRIVATE_ED_KEY }}

@@ -47,14 +47,16 @@ PersonaStack checks for updates while it is running. Open the menu-bar dropdown 
 
 ## Publish a release
 
-Keep the authored user changes in `release-notes/next.md`. Commit code and notes to `main`, then push an annotated version tag:
+Keep the authored user changes in `release-notes/next.md`. Commit code and notes to `main`, then create a new stable `vX.Y.Z` release at [GitHub Releases](https://github.com/personastack/macos/releases/new) targeting `main`. A tag push also starts the same workflow:
 
 ```sh
 git tag -a v0.11.0 -m "PersonaStack 0.11.0"
 git push origin refs/tags/v0.11.0
 ```
 
-The tag workflow runs tests and universal builds, signs and notarizes the installer, then automatically publishes the source Release, Homebrew cask and signed Sparkle feed. Actions fills the changelog version and date from the tag/run. It verifies the served public installer bytes and retains a delivery receipt. There is no local packaging or manual publication approval step. `workflow_dispatch` remains an optional unsigned development check.
+The release workflow runs tests and universal builds, signs and notarizes the installer, then automatically publishes the source Release, Homebrew cask and signed Sparkle feed. Actions fills the changelog version and date from the tag/run. It verifies the served public installer bytes and retains a delivery receipt. There is no local packaging or manual publication approval step. `workflow_dispatch` remains an optional unsigned development check.
+
+All ten custom secrets are repository secrets in `personastack/macos`. The public updater key is a repository variable. Their exact-name recovery fields are in the PersonaStack 1Password vault item **PersonaStack macOS Release - ACTIVE GitHub Actions Recovery** (`yggfet2yylb3jaxqnfy6krswle`). Original signing archives and the Communication Notifications profile are also retained there as separate documents.
 
 Configure these repository settings once before the first tag. Renew expiring Apple credentials and provisioning profiles as needed:
 
