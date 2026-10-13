@@ -6,6 +6,26 @@ import WebKit
 
 @MainActor
 struct MainWindowLifecycleTests {
+    @Test func nativeWindowMenuReopenReattachesRetainedContentAndReturnsToPersonas() {
+        let fixture = WindowFixture()
+        defer { fixture.dispose() }
+        fixture.attach()
+        fixture.window.makeKeyAndOrderFront(nil)
+        fixture.host.openDesktopFlow(path: "/user/desktop/harnesses", query: [:])
+        fixture.window.close()
+        #expect(fixture.host.webView.superview !== fixture.container)
+        // SwiftUI's Window menu may order the retained scene forward without
+        // calling the app's custom reopener or recreating its NSView.
+        fixture.window.makeKeyAndOrderFront(nil)
+        // Swift Testing does not run NSApplication's event loop, so it orders
+        // the real window but cannot make it key. Drive its native notification.
+        NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: fixture.window)
+        #expect(fixture.host.mainWindow === fixture.window)
+        #expect(fixture.host.webView.superview === fixture.container)
+        #expect(fixture.host.webView.window === fixture.window)
+        #expect(fixture.requests.map(\.path) == ["/user/desktop/harnesses", "/user/personas"])
+    }
+
     @Test func externalAndRejectedLinksPreserveCurrentAgentSetupScope() async throws {
         let url = URL(string: "https://my.personastack.ai/user/personas")!
         let view = WKWebView()

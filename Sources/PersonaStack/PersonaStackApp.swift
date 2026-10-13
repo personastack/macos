@@ -169,6 +169,7 @@ final class MainWebViewHost {
     private(set) weak var mainWindow: NSWindow?
     private weak var mainContainer: NSView?
     private var windowCloseObservation: NSObjectProtocol?
+    private var windowKeyObservation: NSObjectProtocol?
     private var resetOnNextOpen = false
     private weak var closedWindow: NSWindow?
 
@@ -193,6 +194,7 @@ final class MainWebViewHost {
         guard window !== backgroundWindow else { return }
         if mainWindow !== window {
             if let windowCloseObservation { NotificationCenter.default.removeObserver(windowCloseObservation) }
+            if let windowKeyObservation { NotificationCenter.default.removeObserver(windowKeyObservation) }
             prepareToShow()
             mainWindow = window
             NSApp.setActivationPolicy(.regular)
@@ -205,6 +207,19 @@ final class MainWebViewHost {
                     self.closedWindow = window
                     self.mainWindow = nil
                     if let container = self.webView.superview { self.park(from: container) }
+                }
+            }
+            windowKeyObservation = NotificationCenter.default.addObserver(
+                forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main
+            ) { [weak self, weak window] _ in
+                MainActor.assumeIsolated {
+                    guard let self, let window, self.closedWindow === window,
+                          let container = self.mainContainer, container.window === window,
+                          !self.coordinator.isRetired else { return }
+                    // SwiftUI's Window menu can reuse its scene without another
+                    // NSView update. Restore the parked content on native reopen.
+                    self.prepareToShow()
+                    self.attach(to: container)
                 }
             }
         }
@@ -301,7 +316,9 @@ final class MainWebViewHost {
 
     func retire() {
         if let windowCloseObservation { NotificationCenter.default.removeObserver(windowCloseObservation) }
+        if let windowKeyObservation { NotificationCenter.default.removeObserver(windowKeyObservation) }
         windowCloseObservation = nil
+        windowKeyObservation = nil
         mainWindow = nil
         mainContainer = nil
         sessionRefresh.stop()
