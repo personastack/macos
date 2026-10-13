@@ -1,10 +1,34 @@
 import AppKit
+import PersonaStackCore
 import Testing
 import WebKit
 @testable import PersonaStack
 
 @MainActor
 struct MainWindowLifecycleTests {
+    @Test func externalAndRejectedLinksPreserveCurrentAgentSetupScope() async throws {
+        let url = URL(string: "https://my.personastack.ai/user/personas")!
+        let view = WKWebView()
+        let manager = AgentBridgeSetupManager.shared
+        manager.register(view, appURL: url)
+        defer { manager.unregister(view) }
+        var external: [URL] = []
+        let coordinator = PersonaStackWebView.Coordinator(appURL: url, notificationCoordinator: nil,
+            cancelPermissionVerification: {}, openExternalURL: { external.append($0) })
+        coordinator.webView = view
+        let state = try await manager.apply(AgentBridgePageCommand.parse(["version": "2", "action": "state", "scope": ""]), view: view)
+        let scope = try #require(state["scope"] as? String)
+        let current = try AgentBridgePageCommand.parse(["version": "2", "action": "state", "scope": scope])
+        for raw in ["https://example.invalid/help", "file:///tmp/example"] {
+            let destination = try #require(URL(string: raw))
+            #expect(coordinator.navigationPolicy(for: destination, in: view, mainFrame: true, userActivated: true) == .cancel)
+            _ = try await manager.apply(current, view: view)
+        }
+        #expect(external.map(\.host) == ["example.invalid"])
+        #expect(coordinator.navigationPolicy(for: url, in: view, mainFrame: true) == .allow)
+        await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(current, view: view) }
+    }
+
     @Test func closedWindowWithRetainedSwiftUIContainerReattachesBeforePresentation() {
         let fixture = WindowFixture()
         defer { fixture.dispose() }

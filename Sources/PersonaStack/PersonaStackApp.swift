@@ -390,6 +390,7 @@ struct PersonaStackWebView: NSViewRepresentable {
         private(set) var isRetired = false
         private(set) var documentGeneration = UUID()
         private let mediaPermission: DesktopMediaCapturePermission
+        private let openExternalURL: (URL) -> Void
 
         init(
             appURL: URL,
@@ -407,7 +408,8 @@ struct PersonaStackWebView: NSViewRepresentable {
                 CuaSetupWindow.shared.cancel()
             },
             concernNotificationsEnabled: @escaping () -> Bool = { DesktopConcernNotificationSettings.isEnabled() },
-            mediaPermission: DesktopMediaCapturePermission = .shared
+            mediaPermission: DesktopMediaCapturePermission = .shared,
+            openExternalURL: @escaping (URL) -> Void = { NSWorkspace.shared.open($0) }
         ) {
             self.appURL = appURL
             self.scheduleNotification = scheduleNotification
@@ -415,6 +417,7 @@ struct PersonaStackWebView: NSViewRepresentable {
             self.concernNotificationsEnabled = concernNotificationsEnabled
             self.cancelPermissionVerification = cancelPermissionVerification
             self.mediaPermission = mediaPermission
+            self.openExternalURL = openExternalURL
             super.init()
             if let notificationCoordinator {
                 configureNotificationCenter(notificationCoordinator)
@@ -511,24 +514,51 @@ struct PersonaStackWebView: NSViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
-            guard !isRetired else { return .cancel }
-            guard let url = navigationAction.request.url else {
-                return .cancel
-            }
+            guard let url = navigationAction.request.url else { return .cancel }
+            return navigationPolicy(for: url, in: webView,
+                mainFrame: navigationAction.targetFrame?.isMainFrame == true,
+                newWindow: navigationAction.targetFrame == nil,
+                userActivated: navigationAction.navigationType == .linkActivated,
+                downloadRequested: navigationAction.shouldPerformDownload)
+        }
 
-            if NavigationPolicy.shouldDownload(url, requested: navigationAction.shouldPerformDownload, appURL: appURL) {
+        func navigationPolicy(for url: URL, in webView: WKWebView, mainFrame: Bool,
+                              newWindow: Bool = false, userActivated: Bool = false,
+                              downloadRequested: Bool = false) -> WKNavigationActionPolicy {
+            guard !isRetired else { return .cancel }
+
+            if NavigationPolicy.shouldDownload(url, requested: downloadRequested, appURL: appURL) {
                 return .download
             }
 
-            if webView === self.webView, navigationAction.targetFrame?.isMainFrame == true,
+            if newWindow {
+                if NavigationPolicy.isGoogleOAuthURL(url) {
+                    return .allow
+                }
+                if NavigationPolicy.canOpenExternally(url) { openExternalURL(url) }
+                return .cancel
+            }
+
+            if NavigationPolicy.shouldOpenInDefaultBrowser(
+                url,
+                linkWasUserActivated: userActivated,
+                appURL: appURL
+            ) {
+                openExternalURL(url)
+                return .cancel
+            }
+
+            guard NavigationPolicy.canLoadInWebView(url) else { return .cancel }
+
+            if webView === self.webView, mainFrame,
                ChatWindowCommand.sameOrigin(url, appURL) {
                 DesktopControlSetupManager.shared.invalidate(webView)
             }
-            if webView === self.webView, navigationAction.targetFrame?.isMainFrame == true {
+            if webView === self.webView, mainFrame {
                 AgentBridgeSetupManager.shared.invalidate(webView)
             }
 
-            if webView === self.webView, navigationAction.targetFrame?.isMainFrame == true,
+            if webView === self.webView, mainFrame,
                ["/login", "/logout"].contains(url.path) {
                 ChatWindowManager.shared.invalidateSession()
                 StackWindowManager.shared.invalidateSession()
@@ -536,24 +566,7 @@ struct PersonaStackWebView: NSViewRepresentable {
                 AgentBridgeSetupManager.shared.invalidateSession()
             }
 
-            if navigationAction.targetFrame == nil {
-                if NavigationPolicy.isGoogleOAuthURL(url) {
-                    return .allow
-                }
-                if NavigationPolicy.canOpenExternally(url) { NSWorkspace.shared.open(url) }
-                return .cancel
-            }
-
-            if NavigationPolicy.shouldOpenInDefaultBrowser(
-                url,
-                linkWasUserActivated: navigationAction.navigationType == .linkActivated,
-                appURL: appURL
-            ) {
-                NSWorkspace.shared.open(url)
-                return .cancel
-            }
-
-            return NavigationPolicy.canLoadInWebView(url) ? .allow : .cancel
+            return .allow
         }
 
         func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse) async -> WKNavigationResponsePolicy {
