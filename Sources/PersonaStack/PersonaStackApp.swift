@@ -53,11 +53,10 @@ struct PersonaStackApp: App {
     var body: some Scene {
         Window("PersonaStack", id: "personastack-main") {
             ZStack(alignment: .topTrailing) {
-                PersonaStackWebView(url: serverSettings.appPageURL)
+                PersonaStackWebView(url: serverSettings.appPageURL, applicationDelegate: terminationDelegate)
                     .id(serverSettings.generation)
                     .frame(minWidth: 1172, minHeight: 700)
                     .background(Color(nsColor: WindowPresentation.canvasColor).ignoresSafeArea())
-                    .background(WindowPresentationConfigurator(applicationDelegate: terminationDelegate))
                     .overlay {
                         MainWebViewLoadRecoveryOverlay(coordinator: MainWebViewHost.shared.coordinator)
                     }
@@ -66,7 +65,7 @@ struct PersonaStackApp: App {
             }
         }
         .defaultSize(width: 1440, height: 960)
-        .windowStyle(.hiddenTitleBar)
+        .windowStyle(.titleBar)
         .commands {
             DesktopServerSettingsCommands()
             DesktopUpdateCommands()
@@ -134,9 +133,17 @@ final class MainWebViewHost {
     }
 
     static func showMainWindow(openWindow: () -> Void) {
+        shared.show(openWindow: openWindow)
+    }
+
+    func show(openWindow: () -> Void) {
+        guard !coordinator.isRetired else { return }
+        let retainedWindow = mainWindow ?? closedWindow
+        prepareToShow()
         NSApp.setActivationPolicy(.regular)
         NSApp.unhide(nil)
-        if let window = NSApp.windows.first(where: { $0.title == "PersonaStack" }) {
+        if let window = retainedWindow, let container = mainContainer, container.window === window {
+            attach(to: container)
             if window.isMiniaturized { window.deminiaturize(nil) }
             window.makeKeyAndOrderFront(nil)
         } else {
@@ -159,6 +166,51 @@ final class MainWebViewHost {
     private let authorizeNotifications: () -> Void
     private let sessionRefresh: DesktopSessionRefresh
     private var notificationAuthorizationRequested = false
+    private(set) weak var mainWindow: NSWindow?
+    private weak var mainContainer: NSView?
+    private var windowCloseObservation: NSObjectProtocol?
+    private var resetOnNextOpen = false
+    private weak var closedWindow: NSWindow?
+
+    func prepareToShow() {
+        closedWindow = nil
+        guard !coordinator.isRetired, resetOnNextOpen,
+              var destination = URLComponents(url: coordinator.appURL, resolvingAgainstBaseURL: false) else { return }
+        destination.path = "/user/personas"
+        destination.query = nil
+        destination.fragment = nil
+        guard let url = destination.url else { return }
+        navigate(to: url)
+    }
+
+    func navigate(to url: URL) {
+        guard !coordinator.isRetired else { return }
+        resetOnNextOpen = false
+        coordinator.start(url)
+    }
+
+    private func bindWindow(_ window: NSWindow) {
+        guard window !== backgroundWindow else { return }
+        if mainWindow !== window {
+            if let windowCloseObservation { NotificationCenter.default.removeObserver(windowCloseObservation) }
+            prepareToShow()
+            mainWindow = window
+            NSApp.setActivationPolicy(.regular)
+            windowCloseObservation = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification, object: window, queue: .main
+            ) { [weak self, weak window] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.resetOnNextOpen = true
+                    self.closedWindow = window
+                    self.mainWindow = nil
+                    if let container = self.webView.superview { self.park(from: container) }
+                }
+            }
+        }
+        WindowPresentation.configure(window)
+        MainWindowNavigation.install(on: window, webView: webView)
+    }
 
     init(appURL: URL, loadPage: Bool = true, resumePermissionSetup: Bool = false,
          requestNotifications: Bool = true,
@@ -223,19 +275,21 @@ final class MainWebViewHost {
         components.queryItems = query.sorted(by: { $0.key < $1.key }).map { URLQueryItem(name: $0.key, value: $0.value) }
         components.fragment = nil
         guard let url = components.url else { return }
-        coordinator.start(url)
+        navigate(to: url)
     }
 
     func attach(to container: NSView) {
-        guard webView.superview !== container else { return }
-        backgroundWindow.contentView = NSView(frame: backgroundWindow.contentView?.bounds ?? .zero)
-        webView.removeFromSuperview()
-        webView.frame = container.bounds
-        webView.autoresizingMask = [.width, .height]
-        container.addSubview(webView)
-        if let window = container.window {
-            MainWindowNavigation.install(on: window, webView: webView)
+        guard !coordinator.isRetired else { return }
+        if let window = container.window, window === closedWindow, !window.isVisible { return }
+        mainContainer = container
+        if webView.superview !== container {
+            backgroundWindow.contentView = NSView(frame: backgroundWindow.contentView?.bounds ?? .zero)
+            webView.removeFromSuperview()
+            webView.frame = container.bounds
+            webView.autoresizingMask = [.width, .height]
+            container.addSubview(webView)
         }
+        if let window = container.window { bindWindow(window) }
         requestNotificationAuthorizationIfNeeded()
     }
 
@@ -246,6 +300,10 @@ final class MainWebViewHost {
     }
 
     func retire() {
+        if let windowCloseObservation { NotificationCenter.default.removeObserver(windowCloseObservation) }
+        windowCloseObservation = nil
+        mainWindow = nil
+        mainContainer = nil
         sessionRefresh.stop()
         ChatWindowManager.shared.unregister(webView)
         StackWindowManager.shared.unregister(webView)
@@ -272,56 +330,54 @@ final class MainWebViewHost {
     }
 }
 
-struct WindowPresentationConfigurator: NSViewRepresentable {
-    @Environment(\.openWindow) private var openWindow
-    let applicationDelegate: PersonaStackTerminationDelegate
+/// Bind to the actual window after AppKit attaches SwiftUI's container. A
+/// makeNSView call alone has no window, and a server switch retires its old host.
+@MainActor
+final class MainWebViewContainer: NSView {
+    let host: MainWebViewHost
 
-    func makeNSView(context: Context) -> NSView {
-        let action = openWindow
-        applicationDelegate.installMainWindowReopener {
-            MainWebViewHost.showMainWindow { action(id: "personastack-main") }
-        }
-        return WindowPresentationView()
+    init(host: MainWebViewHost) {
+        self.host = host
+        super.init(frame: .zero)
+        host.attach(to: self)
     }
 
-    func updateNSView(_ nsView: NSView, context: Context) {}
+    required init?(coder: NSCoder) { return nil }
 
-    private final class WindowPresentationView: NSView {
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            DispatchQueue.main.async { [weak self] in
-                guard let window = self?.window else { return }
-                NSApp.setActivationPolicy(.regular)
-                WindowPresentation.configure(window)
-                MainWindowNavigation.install(on: window, webView: MainWebViewHost.shared.webView)
-            }
-        }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil else { return }
+        host.attach(to: self)
     }
 }
 
 struct PersonaStackWebView: NSViewRepresentable {
+    @Environment(\.openWindow) private var openWindow
     let url: URL
+    let applicationDelegate: PersonaStackTerminationDelegate
 
     func makeCoordinator() -> Coordinator {
         MainWebViewHost.shared.coordinator
     }
 
-    func makeNSView(context: Context) -> NSView {
-        let container = NSView(frame: .zero)
-        MainWebViewHost.shared.attach(to: container)
-        return container
+    func makeNSView(context: Context) -> MainWebViewContainer {
+        let action = openWindow
+        applicationDelegate.installMainWindowReopener {
+            MainWebViewHost.showMainWindow { action(id: "personastack-main") }
+        }
+        return MainWebViewContainer(host: MainWebViewHost.shared)
     }
 
-    func updateNSView(_ container: NSView, context: Context) {
-        MainWebViewHost.shared.attach(to: container)
+    func updateNSView(_ container: MainWebViewContainer, context: Context) {
+        container.host.attach(to: container)
     }
 
-    static func dismantleNSView(_ container: NSView, coordinator: Coordinator) {
-        MainWebViewHost.shared.park(from: container)
+    static func dismantleNSView(_ container: MainWebViewContainer, coordinator: Coordinator) {
+        container.host.park(from: container)
     }
 
     @MainActor
-    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler, WKScriptMessageHandlerWithReply {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler, WKScriptMessageHandlerWithReply, NSWindowDelegate {
         weak var webView: WKWebView?
         let appURL: URL
         let loadRecovery = MainWebViewLoadRecovery()
@@ -330,7 +386,7 @@ struct PersonaStackWebView: NSViewRepresentable {
         private let concernNotificationsEnabled: () -> Bool
         private let cancelPermissionVerification: () -> Void
         private let loadRequest: @MainActor (WKWebView, URLRequest) -> AnyObject?
-        private var popupWindows: [ObjectIdentifier: NSWindow] = [:]
+        private(set) var popupWindows: [ObjectIdentifier: NSWindow] = [:]
         private(set) var isRetired = false
         private(set) var documentGeneration = UUID()
         private let mediaPermission: DesktopMediaCapturePermission
@@ -510,6 +566,7 @@ struct PersonaStackWebView: NSViewRepresentable {
             for navigationAction: WKNavigationAction,
             windowFeatures: WKWindowFeatures
         ) -> WKWebView? {
+            guard !isRetired else { return nil }
             guard let url = navigationAction.request.url,
                   NavigationPolicy.isGoogleOAuthURL(url) else {
                 if let url = navigationAction.request.url, NavigationPolicy.canOpenExternally(url) {
@@ -518,6 +575,11 @@ struct PersonaStackWebView: NSViewRepresentable {
                 return nil
             }
 
+            return makeOAuthPopup(configuration: configuration)
+        }
+
+        func makeOAuthPopup(configuration: WKWebViewConfiguration, present: Bool = true) -> WKWebView? {
+            guard !isRetired else { return nil }
             WindowPresentation.configureWebView(configuration)
             let popup = WKWebView(frame: .zero, configuration: configuration)
             popup.navigationDelegate = self
@@ -527,16 +589,27 @@ struct PersonaStackWebView: NSViewRepresentable {
             controller.view = popup
             let window = NSWindow(contentViewController: controller)
             window.title = "Sign in with Google"
+            window.isReleasedWhenClosed = false
+            window.delegate = self
             window.setContentSize(NSSize(width: 520, height: 700))
             window.center()
-            window.makeKeyAndOrderFront(nil)
             popupWindows[ObjectIdentifier(popup)] = window
+            if present { window.makeKeyAndOrderFront(nil) }
             return popup
         }
 
         func webViewDidClose(_ webView: WKWebView) {
-            guard let window = popupWindows.removeValue(forKey: ObjectIdentifier(webView)) else { return }
-            window.close()
+            popupWindows[ObjectIdentifier(webView)]?.close()
+        }
+
+        func windowWillClose(_ notification: Notification) {
+            guard let window = notification.object as? NSWindow,
+                  let popup = window.contentViewController?.view as? WKWebView,
+                  popupWindows.removeValue(forKey: ObjectIdentifier(popup)) != nil else { return }
+            popup.stopLoading()
+            popup.navigationDelegate = nil
+            popup.uiDelegate = nil
+            window.delegate = nil
         }
 
         func retire() {
@@ -545,18 +618,7 @@ struct PersonaStackWebView: NSViewRepresentable {
             onDocumentLoaded = nil
             loadRecovery.reset()
             invalidateDocumentVerification()
-            for window in popupWindows.values {
-                if let popup = window.contentViewController?.view as? WKWebView {
-                    popup.stopLoading()
-                    popup.navigationDelegate = nil
-                    popup.uiDelegate = nil
-                    for name in ["personastackConcern", "personastackChat", "personastackStack", "personastackLocalSession", "personastackAgentBridge", "personastackDesktopControl"] {
-                        popup.configuration.userContentController.removeScriptMessageHandler(forName: name)
-                    }
-                }
-                window.close()
-            }
-            popupWindows.removeAll()
+            for window in Array(popupWindows.values) { window.close() }
             webView?.setMicrophoneCaptureState(.none)
             webView?.configuration.userContentController.removeScriptMessageHandler(forName: DesktopMediaCapturePermission.bridgeName, contentWorld: .page)
             webView?.stopLoading()

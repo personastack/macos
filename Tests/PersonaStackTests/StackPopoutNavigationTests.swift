@@ -5,6 +5,26 @@ import WebKit
 @testable import PersonaStack
 
 struct StackPopoutNavigationTests {
+    @MainActor @Test func cancellationPreservesPopoutAndClosedWindowCannotRefocus() {
+        _ = NSApplication.shared
+        let preferences = PopoutTestPreferences()
+        var closes = 0
+        let popout = StackPopoutWindow(url: URL(string: "https://example.invalid/stream")!,
+            transparent: false, kind: .stackStream, loadPage: false, defaults: preferences.defaults) { closes += 1 }
+        defer { popout.dispose() }
+        let cancelled = NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled)
+        popout.webView(popout.webView, didFailProvisionalNavigation: nil, withError: cancelled)
+        popout.webView(popout.webView, didFail: nil, withError: cancelled)
+        #expect(closes == 0 && popout.webView.navigationDelegate != nil)
+        popout.window.close()
+        #expect(closes == 1)
+        #expect(popout.webView.navigationDelegate == nil && popout.webView.uiDelegate == nil)
+        popout.focus()
+        #expect(!popout.window.isVisible)
+        popout.dispose()
+        #expect(closes == 1)
+    }
+
     @MainActor @Test func personaLinksReopenMainWindowAndPreservePinnedStream() throws {
         _ = NSApplication.shared
         let preferences = PopoutTestPreferences()

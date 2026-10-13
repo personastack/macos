@@ -44,6 +44,11 @@ public enum NavigationPolicy {
         }
     }
 
+    public static func isCancelledNavigation(_ error: Error) -> Bool {
+        let error = error as NSError
+        return error.domain == NSURLErrorDomain && error.code == NSURLErrorCancelled
+    }
+
     public static func shouldDownload(_ url: URL, requested: Bool, appURL: URL) -> Bool {
         guard requested else { return false }
         if url.scheme?.lowercased() == "blob" {

@@ -5,6 +5,52 @@ import PersonaStackCore
 @testable import PersonaStack
 
 struct ChatWindowTests {
+    @MainActor @Test func directCloseRetiresChatAndAllowsFreshWindow() throws {
+        _ = NSApplication.shared
+        let preferences = PopoutTestPreferences()
+        let manager = ChatWindowManager(loadPages: false, defaults: preferences.defaults, presentWindows: false)
+        defer { manager.invalidateSession() }
+        let base = URL(string: "https://example.invalid")!
+        manager.apply(.open("p-1", "scope"), base: base)
+        let first = try #require(manager.chat(for: "p-1"))
+        first.window.close()
+        #expect(manager.chat(for: "p-1") == nil)
+        #expect(first.webView.navigationDelegate == nil && first.webView.uiDelegate == nil)
+        manager.apply(.open("p-1", "scope"), base: base)
+        #expect(manager.chat(for: "p-1") !== first)
+        first.dispose()
+        #expect(manager.chat(for: "p-1") != nil)
+    }
+
+    @MainActor @Test func collapsedChatRetainsKeyboardFocusAndNativeClose() {
+        _ = NSApplication.shared
+        let preferences = PopoutTestPreferences()
+        var closes = 0
+        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false,
+            defaults: preferences.defaults) { closes += 1 }
+        defer { chat.dispose() }
+        chat.apply(.collapse)
+        #expect(chat.window.canBecomeKey)
+        chat.window.performClose(nil)
+        #expect(closes == 1)
+        #expect(chat.webView.navigationDelegate == nil)
+    }
+
+    @MainActor @Test func cancelledChatNavigationKeepsWindowUntilRealFailure() {
+        _ = NSApplication.shared
+        let preferences = PopoutTestPreferences()
+        var closes = 0
+        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false,
+            defaults: preferences.defaults) { closes += 1 }
+        defer { chat.dispose() }
+        let cancelled = NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled)
+        chat.webView(chat.webView, didFailProvisionalNavigation: nil, withError: cancelled)
+        chat.webView(chat.webView, didFail: nil, withError: cancelled)
+        #expect(closes == 0 && chat.webView.navigationDelegate != nil)
+        chat.webView(chat.webView, didFail: nil, withError: URLError(.notConnectedToInternet))
+        #expect(closes == 1)
+    }
+
     @MainActor
     @Test func testExpandedChatUsesNativeCornersAndCollapsedAvatarMask() {
         _ = NSApplication.shared

@@ -376,7 +376,7 @@ final class DesktopUpdater: NSObject, ObservableObject {
 
     private var hasVisibleMainWindow: Bool {
         guard let app = NSApp else { return false }
-        return app.isActive && app.windows.contains { $0.title == "PersonaStack" && $0.isVisible }
+        return app.isActive && MainWebViewHost.shared.mainWindow?.isVisible == true
     }
 
     static func confirmReadyRestart() -> Bool {

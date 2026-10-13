@@ -22,8 +22,7 @@ final class MainWebViewLoadRecovery: ObservableObject {
     func navigationFailed(_ navigation: AnyObject?, error: Error) {
         guard isCurrent(navigation) else { return }
         currentNavigation = nil
-        let error = error as NSError
-        guard error.domain != NSURLErrorDomain || error.code != NSURLErrorCancelled else { return }
+        guard !NavigationPolicy.isCancelledNavigation(error) else { return }
         isFailed = true
     }
 

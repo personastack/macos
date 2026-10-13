@@ -38,7 +38,8 @@ import AppKit
 }
 @MainActor final class MainWebViewHost {
     static let shared = MainWebViewHost()
-    let coordinator = NavigationProbe()
+    var mainWindow: NSWindow?
+    func navigate(to destination: URL) {}
 }
 @MainActor final class NavigationProbe { func start(_ destination: URL) {} }
 @MainActor final class DesktopUpdater {

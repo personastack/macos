@@ -31,7 +31,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         timeout = .seconds(10)
         moveToMenuBar = Self.hideWindows
         hasMiniaturizedMainWindow = {
-            NSApp.windows.contains { $0.title == "PersonaStack" && $0.isMiniaturized }
+            MainWebViewHost.shared.mainWindow?.isMiniaturized == true
         }
         recordQuitIntent = {
             let preferences = UserDefaults.standard
@@ -40,7 +40,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
                 isUpdateRelaunch: preferences.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey),
                 preferences: preferences)
         }
-        navigateMainWindow = { MainWebViewHost.shared.coordinator.start($0) }
+        navigateMainWindow = { MainWebViewHost.shared.navigate(to: $0) }
         super.init()
     }
 
@@ -99,9 +99,9 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
          cancelPermissionRestart: @escaping @MainActor () -> Void = {},
          recordQuitIntent: @escaping @MainActor () -> Void = {},
          moveToMenuBar: @escaping @MainActor (NSApplication) -> Void = PersonaStackTerminationDelegate.hideWindows,
-         navigateMainWindow: @escaping @MainActor (URL) -> Void = { MainWebViewHost.shared.coordinator.start($0) },
+         navigateMainWindow: @escaping @MainActor (URL) -> Void = { MainWebViewHost.shared.navigate(to: $0) },
          hasMiniaturizedMainWindow: @escaping @MainActor () -> Bool = {
-             NSApp.windows.contains { $0.title == "PersonaStack" && $0.isMiniaturized }
+             MainWebViewHost.shared.mainWindow?.isMiniaturized == true
          }) {
         self.shutdown = shutdown
         self.terminate = terminate

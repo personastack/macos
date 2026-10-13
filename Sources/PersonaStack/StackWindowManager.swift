@@ -114,7 +114,7 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         configuration.websiteDataStore = .default()
         configuration.applicationNameForUserAgent = "PersonaStackDesktop/1"
         webView = WKWebView(frame: .zero, configuration: configuration)
-        let windowType: NSWindow.Type = kind == .stackGraph ? StackGraphWindow.self : NSWindow.self
+        let windowType: NSWindow.Type = kind == .stackGraph ? NativePopoutWindow.self : NSWindow.self
         window = windowType.init(contentRect: NSRect(x: 0, y: 0, width: 900, height: 700),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                           backing: .buffered, defer: false)
@@ -152,6 +152,7 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     }
 
     func focus() {
+        guard !disposed else { return }
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
     }
@@ -161,6 +162,8 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         disposed = true
         presentation?.invalidate()
         webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
         window.close()
         onClose()
     }
@@ -170,14 +173,20 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
         disposed = true
         presentation?.invalidate()
         webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
         onClose()
     }
 
     func windowDidFailToEnterFullScreen(_ window: NSWindow) { presentation?.fullscreenTransitionFailed() }
     func windowDidFailToExitFullScreen(_ window: NSWindow) { presentation?.fullscreenTransitionFailed() }
 
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { dispose() }
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { dispose() }
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        if !NavigationPolicy.isCancelledNavigation(error) { dispose() }
+    }
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        if !NavigationPolicy.isCancelledNavigation(error) { dispose() }
+    }
 
     func webView(_ webView: WKWebView, decidePolicyFor response: WKNavigationResponse) async -> WKNavigationResponsePolicy {
         if response.isForMainFrame, let http = response.response as? HTTPURLResponse, http.statusCode >= 400 {
@@ -209,20 +218,4 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { dispose() }
-}
-
-/// Borderless graph windows retain keyboard focus and the standard close action.
-@MainActor
-private final class StackGraphWindow: NSWindow {
-    override var canBecomeKey: Bool { true }
-
-    override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
-        if !styleMask.contains(.titled), item.action == #selector(performClose(_:)) { return true }
-        return super.validateUserInterfaceItem(item)
-    }
-
-    override func performClose(_ sender: Any?) {
-        if styleMask.contains(.titled) { super.performClose(sender) }
-        else { close() }
-    }
 }

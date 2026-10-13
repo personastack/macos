@@ -347,3 +347,19 @@ final class GraphPinOverlayView: NSView {
         isHidden = true
     }
 }
+
+/// Borderless pop-out windows retain keyboard focus and the standard close action.
+@MainActor
+final class NativePopoutWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+
+    override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
+        if !styleMask.contains(.titled), item.action == #selector(performClose(_:)) { return true }
+        return super.validateUserInterfaceItem(item)
+    }
+
+    override func performClose(_ sender: Any?) {
+        if styleMask.contains(.titled) { super.performClose(sender) }
+        else { close() }
+    }
+}

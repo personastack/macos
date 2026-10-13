@@ -108,7 +108,7 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
         config.websiteDataStore = .default()
         config.applicationNameForUserAgent = "PersonaStackDesktop/1"
         webView = ChatWebView(frame: .zero, configuration: config)
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 676),
+        window = NativePopoutWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 676),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
         super.init()
@@ -158,8 +158,19 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
         return true
     }
 
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { dispose() }
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { dispose() }
+    func windowWillClose(_ notification: Notification) {
+        guard !disposed else { return }
+        closePending = true
+        dispose()
+        onClose()
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        if !NavigationPolicy.isCancelledNavigation(error) { dispose() }
+    }
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        if !NavigationPolicy.isCancelledNavigation(error) { dispose() }
+    }
 
     func webView(_ webView: WKWebView, decidePolicyFor response: WKNavigationResponse) async -> WKNavigationResponsePolicy {
         navigationResponsePolicy(isMainFrame: response.isForMainFrame, response: response.response,

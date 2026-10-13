@@ -11,8 +11,15 @@ final class MainWindowNavigation: NSTitlebarAccessoryViewController {
 
     static func install(on window: NSWindow, webView: WKWebView) {
         if let navigation = window.titlebarAccessoryViewControllers.compactMap({ $0 as? MainWindowNavigation }).first {
-            navigation.bind(to: webView)
-            return
+            if navigation.view.window === window {
+                navigation.bind(to: webView)
+                return
+            }
+            // AppKit keeps a detached controller's old layout container. Replace
+            // the controller as well as the view when rebuilding native chrome.
+            if let index = window.titlebarAccessoryViewControllers.firstIndex(of: navigation) {
+                window.removeTitlebarAccessoryViewController(at: index)
+            }
         }
         let navigation = MainWindowNavigation()
         navigation.bind(to: webView)

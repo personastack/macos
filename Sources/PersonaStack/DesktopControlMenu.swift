@@ -113,8 +113,8 @@ struct DesktopControlMenu: View {
     }
 
     private func openDesktopFlow(path: String, query: [String: String]) {
-        MainWebViewHost.showMainWindow { openWindow(id: "personastack-main") }
         MainWebViewHost.shared.openDesktopFlow(path: path, query: query)
+        MainWebViewHost.showMainWindow { openWindow(id: "personastack-main") }
     }
 
     private var connectionStatus: some View {
