@@ -77,7 +77,7 @@ func (s Session) ConnectFrame(nonce string) (externalagentprotocol.Frame, error)
 		ClientKind:                externalagentprotocol.ClientKindMacOSApp,
 		ProtocolVersion:           protocolVersions[0],
 		SupportedProtocolVersions: protocolVersions,
-		ConnectorVersion:          buildinfo.VersionString(),
+		ClientVersion:             buildinfo.VersionString(),
 		RuntimeKind:               runtimeKindForAdapter(s.Binding.RuntimeKind),
 		ConnectionGeneration:      s.Binding.ConnectionGeneration,
 		Hostname:                  localHostname(),
@@ -129,11 +129,10 @@ func (s Session) HeartbeatFrameWithDiagnostic(state runtime.AdapterState, diagno
 		NativeMCPToolNamespace: strings.TrimSpace(s.Binding.NativeMCPNamespace),
 		NativeMCPToolPrefix:    nativeMCPToolPrefix(s.Binding.RuntimeKind, s.Binding.NativeMCPServer),
 		NativeToolNamingRule:   nativeToolNamingRule(s.Binding.RuntimeKind),
-		ConnectorVersion:       buildinfo.VersionString(),
+		ClientVersion:          buildinfo.VersionString(),
 		GitCommit:              buildinfo.GitCommitString(),
 		OS:                     stdruntime.GOOS,
 		Arch:                   stdruntime.GOARCH,
-		ReleaseChannel:         buildinfo.ReleaseChannelString(),
 		LastWakeProbeAt:        lastWakeProbeAt,
 	}
 	return frame

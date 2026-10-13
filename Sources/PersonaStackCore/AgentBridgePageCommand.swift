@@ -16,7 +16,6 @@ public struct AgentBridgePageCommand: Sendable {
     public static func parse(_ body: Any) throws -> Self {
         let schemas: [String: Set<String>] = [
             "state": [], "discover": ["runtime_kind"], "connections": [],
-            "migration_prepare": ["runtime_kind", "workspace_id", "persona_id", "profile_candidate_id", "connection_id", "connection_generation"],
             "prepare": ["runtime_kind", "workspace_id", "persona_id", "profile_candidate_id"],
             "enroll": ["preparation_id", "code"],
             "check": ["connection_id", "workspace_id", "persona_id", "connection_generation"],

@@ -3,10 +3,9 @@ package buildinfo
 import "strings"
 
 var (
-	Version        = "0.1.0-dev"
-	GitCommit      = "unknown"
-	BuildDate      = "unknown"
-	ReleaseChannel = "dev"
+	Version   = "0.1.0-dev"
+	GitCommit = "unknown"
+	BuildDate = "unknown"
 )
 
 func VersionString() string {
@@ -15,8 +14,4 @@ func VersionString() string {
 
 func GitCommitString() string {
 	return strings.TrimSpace(GitCommit)
-}
-
-func ReleaseChannelString() string {
-	return strings.TrimSpace(ReleaseChannel)
 }

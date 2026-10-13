@@ -11,12 +11,6 @@ import (
 // account encodes the complete binding/suffix key before the native C string
 // boundary. BindingKey.String contains a NUL separator that must never truncate.
 func (s KeychainStore) account(key string) (string, error) {
-	if s.service() == "personastack-connector" {
-		if strings.ContainsRune(key, '\x00') {
-			return "", fmt.Errorf("invalid legacy Keychain account")
-		}
-		return key, nil
-	}
 	return "v1:" + base64.RawURLEncoding.EncodeToString([]byte(key)), nil
 }
 
@@ -28,14 +22,9 @@ type SecretStore interface {
 	Set(string, string) error
 	Delete(string) error
 }
-type KeychainStore struct{ Service string }
+type KeychainStore struct{}
 
-func (s KeychainStore) service() string {
-	if s.Service != "" {
-		return s.Service
-	}
-	return keyringService
-}
+func (s KeychainStore) service() string { return keyringService }
 
 func getSecret(store SecretStore, key string) string {
 	value, err := store.Get(key)
@@ -97,8 +86,7 @@ func storeBindingSecretsWith(secrets SecretStore, binding Binding) (Binding, err
 }
 
 func loadBindingSecretsWith(secrets SecretStore, binding Binding) Binding {
-	// Scrub legacy path and agent fields before any command can reuse them as a
-	// fallback target. The connector must await an API-selected runtime target.
+	// Secrets stay partitioned by the approved environment and connection.
 
 	connectionID := binding.Key().String()
 	if connectionID == "" {

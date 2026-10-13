@@ -107,13 +107,13 @@ private actor AgentBridgeManagementFixture: AgentBridgeControlTransport, AgentBr
             "workspace_id": "ws_11111111111111111111111111111111", "persona_id": "persona-a", "connection_id": "conn-a", "connection_generation": 7])
     }
 
-    @Test @MainActor func migrationReadinessUsesActualVerifiedHelperContract() throws {
+    @Test @MainActor func enrollmentReadinessUsesActualVerifiedHelperContract() throws {
         let remote = try JSONDecoder().decode(AgentBridgeHostedBinding.self, from: Data(current.utf8))
         let verified = try JSONDecoder().decode(AgentBridgeConnections.self, from: Data(local.utf8))
         let key = AgentBridgeBindingKey(environmentID: "https://my.personastack.ai", connectionID: "conn-a")
-        #expect(AgentBridgeSetupManager.migrationReady(remote: remote, local: verified, binding: key))
+        #expect(AgentBridgeSetupManager.enrollmentReady(remote: remote, local: verified, binding: key))
         let gatewayOnly = try JSONDecoder().decode(AgentBridgeConnections.self, from: Data(local.replacingOccurrences(of: "mcp_verified", with: "ready").utf8))
-        #expect(!AgentBridgeSetupManager.migrationReady(remote: remote, local: gatewayOnly, binding: key))
+        #expect(!AgentBridgeSetupManager.enrollmentReady(remote: remote, local: gatewayOnly, binding: key))
     }
 
     @Test @MainActor func rejectedMCPCustodyCannotRepairOrStartGateway() async throws {

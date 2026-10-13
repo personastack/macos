@@ -32,7 +32,7 @@ type ioDiscard struct{}
 func (ioDiscard) Write(p []byte) (int, error) { return len(p), nil }
 
 // TryStartGatewayForHome starts the default selected-account OpenClaw gateway.
-// An existing listener is never replaced because the Connector cannot safely
+// An existing listener is never replaced because the app cannot safely
 // attribute it to a different account.
 func TryStartGatewayForHome(homeDir string, identity hermessetup.ProcessIdentity, gatewayReachable func() bool) (bool, error) {
 	return TryStartGatewayForHomeAt(homeDir, identity, 18789, gatewayReachable)

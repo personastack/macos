@@ -12,8 +12,6 @@ public enum AgentBridgeFailure: String, Error, Sendable {
     case reconnectRequired = "reconnect_required"
     case busy
     case cleanupRequired = "cleanup_required"
-    case migrationRequired = "migration_required"
-    case migrationIncomplete = "migration_incomplete"
     case backgroundApprovalRequired = "background_approval_required"
     case serviceUnavailable = "service_unavailable"
     case operationTimeout = "operation_timeout"
@@ -63,10 +61,9 @@ public struct AgentBridgePreparation: Codable, Sendable {
     public let profileCandidateID: String?
     public let expiresAt: String?
     public let existingBindingKey: AgentBridgeBindingKey?
-    public let migrationPending: Bool?
     enum CodingKeys: String, CodingKey {
         case preparationID = "preparation_id", devicePublicKey = "device_public_key"
-        case profileCandidateID = "profile_candidate_id", expiresAt = "expires_at", existingBindingKey = "existing_binding_key", migrationPending = "migration_pending"
+        case profileCandidateID = "profile_candidate_id", expiresAt = "expires_at", existingBindingKey = "existing_binding_key"
     }
 }
 
@@ -101,31 +98,9 @@ public struct AgentBridgeConnection: Codable, Sendable {
         case connectionGeneration = "connection_generation", preparedTarget = "prepared_target"
     }
 }
-public struct AgentBridgeMigrationHelp: Codable, Sendable {
-    public let profileLabel: String
-    public let profileConfigPath: String
-    public let legacyEntryKey: String
-    public let backupDirectory: String
-    enum CodingKeys: String, CodingKey {
-        case profileLabel = "profile_label", profileConfigPath = "profile_config_path"
-        case legacyEntryKey = "legacy_entry_key", backupDirectory = "backup_directory"
-    }
-}
-public struct AgentBridgeMigrationCapture: Codable, Sendable {
-    public let migrationID: UUID
-    public let wasPaused: Bool?
-    public let pauseVersion: Int?
-    public let legacyServiceScope: String
-    public let profileCandidateID: String
-    enum CodingKeys: String, CodingKey {
-        case wasPaused = "was_paused", pauseVersion = "pause_version"
-        case migrationID = "migration_id", legacyServiceScope = "legacy_service_scope", profileCandidateID = "profile_candidate_id"
-    }
-}
 public struct AgentBridgeConnections: Codable, Sendable {
     public let connections: [AgentBridgeConnection]
-    public let pendingMigrationCount: Int?
-    enum CodingKeys: String, CodingKey { case connections, pendingMigrationCount = "pending_migration_count" }
+    enum CodingKeys: String, CodingKey { case connections }
 }
 public struct AgentBridgeEnrollment: Codable, Sendable {
     public let bindingKey: AgentBridgeBindingKey
@@ -138,7 +113,6 @@ public struct AgentBridgeAdmission: Codable, Sendable {
     enum CodingKeys: String, CodingKey { case activeRunIDs = "active_run_ids", quiesced }
 }
 public struct AgentBridgeAcknowledgement: Codable, Sendable {
-    public let cancelled: Bool?
     public let disabled: Bool?
     public let disconnected: Bool?
 }
@@ -150,7 +124,7 @@ public struct AgentBridgeRequest: Encodable, Sendable {
     public let operation: String
     private let payload: [String: AgentBridgeValue]
     public init(requestID: UUID = UUID(), operation: String, payload: [String: AgentBridgeValue]) throws {
-        guard ["discover", "prepare", "enroll", "status", "check", "repair", "disconnect", "quiesce", "resume", "stop_background", "migration_prepare", "migration_repair", "migration_cancel", "migration_help"].contains(operation) else {
+        guard ["discover", "prepare", "enroll", "status", "check", "repair", "disconnect", "quiesce", "resume", "stop_background"].contains(operation) else {
             throw AgentBridgeFailure.invalidRequest
         }
         self.requestID = requestID; self.operation = operation; self.payload = payload

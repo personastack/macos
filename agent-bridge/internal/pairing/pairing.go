@@ -39,11 +39,9 @@ type Result struct {
 }
 
 type ExchangeError struct {
-	StatusCode              int
-	ErrorCode               externalagentprotocol.PairingExchangeErrorCode
-	Message                 string
-	MinimumConnectorVersion string
-	UpdateCommand           string
+	StatusCode int
+	ErrorCode  externalagentprotocol.PairingExchangeErrorCode
+	Message    string
 }
 
 func (e ExchangeError) Error() string {
@@ -53,9 +51,6 @@ func (e ExchangeError) Error() string {
 	}
 	if e.ErrorCode == "" {
 		return fmt.Sprintf("%s: status=%d", message, e.StatusCode)
-	}
-	if strings.TrimSpace(e.UpdateCommand) != "" {
-		return fmt.Sprintf("%s: %s (update: %s)", e.ErrorCode, message, strings.TrimSpace(e.UpdateCommand))
 	}
 	return fmt.Sprintf("%s: %s", e.ErrorCode, message)
 }
@@ -67,6 +62,9 @@ func (c Client) Exchange(ctx context.Context, request Request) (Result, error) {
 	code := strings.TrimSpace(request.Code)
 	if code == "" {
 		return Result{}, fmt.Errorf("pairing code required")
+	}
+	if request.RuntimeKind != runtime.AdapterKindHermes && request.RuntimeKind != runtime.AdapterKindOpenClaw {
+		return Result{}, fmt.Errorf("explicit supported native runtime required")
 	}
 	runtimeKind := runtimeKindForAdapter(request.RuntimeKind)
 	privateKey := request.PrivateKey
@@ -88,7 +86,6 @@ func (c Client) Exchange(ctx context.Context, request Request) (Result, error) {
 		ClientVersion:             buildinfo.VersionString(),
 		DesktopPreparation:        request.DesktopPreparation,
 		RuntimeKind:               runtimeKind,
-		ConnectorVersion:          buildinfo.VersionString(),
 		ProtocolVersion:           externalagentprotocol.ProtocolVersionV4,
 		SupportedProtocolVersions: externalagentprotocol.SupportedProtocolVersions(),
 		OS:                        goruntime.GOOS,
@@ -128,31 +125,19 @@ func (c Client) Exchange(ctx context.Context, request Request) (Result, error) {
 			return Result{}, fmt.Errorf("pairing exchange failed: status=%d", response.StatusCode)
 		}
 		return Result{}, ExchangeError{
-			StatusCode:              response.StatusCode,
-			ErrorCode:               errorResponse.ErrorCode,
-			Message:                 errorResponse.Message,
-			MinimumConnectorVersion: errorResponse.MinimumConnectorVersion,
-			UpdateCommand:           errorResponse.UpdateCommand,
+			StatusCode: response.StatusCode,
+			ErrorCode:  errorResponse.ErrorCode,
+			Message:    errorResponse.Message,
 		}
 	}
 	var decoded externalagentprotocol.PairingExchangeResponse
 	if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil {
 		return Result{}, fmt.Errorf("decode pairing response: %w", err)
 	}
+	if decoded.ClientKind != externalagentprotocol.ClientKindMacOSApp || decoded.RuntimeKind != runtimeKind {
+		return Result{}, fmt.Errorf("pairing response changed prepared app or runtime scope")
+	}
 	negotiatedKind := decoded.RuntimeKind
-	if negotiatedKind == "" {
-		if runtimeKind != "" {
-			negotiatedKind = runtimeKind
-		} else {
-			return Result{}, fmt.Errorf("pairing response did not negotiate a runtime kind")
-		}
-	}
-	if runtimeKind != "" && negotiatedKind != runtimeKind {
-		return Result{}, fmt.Errorf("pairing response changed explicitly selected runtime kind")
-	}
-	if negotiatedKind != externalagentprotocol.RuntimeKindHermes && negotiatedKind != externalagentprotocol.RuntimeKindOpenClaw {
-		return Result{}, fmt.Errorf("pairing response negotiated unsupported runtime kind")
-	}
 	negotiatedAdapterKind := adapterKindForExternalRuntime(negotiatedKind)
 	return Result{Binding: config.Binding{
 		ConnectionID:         config.ConnectionID(strings.TrimSpace(decoded.ConnectionID)),
@@ -190,8 +175,6 @@ func pairingCodeHash(code string) string {
 
 func runtimeKindForAdapter(kind runtime.AdapterKind) externalagentprotocol.RuntimeKind {
 	switch kind {
-	case runtime.AdapterKindAuto:
-		return ""
 	case runtime.AdapterKindOpenClaw:
 		return externalagentprotocol.RuntimeKindOpenClaw
 	default:

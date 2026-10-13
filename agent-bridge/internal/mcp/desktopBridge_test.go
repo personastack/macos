@@ -209,66 +209,6 @@ func TestDesktopAgentBridgeMCPConfigSymlink(t *testing.T) {
 	}
 }
 
-func TestDesktopAgentBridgeCapturedLegacyTransfer(t *testing.T) {
-	t.Parallel()
-	b, store, path := installedFixture(t)
-	capture, err := CaptureLegacy(b, "migration", filepath.Join(filepath.Dir(path), "backup"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	old, _ := os.ReadFile(path)
-	b.Migration = &capture
-	b.NativeMCPServer = "new-issued"
-	b.NativeMCPNamespace = "mcp_new"
-	b.PersonaMCPToken = "new-secret"
-	b.MCPOwnership = config.MCPOwnership{}
-	if err := store.SaveBinding(b); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = (Installer{Store: store}).InstallBinding(b); err != nil {
-		t.Fatal(err)
-	}
-	raw, _ := os.ReadFile(path)
-	if strings.Contains(string(raw), "issued:") && !strings.Contains(string(raw), "new-issued:") {
-		t.Fatal("new entry absent")
-	}
-	if strings.Contains(string(raw), "\n    issued:") || !strings.Contains(string(raw), "Bearer new-secret") || !strings.Contains(string(raw), "unrelated:") {
-		t.Fatalf("transfer %s", raw)
-	}
-	backup, _ := os.ReadFile(capture.BackupPath)
-	if string(backup) != string(old) {
-		t.Fatal("exact backup changed")
-	}
-	saved, _ := config.BindingFor(store, b)
-	if saved.Migration != nil || saved.MCPOwnership.EntryKey != "new-issued" {
-		t.Fatal("migration not finalized")
-	}
-}
-func TestDesktopAgentBridgeCapturedLegacyEditRefusal(t *testing.T) {
-	t.Parallel()
-	b, store, path := installedFixture(t)
-	capture, err := CaptureLegacy(b, "migration", filepath.Join(filepath.Dir(path), "backup"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, _ := os.ReadFile(path)
-	raw = []byte(strings.ReplaceAll(string(raw), "Bearer secret", "Bearer edited"))
-	os.WriteFile(path, raw, 0600)
-	b.Migration = &capture
-	b.NativeMCPServer = "new"
-	b.MCPOwnership = config.MCPOwnership{}
-	if err := store.SaveBinding(b); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = (Installer{Store: store}).InstallBinding(b); err == nil {
-		t.Fatal("changed captured entry replaced")
-	}
-	after, _ := os.ReadFile(path)
-	if string(after) != string(raw) {
-		t.Fatal("failed transfer changed config")
-	}
-}
-
 func TestDesktopAgentBridgeMalformedNativeConfigPreserved(t *testing.T) {
 	t.Parallel()
 	b, store, path := installedFixture(t)
@@ -382,5 +322,45 @@ func TestDesktopAgentBridgeOpenClawUnsupportedNativeCatalogBlocksDirectMCP(t *te
 	after, _ := os.ReadFile(path)
 	if string(after) != string(before) {
 		t.Fatal("native refusal changed profile configuration")
+	}
+}
+
+func TestDesktopAgentBridgeSetupPreservesFormerConnectorEntryAndBackup(t *testing.T) {
+	t.Parallel()
+	b, store, path := installedFixture(t)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = append(raw, []byte("    former-connector:\n        command: personastack-connector\n        args: [mcp, stdio, --binding, old-connection]\n")...)
+	err = os.WriteFile(path, raw, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(filepath.Dir(path), "manual-backup")
+	err = os.WriteFile(backup, []byte("preserved user backup"), 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (Installer{Store: store}).InstallBinding(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = RemoveOwned(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, retained := range []string{"former-connector:", "command: personastack-connector", "old-connection", "unrelated:", "user_key: keep"} {
+		if !strings.Contains(string(after), retained) {
+			t.Fatalf("unowned entry or native data changed: %s", after)
+		}
+	}
+	savedBackup, err := os.ReadFile(backup)
+	if err != nil || string(savedBackup) != "preserved user backup" {
+		t.Fatal("native backup changed")
 	}
 }

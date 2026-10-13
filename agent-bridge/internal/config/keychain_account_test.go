@@ -27,13 +27,7 @@ func TestDesktopAgentBridgeKeychainFullAccountEncoding(t *testing.T) {
 			}
 		}
 	}
-	legacy := KeychainStore{Service: "personastack-connector"}
-	if account, err := legacy.account("connection:persona-mcp-token"); err != nil || account != "connection:persona-mcp-token" {
-		t.Fatal("legacy migration lookup changed")
-	}
-	if _, err := legacy.account("connection\x00:persona-mcp-token"); err == nil {
-		t.Fatal("NUL legacy account accepted")
-	}
+
 }
 
 type deniedMCPSecrets struct{}

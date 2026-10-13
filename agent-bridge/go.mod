@@ -4,7 +4,7 @@ go 1.26.6
 
 require github.com/google/uuid v1.6.0
 
-require github.com/personastack/agent-gateway v1.0.4-0.20261010111436-c50cf9c4510d
+require github.com/personastack/agent-gateway v1.0.4-0.20261013003447-5e08821c05df
 
 require (
 	github.com/gorilla/websocket v1.5.4-0.20240701034025-d67f41855da4

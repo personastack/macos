@@ -110,10 +110,7 @@ func ConfigureBinding(b *config.Binding, repairHermesToolset bool, openClawAppsC
 	if err != nil {
 		return InstallResult{}, err
 	}
-	if err = transferCapturedEntry(entries, *b, canonical); err != nil {
-		return InstallResult{}, err
-	}
-	if b.Migration == nil && b.MCPOwnership.EntryKey != "" && b.MCPOwnership.EntryKey != b.NativeMCPServer {
+	if b.MCPOwnership.EntryKey != "" && b.MCPOwnership.EntryKey != b.NativeMCPServer {
 		previous, previousIndex := entryAt(entries, b.MCPOwnership.EntryKey)
 		if previous != nil {
 			if fingerprint(previous, b.InventorySeed) != b.MCPOwnership.Fingerprint {
@@ -160,7 +157,6 @@ func ConfigureBinding(b *config.Binding, repairHermesToolset bool, openClawAppsC
 		return InstallResult{}, err
 	}
 	b.MCPOwnership = config.MCPOwnership{ConfigPath: b.NativeConfigPath, CanonicalConfigPath: canonical, EntryKey: b.NativeMCPServer, Fingerprint: fingerprint(entry, b.InventorySeed), FormatVersion: 1}
-	b.Migration = nil
 	return InstallResult{ConnectionID: b.ConnectionID, Runtime: b.RuntimeKind, Path: b.NativeConfigPath, ServerName: b.NativeMCPServer, Note: "native MCP entry configured"}, nil
 }
 func RemoveOwned(b config.Binding) error {

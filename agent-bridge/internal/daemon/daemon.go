@@ -42,8 +42,8 @@ type Runner struct {
 	ReconcileAttemptTimeout time.Duration
 }
 
-var errConnectorBindingRemoved = errors.New("connector binding removed")
-var errConnectorDraining = errors.New("connector draining")
+var errConnectorBindingRemoved = errors.New("background agent binding removed")
+var errConnectorDraining = errors.New("background agent draining")
 
 const websocketReadTimeout = 60 * time.Second
 
@@ -453,7 +453,7 @@ func (r Runner) runBindingSession(ctx context.Context, binding config.Binding, s
 		writeMu.Lock()
 		defer writeMu.Unlock()
 		deadline := r.now().Add(5 * time.Second)
-		err := conn.WriteControl(websocket.PingMessage, []byte("personastack-connector"), deadline)
+		err := conn.WriteControl(websocket.PingMessage, []byte("personastack-agent-bridge"), deadline)
 		if err != nil {
 			writeFailureOnce.Do(func() {
 				cancelSession()

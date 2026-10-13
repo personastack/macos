@@ -53,8 +53,6 @@ private final class AgentBridgeFixtureRegistration: AgentBridgeServiceRegistrati
 private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
     var hasRegisteredService = true
     var busy = true
-    var pendingMigration = false
-    func hasPendingMigrationCapture() async throws -> Bool { pendingMigration }
     var log: [String] = []
     func quiesce() async throws -> AgentBridgeAdmission {
         log.append("quiesce")
@@ -82,7 +80,7 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
             var privateGrant = valid; privateGrant[field] = true
             #expect(throws: AgentBridgeFailure.invalidRequest) { try AgentBridgePageCommand.parse(privateGrant) }
         }
-        for action in ["quiesce", "resume", "stop_background", "register", "execute", "migration_help", "migration_repair", "migration_cancel"] {
+        for action in ["quiesce", "resume", "stop_background", "register", "execute", "migration_prepare", "migration_help", "migration_repair", "migration_cancel"] {
             #expect(throws: AgentBridgeFailure.invalidRequest) {
                 try AgentBridgePageCommand.parse(["version": "2", "action": action, "scope": "native-document"])
             }
@@ -178,20 +176,6 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
         try await handoff.restoreAtLaunch()
         #expect(lifecycle.log.suffix(2) == ["restore-readback", "resume"])
         #expect(!preferences.bool(forKey: AgentBridgeUpdateHandoff.restoreKey))
-    }
-
-    @Test @MainActor func retainedMigrationBlocksReplacementBeforeQuiesceOrUnregister() async throws {
-        let lifecycle = AgentBridgeFixtureLifecycle()
-        lifecycle.busy = false; lifecycle.pendingMigration = true
-        let preferences = UserDefaults(suiteName: "AgentBridgeTests." + UUID().uuidString)!
-        let handoff = AgentBridgeUpdateHandoff(service: lifecycle, preferences: preferences, pendingNativeMigration: { false })
-        await #expect(throws: AgentBridgeFailure.migrationIncomplete) { try await handoff.prepareReplacement() }
-        #expect(lifecycle.log.isEmpty)
-        #expect(!preferences.bool(forKey: AgentBridgeUpdateHandoff.restoreKey))
-        lifecycle.pendingMigration = false
-        let nativeCutover = AgentBridgeUpdateHandoff(service: lifecycle, preferences: preferences, pendingNativeMigration: { true })
-        await #expect(throws: AgentBridgeFailure.migrationIncomplete) { try await nativeCutover.prepareReplacement() }
-        #expect(lifecycle.log.isEmpty)
     }
 
     @Test @MainActor func nativeStateIssuesScopeAndForeignDocumentHasNoHelperCalls() async throws {
@@ -388,4 +372,57 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
         #expect(await transport.operations == ["status", "discover", "status"])
     }
 
+}
+
+@Suite struct AgentBridgeRetirementTests {
+    @Test(arguments: ["migration_prepare", "migration_repair", "migration_cancel", "migration_help"])
+    func retiredPrivateOperationsAreRejected(_ operation: String) {
+        #expect(throws: AgentBridgeFailure.invalidRequest) {
+            try AgentBridgeRequest(operation: operation, payload: [:])
+        }
+    }
+    @Test func retiredPageProposalIsRejectedWithCompleteOldSchema() {
+        #expect(throws: AgentBridgeFailure.invalidRequest) {
+            try AgentBridgePageCommand.parse(["version": "2", "action": "migration_prepare", "scope": "native-document",
+                "runtime_kind": "hermes", "workspace_id": "ws_11111111111111111111111111111111",
+                "persona_id": "persona-a", "profile_candidate_id": "rt_profile_a", "connection_id": "conn-a",
+                "connection_generation": 7])
+        }
+    }
+}
+
+@Suite struct AgentBridgeStopBackgroundTests {
+    @Test @MainActor func idleStopQuiescesAndDisablesBeforeUnregister() async throws {
+        let transport = AgentBridgeFixtureTransport([
+            ("quiesce", #"{"quiesced":true,"active_run_ids":[]}"#),
+            ("stop_background", #"{"disabled":true}"#)
+        ])
+        let registration = AgentBridgeFixtureRegistration()
+        registration.status = .enabled
+        let preferences = UserDefaults(suiteName: "AgentBridgeStopBackgroundTests." + UUID().uuidString)!
+        let service = AgentBridgeService(registration: registration,
+            client: AgentBridgeControlClient(transport: transport), preferences: preferences,
+            requireSignature: {}, clearDisabledPreference: {})
+        try await service.stopBackground()
+        #expect(await transport.operations == ["quiesce", "stop_background"])
+        #expect(registration.calls == ["unregister"])
+        #expect(registration.status == .notRegistered)
+        #expect(preferences.bool(forKey: AgentBridgeService.disabledKey))
+    }
+    @Test @MainActor func assignedWorkStopsDisableBeforeAnyUnregister() async {
+        let transport = AgentBridgeFixtureTransport([
+            ("quiesce", #"{"quiesced":true,"active_run_ids":["run-a"]}"#)
+        ])
+        let registration = AgentBridgeFixtureRegistration()
+        registration.status = .enabled
+        let preferences = UserDefaults(suiteName: "AgentBridgeStopBackgroundTests." + UUID().uuidString)!
+        let service = AgentBridgeService(registration: registration,
+            client: AgentBridgeControlClient(transport: transport), preferences: preferences,
+            requireSignature: {}, clearDisabledPreference: {})
+        await #expect(throws: AgentBridgeFailure.busy) { try await service.stopBackground() }
+        #expect(await transport.operations == ["quiesce"])
+        #expect(registration.calls.isEmpty)
+        #expect(registration.status == .enabled)
+        #expect(!preferences.bool(forKey: AgentBridgeService.disabledKey))
+    }
 }

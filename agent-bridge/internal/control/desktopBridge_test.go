@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/personastack/agent-gateway/pkg/externalagentprotocol"
 	"github.com/personastack/macos/agent-bridge/internal/config"
 	"github.com/personastack/macos/agent-bridge/internal/pairing"
 	"github.com/personastack/macos/agent-bridge/internal/runtime"
@@ -230,238 +229,6 @@ func TestDesktopAgentBridgeUnsafeEnvironmentFile(t *testing.T) {
 	}
 }
 
-func TestDesktopAgentBridgeMigrationCaptureScope(t *testing.T) {
-	t.Parallel()
-	c, _, profiles := fixture(t)
-	root := t.TempDir()
-	path := root + "/config.yaml"
-	raw := "mcp_servers:\n  old-issued:\n    transport: streamable-http\n    url: https://mcp.test/mcp\n    headers:\n      Authorization: Bearer old-secret\n"
-	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
-		t.Fatal(err)
-	}
-	profiles[0].Resolved.ConfigPath = path
-	c.Discover = func(k runtime.AdapterKind, seed string) ([]targetinventory.Profile, []error) {
-		return profiles[:1], nil
-	}
-	c.MigrationDirectory = root + "/private"
-	workspace := "ws_" + strings.Repeat("a", 32)
-	document := uuid.NewString()
-	scope := PreparePayload{EnvironmentID: "https://app.test", WorkspaceID: workspace, PersonaID: "persona", RuntimeKind: "hermes", ProfileCandidateID: profiles[0].CandidateID, DocumentID: document}
-	calls := 0
-	c.LegacyRead = func(environment Environment, p MigrationPreparePayload) (config.Binding, error) {
-		calls++
-		if environment.GatewayBaseURL != "https://gateway.test" || p.ConnectionID != "old" {
-			t.Fatal("wrong legacy custody")
-		}
-		return config.Binding{ConnectionID: "old", PersonaID: "persona", ConnectionGeneration: 2, RuntimeKind: runtime.AdapterKindHermes, NativeMCPServer: "old-issued", NativeMCPNamespace: "mcp_old", PersonaMCPURL: "https://mcp.test/mcp", PersonaMCPToken: "old-secret"}, nil
-	}
-	wasPaused, pauseVersion := false, int64(0)
-	payload, _ := json.Marshal(MigrationPreparePayload{PreparePayload: scope, ConnectionID: "old", ConnectionGeneration: 2, WasPaused: &wasPaused, PauseVersion: &pauseVersion})
-	result := request(t, c, "migration_prepare", string(payload))
-	if result.Error != nil || result.Result.MigrationID == "" || result.Result.LegacyServiceScope != "user_launch_agent" {
-		t.Fatalf("capture %+v", result)
-	}
-	setup := prepare(t, c, profiles[0], "persona", workspace, document)
-	if setup.Error != nil {
-		t.Fatal(setup.Error)
-	}
-	c.Exchange = func(ctx context.Context, env Environment, p pairing.Request) (pairing.Result, error) {
-		return pairing.Result{Binding: config.Binding{ConnectionID: "new", PersonaID: "persona", RuntimeKind: runtime.AdapterKindHermes}}, nil
-	}
-	enroll, _ := json.Marshal(EnrollPayload{PreparationID: setup.Result.PreparationID, Code: "code", DocumentID: document, MigrationID: result.Result.MigrationID})
-	enrolled := request(t, c, "enroll", string(enroll))
-	if enrolled.Error != nil {
-		t.Fatal(enrolled.Error)
-	}
-	binding, _ := c.Store.Binding("new")
-	if binding.Migration == nil || binding.Migration.LegacyConnectionID != "old" || calls != 1 {
-		t.Fatal("capture not held by exact new binding")
-	}
-	after, _ := os.ReadFile(path)
-	if string(after) != raw {
-		t.Fatal("capture/enroll changed native config before target selection")
-	}
-}
-
-func TestDesktopAgentBridgeInterruptedMigrationRepair(t *testing.T) {
-	t.Parallel()
-	c, _, profiles := fixture(t)
-	workspace := "ws_" + strings.Repeat("b", 32)
-	oldDocument, newDocument := uuid.NewString(), uuid.NewString()
-	scope := PreparePayload{EnvironmentID: "https://app.test", WorkspaceID: workspace, PersonaID: "persona", RuntimeKind: "hermes", ProfileCandidateID: profiles[0].CandidateID, DocumentID: oldDocument}
-	c.migrations = map[string]migration{"captured": {Scope: scope, DocumentID: oldDocument, Capture: config.MigrationCapture{ID: "captured", LegacyConnectionID: "old", WasPaused: true, PauseVersion: 7}, ExpiresAt: c.now().Add(time.Minute)}}
-	currentPauseVersion := int64(7)
-	p := MigrationRepairPayload{PauseVersion: &currentPauseVersion, PreparePayload: scope, RevocationReadback: MigrationAbsenceReadback{EnvironmentID: scope.EnvironmentID, WorkspaceID: workspace, PersonaID: "persona", BindingAbsent: true}}
-	p.DocumentID = newDocument
-	foreign := prepare(t, c, profiles[0], "another-persona", workspace, newDocument)
-	if foreign.Error == nil || foreign.Error.Code != "profile_in_use" {
-		t.Fatal("foreign persona capture claim admitted")
-	}
-	pending := prepare(t, c, profiles[0], "persona", workspace, newDocument)
-	if pending.Error != nil || !pending.Result.MigrationPending || pending.Result.PreparationID != "" {
-		t.Fatal("interrupted migration bypassed pending gate")
-	}
-	currentPauseVersion = 8
-	stale, _ := json.Marshal(p)
-	staleResult := request(t, c, "migration_repair", string(stale))
-	if staleResult.Error == nil || c.migrations["captured"].DocumentID != oldDocument {
-		t.Fatal("changed pause version rebound capture")
-	}
-	currentPauseVersion = 7
-	raw, _ := json.Marshal(p)
-	result := request(t, c, "migration_repair", string(raw))
-	if result.Error != nil || result.Result.MigrationID != "captured" || result.Result.WasPaused == nil || !*result.Result.WasPaused || result.Result.PauseVersion == nil || *result.Result.PauseVersion != 7 || c.migrations["captured"].Scope.DocumentID != newDocument {
-		t.Fatalf("repair %+v", result)
-	}
-
-	fresh := prepare(t, c, profiles[0], "persona", workspace, newDocument)
-	if fresh.Error != nil || fresh.Result.MigrationPending || fresh.Result.PreparationID == "" {
-		t.Fatal("repaired capture did not reopen ordinary prepare")
-	}
-	p.ProfileCandidateID = profiles[1].CandidateID
-	raw, _ = json.Marshal(p)
-	result = request(t, c, "migration_repair", string(raw))
-	if result.Error == nil {
-		t.Fatal("foreign profile repair admitted")
-	}
-	if c.migrations["captured"].DocumentID != newDocument {
-		t.Fatal("foreign repair changed capture")
-	}
-	p.ProfileCandidateID = profiles[0].CandidateID
-	p.RevocationReadback.PersonaID = "foreign"
-	raw, _ = json.Marshal(p)
-	result = request(t, c, "migration_repair", string(raw))
-	if result.Error == nil {
-		t.Fatal("foreign readback admitted")
-	}
-	p.RevocationReadback.PersonaID = "persona"
-	capture := c.migrations["captured"]
-	capture.ExpiresAt = c.now().Add(-time.Second)
-	c.migrations["captured"] = capture
-	raw, _ = json.Marshal(p)
-	result = request(t, c, "migration_repair", string(raw))
-	if result.Error == nil || len(c.migrations) != 0 {
-		t.Fatal("expired capture renewed")
-	}
-	result = request(t, c, "migration_repair", string(raw))
-	if result.Error == nil {
-		t.Fatal("missing capture synthesized")
-	}
-}
-
-func TestDesktopAgentBridgePendingMigrationUpdateGate(t *testing.T) {
-	t.Parallel()
-	c, store, _ := fixture(t)
-	c.migrations = map[string]migration{"pending": {ExpiresAt: c.now().Add(time.Minute)}}
-	status := request(t, c, "status", `{}`)
-	raw, _ := json.Marshal(status)
-	if !strings.Contains(string(raw), `"pending_migration_count":1`) {
-		t.Fatalf("missing finite pending count %s", raw)
-	}
-	blocked := request(t, c, "quiesce", `{}`)
-	if blocked.Error == nil || blocked.Error.Code != "busy" {
-		t.Fatal("update quiesce lost pending capture")
-	}
-	delete(c.migrations, "pending")
-	binding := config.Binding{EnvironmentID: "https://app.test", ConnectionID: "enrolled", Migration: &config.MigrationCapture{ID: "bound"}}
-	store.SaveBinding(binding)
-	status = request(t, c, "status", `{}`)
-	if status.Result.PendingMigrationCount != 1 {
-		t.Fatal("bound uninstalled migration omitted")
-	}
-	config.UpdateBinding(store, binding, func(latest *config.Binding) error { latest.Migration = nil; return nil })
-	status = request(t, c, "status", `{}`)
-	raw, _ = json.Marshal(status)
-	if !strings.Contains(string(raw), `"pending_migration_count":0`) {
-		t.Fatal("completed migration blocks update")
-	}
-}
-
-func TestDesktopAgentBridgeCancelMigrationBeforeRevocation(t *testing.T) {
-	t.Parallel()
-	c, _, profiles := fixture(t)
-	document := uuid.NewString()
-	scope := PreparePayload{EnvironmentID: "https://app.test", WorkspaceID: "ws_" + strings.Repeat("c", 32), PersonaID: "persona", RuntimeKind: "hermes", ProfileCandidateID: profiles[0].CandidateID, DocumentID: document}
-	c.migrations = map[string]migration{"pending": {LegacyGeneration: 2, Scope: scope, DocumentID: document, Capture: config.MigrationCapture{LegacyConnectionID: "old"}, ExpiresAt: c.now().Add(time.Minute)}}
-	p := MigrationCancelPayload{MigrationID: "pending", DocumentID: document, LegacyBindingReadback: LegacyPresenceReadback{EnvironmentID: scope.EnvironmentID, WorkspaceID: scope.WorkspaceID, PersonaID: "persona", ConnectionID: "old", ConnectionGeneration: 2, BindingPresent: false}}
-	raw, _ := json.Marshal(p)
-	denied := request(t, c, "migration_cancel", string(raw))
-	if denied.Error == nil || len(c.migrations) != 1 {
-		t.Fatal("revoked migration discarded")
-	}
-	p.LegacyBindingReadback.BindingPresent = true
-	raw, _ = json.Marshal(p)
-	cancelled := request(t, c, "migration_cancel", string(raw))
-	if cancelled.Error != nil || cancelled.Result.Cancelled == nil || !*cancelled.Result.Cancelled || len(c.migrations) != 0 {
-		t.Fatal("unrevoked capture not cancelled")
-	}
-}
-
-func TestDesktopAgentBridgeManualMigrationHelpAndResetGate(t *testing.T) {
-	t.Parallel()
-	c, store, profiles := fixture(t)
-	root := t.TempDir()
-	path := root + "/config.yaml"
-	original := "mcp_servers:\n  old-issued:\n    transport: streamable-http\n    url: https://mcp.test/mcp\n    headers:\n      Authorization: Bearer never-return-this\n"
-	if err := os.WriteFile(path, []byte(original), 0600); err != nil {
-		t.Fatal(err)
-	}
-	profiles[0].Resolved.ConfigPath = path
-	c.Discover = func(k runtime.AdapterKind, seed string) ([]targetinventory.Profile, []error) {
-		return profiles[:1], nil
-	}
-	c.MigrationDirectory = root + "/backups"
-	websocket, err := externalagentprotocol.ResolveWebsocketURL("https://gateway.test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacy := config.Binding{ConnectionID: "old", PersonaID: "persona", RuntimeKind: runtime.AdapterKindHermes, NativeMCPServer: "old-issued", PersonaMCPURL: "https://mcp.test/mcp", GatewayWebsocketURL: websocket}
-	c.LegacyMetadataRead = func(e Environment) ([]config.Binding, error) {
-		if e.EnvironmentID != "https://app.test" {
-			t.Fatal("wrong environment")
-		}
-		return []config.Binding{legacy}, nil
-	}
-	scope := PreparePayload{EnvironmentID: "https://app.test", WorkspaceID: "ws_" + strings.Repeat("d", 32), PersonaID: "persona", RuntimeKind: "hermes", ProfileCandidateID: profiles[0].CandidateID, DocumentID: uuid.NewString()}
-	p := MigrationHelpPayload{PreparePayload: scope, RevocationReadback: MigrationAbsenceReadback{EnvironmentID: scope.EnvironmentID, WorkspaceID: scope.WorkspaceID, PersonaID: scope.PersonaID}}
-	raw, _ := json.Marshal(p)
-	denied := request(t, c, "migration_help", string(raw))
-	if denied.Error == nil || denied.Error.Code != "scope_changed" {
-		t.Fatal("missing native absence accepted")
-	}
-	gate := prepare(t, c, profiles[0], scope.PersonaID, scope.WorkspaceID, scope.DocumentID)
-	if gate.Error == nil || gate.Error.Code != "migration_required" || len(c.preparations) != 0 {
-		t.Fatal("fresh enrollment allowed over uncaptured legacy entry")
-	}
-	p.RevocationReadback.BindingAbsent = true
-	raw, _ = json.Marshal(p)
-	result := request(t, c, "migration_help", string(raw))
-	if result.Error != nil || result.Result.ProfileConfigPath != path || result.Result.LegacyEntryKey != "old-issued" || result.Result.BackupDirectory != c.MigrationDirectory {
-		t.Fatalf("wrong native-only guidance: %+v", result)
-	}
-	encoded, _ := json.Marshal(result)
-	if strings.Contains(string(encoded), "never-return-this") || len(store.ListBindings()) != 0 {
-		t.Fatal("secret exposure or mutation")
-	}
-	after, _ := os.ReadFile(path)
-	if string(after) != original {
-		t.Fatal("help mutated native configuration")
-	}
-	legacy.PersonaID = "foreign"
-	foreign := request(t, c, "migration_help", string(raw))
-	if foreign.Error == nil || foreign.Error.Code != "profile_in_use" {
-		t.Fatal("foreign metadata scope accepted")
-	}
-	legacy.PersonaID = "persona"
-	if err := os.WriteFile(path, []byte("mcp_servers: {}\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	reset := prepare(t, c, profiles[0], scope.PersonaID, scope.WorkspaceID, scope.DocumentID)
-	if reset.Error != nil || reset.Result.PreparationID == "" {
-		t.Fatalf("manual reset did not clear prepare gate: %+v", reset)
-	}
-}
-
 func TestDesktopAgentBridgeInterruptedPreparationRetryFencesOldDocument(t *testing.T) {
 	t.Parallel()
 	c, _, profiles := fixture(t)
@@ -612,5 +379,66 @@ func TestDesktopAgentBridgeRepairReportsAdmissionAndSelectionConflict(t *testing
 				t.Fatalf("Repair conflict mapped to unsafe cleanup: %+v", result)
 			}
 		})
+	}
+}
+
+func TestDesktopAgentBridgeRetiredMigrationOperationsHaveNoSideEffects(t *testing.T) {
+	t.Parallel()
+	for _, operation := range []string{"migration_prepare", "migration_repair", "migration_cancel", "migration_help"} {
+		t.Run(operation, func(t *testing.T) {
+			t.Parallel()
+			c, store, _ := fixture(t)
+			c.Exchange = func(context.Context, Environment, pairing.Request) (pairing.Result, error) {
+				t.Fatal("retired operation attempted pairing")
+				return pairing.Result{}, nil
+			}
+			c.Discover = func(runtime.AdapterKind, string) ([]targetinventory.Profile, []error) {
+				t.Fatal("retired operation inspected profiles")
+				return nil, nil
+			}
+			c.Stop = func() error { t.Fatal("retired operation stopped helper"); return nil }
+			result := request(t, c, operation, `{}`)
+			if result.Error == nil || result.Error.Code != "invalid_request" || result.Result != nil {
+				t.Fatalf("retired operation admitted: %+v", result)
+			}
+			if len(store.ListBindings()) != 0 || len(c.preparations) != 0 {
+				t.Fatal("retired operation changed custody")
+			}
+		})
+	}
+}
+
+func TestDesktopAgentBridgeRetiredEnrollmentCaptureIsRejected(t *testing.T) {
+	t.Parallel()
+	c, store, profiles := fixture(t)
+	document := uuid.NewString()
+	setup := prepare(t, c, profiles[0], "persona-a", "ws_11111111111111111111111111111111", document)
+	if setup.Error != nil {
+		t.Fatal(setup.Error)
+	}
+	c.Exchange = func(context.Context, Environment, pairing.Request) (pairing.Result, error) {
+		t.Fatal("retired capture attempted pairing")
+		return pairing.Result{}, nil
+	}
+	payload := `{"preparation_id":"` + setup.Result.PreparationID + `","code":"code","document_id":"` + document + `","migration_id":"` + uuid.NewString() + `"}`
+	denied := request(t, c, "enroll", payload)
+	if denied.Error == nil || denied.Error.Code != "invalid_request" {
+		t.Fatalf("retired field admitted: %+v", denied)
+	}
+	if len(store.ListBindings()) != 0 || len(c.preparations) != 1 {
+		t.Fatal("rejected capture consumed setup or saved binding")
+	}
+}
+
+func TestDesktopAgentBridgeStatusContainsOnlyManagedConnections(t *testing.T) {
+	t.Parallel()
+	c, _, _ := fixture(t)
+	result := request(t, c, "status", `{}`)
+	raw, err := json.Marshal(result.Result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != `{"connections":[]}` {
+		t.Fatalf("unexpected status fields: %s", raw)
 	}
 }

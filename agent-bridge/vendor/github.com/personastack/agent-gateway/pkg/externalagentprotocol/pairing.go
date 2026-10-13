@@ -1,11 +1,10 @@
 package externalagentprotocol
 
-// ClientKind distinguishes application-owned bridges from the retiring standalone distribution.
+// ClientKind identifies the app-owned bridge admitted by the API.
 type ClientKind string
 
 const (
-	ClientKindStandaloneConnector ClientKind = "standalone_connector"
-	ClientKindMacOSApp            ClientKind = "macos_app"
+	ClientKindMacOSApp ClientKind = "macos_app"
 )
 
 // DesktopPreparation binds a short-lived enrollment to the helper's key and opaque profile.
@@ -16,15 +15,13 @@ type DesktopPreparation struct {
 	ProfileCandidateID string `json:"profile_candidate_id"`
 }
 
-// PairingExchangeRequest is sent by Connector after the user runs the browser
-// pairing command.
+// PairingExchangeRequest is sent by the macOS helper after scoped desktop preparation.
 type PairingExchangeRequest struct {
 	ClientKind                ClientKind          `json:"client_kind,omitempty"`
 	ClientVersion             string              `json:"client_version,omitempty"`
 	DesktopPreparation        *DesktopPreparation `json:"desktop_preparation,omitempty"`
 	Code                      string              `json:"code"`
 	RuntimeKind               RuntimeKind         `json:"runtime_kind"`
-	ConnectorVersion          string              `json:"connector_version"`
 	ProtocolVersion           string              `json:"protocol_version"`
 	SupportedProtocolVersions []string            `json:"supported_protocol_versions,omitempty"`
 	OS                        string              `json:"os,omitempty"`
@@ -40,14 +37,12 @@ type PairingExchangeRequest struct {
 type PairingExchangeErrorCode string
 
 const (
-	PairingExchangeErrorUnsupportedConnectorVersion PairingExchangeErrorCode = "unsupported_connector_version"
+	PairingExchangeErrorUnsupportedProtocol PairingExchangeErrorCode = "unsupported_protocol"
 )
 
 type PairingExchangeErrorResponse struct {
-	ErrorCode               PairingExchangeErrorCode `json:"error_code"`
-	Message                 string                   `json:"message"`
-	MinimumConnectorVersion string                   `json:"minimum_connector_version,omitempty"`
-	UpdateCommand           string                   `json:"update_command,omitempty"`
+	ErrorCode PairingExchangeErrorCode `json:"error_code"`
+	Message   string                   `json:"message"`
 }
 
 // PairingExchangeResponse returns the durable API-owned bridge binding.

@@ -35,23 +35,10 @@ func (kind ExternalAgentKind) String() string {
 	}
 }
 
-type MigrationCapture struct {
-	WasPaused           bool
-	PauseVersion        int64
-	ID                  string
-	ConfigPath          string
-	CanonicalConfigPath string
-	EntryKey            string
-	Namespace           string
-	Fingerprint         string
-	BackupPath          string
-	LegacyConnectionID  ConnectionID
-}
 type Binding struct {
 	PersonaMCPSecretUnavailable bool `json:"-"`
 	ReadinessDiagnosticCode     string
 
-	Migration                *MigrationCapture `json:",omitempty"`
 	EnvironmentID            string
 	WorkspaceID              string
 	ProfileCandidateID       string

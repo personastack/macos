@@ -17,9 +17,9 @@ struct AgentBridgeHostedBinding: Decodable, Sendable {
         case readinessStatus = "readiness_status", runLaneStatus = "run_lane_status"
         case targetInventory = "target_inventory", targetSelection = "target_selection"
     }
-    func require(workspace: String, persona: String, connection: String, generation: Int, clientKind expectedKind: String = "macos_app") throws {
+    func require(workspace: String, persona: String, connection: String, generation: Int) throws {
         guard workspaceID == workspace, personaID == persona, connectionID == connection,
-              connectionGeneration == generation, clientKind == expectedKind else { throw AgentBridgeFailure.scopeChanged }
+              connectionGeneration == generation, clientKind == "macos_app" else { throw AgentBridgeFailure.scopeChanged }
     }
 }
 
@@ -61,7 +61,7 @@ struct AgentBridgeHostedAuthority: Sendable {
 
     /// Readback is authoritative. A token.revoked notification cannot enter this path.
     func revoke(configuration: DesktopEnvironmentConfiguration, cookies: String, workspace: String,
-                persona: String, connection: String, generation: Int, csrfToken: String, clientKind: String = "macos_app", requireIdle: Bool = false,
+                persona: String, connection: String, generation: Int, csrfToken: String, requireIdle: Bool = false,
                 validateScope: @MainActor @Sendable () async throws -> Void = {}) async throws {
         guard !csrfToken.isEmpty, csrfToken.utf8.count <= 512, !csrfToken.contains(where: { $0.isWhitespace }) else {
             throw AgentBridgeFailure.invalidRequest
@@ -69,7 +69,7 @@ struct AgentBridgeHostedAuthority: Sendable {
         let before = try await read(configuration: configuration, cookies: cookies, persona: persona)
         guard before.workspaceID == workspace, before.personaID == persona else { throw AgentBridgeFailure.scopeChanged }
         if before.connectionID == nil || before.connectionID == "" { return }
-        try before.require(workspace: workspace, persona: persona, connection: connection, generation: generation, clientKind: clientKind)
+        try before.require(workspace: workspace, persona: persona, connection: connection, generation: generation)
         if requireIdle && before.runLaneStatus != "idle" { throw AgentBridgeFailure.busy }
         try await validateScope()
         let deletion = try request(configuration: configuration, cookies: cookies, method: "DELETE", persona: persona,
@@ -82,6 +82,32 @@ struct AgentBridgeHostedAuthority: Sendable {
         try await validateScope()
         guard after.workspaceID == workspace, after.personaID == persona,
               after.connectionID == nil || after.connectionID == "" else { throw AgentBridgeFailure.cleanupRequired }
+    }
+
+    /// Stop requires the explicit native confirmation and exact binding readback owned by the caller.
+    func stop(configuration: DesktopEnvironmentConfiguration, cookies: String, csrf: String, persona: String) async throws {
+        guard ChatWindowCommand.validPersonaID(persona), !cookies.isEmpty,
+              !csrf.isEmpty, csrf.utf8.count <= 512, !csrf.contains(where: { $0.isWhitespace }) else {
+            throw AgentBridgeFailure.invalidRequest
+        }
+        var request = URLRequest(url: configuration.appURL.appendingPathComponent("user/personas/stop"))
+        request.httpMethod = "POST"
+        request.httpShouldHandleCookies = false
+        request.setValue(cookies, forHTTPHeaderField: "Cookie")
+        request.setValue(configuration.appOrigin, forHTTPHeaderField: "Origin")
+        request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(csrf, forHTTPHeaderField: "X-CSRF-Token")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Body: Encodable { let persona_id: String }
+        request.httpBody = try JSONEncoder().encode(Body(persona_id: persona))
+        let (data, status) = try await transport.request(request)
+        guard [200, 202].contains(status) else {
+            throw [401, 403].contains(status) ? AgentBridgeFailure.scopeChanged : .serviceUnavailable
+        }
+        struct Response: Decodable { let accepted: Bool; let ok: Bool }
+        let response = try JSONDecoder().decode(Response.self, from: data)
+        guard response.accepted, response.ok else { throw AgentBridgeFailure.busy }
     }
 
     private func request(configuration: DesktopEnvironmentConfiguration, cookies: String, method: String,

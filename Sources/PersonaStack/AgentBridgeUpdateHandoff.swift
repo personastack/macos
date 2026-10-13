@@ -5,7 +5,6 @@ import ServiceManagement
 @MainActor
 protocol AgentBridgeUpdateLifecycle: AnyObject {
     var hasRegisteredService: Bool { get }
-    func hasPendingMigrationCapture() async throws -> Bool
     func quiesce() async throws -> AgentBridgeAdmission
     func resume() async throws
     func retireForReplacement() async throws
@@ -21,14 +20,12 @@ final class AgentBridgeUpdateHandoff {
     static let restoreKey = "agentBridge.restoreAfterAppUpdate"
     private let service: any AgentBridgeUpdateLifecycle
     private let preferences: UserDefaults
-    private let pendingNativeMigration: @MainActor () -> Bool
     private(set) var isPreparing = false
     private var quiesced = false
     private var retired = false
 
-    init(service: any AgentBridgeUpdateLifecycle = AgentBridgeService.shared, preferences: UserDefaults = .standard,
-         pendingNativeMigration: @escaping @MainActor () -> Bool = { AgentBridgeSetupManager.shared.hasPendingMigrationCutover }) {
-        self.service = service; self.preferences = preferences; self.pendingNativeMigration = pendingNativeMigration
+    init(service: any AgentBridgeUpdateLifecycle = AgentBridgeService.shared, preferences: UserDefaults = .standard) {
+        self.service = service; self.preferences = preferences
     }
     var needsHandoff: Bool { service.hasRegisteredService || retired }
 
@@ -38,9 +35,6 @@ final class AgentBridgeUpdateHandoff {
         guard needsHandoff else { return }
         guard !isPreparing else { throw AgentBridgeFailure.busy }
         if retired { return }
-        guard !pendingNativeMigration() else { throw AgentBridgeFailure.migrationIncomplete }
-        let pendingCapture = try await service.hasPendingMigrationCapture()
-        guard !pendingCapture else { throw AgentBridgeFailure.migrationIncomplete }
         isPreparing = true
         defer { isPreparing = false }
         let result = try await service.quiesce()

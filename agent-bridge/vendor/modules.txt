@@ -4,7 +4,7 @@ github.com/google/uuid
 # github.com/gorilla/websocket v1.5.4-0.20240701034025-d67f41855da4
 ## explicit; go 1.20
 github.com/gorilla/websocket
-# github.com/personastack/agent-gateway v1.0.4-0.20261010111436-c50cf9c4510d
+# github.com/personastack/agent-gateway v1.0.4-0.20261013003447-5e08821c05df
 ## explicit; go 1.25.5
 github.com/personastack/agent-gateway/pkg/externalagentprotocol
 # golang.org/x/net v0.48.0

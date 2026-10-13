@@ -1,6 +1,6 @@
 # Moved source ownership
 
-Connector remains intact during migration. The following packages and relevant tests move unchanged before focused repairs into this private module. All paths below retain their `internal/` prefix.
+The standalone Connector source is retired. The following packages and relevant tests move unchanged before focused repairs into this private module. All paths below retain their `internal/` prefix.
 
 - Connector `internal/config` → macOS `agent-bridge/internal/config`.
 - Connector `internal/daemon` → macOS `agent-bridge/internal/daemon`.
@@ -18,4 +18,4 @@ Connector remains intact during migration. The following packages and relevant t
 
 Gateway `pkg/externalagentprotocol` replaces the duplicated Connector protocol package. No protocol DTO is copied. CLI, service, installmetadata, release-manifest and standalone release workflow packages are excluded. Legacy MCP proxies and root account switching are removed from the moved tree before task closure.
 
-The new selected-profile, custody, ownership and migration contract has dedicated `TestDesktopAgentBridge*` in-process tests. Legacy CLI-release, root inventory, stdio/loopback proxy, uncancellable responses and transcript-observer tests were not moved because those modes are absent from the private helper. Retained bridge, runtime pure policy, auth-resolution and setup tests remain. The moved MCP HTTP probe keeps the initialize/initialized/tools-list parser and session negotiation. It has no stdio or GET notification proxy entrypoint.
+The new selected-profile, custody and ownership contract has dedicated `TestDesktopAgentBridge*` in-process tests. Legacy CLI-release, root inventory, stdio/loopback proxy, uncancellable responses and transcript-observer tests were not moved because those modes are absent from the private helper. Retained bridge, runtime pure policy, auth-resolution and setup tests remain. The moved MCP HTTP probe keeps the initialize/initialized/tools-list parser and session negotiation. It has no stdio or GET notification proxy entrypoint.

@@ -42,8 +42,8 @@ func TestConnectFrameSignsAPIVerifiableMessage(t *testing.T) {
 	if len(frame.Connect.SupportedProtocolVersions) != 1 || frame.Connect.SupportedProtocolVersions[0] != externalagentprotocol.ProtocolVersionV4 {
 		t.Fatalf("supported protocol versions: %+v", frame.Connect.SupportedProtocolVersions)
 	}
-	if frame.Connect.ConnectorVersion != buildinfo.VersionString() {
-		t.Fatalf("connector version: got=%s want=%s", frame.Connect.ConnectorVersion, buildinfo.VersionString())
+	if frame.Connect.ClientVersion != buildinfo.VersionString() {
+		t.Fatalf("client version: got=%s want=%s", frame.Connect.ClientVersion, buildinfo.VersionString())
 	}
 	if frame.Connect.OS != stdruntime.GOOS || frame.Connect.Arch != stdruntime.GOARCH {
 		t.Fatalf("connect platform metadata: got=%s/%s want=%s/%s", frame.Connect.OS, frame.Connect.Arch, stdruntime.GOOS, stdruntime.GOARCH)
@@ -113,14 +113,11 @@ func TestHeartbeatFrameReportsBuildMetadata(t *testing.T) {
 	// Serial: this inherited fixture changes process-global linker build metadata.
 	oldVersion := buildinfo.Version
 	oldCommit := buildinfo.GitCommit
-	oldChannel := buildinfo.ReleaseChannel
 	buildinfo.Version = "v1.2.3"
 	buildinfo.GitCommit = "abc123"
-	buildinfo.ReleaseChannel = "test"
 	t.Cleanup(func() {
 		buildinfo.Version = oldVersion
 		buildinfo.GitCommit = oldCommit
-		buildinfo.ReleaseChannel = oldChannel
 	})
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -129,7 +126,7 @@ func TestHeartbeatFrameReportsBuildMetadata(t *testing.T) {
 	session := testSession(t, publicKey, privateKey)
 
 	frame := session.HeartbeatFrame(runtime.AdapterStateReady, nil)
-	if frame.Heartbeat.ConnectionGeneration != 5 || frame.Heartbeat.ConnectorVersion != "v1.2.3" || frame.Heartbeat.GitCommit != "abc123" || frame.Heartbeat.ReleaseChannel != "test" {
+	if frame.Heartbeat.ConnectionGeneration != 5 || frame.Heartbeat.ClientVersion != "v1.2.3" || frame.Heartbeat.GitCommit != "abc123" {
 		t.Fatalf("unexpected heartbeat metadata: %+v", frame.Heartbeat)
 	}
 	if frame.Heartbeat.NativeMCPServerName != "personastack-conn-1" || frame.Heartbeat.NativeMCPToolPrefix != "mcp_personastack-conn-1_" || frame.Heartbeat.NativeToolNamingRule != externalagentprotocol.NativeToolNamingRuleMCPServerPrefix {

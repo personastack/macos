@@ -107,3 +107,65 @@ private actor AgentBridgeAuthorityFixture: AgentBridgeHostedTransport {
         #expect(await fixture.methods == ["GET"])
     }
 }
+
+private actor AgentBridgeStopFixture: AgentBridgeHostedTransport {
+    let status: Int
+    let json: String
+    private(set) var calls = 0
+    init(status: Int = 202, json: String = #"{"accepted":true,"ok":true}"#) { self.status = status; self.json = json }
+    func request(_ request: URLRequest) throws -> (Data, Int) {
+        calls += 1
+        #expect(calls == 1)
+        #expect(request.httpMethod == "POST")
+        #expect(request.url?.absoluteString == "https://my.personastack.ai/user/personas/stop")
+        #expect(request.httpShouldHandleCookies == false)
+        #expect(request.value(forHTTPHeaderField: "Cookie") == "personastack_session=fixture")
+        #expect(request.value(forHTTPHeaderField: "Origin") == "https://my.personastack.ai")
+        #expect(request.value(forHTTPHeaderField: "X-Requested-With") == "XMLHttpRequest")
+        #expect(request.value(forHTTPHeaderField: "X-CSRF-Token") == "csrf-fixture")
+        #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
+        #expect(request.value(forHTTPHeaderField: "Accept") == "application/json")
+        let body = try JSONSerialization.jsonObject(with: request.httpBody!) as? [String: String]
+        #expect(body == ["persona_id": "persona-a"])
+        return (Data(json.utf8), status)
+    }
+}
+
+@Suite struct AgentBridgeStopAuthorityTests {
+    @Test(arguments: [200, 202]) func confirmedStopUsesOwnedHTTPContract(_ status: Int) async throws {
+        let fixture = AgentBridgeStopFixture(status: status)
+        try await AgentBridgeHostedAuthority(transport: fixture).stop(configuration: .production,
+            cookies: "personastack_session=fixture", csrf: "csrf-fixture", persona: "persona-a")
+        #expect(await fixture.calls == 1)
+    }
+    @Test(arguments: [401, 403, 503]) func refusedStopNeverReportsAcceptance(_ status: Int) async {
+        let fixture = AgentBridgeStopFixture(status: status)
+        await #expect(throws: status == 503 ? AgentBridgeFailure.serviceUnavailable : AgentBridgeFailure.scopeChanged) {
+            try await AgentBridgeHostedAuthority(transport: fixture).stop(configuration: .production,
+                cookies: "personastack_session=fixture", csrf: "csrf-fixture", persona: "persona-a")
+        }
+        #expect(await fixture.calls == 1)
+    }
+    @Test(arguments: [#"{"accepted":false,"ok":true}"#, #"{"accepted":true,"ok":false}"#])
+    func unacceptedStopRemainsBusy(_ json: String) async {
+        let fixture = AgentBridgeStopFixture(json: json)
+        await #expect(throws: AgentBridgeFailure.busy) {
+            try await AgentBridgeHostedAuthority(transport: fixture).stop(configuration: .production,
+                cookies: "personastack_session=fixture", csrf: "csrf-fixture", persona: "persona-a")
+        }
+    }
+    @Test(arguments: ["", "bad csrf"]) func invalidConsentTokenHasNoHTTPCall(_ csrf: String) async {
+        let fixture = AgentBridgeStopFixture()
+        await #expect(throws: AgentBridgeFailure.invalidRequest) {
+            try await AgentBridgeHostedAuthority(transport: fixture).stop(configuration: .production,
+                cookies: "personastack_session=fixture", csrf: csrf, persona: "persona-a")
+        }
+        #expect(await fixture.calls == 0)
+    }
+    @Test func standaloneHostedBindingCannotAuthorizeAppManagement() throws {
+        let value = try JSONDecoder().decode(AgentBridgeHostedBinding.self, from: Data(#"{"workspace_id":"ws_11111111111111111111111111111111","persona_id":"persona-a","connection_id":"conn-a","connection_generation":7,"client_kind":"standalone_connector"}"#.utf8))
+        #expect(throws: AgentBridgeFailure.scopeChanged) {
+            try value.require(workspace: "ws_11111111111111111111111111111111", persona: "persona-a", connection: "conn-a", generation: 7)
+        }
+    }
+}

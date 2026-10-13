@@ -25,23 +25,19 @@ import (
 )
 
 type Controller struct {
-	Store              config.WritableStore
-	Seed               string
-	Environments       func() ([]Environment, error)
-	Discover           func(runtime.AdapterKind, string) ([]targetinventory.Profile, []error)
-	Exchange           func(context.Context, Environment, pairing.Request) (pairing.Result, error)
-	Check              func(context.Context, config.Binding) (runtime.Detection, error)
-	Repair             func(context.Context, config.Binding, bool, bool, bool) error
-	Cleanup            func(config.Binding) error
-	Now                func() time.Time
-	Stop               func() error
-	Shutdown           func()
-	mu                 sync.Mutex
-	preparations       map[string]preparation
-	migrations         map[string]migration
-	LegacyMetadataRead func(Environment) ([]config.Binding, error)
-	LegacyRead         func(Environment, MigrationPreparePayload) (config.Binding, error)
-	MigrationDirectory string
+	Store        config.WritableStore
+	Seed         string
+	Environments func() ([]Environment, error)
+	Discover     func(runtime.AdapterKind, string) ([]targetinventory.Profile, []error)
+	Exchange     func(context.Context, Environment, pairing.Request) (pairing.Result, error)
+	Check        func(context.Context, config.Binding) (runtime.Detection, error)
+	Repair       func(context.Context, config.Binding, bool, bool, bool) error
+	Cleanup      func(config.Binding) error
+	Now          func() time.Time
+	Stop         func() error
+	Shutdown     func()
+	mu           sync.Mutex
+	preparations map[string]preparation
 }
 
 func strict(raw []byte, destination interface{}) error {
@@ -128,11 +124,6 @@ func (c *Controller) now() time.Time {
 	return time.Now().UTC()
 }
 func (c *Controller) expirePreparations() {
-	for id, p := range c.migrations {
-		if !c.now().Before(p.ExpiresAt) {
-			delete(c.migrations, id)
-		}
-	}
 	for id, p := range c.preparations {
 		if !c.now().Before(p.ExpiresAt) {
 			delete(c.preparations, id)
@@ -173,30 +164,6 @@ func (c *Controller) profiles(k runtime.AdapterKind) ([]targetinventory.Profile,
 }
 func (c *Controller) perform(ctx context.Context, r Request) (Result, error) {
 	switch r.Operation {
-	case "migration_help":
-		p := MigrationHelpPayload{}
-		if err := strict(r.Payload, &p); err != nil {
-			return Result{}, issue("invalid_request", "Invalid native migration help payload.")
-		}
-		return c.migrationHelp(p)
-	case "migration_cancel":
-		p := MigrationCancelPayload{}
-		if err := strict(r.Payload, &p); err != nil {
-			return Result{}, err
-		}
-		return c.cancelMigration(p)
-	case "migration_repair":
-		p := MigrationRepairPayload{}
-		if err := strict(r.Payload, &p); err != nil {
-			return Result{}, err
-		}
-		return c.repairMigration(p)
-	case "migration_prepare":
-		p := MigrationPreparePayload{}
-		if err := strict(r.Payload, &p); err != nil {
-			return Result{}, err
-		}
-		return c.prepareMigration(p)
 	case "discover":
 		p := DiscoverPayload{}
 		err := strict(r.Payload, &p)
@@ -308,7 +275,7 @@ func (c *Controller) boundProfile(profile targetinventory.Profile) (config.Bindi
 	return config.Binding{}, false
 }
 func (c *Controller) prepare(p PreparePayload) (Result, error) {
-	environment, err := c.environment(p.EnvironmentID)
+	_, err := c.environment(p.EnvironmentID)
 	if err != nil {
 		return Result{}, err
 	}
@@ -331,23 +298,6 @@ func (c *Controller) prepare(p PreparePayload) (Result, error) {
 		if err != nil {
 			return Result{}, issue("scope_changed", "Selected native OpenClaw agent is unavailable or ambiguous.")
 		}
-		captured := false
-		for _, migration := range c.migrations {
-			scope := migration.Scope
-			physical := targetinventory.ResolvedTarget{ConfigPath: migration.Capture.ConfigPath}
-			if scope.ProfileCandidateID != profile.CandidateID && !targetinventory.SharedPhysicalTarget(profile.Resolved, physical) {
-				continue
-			}
-			if scope.EnvironmentID != p.EnvironmentID || scope.WorkspaceID != p.WorkspaceID || scope.PersonaID != p.PersonaID || scope.RuntimeKind != p.RuntimeKind || scope.ProfileCandidateID != p.ProfileCandidateID || scope.OpenClawAgentCandidateID != p.OpenClawAgentCandidateID {
-				return Result{}, issue("profile_in_use", "This profile has a migration for another persona.")
-			}
-			if scope.DocumentID == p.DocumentID && c.now().Before(migration.ExpiresAt) {
-				captured = true
-			}
-			if scope.DocumentID != p.DocumentID && c.now().Before(migration.ExpiresAt) {
-				return Result{MigrationPending: true, ProfileCandidateID: p.ProfileCandidateID}, nil
-			}
-		}
 		if bound, exists := c.boundProfile(profile); exists {
 			if bound.EnvironmentID == p.EnvironmentID && string(bound.PersonaID) == p.PersonaID && bound.WorkspaceID == p.WorkspaceID {
 				if k == runtime.AdapterKindOpenClaw && bound.OpenClawAgentID != profile.Resolved.OpenClawAgentID {
@@ -357,15 +307,6 @@ func (c *Controller) prepare(p PreparePayload) (Result, error) {
 				return Result{ExistingBindingKey: &key}, nil
 			}
 			return Result{}, issue("profile_in_use", "This profile is connected to another persona.")
-		}
-		if !captured {
-			entry, err := c.legacyEntryForScope(environment, p, profile.Resolved.ConfigPath)
-			if err != nil {
-				return Result{}, err
-			}
-			if entry != "" {
-				return Result{}, issue("migration_required", "The selected profile still contains its exact legacy MCP entry. Resume migration or inspect native cleanup before enrolling.")
-			}
 		}
 		for id, reserved := range c.preparations {
 			if reserved.Profile.Kind != k || !targetinventory.SharedPhysicalTarget(profile.Resolved, reserved.Profile.Resolved) {
@@ -418,15 +359,6 @@ func (c *Controller) enroll(ctx context.Context, p EnrollPayload) (Result, error
 	if _, occupied := c.boundProfile(prepared.Profile); occupied {
 		return Result{}, issue("profile_in_use", "Profile is already connected.")
 	}
-	var captured *config.MigrationCapture
-	if p.MigrationID != "" {
-		capture, ok := c.migrations[p.MigrationID]
-		if !ok || capture.DocumentID != p.DocumentID || capture.Scope != prepared.Scope || !c.now().Before(capture.ExpiresAt) {
-			return Result{}, issue("scope_changed", "Migration capture no longer matches this setup.")
-		}
-		copy := capture.Capture
-		captured = &copy
-	}
 	k, _ := kind(prepared.Scope.RuntimeKind)
 	proof := externalagentprotocol.DesktopPreparation{PreparationID: p.PreparationID, DevicePublicKey: base64.StdEncoding.EncodeToString(prepared.PublicKey), ProfileCandidateID: prepared.Profile.CandidateID}
 	request := pairing.Request{Code: p.Code, RuntimeKind: k, ConfigureMCP: true, PrivateKey: prepared.PrivateKey, DesktopPreparation: &proof}
@@ -454,18 +386,14 @@ func (c *Controller) enroll(ctx context.Context, p EnrollPayload) (Result, error
 	binding.NativeProfileName = prepared.Profile.Resolved.ProfileName
 	binding.HermesHome = prepared.Profile.Resolved.HermesHome
 	binding.OpenClawAgentID = prepared.Profile.Resolved.OpenClawAgentID
-	// Pairing and legacy migration never grant native shared-host startup.
+	// Pairing never grant native shared-host startup.
 	binding.RuntimeLaunchAllowed = false
 
-	binding.Migration = captured
 	err = c.Store.SaveBinding(binding)
 	if err != nil {
 		return Result{}, issue("credential_unavailable", "Could not save native enrollment credentials.")
 	}
 	delete(c.preparations, p.PreparationID)
-	if p.MigrationID != "" {
-		delete(c.migrations, p.MigrationID)
-	}
 	key := binding.Key()
 	return Result{BindingKey: &key, PersonaID: string(binding.PersonaID)}, nil
 }
@@ -491,7 +419,7 @@ func (c *Controller) status(ctx context.Context, p BindingPayload, probe bool) (
 	if err != nil {
 		return Result{}, err
 	}
-	result := Result{Connections: []Connection{}, PendingMigrationCount: c.pendingMigrationCount()}
+	result := Result{Connections: []Connection{}}
 	for _, b := range bindings {
 		row := Connection{ConnectionGeneration: b.ConnectionGeneration, BindingKey: b.Key(), PersonaID: string(b.PersonaID), RuntimeKind: b.RuntimeKind.String(), ReadinessState: b.ReadinessState.String(), ActiveRunID: b.ActiveRunID}
 		if validWorkspaceID(b.WorkspaceID) && b.AccountCandidateID != "" && b.ProfileCandidateID != "" {
@@ -630,9 +558,6 @@ func (c *Controller) disconnect(p DisconnectPayload) (Result, error) {
 	return Result{Disconnected: &done}, nil
 }
 func (c *Controller) quiesce(p BindingPayload, value bool) (Result, error) {
-	if value && p.BindingKey == nil && c.pendingMigrationCount() > 0 {
-		return Result{}, issue("busy", "Finish pending migration before updating or stopping background agents.")
-	}
 	bindings, err := c.selected(p)
 	if err != nil {
 		return Result{}, err
@@ -695,14 +620,4 @@ func validWorkspaceID(value string) bool {
 		}
 	}
 	return true
-}
-
-func (c *Controller) pendingMigrationCount() int {
-	count := len(c.migrations)
-	for _, binding := range c.Store.ListBindings() {
-		if binding.Migration != nil {
-			count++
-		}
-	}
-	return count
 }

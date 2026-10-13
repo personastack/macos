@@ -63,7 +63,6 @@ struct AgentBridgeMenu: View {
     private func explanation(_ error: any Error) -> String {
         switch error as? AgentBridgeFailure {
         case .busy: "Finish or Stop assigned persona work in PersonaStack. Retry Stop or Resume Background Agents. If an app update is staged, finish the update first."
-        case .migrationIncomplete: "Finish the interrupted profile migration before stopping Background Agents. Select the same persona and profile to resume setup."
         case .backgroundApprovalRequired: "Allow PersonaStack in General → Login Items & Extensions, then retry."
         case .credentialUnavailable: "Unlock or authorize the saved Keychain credential, then Check connection or retry the failed action."
         default: "Background agents are unavailable. Try Enable Background Agents again."
