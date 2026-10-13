@@ -8,6 +8,14 @@
 
 ## Fixed
 
+- Restore the main page when reopening PersonaStack through the macOS Window menu.
+- Prevent a canceled or failed restart from installing an update after Background Agents finish stopping.
+- Keep Quit from installing a canceled restart while Background Agents are resuming.
+- Allow app updates while Background Agents are waiting for macOS approval. Restore automatic downloads when background agents were disabled outside the app.
+- Preserve pending OpenClaw setup when pausing and resuming background agents. Show paused connections as unavailable during checks.
+- Preserve Hermes gateway startup approval when repairing a running profile.
+- Keep local-agent setup usable after opening an external help link or rejecting a navigation.
+
 - Keep Refresh, Back, and Forward visible when opening desktop menu flows or reopening the main window.
 - Return to the persona list after closing and reopening the main window. Menu actions and notification links still open their selected destination.
 - Release Google sign-in windows when they close.
