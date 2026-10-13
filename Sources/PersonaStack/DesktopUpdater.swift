@@ -80,6 +80,9 @@ final class DesktopUpdater: NSObject, ObservableObject {
     private var immediateInstallHandler: (() -> Void)?
     private var isImmediateInstallRequested = false
     private var isAgentBridgeReplacementPrepared = false
+    private var replacementGeneration = UUID()
+    private var preparationTask: (id: UUID, task: Task<Bool, Never>)?
+    private var cancellationTask: Task<Void, Never>?
 
     private override convenience init() {
         self.init(updaterFactory: { SparkleUpdateClient(hostBundle: .main, userDriver: $0, delegate: $1) },
@@ -159,6 +162,7 @@ final class DesktopUpdater: NSObject, ObservableObject {
         userDriver = driver
         self.updater = updater
         if agentBridgeNeedsHandoff() { suspendAutomaticDownloads() }
+        else { restoreAutomaticDownloadsAfterAgentsStopped() }
         do {
             try updater.start()
             didStart = true
@@ -264,11 +268,15 @@ final class DesktopUpdater: NSObject, ObservableObject {
     }
 
     private func beginImmediateInstallation(_ immediateInstallHandler: @escaping () -> Void) {
-        guard !isImmediateInstallRequested else { return }
+        guard !isImmediateInstallRequested, cancellationTask == nil else { return }
         isImmediateInstallRequested = true
+        let generation = replacementGeneration
         if !agentBridgeNeedsHandoff() { finishImmediateInstallation(immediateInstallHandler); return }
         Task { @MainActor in
-            guard await prepareBackgroundAgentsForUpdate() else { isImmediateInstallRequested = false; return }
+            let prepared = await prepareBackgroundAgentsForUpdate()
+            guard replacementGeneration == generation else { return }
+            guard prepared else { isImmediateInstallRequested = false; return }
+            guard isImmediateInstallRequested else { return }
             finishImmediateInstallation(immediateInstallHandler)
         }
     }
@@ -301,35 +309,68 @@ final class DesktopUpdater: NSObject, ObservableObject {
     }
 
     func prepareBackgroundAgentsForUpdate() async -> Bool {
+        guard cancellationTask == nil else { return false }
+        if let preparationTask { return await preparationTask.task.value }
+        let generation = replacementGeneration
+        let id = UUID()
+        let task = Task { @MainActor in await self.performBackgroundPreparation(generation: generation) }
+        preparationTask = (id, task)
+        let prepared = await task.value
+        if preparationTask?.id == id { preparationTask = nil }
+        return prepared && replacementGeneration == generation
+    }
+
+    private func performBackgroundPreparation(generation: UUID) async -> Bool {
         do {
             try await prepareAgentBridgeUpdate()
+            guard replacementGeneration == generation else { return false }
             isAgentBridgeReplacementPrepared = true
             waitsForBackgroundAgents = false
             return true
         } catch {
+            guard replacementGeneration == generation else { return false }
             waitsForBackgroundAgents = true
             switch error as? AgentBridgeFailure {
             case .busy:
-                statusMessage = "Finish or Stop assigned persona work, then retry Restart Now. Cancel the update to resume background agents."
+                statusMessage = "Finish or Stop assigned persona work, then retry Restart Now. Cancel the restart to resume background agents."
             default:
-                statusMessage = "Background agents could not stop safely. Cancel the update and retry."
+                statusMessage = "Background agents could not stop safely. Cancel the restart and retry."
             }
             return false
         }
     }
 
     func resumeBackgroundAgentsAfterCanceledUpdate() async {
+        cancelBackgroundUpdate()
+        await cancellationTask?.value
+    }
+
+    private func finishBackgroundCancellation(showStatus: Bool) async {
+        // Native unregister can finish after cancellation. Restore only after
+        // that operation settles so it cannot retire a helper we just resumed.
+        if let preparationTask { _ = await preparationTask.task.value }
         do {
             try await cancelAgentBridgeUpdate()
             isAgentBridgeReplacementPrepared = false
             waitsForBackgroundAgents = false
+            if showStatus, isReady {
+                statusMessage = "Restart canceled. Background agents resumed. The update is still ready."
+            }
         } catch {
             statusMessage = "Background agents could not resume. Retry background setup."
         }
     }
 
-    func cancelBackgroundUpdate() {
-        Task { @MainActor in await resumeBackgroundAgentsAfterCanceledUpdate() }
+    func cancelBackgroundUpdate(showStatus: Bool = false) {
+        guard cancellationTask == nil else { return }
+        if isImmediateInstallRequested { cancelPermissionRestart() }
+        replacementGeneration = UUID()
+        isImmediateInstallRequested = false
+        isAgentBridgeReplacementPrepared = false
+        cancellationTask = Task { @MainActor in
+            await finishBackgroundCancellation(showStatus: showStatus)
+            cancellationTask = nil
+        }
     }
 
     /// An unexpected old staged installer must not replace a live helper on Quit.
@@ -654,13 +695,12 @@ extension DesktopUpdater: SPUUpdaterDelegate {
     }
 
     func handleUpdateFailure(domain: String, code: Int) {
-        Task { @MainActor in await resumeBackgroundAgentsAfterCanceledUpdate() }
         isChecking = false
         isAutomaticallyDownloading = false
         isWaitingForApproval = false
         isInformationalUpdate = false
         guard domain != SUSparkleErrorDomain || code != 1001 else { return }
-        if isImmediateInstallRequested { cancelPermissionRestart() }
+        cancelBackgroundUpdate()
         immediateInstallHandler = nil
         isImmediateInstallRequested = false
         statusMessage = "Update couldn't finish. PersonaStack is still available. Try again."
@@ -690,7 +730,7 @@ extension DesktopUpdater: SPUUpdaterDelegate {
 
     func handleSkippedUpdate(version: String) {
         guard offeredVersion == version else { return }
-        if isImmediateInstallRequested { cancelPermissionRestart() }
+        cancelBackgroundUpdate()
         isChecking = false
         isAutomaticallyDownloading = false
         isWaitingForApproval = false
@@ -772,7 +812,11 @@ struct DesktopUpdateCommands: Commands {
 }
 
 struct DesktopUpdatesMenuSection: View {
-    @ObservedObject private var updater = DesktopUpdater.shared
+    @ObservedObject private var updater: DesktopUpdater
+
+    init(updater: DesktopUpdater = .shared) {
+        self.updater = updater
+    }
 
     var body: some View {
         Text("Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "Unknown")")
@@ -786,7 +830,7 @@ struct DesktopUpdatesMenuSection: View {
             Button("Later") { updater.dismissReadyToast() }
         }
         if updater.waitsForBackgroundAgents {
-            Button("Cancel Update and Resume Background Agents") { updater.cancelBackgroundUpdate() }
+            Button("Cancel Restart and Resume Background Agents") { updater.cancelBackgroundUpdate(showStatus: true) }
         }
         Button("Check for Updates…") { updater.checkForUpdates() }
             .disabled(!updater.isAvailable || !updater.canCheckForUpdates || updater.isChecking)

@@ -52,10 +52,12 @@ private final class AgentBridgeFixtureRegistration: AgentBridgeServiceRegistrati
 @MainActor
 private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
     var hasRegisteredService = true
+    var canQuiesce = true
     var busy = true
     var log: [String] = []
     func quiesce() async throws -> AgentBridgeAdmission {
         log.append("quiesce")
+        guard canQuiesce else { throw AgentBridgeFailure.serviceUnavailable }
         let json = busy ? #"{"quiesced":true,"active_run_ids":["run-a"]}"# : #"{"quiesced":true,"active_run_ids":[]}"#
         return try JSONDecoder().decode(AgentBridgeAdmission.self, from: Data(json.utf8))
     }
@@ -65,6 +67,21 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
 }
 
 @Suite struct AgentBridgeTests {
+    @Test @MainActor func updateCanRetireAHelperWaitingForMacOSApproval() async throws {
+        let registration = AgentBridgeFixtureRegistration()
+        registration.status = .requiresApproval
+        let transport = AgentBridgeFixtureTransport([])
+        let preferences = UserDefaults(suiteName: "AgentBridgeTests." + UUID().uuidString)!
+        let lifecycle = AgentBridgeService(registration: registration,
+            client: AgentBridgeControlClient(transport: transport), preferences: preferences,
+            requireSignature: {}, clearDisabledPreference: {})
+        let handoff = AgentBridgeUpdateHandoff(service: lifecycle, preferences: preferences)
+        try await handoff.prepareReplacement()
+        #expect(registration.calls == ["unregister"])
+        #expect(await transport.operations.isEmpty)
+        #expect(preferences.bool(forKey: AgentBridgeUpdateHandoff.restoreKey))
+    }
+
     @Test func finitePageBoundaryRejectsNativeOnlyCommandsAndRawAuthority() throws {
         let valid: [String: Any] = ["version": "2", "action": "prepare", "scope": "native-document",
             "runtime_kind": "hermes", "workspace_id": "ws_11111111111111111111111111111111",

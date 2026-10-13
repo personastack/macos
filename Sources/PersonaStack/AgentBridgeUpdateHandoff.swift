@@ -5,6 +5,7 @@ import ServiceManagement
 @MainActor
 protocol AgentBridgeUpdateLifecycle: AnyObject {
     var hasRegisteredService: Bool { get }
+    var canQuiesce: Bool { get }
     func quiesce() async throws -> AgentBridgeAdmission
     func resume() async throws
     func retireForReplacement() async throws
@@ -12,6 +13,7 @@ protocol AgentBridgeUpdateLifecycle: AnyObject {
 }
 extension AgentBridgeService: AgentBridgeUpdateLifecycle {
     var hasRegisteredService: Bool { status == .enabled || status == .requiresApproval }
+    var canQuiesce: Bool { status == .enabled }
 }
 
 @MainActor
@@ -37,10 +39,12 @@ final class AgentBridgeUpdateHandoff {
         if retired { return }
         isPreparing = true
         defer { isPreparing = false }
-        let result = try await service.quiesce()
-        guard result.quiesced else { throw AgentBridgeFailure.serviceUnavailable }
-        quiesced = true
-        guard result.activeRunIDs.isEmpty else { throw AgentBridgeFailure.busy }
+        if service.canQuiesce {
+            let result = try await service.quiesce()
+            guard result.quiesced else { throw AgentBridgeFailure.serviceUnavailable }
+            quiesced = true
+            guard result.activeRunIDs.isEmpty else { throw AgentBridgeFailure.busy }
+        }
         preferences.set(true, forKey: Self.restoreKey)
         try await service.retireForReplacement()
         retired = true

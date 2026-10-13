@@ -20,6 +20,75 @@ private final class AgentBridgeUpdaterState {
 }
 
 @Suite struct AgentBridgeUpdaterTests {
+    @Test @MainActor func canceledPreparedReplacementBlocksQuitBeforeHelperResumes() async throws {
+        var release: CheckedContinuation<Void, Never>?
+        let updater = DesktopUpdater(updaterFactory: { _, _ in AgentBridgeUpdaterClient() },
+            preferences: UserDefaults(suiteName: "AgentBridgeUpdaterTests." + UUID().uuidString)!,
+            presentReadyReminder: { _ in }, clearAvailableNotification: { _ in }, clearUpdateNotifications: { _ in },
+            agentBridgeNeedsHandoff: { true }, prepareAgentBridgeUpdate: {}, cancelAgentBridgeUpdate: {
+                await withCheckedContinuation { release = $0 }
+            })
+        updater.projectReady(version: "0.9.0", notifyWhenInactive: false)
+        #expect(await updater.prepareBackgroundAgentsForUpdate())
+        #expect(updater.allowsTermination())
+        updater.cancelBackgroundUpdate()
+        #expect(!updater.allowsTermination())
+        for _ in 0..<100 where release == nil { await Task.yield() }
+        let pending = try #require(release)
+        #expect(!updater.allowsTermination())
+        pending.resume()
+        for _ in 0..<20 { await Task.yield() }
+        #expect(!updater.allowsTermination())
+    }
+
+    @Test @MainActor func startupRestoresAutomaticDownloadsWhenBackgroundHelperWasDisabledOutsideApp() {
+        let preferences = UserDefaults(suiteName: "AgentBridgeUpdaterTests." + UUID().uuidString)!
+        preferences.set(true, forKey: "agentBridge.savedAutomaticDownloads")
+        let client = AgentBridgeUpdaterClient()
+        client.automaticallyDownloadsUpdates = false
+        let updater = DesktopUpdater(updaterFactory: { _, _ in client }, preferences: preferences,
+            agentBridgeNeedsHandoff: { false }, prepareAgentBridgeUpdate: {}, cancelAgentBridgeUpdate: {})
+        updater.start(publicKey: Data(repeating: 1, count: 32).base64EncodedString(), feed: DesktopUpdatePolicy.feedURL)
+        #expect(client.automaticallyDownloadsUpdates)
+        #expect(updater.automaticallyDownloadsUpdates)
+        #expect(preferences.object(forKey: "agentBridge.savedAutomaticDownloads") == nil)
+    }
+
+    @Test(arguments: ["resume", "skip", "failure"]) @MainActor
+    func cancelledRestartCannotInstallAfterDelayedBackgroundPreparation(_ outcome: String) async throws {
+        let preferences = UserDefaults(suiteName: "AgentBridgeUpdaterTests." + UUID().uuidString)!
+        var release: CheckedContinuation<Void, Error>?
+        var calls: [String] = []
+        var installs = 0
+        let updater = DesktopUpdater(updaterFactory: { _, _ in AgentBridgeUpdaterClient() },
+            preferences: preferences, presentAvailableReminder: { _ in }, presentReadyReminder: { _ in },
+            clearAvailableNotification: { _ in }, clearUpdateNotifications: { _ in }, confirmRestart: { true },
+            agentBridgeNeedsHandoff: { true }, prepareAgentBridgeUpdate: {
+                calls.append("prepare")
+                try await withCheckedThrowingContinuation { release = $0 }
+                calls.append("prepared")
+            }, cancelAgentBridgeUpdate: { calls.append("resume") })
+        _ = updater.retainAutomaticInstallHandler(version: "0.9.0") { installs += 1 }
+        updater.restartToInstall()
+        for _ in 0..<100 where release == nil { await Task.yield() }
+        let pending = try #require(release)
+        switch outcome {
+        case "skip": updater.handleSkippedUpdate(version: "0.9.0")
+        case "failure": updater.handleUpdateFailure(domain: "fixture", code: 1)
+        default: updater.cancelBackgroundUpdate(showStatus: true)
+        }
+        for _ in 0..<20 { await Task.yield() }
+        #expect(calls == ["prepare"])
+        pending.resume()
+        for _ in 0..<100 where !calls.contains("resume") { await Task.yield() }
+        for _ in 0..<20 { await Task.yield() }
+        #expect(calls == ["prepare", "prepared", "resume"])
+        #expect(installs == 0)
+        #expect(!preferences.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey))
+        #expect(!updater.waitsForBackgroundAgents)
+        if outcome == "resume" { #expect(updater.statusMessage == "Restart canceled. Background agents resumed. The update is still ready.") }
+    }
+
     @Test @MainActor func automaticInstallPreferenceIsPreservedWhileActualDownloadsPause() throws {
         let preferences = UserDefaults(suiteName: "AgentBridgeUpdaterTests." + UUID().uuidString)!
         preferences.set(true, forKey: "SUAutomaticallyUpdate")
