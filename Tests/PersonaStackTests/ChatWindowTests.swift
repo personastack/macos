@@ -5,6 +5,22 @@ import PersonaStackCore
 @testable import PersonaStack
 
 struct ChatWindowTests {
+    @MainActor @Test func repeatedExpansionRestoresVisibleNativePin() {
+        _ = NSApplication.shared
+        let preferences = PopoutTestPreferences()
+        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false,
+            defaults: preferences.defaults) {}
+        defer { chat.dispose() }
+        for _ in 0..<3 {
+            #expect(chat.presentation.pinButton.window === chat.window)
+            chat.apply(.collapse)
+            #expect(chat.presentation.pinButton.window == nil)
+            chat.apply(.expand)
+            #expect(chat.presentation.pinButton.window === chat.window)
+            #expect(chat.window.titlebarAccessoryViewControllers.count == 1)
+        }
+    }
+
     @MainActor @Test func directCloseRetiresChatAndAllowsFreshWindow() throws {
         _ = NSApplication.shared
         let preferences = PopoutTestPreferences()
