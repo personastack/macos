@@ -171,13 +171,13 @@ func (r Runner) RepairBinding(ctx context.Context, b config.Binding, restartConf
 		if _, err := mcp.ConfigureBinding(current, true, openClawAppsConfirmed); err != nil {
 			return err
 		}
-		current.RuntimeLaunchAllowed = restartConfirmed
 		if current.RuntimeKind == runtime.AdapterKindHermes {
-			current.RuntimeLaunchAllowed = hermesHostConfirmed
+			current.RuntimeLaunchAllowed = current.RuntimeLaunchAllowed || hermesHostConfirmed
 			current.ReadinessState = runtime.AdapterStateCapabilityMissing
 			current.ReadinessDiagnosticCode = "capability_missing"
 		}
 		if current.RuntimeKind == runtime.AdapterKindOpenClaw {
+			current.RuntimeLaunchAllowed = restartConfirmed
 			current.OpenClawSetupPending = true
 			current.OpenClawReadinessSession = runtime.OpenClawSessionIdentity{}
 		}

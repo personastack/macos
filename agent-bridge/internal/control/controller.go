@@ -442,6 +442,8 @@ func (c *Controller) status(ctx context.Context, p BindingPayload, probe bool) (
 		if b.Quiesced {
 			row.ReadinessState = "unavailable"
 			row.DiagnosticCode = "busy"
+			result.Connections = append(result.Connections, row)
+			continue
 		}
 		if probe {
 			if c.Check == nil {
@@ -566,9 +568,6 @@ func (c *Controller) quiesce(p BindingPayload, value bool) (Result, error) {
 	for _, b := range bindings {
 		err = config.UpdateBinding(c.Store, b, func(latest *config.Binding) error {
 			latest.Quiesced = value
-			if value {
-				latest.OpenClawSetupPending = false
-			}
 			b = *latest
 			return nil
 		})

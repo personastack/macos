@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -74,6 +75,36 @@ func TestDesktopAgentBridgeHermesHostConsentAndScope(t *testing.T) {
 			}
 			if owned && (string(envBefore) != string(envAfter) || strings.Contains(string(after), "enabled: true")) {
 				t.Fatal("eligible attach changed shared-host API config")
+			}
+		})
+	}
+}
+
+func TestHermesRepairPreservesExistingStartupConsent(t *testing.T) {
+	t.Parallel()
+	for _, allowed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("startup allowed %t", allowed), func(t *testing.T) {
+			t.Parallel()
+			b, store, runner := freshSelectedFixture(t)
+			b.TargetSelectionRevision = 3
+			b.RuntimeLaunchAllowed = allowed
+			err := store.SaveBinding(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = os.WriteFile(filepath.Join(b.HermesHome, ".env"), []byte("API_SERVER_KEY=existing-host-key-123\n"), 0600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runner.MCPHTTPClient = acceptedMCPCredentialClient(t, nil)
+			runner.VerifyRuntimeEndpoint = func(context.Context, string, string, string, string) (bool, error) { return true, nil }
+			err = runner.RepairBinding(context.Background(), b, true, false, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current, _ := config.BindingFor(store, b)
+			if current.RuntimeLaunchAllowed != allowed {
+				t.Fatalf("profile repair changed existing shared-host startup consent from %t to %t", allowed, current.RuntimeLaunchAllowed)
 			}
 		})
 	}
