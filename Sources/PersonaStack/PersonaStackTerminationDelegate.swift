@@ -21,11 +21,10 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
 
     override init() {
         shutdown = {
-            await DesktopControlRuntime.shared.shutdownForQuit()
-            return true
+            await Self.cleanupControlForQuit(DesktopControlRuntime.shared)
         }
         terminate = { $0.terminate(nil) }
-        hasActiveSessions = { false }
+        hasActiveSessions = { Self.controlCleanupPendingForQuit(DesktopControlRuntime.shared) }
         showCleanupFailure = {}
         cancelPermissionRestart = { DesktopApplicationRestart.shared.cancelPendingRestart() }
         timeout = .seconds(10)
@@ -42,6 +41,15 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         }
         navigateMainWindow = { MainWebViewHost.shared.navigate(to: $0) }
         super.init()
+    }
+
+    static func cleanupControlForQuit(_ runtime: DesktopControlRuntime) async -> Bool {
+        await runtime.shutdownForQuit()
+        return !controlCleanupPendingForQuit(runtime)
+    }
+
+    static func controlCleanupPendingForQuit(_ runtime: DesktopControlRuntime) -> Bool {
+        runtime.hasPendingControlCleanupForQuit
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {

@@ -17,6 +17,7 @@ import AppKit
 }
 @MainActor final class DesktopControlRuntime {
     static let shared = DesktopControlRuntime()
+    var hasPendingControlCleanupForQuit = false
     func shutdownForQuit() async {}
 }
 @MainActor enum DesktopCrashRecoveryPolicy {

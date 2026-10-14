@@ -138,6 +138,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     var hasActiveInstallation: Bool { activeInstallation != nil }
     var hasPendingEnvironmentSwitch: Bool { environmentSwitchPending }
     var isDisconnecting: Bool { disconnecting }
+    var hasPendingControlCleanupForQuit: Bool {
+        executorCleanupInProgress || executorCleanupFailed || !executor.permissionSetupAvailable
+    }
     var permissionSetupAvailable: Bool {
         cuaSetupBlockReason == nil
     }
@@ -568,6 +571,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         await current?.stop()
         await stopLocalControl(generation: generation)
         activeInstallation = nil
+        // A refused Quit leaves the app available for an explicit cleanup retry.
+        if executorCleanupFailed { disconnecting = false }
     }
 
     func prepareForEnvironmentSwitch() async throws {
