@@ -5,6 +5,45 @@ import WebKit
 @testable import PersonaStack
 
 struct StackPopoutNavigationTests {
+    @MainActor @Test func selectedOriginFileDownloadsPreserveStreamAndSession() throws {
+        _ = NSApplication.shared
+        let preferences = PopoutTestPreferences()
+        let page = URL(string: "https://example.invalid:444/user/stacks/desktop-popout?view=stream")!
+        let file = URL(string: "https://example.invalid:444/user/stacks/assets/download?workspace_id=ws&stack_id=s&asset_id=a")!
+        var destinations: [URL] = []
+        var closes = 0
+        let stream = StackPopoutWindow(url: page, transparent: false, kind: .stackStream,
+            loadPage: false, defaults: preferences.defaults, navigateMainWindow: { destinations.append($0) }, openExternalURL: { _ in }) { closes += 1 }
+        defer { stream.dispose() }
+        let view = stream.webView
+        let frame = stream.window.frame
+        #expect(view.configuration.websiteDataStore === WKWebsiteDataStore.default())
+        for pinned in [false, true] {
+            if pinned { stream.presentation?.togglePin() }
+            for mainFrame in [false, true] {
+                #expect(stream.navigationPolicy(for: file, userActivated: true, mainFrame: mainFrame, downloadRequested: true) == .download)
+                #expect(stream.webView === view && stream.window.frame == frame)
+                #expect(stream.window.level == (pinned ? .floating : .normal))
+            }
+        }
+        for status in [200, 401, 403, 404, 410, 500] {
+            let response = try #require(HTTPURLResponse(url: file, statusCode: status, httpVersion: nil,
+                headerFields: ["Content-Disposition": "attachment; filename=brief.pdf"]))
+            #expect(stream.responsePolicy(for: response, mainFrame: true, canShowMIMEType: false)
+                == (status == 200 ? .download : .cancel))
+        }
+        #expect(destinations.isEmpty && closes == 0)
+        #expect(stream.webView.navigationDelegate != nil)
+        let graph = StackPopoutWindow(url: page, transparent: true, kind: .stackGraph,
+            loadPage: false, defaults: preferences.defaults, navigateMainWindow: { destinations.append($0) }) {}
+        defer { graph.dispose() }
+        #expect(graph.navigationPolicy(for: file, userActivated: true, mainFrame: true, downloadRequested: true) == .cancel)
+        #expect(destinations == [file])
+        for raw in ["https://foreign.invalid/user/stacks/assets/download", "https://user:password@example.invalid:444/user/stacks/assets/download"] {
+            #expect(stream.navigationPolicy(for: try #require(URL(string: raw)), userActivated: true, mainFrame: true, downloadRequested: true) == .cancel)
+        }
+    }
+
     @MainActor @Test func cancellationPreservesPopoutAndClosedWindowCannotRefocus() {
         _ = NSApplication.shared
         let preferences = PopoutTestPreferences()

@@ -33,6 +33,7 @@ struct NavigationPolicyTests {
 
     @Test(arguments: [
         "https://desktop.example/user/personas/chat/media/file?download=1",
+        "https://desktop.example/user/stacks/assets/download?workspace_id=ws&stack_id=s&asset_id=a",
         "blob:https://desktop.example/attachment",
         "blob:https://desktop.example:443/attachment",
     ])
@@ -52,6 +53,23 @@ struct NavigationPolicyTests {
         let app = try #require(URL(string: "https://desktop.example/user/personas"))
         let download = try #require(URL(string: rawURL))
         #expect(!NavigationPolicy.shouldDownload(download, requested: true, appURL: app))
+    }
+
+    @Test func stackAssetDownloadsRequireSuccessfulPrivateAttachmentResponse() throws {
+        let app = URL(string: "https://desktop.example/user/stacks")!
+        let source = URL(string: "https://desktop.example/user/stacks/assets/download?workspace_id=ws&stack_id=s&asset_id=a")!
+        for status in [200, 401, 403, 404, 410, 500] {
+            for destination in [source, URL(string: "https://desktop.example/login")!, URL(string: "https://foreign.example/user/stacks/assets/download")!, URL(string: "https://user:password@desktop.example/user/stacks/assets/download")!] {
+                for disposition in ["attachment; filename=brief.pdf", "inline", "attachment-invalid", ""] {
+                    let response = try #require(HTTPURLResponse(url: destination, statusCode: status, httpVersion: nil,
+                        headerFields: ["Content-Disposition": disposition]))
+                    #expect(NavigationPolicy.permitsStackAssetDownload(response: response, originalURL: source, appURL: app)
+                        == (status == 200 && destination == source && disposition.hasPrefix("attachment;")))
+                }
+            }
+        }
+        #expect(!NavigationPolicy.permitsStackAssetDownload(response: URLResponse(url: source, mimeType: nil,
+            expectedContentLength: 0, textEncodingName: nil), originalURL: source, appURL: app))
     }
 
     @Test

@@ -58,6 +58,20 @@ public enum NavigationPolicy {
         return keepsInApp(url, appURL: appURL)
     }
 
+    public static func isStackAssetDownload(_ url: URL, appURL: URL) -> Bool {
+        url.path == "/user/stacks/assets/download" && keepsInApp(url, appURL: appURL)
+    }
+
+    /// A download attribute must never turn a denied file request or login redirect into a saved file.
+    public static func permitsStackAssetDownload(response: URLResponse, originalURL: URL?, appURL: URL) -> Bool {
+        guard let originalURL, isStackAssetDownload(originalURL, appURL: appURL) else { return true }
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+              let finalURL = http.url, isStackAssetDownload(finalURL, appURL: appURL),
+              let disposition = http.value(forHTTPHeaderField: "Content-Disposition") else { return false }
+        return disposition.split(separator: ";", maxSplits: 1).first?
+            .trimmingCharacters(in: .whitespaces).lowercased() == "attachment"
+    }
+
     private static func normalizedOrigin(_ url: URL) -> String? {
         guard var parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let scheme = parts.scheme?.lowercased(), ["http", "https"].contains(scheme),

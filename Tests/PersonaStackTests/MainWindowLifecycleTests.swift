@@ -44,6 +44,9 @@ struct MainWindowLifecycleTests {
             #expect(coordinator.navigationPolicy(for: destination, in: view, mainFrame: true, userActivated: true) == .cancel)
             _ = try await manager.apply(current, view: view)
         }
+        let download = URL(string: "https://my.personastack.ai/user/stacks/assets/download?workspace_id=ws&stack_id=s&asset_id=a")!
+        #expect(coordinator.navigationPolicy(for: download, in: view, mainFrame: true, userActivated: true, downloadRequested: true) == .download)
+        _ = try await manager.apply(current, view: view)
         #expect(external.map(\.host) == ["example.invalid"])
         #expect(coordinator.navigationPolicy(for: url, in: view, mainFrame: true) == .allow)
         await #expect(throws: AgentBridgeFailure.scopeChanged) { _ = try await manager.apply(current, view: view) }

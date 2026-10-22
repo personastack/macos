@@ -24,7 +24,7 @@ PersonaStack for macOS presents a selected PersonaStack web surface in a dedicat
 - Keep `https://accounts.google.com` OAuth popups in a native child window so Google Sign-In can return to the embedded app. Native close and script close both retire the popup registration and delegates. A retired coordinator cannot create another popup.
 - Allow automated top-level redirects to preserve existing OAuth callback flows.
 - Download non-displayable responses to the user's Downloads directory.
-- Honor explicit download attributes for the selected origin and its blob URLs in main and floating chat windows. Preserve existing files by choosing a bounded, collision-free filename in Downloads.
+- Honor explicit download attributes for the selected origin and its blob URLs in main and floating chat windows. Stack Stream pop-outs download same-origin stack assets through their existing authenticated WebView session. Downloads preserve the Stream window and its pin state. Require a successful same-origin attachment response before saving stack assets, including in main and chat windows. Denials and redirects never become saved files. Preserve existing files by choosing a bounded, collision-free filename in Downloads.
 - HTML file inputs in the main window and pop-outs open a native file picker attached to the requesting window. Honor the input's multiple-selection and directory-selection options. Cancel returns no files. Hosted image validation, cropping, uploads, and drag-and-drop remain owned by the web app.
 - Expose no native JavaScript bridge, local API, credentials, or direct PersonaStack service connection.
 
@@ -66,6 +66,7 @@ PersonaStack for macOS presents a selected PersonaStack web surface in a dedicat
 - Popout bridge messages use version `1` and only `minimize`, `close`, `collapse`, `expand`, `pin`, or `drag` with finite bounded `dx`/`dy` numbers. Reject extra keys, unregistered web views, child frames, and origins other than the configured app origin.
 - Only expanded geometry is remembered by the shared local presentation. Pinning and the persona-window map are ephemeral. No launch restoration, all-Spaces mode, native message storage, new authentication flow, or independent stream is added.
 - Run focused native checks with `swift test --disable-xctest`. Tests use Swift Testing and in-process AppKit windows without network loads.
+- Explicit Stack Stream native download acceptance uses `node scripts/stream-download-fixture.mjs`. Set `PERSONASTACK_STREAM_DOWNLOAD_FIXTURE_URL` to its loopback URL and run `swift test --disable-xctest --filter HostedStreamDownloadTests`. The fixture sets an HTTP-only session cookie and serves bounded fake bytes. The test uses a run-owned temporary download directory and proves private attachment bytes, denial/redirect rejection, and Stream survival. It never contacts the API or user storage and is skipped in ordinary tests.
 - Explicit hosted/native acceptance uses the sibling web repository: build its TypeScript assets, then run `node scripts/desktop-chat-fixture.mjs`. Set `PERSONASTACK_CHAT_FIXTURE_URL` to its printed loopback URL and run `swift test --disable-xctest --filter HostedChatSmokeTests` in this repository. The fixture uses fake messages. This lane is skipped by ordinary tests and never contacts the PersonaStack API.
 
 ## Stack pop-outs

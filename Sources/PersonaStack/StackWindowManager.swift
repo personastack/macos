@@ -79,7 +79,7 @@ final class StackWindowManager: NSObject, WKScriptMessageHandlerWithReply {
 }
 
 @MainActor
-final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate {
+final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, NSWindowDelegate {
     func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
                  initiatedByFrame frame: WKFrameInfo,
                  completionHandler: @escaping @MainActor @Sendable ([URL]?) -> Void) {
@@ -94,18 +94,23 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     private let navigateMainWindow: (URL) -> Void
     private let openExternalURL: (URL) -> Void
     private var disposed = false
+    private let permitsFileDownloads: Bool
+    private let downloadDirectory: URL?
 
     init(
         url: URL,
         transparent: Bool,
         kind: PopoutWindowKind? = nil,
         loadPage: Bool = true,
+        downloadDirectory: URL? = nil,
         defaults: UserDefaults = .standard,
         navigateMainWindow: @escaping (URL) -> Void = { _ in },
         openExternalURL: @escaping (URL) -> Void = { NSWorkspace.shared.open($0) },
         onClose: @escaping () -> Void
     ) {
         self.url = url
+        self.permitsFileDownloads = kind == .stackStream
+        self.downloadDirectory = downloadDirectory ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
         self.onClose = onClose
         self.navigateMainWindow = navigateMainWindow
         self.openExternalURL = openExternalURL
@@ -189,21 +194,32 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor response: WKNavigationResponse) async -> WKNavigationResponsePolicy {
-        if response.isForMainFrame, let http = response.response as? HTTPURLResponse, http.statusCode >= 400 {
+        responsePolicy(for: response.response, mainFrame: response.isForMainFrame, canShowMIMEType: response.canShowMIMEType)
+    }
+
+    func responsePolicy(for response: URLResponse, mainFrame: Bool, canShowMIMEType: Bool) -> WKNavigationResponsePolicy {
+        if let destination = response.url,
+           permitsFileDownloads && NavigationPolicy.isStackAssetDownload(destination, appURL: url) {
+            return NavigationPolicy.permitsStackAssetDownload(response: response, originalURL: destination, appURL: url)
+                ? .download : .cancel
+        }
+        if mainFrame, let http = response as? HTTPURLResponse, http.statusCode >= 400 {
             dispose()
             return .cancel
         }
-        return response.canShowMIMEType ? .allow : .cancel
+        return canShowMIMEType ? .allow : .cancel
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction) async -> WKNavigationActionPolicy {
         guard let destination = action.request.url else { return .cancel }
         return navigationPolicy(for: destination, userActivated: action.navigationType == .linkActivated,
-                                mainFrame: action.targetFrame?.isMainFrame == true)
+                                mainFrame: action.targetFrame?.isMainFrame == true, downloadRequested: action.shouldPerformDownload)
     }
 
-    func navigationPolicy(for destination: URL, userActivated: Bool, mainFrame: Bool) -> WKNavigationActionPolicy {
+    func navigationPolicy(for destination: URL, userActivated: Bool, mainFrame: Bool, downloadRequested: Bool = false) -> WKNavigationActionPolicy {
         guard !disposed else { return .cancel }
+        if permitsFileDownloads && NavigationPolicy.isStackAssetDownload(destination, appURL: url),
+           NavigationPolicy.shouldDownload(destination, requested: downloadRequested, appURL: url) { return .download }
         if destination == url && mainFrame { return .allow }
         if userActivated {
             if NavigationPolicy.keepsInApp(destination, appURL: url) {
@@ -215,6 +231,21 @@ final class StackPopoutWindow: NSObject, WKNavigationDelegate, WKUIDelegate, NSW
             dispose()
         }
         return .cancel
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
+    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String) async -> URL? {
+        guard !disposed,
+              NavigationPolicy.permitsStackAssetDownload(response: response, originalURL: download.originalRequest?.url, appURL: url),
+              let downloads = downloadDirectory else { return nil }
+        return DesktopDownloadDestination.choose(suggestedFilename: suggestedFilename, directory: downloads)
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { dispose() }

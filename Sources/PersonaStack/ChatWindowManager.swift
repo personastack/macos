@@ -292,7 +292,8 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
     func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) { download.delegate = self }
     func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) { download.delegate = self }
     func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String) async -> URL? {
-        guard let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else { return nil }
+        guard NavigationPolicy.permitsStackAssetDownload(response: response, originalURL: download.originalRequest?.url, appURL: url),
+              let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else { return nil }
         return DesktopDownloadDestination.choose(suggestedFilename: suggestedFilename, directory: downloads)
     }
 }
