@@ -60,6 +60,9 @@ final class MainWindowNavigation: NSTitlebarAccessoryViewController {
     private func configure(_ button: NSButton, symbol: String, label: String, action: Selector) {
         button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)?
             .withSymbolConfiguration(.init(pointSize: 11, weight: .medium))
+        // Keep titlebar symbols light even when AppKit changes the window
+        // emphasis or applies its disabled-control treatment.
+        button.contentTintColor = NSColor(white: 0.88, alpha: 1)
         button.imagePosition = .imageOnly
         button.bezelStyle = .regularSquare
         button.isBordered = false
