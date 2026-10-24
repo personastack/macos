@@ -63,6 +63,9 @@ struct PersonaStackApp: App {
                 DesktopUpdateToast()
                     .padding(18)
             }
+            .overlay(alignment: .bottomTrailing) {
+                DesktopDownloadToast().padding(18)
+            }
         }
         .defaultSize(width: 1440, height: 960)
         .windowStyle(.titleBar)
@@ -697,8 +700,18 @@ struct PersonaStackWebView: NSViewRepresentable {
 
         func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String) async -> URL? {
             guard NavigationPolicy.permitsStackAssetDownload(response: response, originalURL: download.originalRequest?.url, appURL: appURL),
-                  let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else { return nil }
-            return DesktopDownloadDestination.choose(suggestedFilename: suggestedFilename, directory: downloads)
+                  let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first,
+                  let destination = DesktopDownloadDestination.choose(suggestedFilename: suggestedFilename, directory: downloads) else { return nil }
+            DesktopDownloadNotice.shared.track(ObjectIdentifier(download), destination: destination)
+            return destination
+        }
+
+        func downloadDidFinish(_ download: WKDownload) {
+            DesktopDownloadNotice.shared.finished(ObjectIdentifier(download))
+        }
+
+        func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+            DesktopDownloadNotice.shared.failed(ObjectIdentifier(download))
         }
     }
 }
