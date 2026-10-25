@@ -5,6 +5,7 @@ import PersonaStackCore
 final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     var reopenMainWindow: (@MainActor () -> Void)?
     private var shouldRestoreMainWindow = false
+    private var pendingMainPage: URL?
     private let shutdown: @MainActor () async -> Bool
     private let terminate: @MainActor (NSApplication) -> Void
     private let hasActiveSessions: @MainActor () -> Bool
@@ -88,7 +89,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     }
 
     func openMainPage(_ destination: URL) {
-        navigateMainWindow(destination)
+        pendingMainPage = destination
         shouldRestoreMainWindow = true
         restoreMainWindowIfNeeded()
     }
@@ -96,7 +97,10 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     private func restoreMainWindowIfNeeded() {
         guard shouldRestoreMainWindow, let reopenMainWindow else { return }
         shouldRestoreMainWindow = false
+        let destination = pendingMainPage
+        pendingMainPage = nil
         reopenMainWindow()
+        if let destination { navigateMainWindow(destination) }
     }
 
     init(shutdown: @escaping @MainActor () async -> Bool,

@@ -146,7 +146,10 @@ struct ChatWindowTests {
         var reopens = 0
         let delegate = PersonaStackTerminationDelegate(shutdown: { true }, terminate: { _ in }, timeout: .seconds(1),
             navigateMainWindow: { destinations.append($0) })
-        delegate.installMainWindowReopener { reopens += 1 }
+        delegate.installMainWindowReopener {
+            #expect(destinations.count == reopens)
+            reopens += 1
+        }
         let manager = ChatWindowManager(loadPages: false, defaults: preferences.defaults, presentWindows: false)
         manager.navigateMainWindow = { delegate.openMainPage($0) }
         defer { manager.invalidateSession() }
@@ -178,9 +181,12 @@ struct ChatWindowTests {
             navigateMainWindow: { destinations.append($0) })
         let destination = try #require(URL(string: "https://example.invalid/user/personas/p-1"))
         delegate.openMainPage(destination)
-        #expect(destinations == [destination] && reopens == 0)
-        delegate.installMainWindowReopener { reopens += 1 }
-        #expect(reopens == 1)
+        #expect(destinations.isEmpty && reopens == 0)
+        delegate.installMainWindowReopener {
+            #expect(destinations.isEmpty)
+            reopens += 1
+        }
+        #expect(destinations == [destination] && reopens == 1)
     }
 
     @Test func testFixedURLAndOrigin() throws {

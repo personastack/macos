@@ -144,6 +144,40 @@ struct MainWindowLifecycleTests {
         }
     }
 
+    @Test func chatAvatarOpensItsPersonaAfterRestoringMainWindow() throws {
+        for closeMainWindow in [false, true] {
+            let fixture = WindowFixture()
+            defer { fixture.dispose() }
+            fixture.attach()
+            fixture.window.makeKeyAndOrderFront(nil)
+            fixture.host.openDesktopFlow(path: "/user/desktop/skills", query: [:])
+            if closeMainWindow { fixture.window.close() }
+            else { fixture.window.orderOut(nil) }
+            let delegate = PersonaStackTerminationDelegate(shutdown: { true }, terminate: { _ in }, timeout: .seconds(1),
+                navigateMainWindow: {
+                    #expect(fixture.host.mainWindow === fixture.window)
+                    #expect(fixture.window.isVisible)
+                    fixture.host.navigate(to: $0)
+                })
+            delegate.installMainWindowReopener {
+                fixture.host.show { Issue.record("The main window should be retained") }
+            }
+            let preferences = PopoutTestPreferences()
+            let manager = ChatWindowManager(loadPages: false, defaults: preferences.defaults, presentWindows: false)
+            manager.navigateMainWindow = { delegate.openMainPage($0) }
+            defer { manager.invalidateSession() }
+            for persona in ["p-1", "p-2", "p-1"] {
+                manager.apply(.open(persona, "account-a"), base: fixture.host.coordinator.appURL)
+                let chat = try #require(manager.chat(for: persona))
+                chat.apply(.settings)
+                #expect(fixture.requests.last?.absoluteString == "https://example.invalid:8443/user/personas/\(persona)")
+                #expect(fixture.host.webView.window === fixture.window)
+                #expect(manager.chat(for: persona) === chat)
+                #expect(!chat.webView.collapsed)
+            }
+        }
+    }
+
     @Test func ordinaryFocusHideAndOtherWindowCloseDoNotResetPage() {
         let fixture = WindowFixture()
         defer { fixture.dispose() }
