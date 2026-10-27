@@ -135,7 +135,19 @@ struct PopoutWindowPresentationTests {
                 #expect(chromeHeight == standardTitlebarHeight)
                 #expect(window.toolbar == nil)
                 #expect(window.titlebarAccessoryViewControllers.count == 1)
-                #expect(window.titlebarAccessoryViewControllers.first?.layoutAttribute == .right)
+                #expect(window.titlebarAccessoryViewControllers.contains { $0.layoutAttribute == .right })
+                if kind == .chat {
+                    #expect(chrome.resetButton.accessibilityLabel() == "Reset chat")
+                    #expect(chrome.resetButton.image != nil)
+                    let accessory = try #require(chrome.resetButton.superview)
+                    accessory.layoutSubtreeIfNeeded()
+                    #expect(chrome.resetButton.frame.minX >= chrome.pinButton.frame.maxX)
+                    #expect(accessory.bounds.maxX - chrome.resetButton.frame.maxX == 4)
+                    var resets = 0
+                    chrome.onResetChat = { resets += 1 }
+                    chrome.resetButton.performClick(nil)
+                    #expect(resets == 1)
+                }
                 #expect(chrome.pinButton.controlSize == .small)
                 #expect(chrome.pinButton.frame.size == NSSize(width: 24, height: 24))
             } else {

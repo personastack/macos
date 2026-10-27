@@ -120,6 +120,10 @@ final class PersonaChatWindow: NSObject, WKScriptMessageHandlerWithReply, WKNavi
         webView.underPageBackgroundColor = .clear
         window.contentView = webView
         presentation = PopoutWindowPresentation(window: window, webView: webView, kind: .chat, defaults: defaults)
+        presentation.onResetChat = { [weak self] in
+            guard let self, !self.disposed, !self.closePending else { return }
+            self.webView.evaluateJavaScript("window.personastackResetChat?.()", completionHandler: nil)
+        }
         window.delegate = self
         webView.navigationDelegate = self
         webView.uiDelegate = self

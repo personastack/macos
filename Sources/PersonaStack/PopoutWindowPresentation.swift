@@ -59,6 +59,8 @@ final class PopoutWindowPresentation: NSObject, NSToolbarDelegate {
     private static let pinIdentifier = NSToolbarItem.Identifier("popout.pin")
     let toolbar = NSToolbar(identifier: "PersonaStack.Popout")
     let pinButton = NSButton()
+    let resetButton = NSButton()
+    var onResetChat: (() -> Void)?
     private let pinAccessory = NSTitlebarAccessoryViewController()
     private var pinAccessoryConstraints: [NSLayoutConstraint] = []
     private(set) var graphOverlay: GraphPinOverlayView?
@@ -109,11 +111,13 @@ final class PopoutWindowPresentation: NSObject, NSToolbarDelegate {
         setPinned(false)
         pinButton.sizeToFit()
         if kind.usesTitlebarAccessory {
-            let accessoryView = NSView(frame: NSRect(x: 0, y: 0, width: 36, height: 24))
+            let accessoryView = NSView(frame: NSRect(x: 0, y: 0, width: kind == .chat ? 64 : 36, height: 24))
             pinButton.translatesAutoresizingMaskIntoConstraints = false
             accessoryView.addSubview(pinButton)
             pinAccessoryConstraints = [
-                pinButton.centerXAnchor.constraint(equalTo: accessoryView.centerXAnchor),
+                kind == .chat
+                    ? pinButton.leadingAnchor.constraint(equalTo: accessoryView.leadingAnchor, constant: 4)
+                    : pinButton.centerXAnchor.constraint(equalTo: accessoryView.centerXAnchor),
                 pinButton.centerYAnchor.constraint(equalTo: accessoryView.centerYAnchor),
                 pinButton.widthAnchor.constraint(equalToConstant: 24),
                 pinButton.heightAnchor.constraint(equalToConstant: 24),
@@ -125,6 +129,7 @@ final class PopoutWindowPresentation: NSObject, NSToolbarDelegate {
         } else {
             window.toolbar = toolbar
         }
+        if kind == .chat { installChatReset() }
         if kind == .stackGraph { installGraphOverlay(webView: webView) }
         window.center()
         let initialFrame = geometry.read(kind) ?? window.frame
@@ -139,6 +144,41 @@ final class PopoutWindowPresentation: NSObject, NSToolbarDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(willExitFullscreen), name: NSWindow.willExitFullScreenNotification, object: window)
         NotificationCenter.default.addObserver(self, selector: #selector(didExitFullscreen), name: NSWindow.didExitFullScreenNotification, object: window)
         NotificationCenter.default.addObserver(self, selector: #selector(didEnterFullscreen), name: NSWindow.didEnterFullScreenNotification, object: window)
+    }
+
+    private func installChatReset() {
+        // Bootstrap Icons 1.11.3, arrow-counterclockwise. A template image
+        // follows the native titlebar foreground without changing the artwork.
+        let svg = """
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+        <path fill-rule="evenodd" d="M8 3a5 5 0 1 1-4.546 2.914.5.5 0 0 0-.908-.417A6 6 0 1 0 8 2z"/>
+        <path d="M8 4.466V.534a.25.25 0 0 0-.41-.192L5.23 2.308a.25.25 0 0 0 0 .384l2.36 1.966A.25.25 0 0 0 8 4.466"/>
+        </svg>
+        """
+        let image = NSImage(data: Data(svg.utf8))
+        image?.isTemplate = true
+        resetButton.image = image
+        resetButton.imagePosition = .imageOnly
+        resetButton.bezelStyle = .accessoryBarAction
+        resetButton.controlSize = .small
+        resetButton.setAccessibilityLabel("Reset chat")
+        resetButton.toolTip = "Reset chat"
+        resetButton.target = self
+        resetButton.action = #selector(resetChat)
+        let view = pinAccessory.view
+        resetButton.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(resetButton)
+        NSLayoutConstraint.activate([
+            resetButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -4),
+            resetButton.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            resetButton.widthAnchor.constraint(equalToConstant: 24),
+            resetButton.heightAnchor.constraint(equalToConstant: 24),
+        ])
+    }
+
+    @objc private func resetChat() {
+        guard !invalidated, kind == .chat else { return }
+        onResetChat?()
     }
 
     func updateTitle(_ title: String?) {
@@ -198,6 +238,7 @@ final class PopoutWindowPresentation: NSObject, NSToolbarDelegate {
         guard !invalidated else { return }
         recordGeometry()
         invalidated = true
+        onResetChat = nil
         titleObservation = nil
         graphOverlay?.invalidate()
         NotificationCenter.default.removeObserver(self)

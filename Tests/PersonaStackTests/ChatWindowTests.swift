@@ -13,12 +13,40 @@ struct ChatWindowTests {
         defer { chat.dispose() }
         for _ in 0..<3 {
             #expect(chat.presentation.pinButton.window === chat.window)
+            #expect(chat.presentation.resetButton.window === chat.window)
             chat.apply(.collapse)
             #expect(chat.presentation.pinButton.window == nil)
+            #expect(chat.presentation.resetButton.window == nil)
             chat.apply(.expand)
             #expect(chat.presentation.pinButton.window === chat.window)
+            #expect(chat.presentation.resetButton.window === chat.window)
             #expect(chat.window.titlebarAccessoryViewControllers.count == 1)
         }
+    }
+
+    @MainActor @Test func nativeResetInvokesHostedChatAction() async throws {
+        _ = NSApplication.shared
+        let preferences = PopoutTestPreferences()
+        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false,
+            defaults: preferences.defaults) {}
+        defer { chat.dispose() }
+        chat.webView.navigationDelegate = nil
+        chat.webView.loadHTMLString("<script>window.resetCount = 0; window.personastackResetChat = () => { window.resetCount++; };</script>", baseURL: nil)
+        var ready = false
+        for _ in 0..<40 {
+            ready = (try? await chat.webView.evaluateJavaScript("typeof window.personastackResetChat === 'function'")) as? Bool == true
+            if ready { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(ready)
+        chat.presentation.resetButton.performClick(nil)
+        var called = false
+        for _ in 0..<40 {
+            called = (try? await chat.webView.evaluateJavaScript("window.resetCount === 1")) as? Bool == true
+            if called { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(called)
     }
 
     @MainActor @Test func directCloseRetiresChatAndAllowsFreshWindow() throws {
