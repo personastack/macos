@@ -1,5 +1,7 @@
 # PersonaStack for macOS specification
 
+Environment-variable reference: [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md).
+
 ## Purpose
 
 PersonaStack for macOS presents a selected PersonaStack web surface in a dedicated native macOS application window.
