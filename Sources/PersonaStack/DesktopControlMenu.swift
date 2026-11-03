@@ -89,8 +89,12 @@ struct DesktopControlMenu: View {
             }
             .disabled(!action.isEnabled)
         }
-        Menu("Desktop Control") {
+        Menu {
             desktopControlActions
+        } label: {
+            Label { Text("Desktop Control") } icon: {
+                Image(nsImage: DesktopControlIcon.image).renderingMode(.original)
+            }
         }
         Divider()
         Menu("Settings") {
@@ -118,7 +122,13 @@ struct DesktopControlMenu: View {
     }
 
     private var connectionStatus: some View {
-        Label(relayStatus, systemImage: presentation.snapshot.symbol)
+        Label { Text(relayStatus) } icon: {
+            if presentation.snapshot.state == .controlling {
+                Image(nsImage: DesktopControlIcon.image).renderingMode(.original)
+            } else {
+                Image(systemName: presentation.snapshot.symbol)
+            }
+        }
             .foregroundStyle(statusColor)
             .onReceive(status.objectWillChange) { _ in
                 DesktopLoginItemRegistration.clearResolvedApprovalError()
