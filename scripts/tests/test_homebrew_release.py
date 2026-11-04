@@ -121,6 +121,7 @@ else:
                 self.assertIn(hashlib.sha256(archive.read_bytes()).hexdigest(), cask)
                 self.assertIn('pkg "Install PersonaStack.pkg"', cask)
                 self.assertIn("auto_updates true", cask)
+                self.assertIn("  depends_on arch: :arm64", cask)
                 self.assertEqual(self.remote_file(tag, "Casks/personastack.rb"), cask)
                 self.assertEqual(self.remote_file(tag, f"Downloads/{archive.name}"), archive.read_text())
                 create = [c for c in self.calls() if c["tool"] == "gh" and c["args"][1] == "create"][-1]
@@ -132,6 +133,7 @@ else:
                 item = feed.find("channel/item")
                 self.assertEqual(item.findtext(f"{{{SPARKLE}}}version"), version)
                 self.assertEqual(item.findtext("description"), notes.read_text().strip())
+                self.assertEqual(item.findtext(f"{{{SPARKLE}}}hardwareRequirements"), "arm64")
                 self.assertIn(f"/{tag}/Downloads/{archive.name}", item.find("enclosure").get("url"))
         self.assertEqual([i.findtext(f"{{{SPARKLE}}}version") for i in feed.findall("channel/item")],
                          ["1.2.10", "1.2.9"])

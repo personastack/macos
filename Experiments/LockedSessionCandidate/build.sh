@@ -13,7 +13,7 @@ if [ -e "$bundle_dir" ]; then
     exit 1
 fi
 mkdir -p "$contents_dir/MacOS" "$contents_dir/Resources"
-nice -n 15 xcrun --sdk macosx clang -isysroot "$sdk_path" -arch arm64 -arch x86_64 \
+nice -n 15 xcrun --sdk macosx clang -isysroot "$sdk_path" -arch arm64 \
     -std=c11 -Wall -Wextra -Werror -fvisibility=hidden -bundle \
     -Wl,-exported_symbol,_AuthorizationPluginCreate \
     -framework Security -framework SystemConfiguration -framework CoreFoundation \
@@ -39,7 +39,7 @@ codesign --sign - --timestamp=none "$bundle_dir"
 codesign --verify --strict "$bundle_dir"
 
 test_binary="$output_dir/AuthorizationGrantPluginTests"
-nice -n 15 xcrun --sdk macosx clang -isysroot "$sdk_path" -arch arm64 -arch x86_64 \
+nice -n 15 xcrun --sdk macosx clang -isysroot "$sdk_path" -arch arm64 \
     -std=c11 -Wall -Wextra -Werror -DPERSONASTACK_LOCKED_GRANT_TESTING \
     -framework Security -framework SystemConfiguration -framework CoreFoundation \
     -lbsm -I "$repo_dir/Sources/LockedControlAudit/include" \

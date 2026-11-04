@@ -14,7 +14,7 @@ output_dir=$(cd -- "$output_dir" && pwd)
 
 build_id=$(PYTHONDONTWRITEBYTECODE=1 nice -n 15 python3 "$source_dir/receipt.py" identity "$source_dir")
 build_version=$(PYTHONDONTWRITEBYTECODE=1 nice -n 15 python3 "$source_dir/receipt.py" version)
-flags=(-std=c11 -Wall -Wextra -Werror -mmacosx-version-min=14.0 "-DPROBE_BUILD_ID=\"$build_id\"")
+flags=(-arch arm64 -std=c11 -Wall -Wextra -Werror -mmacosx-version-min=14.0 "-DPROBE_BUILD_ID=\"$build_id\"")
 sanitizers=(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
 frameworks=(-framework Security -framework CoreFoundation)
 
@@ -34,18 +34,12 @@ nice -n 15 "$output_dir/action-tests"
 
 bundle="$output_dir/PersonaStackLockedSessionProbe.bundle"
 mkdir -p -- "$bundle/Contents/MacOS"
-for architecture in arm64 x86_64; do
-    nice -n 15 clang "${flags[@]}" -arch "$architecture" -O2 -fvisibility=hidden -bundle \
-        "$source_dir/AuthorizationProbe.c" "${frameworks[@]}" \
-        -o "$output_dir/authorization-$architecture"
-    nice -n 15 clang "${flags[@]}" -arch "$architecture" -O2 \
-        "$source_dir/ProbeActions.c" "${frameworks[@]}" -framework IOKit \
-        -o "$output_dir/probe-$architecture"
-done
-nice -n 15 lipo -create "$output_dir/authorization-arm64" "$output_dir/authorization-x86_64" \
-    -output "$bundle/Contents/MacOS/PersonaStackLockedSessionProbe"
-nice -n 15 lipo -create "$output_dir/probe-arm64" "$output_dir/probe-x86_64" \
-    -output "$output_dir/personastack-locked-session-probe"
+nice -n 15 clang "${flags[@]}" -O2 -fvisibility=hidden -bundle \
+    "$source_dir/AuthorizationProbe.c" "${frameworks[@]}" \
+    -o "$bundle/Contents/MacOS/PersonaStackLockedSessionProbe"
+nice -n 15 clang "${flags[@]}" -O2 \
+    "$source_dir/ProbeActions.c" "${frameworks[@]}" -framework IOKit \
+    -o "$output_dir/personastack-locked-session-probe"
 cat > "$bundle/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -64,9 +58,9 @@ nice -n 15 codesign --sign - --timestamp=none "$bundle"
 nice -n 15 codesign --sign - --timestamp=none "$output_dir/personastack-locked-session-probe"
 nice -n 15 codesign --verify --strict "$bundle"
 nice -n 15 codesign --verify --strict "$output_dir/personastack-locked-session-probe"
-for architecture in arm64 x86_64; do
-    nice -n 15 lipo -verify_arch "$architecture" "$bundle/Contents/MacOS/PersonaStackLockedSessionProbe"
-    nice -n 15 lipo -verify_arch "$architecture" "$output_dir/personastack-locked-session-probe"
+for binary in "$bundle/Contents/MacOS/PersonaStackLockedSessionProbe" \
+    "$output_dir/personastack-locked-session-probe"; do
+    test "$(nice -n 15 lipo -archs "$binary")" = arm64
 done
 cp -- "$source_dir/policy.py" "$source_dir/receipt.py" "$source_dir/README.md" "$output_dir/"
 PYTHONDONTWRITEBYTECODE=1 nice -n 15 python3 "$source_dir/policy.py" leaf "$output_dir/probe-right.plist"

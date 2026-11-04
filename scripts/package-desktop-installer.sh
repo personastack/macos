@@ -41,28 +41,7 @@ PY
     --install-location / --ownership recommended --identifier ai.personastack.desktop \
     --version "$version" --scripts "$staging/scripts" "$staging/app.pkg"
 /usr/bin/productbuild --synthesize --package "$staging/app.pkg" "$staging/distribution.xml"
-python3 - "$staging/distribution.xml" <<'PY'
-import sys, xml.etree.ElementTree as ET
-path = sys.argv[1]
-root = ET.parse(path).getroot()
-title = root.find('title')
-if title is None:
-    title = ET.SubElement(root, 'title')
-title.text = 'PersonaStack'
-options = root.find('options')
-if options is None:
-    options = ET.SubElement(root, 'options')
-options.set('customize', 'never')
-domains = ET.SubElement(root, 'domains')
-domains.set('enable_anywhere', 'false')
-domains.set('enable_currentUserHome', 'false')
-domains.set('enable_localSystem', 'true')
-volume = ET.SubElement(root, 'volume-check')
-ET.SubElement(volume, 'allowed-os-versions').append(ET.Element('os-version', min='14.0'))
-close = ET.SubElement(ET.SubElement(root, 'pkg-ref', id='ai.personastack.desktop'), 'must-close')
-ET.SubElement(close, 'app', id='ai.personastack.desktop')
-ET.ElementTree(root).write(path, encoding='utf-8', xml_declaration=True)
-PY
+python3 "$root_dir/scripts/render-desktop-distribution.py" "$staging/distribution.xml"
 /usr/bin/productbuild --distribution "$staging/distribution.xml" --package-path "$staging" "$staging/product.pkg"
 if [ "$sign_installer" = 1 ]; then
     /usr/bin/productsign --sign "$PERSONASTACK_INSTALLER_SIGNING_IDENTITY" \

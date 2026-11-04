@@ -24,6 +24,8 @@ def main() -> int:
     if len(matches) != 1:
         raise SystemExit(f"expected one appcast item for {version}")
     item = matches[0]
+    if item.findtext(f"{{{namespace}}}hardwareRequirements") != "arm64":
+        raise SystemExit("release must require ARM64 hardware")
     enclosure = item.find("enclosure")
     if enclosure is None:
         raise SystemExit("release item has no enclosure")
@@ -55,6 +57,8 @@ def main() -> int:
     cask_url = re.search(r'^  url "([^"]+)"$', cask, re.MULTILINE)
     if cask_url is None or cask_url.group(1).replace("#{version}", version) != expected_url:
         raise SystemExit("cask URL does not select the same immutable installer as the appcast")
+    if not re.search(r"^  depends_on arch: :arm64$", cask, re.MULTILINE):
+        raise SystemExit("cask must require ARM64 hardware")
     if "auto_updates true" not in cask:
         raise SystemExit("cask does not enable application updates")
     if '  pkg "Install PersonaStack.pkg"' not in cask:

@@ -37,7 +37,28 @@ class PackageAppcastTests(unittest.TestCase):
             self.assertEqual(enclosure.get(f"{{{appcast.SPARKLE}}}installationType"), "package")
             self.assertEqual(enclosure.get("length"), str(archive.stat().st_size))
             self.assertEqual(items[0].findtext("description"), notes.read_text().strip())
+            self.assertEqual(items[0].findtext(f"{{{appcast.SPARKLE}}}hardwareRequirements"), "arm64")
+            self.assertIsNone(items[1].find(f"{{{appcast.SPARKLE}}}hardwareRequirements"))
             self.assertNotIn("old signature", output.read_text())
+
+
+class DesktopDistributionTests(unittest.TestCase):
+    def test_synthesized_installer_overrides_universal_default_and_preserves_package(self):
+        for options in ("", '<options customize="allow" hostArchitectures="arm64,x86_64"/>'):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / "distribution.xml"
+                path.write_text('<installer-gui-script minSpecVersion="1">' + options +
+                                '<pkg-ref id="ai.personastack.desktop" version="1.2.3">app.pkg</pkg-ref>' +
+                                '</installer-gui-script>')
+                subprocess.run([sys.executable, str(ROOT / "scripts/render-desktop-distribution.py"), str(path)], check=True)
+                distribution = ET.parse(path)
+                self.assertEqual(distribution.find("options").get("hostArchitectures"), "arm64")
+                self.assertEqual(distribution.find("options").get("customize"), "never")
+                self.assertEqual(distribution.find("pkg-ref").text, "app.pkg")
+                self.assertEqual(distribution.find("pkg-ref").get("version"), "1.2.3")
+                self.assertEqual(distribution.find("volume-check/allowed-os-versions/os-version").get("min"), "14.0")
+                self.assertEqual(distribution.find("domains").get("enable_localSystem"), "true")
+                self.assertEqual(distribution.find("pkg-ref/must-close/app").get("id"), "ai.personastack.desktop")
 
 
 @unittest.skipUnless(sys.platform == "darwin", "requires macOS package tools")
@@ -63,6 +84,7 @@ class DesktopInstallerTests(unittest.TestCase):
             subprocess.run(["/usr/sbin/pkgutil", "--expand-full", str(output), str(expanded)], check=True, capture_output=True)
             distribution = ET.parse(expanded / "Distribution")
             self.assertEqual(distribution.findtext("title"), "PersonaStack")
+            self.assertEqual(distribution.find("options").get("hostArchitectures"), "arm64")
             self.assertEqual(distribution.find("domains").get("enable_currentUserHome"), "false")
             self.assertEqual(distribution.find("volume-check/allowed-os-versions/os-version").get("min"), "14.0")
             self.assertEqual(distribution.find("pkg-ref/must-close/app").get("id"), "ai.personastack.desktop")
@@ -120,6 +142,7 @@ class StandaloneCUAPackagingTests(unittest.TestCase):
             cask = root / "personastack.rb"
             subprocess.run([str(ROOT / "scripts/render-homebrew-cask.sh"), "1.2.3", str(archive), str(cask)], check=True)
             source = cask.read_text()
+            self.assertIn("  depends_on arch: :arm64", source)
             self.assertNotIn("CuaDriver", source)
             self.assertNotIn("com.trycua", source)
             self.assertIn('if [ -e "/Library/Application Support/PersonaStack/LockedControlInstaller" ]', source)

@@ -13,7 +13,6 @@ bundle_dir="$root_dir/build/PersonaStack.app"
 staging_dir="$root_dir/build/dmg-root"
 rw_dmg="$root_dir/build/PersonaStack-$version-rw.dmg"
 arm64_build_dir="$root_dir/build/swift-arm64"
-x86_64_build_dir="$root_dir/build/swift-x86_64"
 agent_bridge_build_dir="$root_dir/build/agent-bridge"
 
 case "$configuration" in
@@ -40,29 +39,20 @@ if [ -n "$sparkle_public_key" ] && ! python3 -c 'import base64,sys; assert len(b
 fi
 
 "$root_dir/scripts/build-icon.sh"
-swift run --package-path "$root_dir" PersonaStackPolicyCheck
+swift run --package-path "$root_dir" --triple arm64-apple-macosx14.0 PersonaStackPolicyCheck
 if [ "${CLEAN_BUILD:-1}" = 1 ]; then
-  rm -rf "$arm64_build_dir" "$x86_64_build_dir"
+  rm -rf "$arm64_build_dir"
 fi
 swift build --package-path "$root_dir" --scratch-path "$arm64_build_dir" --triple arm64-apple-macosx14.0 -c "$configuration"
-swift build --package-path "$root_dir" --scratch-path "$x86_64_build_dir" --triple x86_64-apple-macosx14.0 -c "$configuration"
 sh "$root_dir/scripts/build-agent-bridge.sh" "$agent_bridge_build_dir" "$version"
 arm64_binary=$(find "$arm64_build_dir" -type f -name PersonaStack -perm -111 -print -quit)
-x86_64_binary=$(find "$x86_64_build_dir" -type f -name PersonaStack -perm -111 -print -quit)
 test -n "$arm64_binary"
-test -n "$x86_64_binary"
 
 rm -rf "$bundle_dir" "$staging_dir" "$rw_dmg"
 mkdir -p "$bundle_dir/Contents/MacOS" "$bundle_dir/Contents/Resources" "$bundle_dir/Contents/Frameworks" \
   "$bundle_dir/Contents/Library/LaunchAgents" "$staging_dir"
-lipo -create \
-  "$arm64_binary" \
-  "$x86_64_binary" \
-  -output "$bundle_dir/Contents/MacOS/PersonaStack"
-lipo -create \
-  "$(dirname "$arm64_binary")/PersonaStackHarnessHook" \
-  "$(dirname "$x86_64_binary")/PersonaStackHarnessHook" \
-  -output "$bundle_dir/Contents/MacOS/PersonaStackHarnessHook"
+cp "$arm64_binary" "$bundle_dir/Contents/MacOS/PersonaStack"
+cp "$(dirname "$arm64_binary")/PersonaStackHarnessHook" "$bundle_dir/Contents/MacOS/PersonaStackHarnessHook"
 chmod 755 "$bundle_dir/Contents/MacOS/PersonaStackHarnessHook"
 cp "$agent_bridge_build_dir/PersonaStackAgentBridge" "$bundle_dir/Contents/MacOS/PersonaStackAgentBridge"
 if [ "$configuration" = release ]; then

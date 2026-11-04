@@ -24,18 +24,15 @@ test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" = "$versi
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = "$version"
 test "$(/usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$plist")" = 'https://raw.githubusercontent.com/personastack/homebrew-tap/main/appcast.xml'
 test "$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$plist" 2>/dev/null || true)" = "$expected_public_key"
-lipo "$bundle/Contents/MacOS/PersonaStack" -verify_arch arm64
-lipo "$bundle/Contents/MacOS/PersonaStack" -verify_arch x86_64
-lipo "$bundle/Contents/MacOS/PersonaStackHarnessHook" -verify_arch arm64
-lipo "$bundle/Contents/MacOS/PersonaStackHarnessHook" -verify_arch x86_64
-lipo "$bundle/Contents/MacOS/PersonaStackAgentBridge" -verify_arch arm64
-lipo "$bundle/Contents/MacOS/PersonaStackAgentBridge" -verify_arch x86_64
+sh "$root_dir/scripts/verify-arm64-binaries.sh" \
+  "$bundle/Contents/MacOS/PersonaStack" \
+  "$bundle/Contents/MacOS/PersonaStackHarnessHook" \
+  "$bundle/Contents/MacOS/PersonaStackAgentBridge"
 test -x "$framework/Versions/B/Autoupdate"
 test -x "$framework/Versions/B/Updater.app/Contents/MacOS/Updater"
 test -x "$framework/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"
 test -x "$framework/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer"
 lipo "$framework/Versions/B/Sparkle" -verify_arch arm64
-lipo "$framework/Versions/B/Sparkle" -verify_arch x86_64
 codesign --verify --deep --strict "$framework"
 verification_dir=$(mktemp -d "${TMPDIR:-/tmp}/personastack-nested-signatures.XXXXXX")
 trap 'rm -rf "$verification_dir"' EXIT

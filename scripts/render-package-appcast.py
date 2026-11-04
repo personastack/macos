@@ -42,6 +42,7 @@ def render(version: str, archive: Path, notes_path: Path, signature: str, output
     ET.SubElement(item, f"{{{SPARKLE}}}version").text = version
     ET.SubElement(item, f"{{{SPARKLE}}}shortVersionString").text = version
     ET.SubElement(item, f"{{{SPARKLE}}}minimumSystemVersion").text = "14.0"
+    ET.SubElement(item, f"{{{SPARKLE}}}hardwareRequirements").text = "arm64"
     ET.SubElement(item, "description", {f"{{{SPARKLE}}}format": "markdown"}).text = notes
     ET.SubElement(item, "enclosure", {
         "url": f"https://raw.githubusercontent.com/personastack/homebrew-tap/desktop-v{version}/Downloads/{archive.name}",

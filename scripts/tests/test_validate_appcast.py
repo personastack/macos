@@ -23,6 +23,8 @@ class ValidateAppcastTests(unittest.TestCase):
         render_cask: bool = False,
         cask_url: Optional[str] = None,
         installation_type: str = "package",
+        hardware: str = "arm64",
+        cask_arch: str = "  depends_on arch: :arm64",
         cask_artifact: str = 'pkg "Install PersonaStack.pkg"',
     ) -> subprocess.CompletedProcess[str]:
         version = "1.2.3"
@@ -44,6 +46,7 @@ class ValidateAppcastTests(unittest.TestCase):
       <enclosure url="{archive_url or expected_url}" length="{len(dmg_bytes)}"
                  sparkle:edSignature="fixture-signature" sparkle:installationType="{installation_type}" />
       <sparkle:version>{version}</sparkle:version>
+      <sparkle:hardwareRequirements>{hardware}</sparkle:hardwareRequirements>
     </item>
   </channel>
 </rss>
@@ -55,6 +58,7 @@ edSignature: fixture-feed-signature
   version "{version}"
   sha256 "{digest}"
   url "{cask_url or expected_url}"
+{cask_arch}
   auto_updates true
   {cask_artifact}
 end
@@ -96,6 +100,20 @@ end
     def test_accepts_certificate_signed_installer(self) -> None:
         result = self.run_validator(filename="PersonaStack-1.2.3-developerid.dmg", render_cask=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_missing_or_incompatible_appcast_hardware(self):
+        for hardware in ("", "x86_64", "arm64,x86_64"):
+            with self.subTest(hardware=hardware):
+                result = self.run_validator(hardware=hardware)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("require ARM64 hardware", result.stderr)
+
+    def test_rejects_missing_or_incompatible_cask_hardware(self):
+        for cask_arch in ("", "  depends_on arch: :x86_64"):
+            with self.subTest(cask_arch=cask_arch):
+                result = self.run_validator(cask_arch=cask_arch)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("cask must require ARM64", result.stderr)
 
     def test_rejects_application_update_that_skips_control_component(self) -> None:
         result = self.run_validator(installation_type="application")

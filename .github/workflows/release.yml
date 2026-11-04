@@ -35,6 +35,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Require an Apple Silicon build host
+        run: test "$(uname -m)" = arm64
       - uses: actions/setup-go@v5
         with:
           go-version-file: agent-bridge/go.mod
@@ -119,7 +121,7 @@ jobs:
           else
             test_scheduling=(--no-parallel)
           fi
-          swift test --disable-xctest --skip-update -j 2 \
+          swift test --triple arm64-apple-macosx14.0 --disable-xctest --skip-update -j 2 \
             "${test_scheduling[@]}" \
             --filter '(AgentBridge|LocalRun|LocalSession|[Hh]arness|[Ss]kill|[Dd]esktop|[Qq]uit|[Tt]ermination|ChatWindow|Popout|[Nn]avigation|MainWebView|MainWindow|[Pp]ermission|[Pp]rotected|[Vv]olume|[Vv]oice|[Mm]icrophone|[Dd]irectory|[Cc]ua|[Nn]otification|[Cc]oncern|[Kk]eychain|[Cc]redential|[Ll]ogin)'
       - name: Build certificate-signed installer
@@ -131,11 +133,9 @@ jobs:
       - name: Build validation binaries
         if: github.event_name == 'workflow_dispatch'
         run: |
-          swift run PersonaStackPolicyCheck
-          for architecture in arm64 x86_64; do
-            swift build --scratch-path "build/validation-$architecture" \
-              --triple "$architecture-apple-macosx14.0" -c release --product PersonaStack
-          done
+          swift run --triple arm64-apple-macosx14.0 PersonaStackPolicyCheck
+          swift build --scratch-path build/validation-arm64 \
+            --triple arm64-apple-macosx14.0 -c release --product PersonaStack
           ./scripts/build-agent-bridge.sh build/validation-agent-bridge "$RELEASE_VERSION"
       - name: Seal signed acceptance candidate
         id: candidate

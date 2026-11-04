@@ -23,6 +23,7 @@ cask "personastack" do
   desc "Native macOS client for PersonaStack"
   homepage "https://my.personastack.ai"
 
+  depends_on arch: :arm64
   depends_on macos: :sonoma
 
   pkg "Install PersonaStack.pkg"

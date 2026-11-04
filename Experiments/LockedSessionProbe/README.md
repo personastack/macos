@@ -15,7 +15,7 @@ probe_parent=$(mktemp -d /tmp/personastack-locked-probe.XXXXXX)
 bash build.sh "$probe_parent/kit"
 ```
 
-Compilation is serial at `nice -n 15`. The kit contains an arm64/x86_64 plug-in, a universal CLI, an offline plist composer, and this procedure. C tests use strict fake engines and activity calls under AddressSanitizer and UndefinedBehaviorSanitizer. Python tests check policy composition and removal. The only real CLI command executed by the build is `--help`.
+Compilation is serial at `nice -n 15`. The kit contains an ARM64-only plug-in, an ARM64-only CLI, an offline plist composer, and this procedure. C tests use strict fake engines and activity calls under AddressSanitizer and UndefinedBehaviorSanitizer. Python tests check policy composition and removal. The only real CLI command executed by the build is `--help`.
 
 The plug-in and CLI use development ad-hoc signatures. This does not establish Developer ID, notarization, host loading, or OS compatibility. `SOURCE.json` binds a clean source revision, source inventory, deterministic build ID, both loaded-image UUIDs and every shipped artifact hash. A dirty source build records no revision and cannot pass receipt verification. Build only the committed source before transferring the kit. Do not merge this plug-in into the production app or publish it through the production updater.
 

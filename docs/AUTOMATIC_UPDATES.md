@@ -12,7 +12,7 @@ Generate the signing key through Sparkle's official `generate_keys` tool. It sav
 
 Before building, the workflow derives the public key from the private-key secret and fails if it does not match the repository variable. It never prints the private key. The workflow publishes in this order:
 
-1. Build one universal DMG with the public key, release version, and embedded Sparkle framework.
+1. Build one ARM64-only DMG with the public key, release version, and embedded Sparkle framework.
 2. Create the app release and publish the same DMG to the versioned tap tag. The generated cask enables `auto_updates true` and records that DMG's SHA-256.
 3. Generate the signed feed using only the current updater-enabled DMG and the prior signed feed. This avoids importing older pre-Sparkle DMGs from `Downloads/`.
 4. Verify the feed and archive signatures with Sparkle's `sign_update --verify`, then check the exact version, length, inline release notes, and immutable tap URL before publishing the new feed on `main`.
