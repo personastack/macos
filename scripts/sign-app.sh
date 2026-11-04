@@ -35,6 +35,11 @@ sign --identifier ai.personastack.desktop.lima \
   --entitlements "$root_dir/Resources/Lima.entitlements" \
   "$bundle/Contents/Resources/LocalCluster/lima/bin/limactl"
 python3 "$root_dir/scripts/lima_runtime.py" seal "$bundle"
+if [ -f "$bundle/Contents/Resources/imsg-provider-manifest.json" ]; then
+  sign --identifier ai.personastack.desktop.imsg \
+    --entitlements "$root_dir/Resources/IMessageProvider.entitlements" "$bundle/Contents/MacOS/imsg"
+  python3 "$root_dir/third_party/imsg/bundle.py" --app-bundle "$bundle" --seal-existing
+fi
 sign --identifier ai.personastack.desktop \
   --entitlements "$root_dir/Resources/Release.entitlements" "$bundle"
 "$root_dir/scripts/verify-app-signature.sh" "$bundle"

@@ -125,13 +125,16 @@ public struct DesktopControlFrame: Codable, Equatable, Sendable {
     public let readiness: String?
     public let diagnosticsSupported: Bool?
     public let diagnostics: DesktopControlDiagnostics?
+    public let imessageProtocolVersion: Int?
+    public let imessage: IMessageGatewayPayload?
 
     public init(version: Int = 1, type: String, requestID: String? = nil, target: DesktopControlTarget? = nil,
                 operation: String? = nil, arguments: DesktopControlJSONValue? = nil, deadlineAt: Date? = nil,
                 result: DesktopControlJSONValue? = nil, errorCode: String? = nil, errorMessage: String? = nil,
                 streamID: String? = nil, sequence: UInt64? = nil, streamChannel: String? = nil,
                 streamData: Data? = nil, lastHeartbeat: Date? = nil, readiness: String? = nil,
-                diagnosticsSupported: Bool? = nil, diagnostics: DesktopControlDiagnostics? = nil) {
+                diagnosticsSupported: Bool? = nil, diagnostics: DesktopControlDiagnostics? = nil,
+                imessageProtocolVersion: Int? = nil, imessage: IMessageGatewayPayload? = nil) {
         self.version = version
         self.type = type
         self.requestID = requestID
@@ -150,6 +153,73 @@ public struct DesktopControlFrame: Codable, Equatable, Sendable {
         self.readiness = readiness
         self.diagnosticsSupported = diagnosticsSupported
         self.diagnostics = diagnostics
+        self.imessageProtocolVersion = imessageProtocolVersion == 0 ? nil : imessageProtocolVersion
+        self.imessage = imessage
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let type = try c.decode(String.self, forKey: .type)
+        if type == "imessage" {
+            let exact = try gatewayContainer(decoder, IMessageEnvelopeKeys.self)
+            self.init(version: try exact.decode(Int.self, forKey: .version), type: type,
+                requestID: try exact.decode(String.self, forKey: .requestID),
+                imessage: try exact.decode(IMessageGatewayPayload.self, forKey: .imessage))
+            return
+        }
+        self.init(version: try c.decode(Int.self, forKey: .version), type: type,
+            requestID: try c.decodeIfPresent(String.self, forKey: .requestID),
+            target: try c.decodeIfPresent(DesktopControlTarget.self, forKey: .target),
+            operation: try c.decodeIfPresent(String.self, forKey: .operation),
+            arguments: try c.decodeIfPresent(DesktopControlJSONValue.self, forKey: .arguments),
+            deadlineAt: try c.decodeIfPresent(Date.self, forKey: .deadlineAt),
+            result: try c.decodeIfPresent(DesktopControlJSONValue.self, forKey: .result),
+            errorCode: try c.decodeIfPresent(String.self, forKey: .errorCode),
+            errorMessage: try c.decodeIfPresent(String.self, forKey: .errorMessage),
+            streamID: try c.decodeIfPresent(String.self, forKey: .streamID),
+            sequence: try c.decodeIfPresent(UInt64.self, forKey: .sequence),
+            streamChannel: try c.decodeIfPresent(String.self, forKey: .streamChannel),
+            streamData: try c.decodeIfPresent(Data.self, forKey: .streamData),
+            lastHeartbeat: try c.decodeIfPresent(Date.self, forKey: .lastHeartbeat),
+            readiness: try c.decodeIfPresent(String.self, forKey: .readiness),
+            diagnosticsSupported: try c.decodeIfPresent(Bool.self, forKey: .diagnosticsSupported),
+            diagnostics: try c.decodeIfPresent(DesktopControlDiagnostics.self, forKey: .diagnostics),
+            imessageProtocolVersion: try c.decodeIfPresent(Int.self, forKey: .imessageProtocolVersion),
+            imessage: try c.decodeIfPresent(IMessageGatewayPayload.self, forKey: .imessage))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        if type == "imessage" {
+            try IMessageGatewayWire.validate(self)
+            var exact = encoder.container(keyedBy: IMessageEnvelopeKeys.self)
+            try exact.encode(version, forKey: .version); try exact.encode(type, forKey: .type)
+            try exact.encode(requestID, forKey: .requestID); try exact.encode(imessage, forKey: .imessage)
+            return
+        }
+        guard imessage == nil else { throw IMessageGatewayWireError.invalidFrame }
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(version, forKey: .version); try c.encode(type, forKey: .type)
+        try c.encodeIfPresent(requestID, forKey: .requestID)
+        try c.encodeIfPresent(target, forKey: .target)
+        try c.encodeIfPresent(operation, forKey: .operation)
+        try c.encodeIfPresent(arguments, forKey: .arguments)
+        try c.encodeIfPresent(deadlineAt, forKey: .deadlineAt)
+        try c.encodeIfPresent(result, forKey: .result)
+        try c.encodeIfPresent(errorCode, forKey: .errorCode)
+        try c.encodeIfPresent(errorMessage, forKey: .errorMessage)
+        try c.encodeIfPresent(streamID, forKey: .streamID)
+        try c.encodeIfPresent(sequence, forKey: .sequence)
+        try c.encodeIfPresent(streamChannel, forKey: .streamChannel)
+        try c.encodeIfPresent(streamData, forKey: .streamData)
+        try c.encodeIfPresent(lastHeartbeat, forKey: .lastHeartbeat)
+        try c.encodeIfPresent(readiness, forKey: .readiness)
+        try c.encodeIfPresent(diagnosticsSupported, forKey: .diagnosticsSupported)
+        try c.encodeIfPresent(diagnostics, forKey: .diagnostics)
+        try c.encodeIfPresent(imessageProtocolVersion, forKey: .imessageProtocolVersion)
+    }
+
+    private enum IMessageEnvelopeKeys: String, CodingKey, CaseIterable {
+        case version, type, requestID = "request_id", imessage
     }
 
     enum CodingKeys: String, CodingKey {
@@ -167,6 +237,8 @@ public struct DesktopControlFrame: Codable, Equatable, Sendable {
         case readiness
         case diagnosticsSupported = "diagnostics_supported"
         case diagnostics
+        case imessageProtocolVersion = "imessage_protocol_version"
+        case imessage
     }
 }
 
@@ -196,6 +268,8 @@ public enum DesktopControlFrameCodec {
     public static let maximumFrameBytes = 8 * 1024 * 1024
 
     public static func decode(_ data: Data) throws -> DesktopControlFrame {
+        var inspection = try IMessageGatewayJSONInspection(data)
+        let selectedIMessage = try inspection.inspect()
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .custom { decoder in
             let value = try decoder.singleValueContainer().decode(String.self)
@@ -207,10 +281,14 @@ public enum DesktopControlFrameCodec {
             if let date = ordinary.date(from: value) { return date }
             throw DecodingError.dataCorruptedError(in: try decoder.singleValueContainer(), debugDescription: "invalid RFC 3339 timestamp")
         }
-        return try decoder.decode(DesktopControlFrame.self, from: data)
+        let frame = try decoder.decode(DesktopControlFrame.self, from: data)
+        guard !selectedIMessage || frame.type == "imessage" else { throw IMessageGatewayWireError.invalidFrame }
+        try IMessageGatewayWire.validate(frame)
+        return frame
     }
 
     public static func encode(_ frame: DesktopControlFrame) throws -> Data {
+        try IMessageGatewayWire.validate(frame)
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .custom { date, encoder in
             let formatter = ISO8601DateFormatter()
@@ -218,6 +296,8 @@ public enum DesktopControlFrameCodec {
             var container = encoder.singleValueContainer()
             try container.encode(formatter.string(from: date))
         }
-        return try encoder.encode(frame)
+        let data = try encoder.encode(frame)
+        guard data.count <= maximumFrameBytes else { throw IMessageGatewayWireError.frameTooLarge }
+        return data
     }
 }

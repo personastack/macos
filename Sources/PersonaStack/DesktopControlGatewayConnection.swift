@@ -36,6 +36,10 @@ actor DesktopControlGatewayConnection {
     private let diagnosticsProvider: DesktopControlDiagnosticsProvider
     private let readinessProvider: DesktopControlReadinessProvider
     private let afterConfigRevocation: DesktopControlConfigRevocationHandler
+    private let iMessageRuntime: IMessageRuntime?
+    private var iMessageConnectionID = UUID()
+    private var iMessageEnabled = false
+    private var iMessageRequestIDs: Set<String> = []
     private let session: URLSession
     private let socketOverride: (any DesktopControlSocket)?
     private let handshakeTimeout: Duration
@@ -69,6 +73,7 @@ actor DesktopControlGatewayConnection {
          diagnosticsProvider: @escaping DesktopControlDiagnosticsProvider = { DesktopControlDiagnostics(activeProcesses: 0, openFileHandles: 0, bufferedOutputBytes: 0, outputGapsTotal: 0) },
          readinessProvider: @escaping DesktopControlReadinessProvider = { nil },
          afterConfigRevocation: @escaping DesktopControlConfigRevocationHandler = {},
+         iMessageRuntime: IMessageRuntime? = nil,
          handler: @escaping DesktopControlCommandHandler) {
         self.installation = installation
         self.session = session ?? DesktopControlNetworkSession.makeWithoutRedirects()
@@ -79,6 +84,7 @@ actor DesktopControlGatewayConnection {
         self.diagnosticsProvider = diagnosticsProvider
         self.readinessProvider = readinessProvider
         self.afterConfigRevocation = afterConfigRevocation
+        self.iMessageRuntime = iMessageRuntime
         self.handler = handler
     }
 
@@ -103,6 +109,10 @@ actor DesktopControlGatewayConnection {
             let ready = try DesktopControlFrameCodec.decode(Self.data(from: first))
             if let error = Self.handshakeError(for: ready) { throw error }
             diagnosticsSupported = ready.diagnosticsSupported == true
+            iMessageEnabled = iMessageRuntime != nil && IMessageGatewayWire.supports(protocolVersion: ready.imessageProtocolVersion)
+            iMessageConnectionID = UUID()
+            if iMessageEnabled { await iMessageRuntime?.bind(connectionID: iMessageConnectionID) }
+            guard !Task.isCancelled, socket === task else { throw DesktopControlGatewayConnectionError.socketUnavailable }
             connected = true
             lastGatewayHeartbeat = now()
             reader = Task { await receiveLoop() }
@@ -177,7 +187,16 @@ actor DesktopControlGatewayConnection {
         }
     }
 
+    private func retireIMessageConnection() {
+        let retiredIMessageConnection = iMessageConnectionID
+        iMessageConnectionID = UUID()
+        iMessageEnabled = false
+        iMessageRequestIDs.removeAll()
+        if let iMessageRuntime { Task { await iMessageRuntime.unbind(connectionID: retiredIMessageConnection) } }
+    }
+
     func stop() {
+        retireIMessageConnection()
         recoveryProbeID = nil
         recoveryProbeTimeout?.cancel()
         recoveryProbeTimeout = nil
@@ -213,7 +232,13 @@ actor DesktopControlGatewayConnection {
                 switch frame.type {
                 case "heartbeat":
                     lastGatewayHeartbeat = now()
+                    if let version = frame.imessageProtocolVersion, version > 0,
+                       !IMessageGatewayWire.supports(protocolVersion: version) {
+                        retireIMessageConnection()
+                    }
                     continue
+                case "imessage":
+                    try await processIMessage(frame)
                 case "failure" where frame.errorCode == "upgrade_required":
                     await disconnected(error: .upgradeRequired)
                     return
@@ -224,7 +249,7 @@ actor DesktopControlGatewayConnection {
                     guard let requestID = frame.requestID, commandTasks[requestID] == nil else {
                         throw DesktopControlGatewayConnectionError.invalidFrame
                     }
-                    guard Self.hasCapacity(for: frame.operation, activeCount: commandTasks.count) else {
+                    guard Self.hasCapacity(for: frame.operation, activeCount: commandTasks.count + iMessageRequestIDs.count) else {
                         try await send(DesktopControlFrame(
                             type: "failure",
                             requestID: requestID,
@@ -243,6 +268,51 @@ actor DesktopControlGatewayConnection {
                 return
             }
         }
+    }
+
+    /// Snapshot installation and admission stay on the ordered reader. Provider
+    /// execution runs in the runtime's bounded FIFO and never blocks this loop.
+    private func processIMessage(_ frame: DesktopControlFrame) async throws {
+        try IMessageGatewayWire.validate(frame)
+        guard let requestID = frame.requestID, let payload = frame.imessage,
+              commandTasks[requestID] == nil, !iMessageRequestIDs.contains(requestID) else {
+            throw DesktopControlGatewayConnectionError.invalidFrame
+        }
+        let connectionID = iMessageConnectionID
+        guard iMessageEnabled, let iMessageRuntime else {
+            try await sendIMessage(.failure(.init(code: .capabilityDisabled,
+                message: "This connection does not support Messages setup.")), requestID: requestID, connectionID: connectionID)
+            return
+        }
+        switch payload {
+        case .snapshot(let snapshot):
+            let response = await iMessageRuntime.install(snapshot, connectionID: connectionID)
+            try await sendIMessage(response, requestID: requestID, connectionID: connectionID)
+        case .command(let command):
+            guard Self.hasCapacity(for: nil, activeCount: commandTasks.count + iMessageRequestIDs.count) else {
+                try await sendIMessage(.failure(.init(code: .busy, message: "This Mac is handling other requests.")),
+                    requestID: requestID, connectionID: connectionID)
+                return
+            }
+            iMessageRequestIDs.insert(requestID)
+            let failure = await iMessageRuntime.admit(command, connectionID: connectionID) { [weak self] response in
+                await self?.completeIMessage(response, requestID: requestID, connectionID: connectionID)
+            }
+            if let failure { await completeIMessage(.failure(failure), requestID: requestID, connectionID: connectionID) }
+        default: throw DesktopControlGatewayConnectionError.invalidFrame
+        }
+    }
+
+    private func sendIMessage(_ payload: IMessageGatewayPayload, requestID: String, connectionID: UUID) async throws {
+        guard connected, iMessageConnectionID == connectionID else { return }
+        try await send(DesktopControlFrame(type: "imessage", requestID: requestID, imessage: payload))
+    }
+
+    private func completeIMessage(_ payload: IMessageGatewayPayload, requestID: String, connectionID: UUID) async {
+        guard iMessageConnectionID == connectionID, iMessageRequestIDs.contains(requestID) else { return }
+        defer { if iMessageConnectionID == connectionID { iMessageRequestIDs.remove(requestID) } }
+        do { try await sendIMessage(payload, requestID: requestID, connectionID: connectionID) }
+        catch { await disconnected() }
     }
 
     private func processCommand(_ frame: DesktopControlFrame) async {
@@ -315,7 +385,8 @@ actor DesktopControlGatewayConnection {
 
     private func cachedHeartbeatFrame() -> DesktopControlFrame {
         DesktopControlFrame(type: "heartbeat", lastHeartbeat: Date(), readiness: readiness,
-                                   diagnostics: diagnosticsSupported ? cachedDiagnostics : nil)
+                                   diagnostics: diagnosticsSupported ? cachedDiagnostics : nil,
+                                   imessageProtocolVersion: iMessageEnabled ? IMessageGatewayWire.protocolVersion : nil)
     }
 
     private func refreshSnapshot() {

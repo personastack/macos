@@ -447,7 +447,8 @@ protocol DesktopControlEnrollmentTransport: Sendable {
 }
 
 protocol DesktopControlRelayStateReading: Sendable {
-    func hasActiveConfig(installation: DesktopControlInstallation, appURL: URL) async throws -> Bool
+    // Preserve each family's authority. The shared OR is insufficient for CUA lifecycle.
+    func configurationState(installation: DesktopControlInstallation, appURL: URL) async throws -> DesktopControlConfigurationState
 }
 
 actor URLSessionDesktopControlEnrollmentTransport: DesktopControlEnrollmentTransport {
@@ -468,16 +469,6 @@ actor URLSessionDesktopControlEnrollmentTransport: DesktopControlEnrollmentTrans
         let (data, response) = try await session.data(for: request)
         guard let response = response as? HTTPURLResponse else { return (Data(), 0) }
         return (data, response.statusCode)
-    }
-}
-
-struct DesktopControlConfigurationState: Decodable, Sendable {
-    let hasActiveConfig: Bool
-    let hasConfig: Bool
-
-    enum CodingKeys: String, CodingKey {
-        case hasActiveConfig = "has_active_config"
-        case hasConfig = "has_config"
     }
 }
 
@@ -530,7 +521,7 @@ actor DesktopControlEnrollmentClient: DesktopControlRelayStateReading {
     }
 
     func hasActiveConfig(installation: DesktopControlInstallation, appURL: URL) async throws -> Bool {
-        try await configurationState(installation: installation, appURL: appURL).hasActiveConfig
+        try await configurationState(installation: installation, appURL: appURL).hasActiveRelayCapability
     }
 
     func configurationState(installation: DesktopControlInstallation, appURL: URL) async throws -> DesktopControlConfigurationState {

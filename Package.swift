@@ -17,11 +17,15 @@ let package = Package(
     targets: [
         .target(name: "DesktopCLIProcess"),
         .target(name: "PersonaStackCore", dependencies: ["Yams", "DesktopCLIProcess"], resources: [.copy("Resources/cua-tools-0.29.1.json")]),
-        .executableTarget(name: "PersonaStack", dependencies: ["PersonaStackCore", .product(name: "Sparkle", package: "Sparkle")],
+        .target(name: "IMessageBridgeProbe", dependencies: ["PersonaStackCore"],
+                path: "Experiments/IMessageBridgeProbe/Sources/IMessageBridgeProbe"),
+        .executableTarget(name: "PersonaStack", dependencies: ["PersonaStackCore", "IMessageBridgeProbe", .product(name: "Sparkle", package: "Sparkle")],
                           linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])]),
         .executableTarget(name: "PersonaStackHarnessHook", dependencies: ["PersonaStackCore"]),
         .executableTarget(name: "PersonaStackPolicyCheck", dependencies: ["PersonaStackCore"]),
         .executableTarget(name: "PersonaStackLockedControlInstaller", dependencies: ["PersonaStackCore"]),
+        .testTarget(name: "IMessageBridgeProbeTests", dependencies: ["PersonaStackCore", "IMessageBridgeProbe"],
+                    path: "Experiments/IMessageBridgeProbe/Tests/IMessageBridgeProbeTests"),
         .testTarget(name: "PersonaStackTests", dependencies: ["PersonaStackCore", "PersonaStack"], resources: [.copy("Fixtures/local-session.json"), .copy("Fixtures/desktop-parity.json")]),
     ]
 )

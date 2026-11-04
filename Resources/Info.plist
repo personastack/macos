@@ -30,6 +30,8 @@
   <true/>
   <key>NSMicrophoneUsageDescription</key>
   <string>Record audio attachments when you choose the microphone in persona chat.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Send iMessages through Messages to conversations you select.</string>
   <key>NSLocalNetworkUsageDescription</key>
   <string>Connect to your selected PersonaStack server on the local network.</string>
   <key>NSPrincipalClass</key>

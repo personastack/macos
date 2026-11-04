@@ -2,19 +2,21 @@ import CryptoKit
 import Darwin
 import Foundation
 import PersonaStackCore
+import Security
 
-/// Native machine proof only. Hosted identity and authorization remain API-owned.
+/// Private native machine proof and setup intention. Hosted authority remains API-owned.
 struct FileDesktopControlCredentialStore: DesktopControlCredentialStoring {
     private static let lock = NSLock()
     private let directory: URL
     private let configurationProvider: @Sendable () throws -> DesktopEnvironmentConfiguration
+    private let randomBytes: @Sendable () throws -> Data
     private let legacyLoader: @Sendable (DesktopEnvironmentConfiguration) throws -> DesktopControlInstallation?
 
     init(directory: URL? = nil, appURL: URL? = nil,
          configurationProvider: (@Sendable () throws -> DesktopEnvironmentConfiguration)? = nil,
          legacyLoader: @escaping @Sendable (DesktopEnvironmentConfiguration) throws -> DesktopControlInstallation? = {
              try KeychainDesktopControlCredentialStore(configuration: $0).loadForMigration()
-         }) {
+         }, randomBytes: (@Sendable () throws -> Data)? = nil) {
         self.directory = directory ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/PersonaStack/DesktopControlCredentials", isDirectory: true)
         self.configurationProvider = configurationProvider ?? {
@@ -22,12 +24,16 @@ struct FileDesktopControlCredentialStore: DesktopControlCredentialStoring {
             return try LaunchConfiguration.selectedEnvironment()
         }
         self.legacyLoader = legacyLoader
+        self.randomBytes = randomBytes ?? { try Self.generateCredentialBytes() }
     }
 
     func load() throws -> DesktopControlInstallation? {
         Self.lock.lock()
         defer { Self.lock.unlock() }
-        let configuration = try configurationProvider()
+        return try loadInstallation(configurationProvider())
+    }
+
+    private func loadInstallation(_ configuration: DesktopEnvironmentConfiguration) throws -> DesktopControlInstallation? {
         if let data = try readFile(configuration) {
             let installation: DesktopControlInstallation?
             do { installation = try JSONDecoder().decode(DesktopControlInstallation?.self, from: data) }
@@ -63,9 +69,120 @@ struct FileDesktopControlCredentialStore: DesktopControlCredentialStoring {
         try writeFile(nil, configuration: configurationProvider())
     }
 
-    private func filename(_ configuration: DesktopEnvironmentConfiguration) -> String {
-        SHA256.hash(data: Data(configuration.preferenceIdentity.utf8))
-            .map { String(format: "%02x", $0) }.joined() + ".json"
+    /// Loading is native custody only. A coordinator must separately validate
+    /// the current human/session before using this proof in a ticket request.
+    func loadPendingEnrollment() throws -> IMessagePendingEnrollment? {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        let configuration = try configurationProvider()
+        return try readPendingEnrollment(configuration)
+    }
+
+    func preparePendingEnrollment(setupReference: String, naturalUserID: String, workspaceID: String,
+                                  expiresAt: String, now: Date = Date()) throws -> IMessagePendingEnrollment {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        let configuration = try configurationProvider()
+        let expiry = try IMessagePendingEnrollment.validateIdentity(setupReference: setupReference,
+            naturalUserID: naturalUserID, workspaceID: workspaceID,
+            environmentIdentity: configuration.preferenceIdentity, expiresAt: expiresAt)
+        guard expiry > now else { throw IMessagePendingEnrollmentError.expired }
+        guard try loadInstallation(configuration) == nil else { throw IMessagePendingEnrollmentError.installationPresent }
+        if let pending = try readPendingEnrollment(configuration) {
+            try pending.requireJourney(setupReference: setupReference, naturalUserID: naturalUserID,
+                workspaceID: workspaceID, environmentIdentity: configuration.preferenceIdentity, expiresAt: expiresAt)
+            try pending.requireUsable(now: now)
+            return pending
+        }
+        let proof: Data
+        do { proof = try randomBytes() }
+        catch { throw IMessagePendingEnrollmentError.randomnessUnavailable }
+        guard proof.count == 32 else { throw IMessagePendingEnrollmentError.randomnessUnavailable }
+        let pending = try IMessagePendingEnrollment(setupReference: setupReference, naturalUserID: naturalUserID,
+            workspaceID: workspaceID, environmentIdentity: configuration.preferenceIdentity,
+            expiresAt: expiresAt, credentialBytes: proof)
+        try writeRecord(try JSONEncoder().encode(pending), configuration: configuration, kind: .pendingIMessage)
+        return pending
+    }
+
+    @discardableResult
+    func clearPendingEnrollment(matching expected: IMessagePendingEnrollment) throws -> Bool {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        let configuration = try configurationProvider()
+        try expected.requireEnvironment(configuration.preferenceIdentity)
+        guard let current = try readPendingEnrollment(configuration), current == expected else { return false }
+        try writeRecord(Data("null".utf8), configuration: configuration, kind: .pendingIMessage)
+        return true
+    }
+
+    private func readPendingEnrollment(_ configuration: DesktopEnvironmentConfiguration) throws -> IMessagePendingEnrollment? {
+        guard let data = try readFile(configuration, kind: .pendingIMessage) else { return nil }
+        let pending: IMessagePendingEnrollment?
+        do { pending = try JSONDecoder().decode(IMessagePendingEnrollment?.self, from: data) }
+        catch { throw DesktopControlEnrollmentError.credentialStoreUnavailable }
+        try pending?.requireEnvironment(configuration.preferenceIdentity)
+        return pending
+    }
+
+    /// Drafts restore intention only. Loading never restores consent, machine
+    /// proof or metadata authority, including when the original journey expired.
+    func loadSetupDraft() throws -> IMessageSetupDraft? {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        return try readSetupDraft(configurationProvider())
+    }
+
+    func saveSetupDraft(_ draft: IMessageSetupDraft, now: Date = Date()) throws {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        let configuration = try configurationProvider()
+        try draft.requireEnvironment(configuration.preferenceIdentity)
+        try draft.requireUsable(now: now)
+        if let current = try readSetupDraft(configuration) {
+            try current.requireJourney(setupReference: draft.setupReference, naturalUserID: draft.naturalUserID,
+                workspaceID: draft.workspaceID, environmentIdentity: draft.environmentIdentity, expiresAt: draft.expiresAt)
+        }
+        try writeRecord(try JSONEncoder().encode(draft), configuration: configuration, kind: .setupIMessage)
+    }
+
+    @discardableResult
+    func clearSetupDraft(matching expected: IMessageSetupDraft) throws -> Bool {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        let configuration = try configurationProvider()
+        try expected.requireEnvironment(configuration.preferenceIdentity)
+        guard let current = try readSetupDraft(configuration), current == expected else { return false }
+        try writeRecord(Data("null".utf8), configuration: configuration, kind: .setupIMessage)
+        return true
+    }
+
+    private func readSetupDraft(_ configuration: DesktopEnvironmentConfiguration) throws -> IMessageSetupDraft? {
+        guard let data = try readFile(configuration, kind: .setupIMessage) else { return nil }
+        let draft: IMessageSetupDraft?
+        do { draft = try JSONDecoder().decode(IMessageSetupDraft?.self, from: data) }
+        catch { throw DesktopControlEnrollmentError.credentialStoreUnavailable }
+        try draft?.requireEnvironment(configuration.preferenceIdentity)
+        return draft
+    }
+
+    private static func generateCredentialBytes() throws -> Data {
+        var bytes = Data(count: 32)
+        let result = bytes.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, $0.count, $0.baseAddress!) }
+        guard result == errSecSuccess else { throw IMessagePendingEnrollmentError.randomnessUnavailable }
+        return bytes
+    }
+
+    private enum RecordKind { case installation, pendingIMessage, setupIMessage }
+
+    private func filename(_ configuration: DesktopEnvironmentConfiguration, kind: RecordKind = .installation) -> String {
+        let identity = SHA256.hash(data: Data(configuration.preferenceIdentity.utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        switch kind {
+        case .installation: return identity + ".json"
+        case .pendingIMessage: return identity + ".imessage-pending.json"
+        case .setupIMessage: return identity + ".imessage-setup.json"
+        }
     }
 
     private func directoryDescriptor(create: Bool) throws -> Int32? {
@@ -92,10 +209,10 @@ struct FileDesktopControlCredentialStore: DesktopControlCredentialStoring {
         }
     }
 
-    private func readFile(_ configuration: DesktopEnvironmentConfiguration) throws -> Data? {
+    private func readFile(_ configuration: DesktopEnvironmentConfiguration, kind: RecordKind = .installation) throws -> Data? {
         guard let parent = try directoryDescriptor(create: false) else { return nil }
         defer { close(parent) }
-        let descriptor = openat(parent, filename(configuration), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        let descriptor = openat(parent, filename(configuration, kind: kind), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
         if descriptor < 0 && errno == ENOENT { return nil }
         guard descriptor >= 0 else { throw DesktopControlEnrollmentError.credentialStoreUnavailable }
         defer { close(descriptor) }
@@ -112,18 +229,56 @@ struct FileDesktopControlCredentialStore: DesktopControlCredentialStoring {
 
     private func writeFile(_ installation: DesktopControlInstallation?,
                            configuration: DesktopEnvironmentConfiguration) throws {
-        guard let parent = try directoryDescriptor(create: true) else {
+        try writeRecord(try JSONEncoder().encode(installation), configuration: configuration, kind: .installation)
+    }
+
+    private func writeRecord(_ data: Data, configuration: DesktopEnvironmentConfiguration, kind: RecordKind) throws {
+        guard !data.isEmpty, data.count <= 16_384,
+              let parent = try directoryDescriptor(create: true) else {
             throw DesktopControlEnrollmentError.credentialStoreUnavailable
         }
         defer { close(parent) }
-        let descriptor = openat(parent, filename(configuration), O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0o600)
+        let destination = filename(configuration, kind: kind)
+        try validateDestination(parent, filename: destination)
+        let temporary = ".\(UUID().uuidString).tmp"
+        let descriptor = openat(parent, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { throw DesktopControlEnrollmentError.credentialStoreUnavailable }
+        defer { close(descriptor); unlinkat(parent, temporary, 0) }
+        guard fchmod(descriptor, 0o600) == 0 else { throw DesktopControlEnrollmentError.credentialStoreUnavailable }
+        try validate(descriptor, type: S_IFREG)
+        try writeAll(data, descriptor: descriptor)
+        guard fsync(descriptor) == 0, renameat(parent, temporary, parent, destination) == 0, fsync(parent) == 0 else {
+            throw DesktopControlEnrollmentError.credentialStoreUnavailable
+        }
+    }
+
+    private func validateDestination(_ parent: Int32, filename: String) throws {
+        let descriptor = openat(parent, filename, O_WRONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        if descriptor < 0 && errno == ENOENT { return }
         guard descriptor >= 0 else { throw DesktopControlEnrollmentError.credentialStoreUnavailable }
         defer { close(descriptor) }
         try validate(descriptor, type: S_IFREG)
-        let data = try JSONEncoder().encode(installation)
-        guard data.count <= 16_384, ftruncate(descriptor, 0) == 0,
-              data.withUnsafeBytes({ write(descriptor, $0.baseAddress, $0.count) }) == data.count else {
-            throw DesktopControlEnrollmentError.credentialStoreUnavailable
+    }
+
+    private func writeAll(_ data: Data, descriptor: Int32) throws {
+        try data.withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress else { throw DesktopControlEnrollmentError.credentialStoreUnavailable }
+            var offset = 0
+            while offset < data.count {
+                let count = write(descriptor, base.advanced(by: offset), data.count - offset)
+                if count < 0 && errno == EINTR { continue }
+                guard count > 0 else { throw DesktopControlEnrollmentError.credentialStoreUnavailable }
+                offset += count
+            }
         }
+    }
+}
+
+extension IMessagePendingEnrollment {
+    /// Canonical digest for the ticket body. Raw proof is used only in native Authorization.
+    var credentialSHA256: String {
+        Data(SHA256.hash(data: credentialBytes)).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 }

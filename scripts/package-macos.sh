@@ -2,6 +2,12 @@
 set -eu
 
 root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+app_only=0
+case "$#:${1-}" in
+  0:) ;;
+  1:--app-only) app_only=1 ;;
+  *) printf '%s\n' 'usage: package-macos.sh [--app-only]' >&2; exit 2 ;;
+esac
 version=${VERSION:-0.1.0}
 configuration=${CONFIGURATION:-release}
 default_url=${PERSONASTACK_DEFAULT_URL:?Set PERSONASTACK_DEFAULT_URL to the PersonaStack environment URL for this build}
@@ -45,8 +51,9 @@ if [ "${CLEAN_BUILD:-1}" = 1 ]; then
 fi
 swift build --package-path "$root_dir" --scratch-path "$arm64_build_dir" --triple arm64-apple-macosx14.0 -c "$configuration"
 sh "$root_dir/scripts/build-agent-bridge.sh" "$agent_bridge_build_dir" "$version"
-arm64_binary=$(find "$arm64_build_dir" -type f -name PersonaStack -perm -111 -print -quit)
-test -n "$arm64_binary"
+arm64_product_dir=$(swift build --package-path "$root_dir" --scratch-path "$arm64_build_dir" --triple arm64-apple-macosx14.0 -c "$configuration" --show-bin-path)
+arm64_binary="$arm64_product_dir/PersonaStack"
+test -x "$arm64_binary"
 
 rm -rf "$bundle_dir" "$staging_dir" "$rw_dmg"
 mkdir -p "$bundle_dir/Contents/MacOS" "$bundle_dir/Contents/Resources" "$bundle_dir/Contents/Frameworks" \
@@ -56,7 +63,8 @@ cp "$(dirname "$arm64_binary")/PersonaStackHarnessHook" "$bundle_dir/Contents/Ma
 chmod 755 "$bundle_dir/Contents/MacOS/PersonaStackHarnessHook"
 cp "$agent_bridge_build_dir/PersonaStackAgentBridge" "$bundle_dir/Contents/MacOS/PersonaStackAgentBridge"
 python3 "$root_dir/scripts/lima_runtime.py" prepare "$bundle_dir"
-if [ "$configuration" = release ]; then
+python3 "$root_dir/third_party/imsg/bundle.py" --app-bundle "$bundle_dir" --build-root "$root_dir/build/imsg-provider"
+if [ "$configuration" = release ] && [ "$app_only" = 0 ]; then
   : "${PERSONASTACK_INSTALLER_SIGNING_IDENTITY:?Developer ID Installer identity is required for the main installer}"
 fi
 cp "$root_dir/Resources/Info.plist" "$bundle_dir/Contents/Info.plist"
@@ -88,6 +96,10 @@ fi
 artifact_suffix=developerid
 "$root_dir/scripts/sign-app.sh" "$bundle_dir"
 "$root_dir/scripts/verify-update-bundle.sh" "$bundle_dir" "$version" "$sparkle_public_key"
+if [ "$app_only" = 1 ]; then
+  printf '%s\n' "Signed app candidate: $bundle_dir"
+  exit 0
+fi
 "$root_dir/scripts/notarize.sh" "$bundle_dir"
 spctl --assess --type execute --verbose=2 "$bundle_dir"
 

@@ -1,0 +1,1376 @@
+--- a/Package.swift
++++ b/Package.swift
+@@ -1,4 +1,4 @@
+-// swift-tools-version: 6.1
++// swift-tools-version: 6.2
+ import PackageDescription
+ 
+ let package = Package(
+@@ -55,6 +55,12 @@
+       ),
+     ]
+ 
++    targets.append(.testTarget(
++      name: "PersonaStackReadTests",
++      dependencies: ["IMsgCore", "imsg", .product(name: "SQLite", package: "SQLite.swift")],
++      path: "TestsPersonaStack"
++    ))
++
+     #if os(macOS)
+       targets.append(contentsOf: [
+         .testTarget(
+--- /dev/null
++++ b/Sources/IMsgCore/MessageStore+PersonaStack.swift
+@@ -0,0 +1,467 @@
++import Foundation
++import SQLite
++
++public enum PersonaStackReadFailure: String, Error, LocalizedError {
++  case invalidArguments = "invalid_arguments"
++  case payloadTooLarge = "payload_too_large"
++  case sourceUnavailable = "source_unavailable"
++  case timeLimit = "time_limit"
++  public var errorDescription: String? { rawValue }
++}
++
++public enum PersonaStackStopReason: String, Codable, Sendable {
++  case caughtUp = "caught_up", outputLimit = "output_limit", scanLimit = "scan_limit", timeLimit = "time_limit"
++}
++
++public struct PersonaStackChat: Codable, Sendable {
++  public let id: String
++  public let guid: String
++  public let name: String
++  public let service: String
++  public let is_group: Bool
++  public let available: Bool
++  public let participants: [String]
++  public let account_id: String?
++  public let account_login: String?
++}
++
++public struct PersonaStackChatMetadata: Codable, Sendable {
++  public let chats: [PersonaStackChat]
++}
++
++public struct PersonaStackChatPage: Codable, Sendable {
++  public let chats: [PersonaStackChat]
++  public let next_chat_rowid: String
++  public let upper_chat_rowid: String
++  public let has_more: Bool
++  public let stop_reason: PersonaStackStopReason
++}
++
++public struct PersonaStackAnchor: Codable, Sendable {
++  public let chat_id: String
++  public let rowid: String
++  public let guid: String
++  public init(chat_id: String, rowid: String, guid: String) {
++    self.chat_id = chat_id; self.rowid = rowid; self.guid = guid
++  }
++}
++
++public struct PersonaStackChatCheckpoint: Codable, Sendable {
++  public let chat_id: String
++  public let guid: String
++  public let service: String
++  public let available: Bool
++  public let tail_rowid: String
++  public let tail_guid: String
++  public let account_id: String?
++  public let account_login: String?
++  public let anchor_matches: Bool?
++}
++
++public struct PersonaStackCheckpoint: Codable, Sendable {
++  public let adapter_revision: Int
++  public let source_high_water: String
++  public let chats: [PersonaStackChatCheckpoint]
++  public let observed_at: String
++}
++
++public struct PersonaStackMessage: Codable, Sendable {
++  public let rowid: String
++  public let guid: String
++  public let chat_id: String
++  public let text: String
++  public let text_truncated: Bool
++  public let is_from_me: Bool
++  public let date: String
++  public let sender: String
++  public let service: String
++  public let attachment_count: Int
++  public let edited_at: String?
++  public let unsent_at: String?
++  // No local attachment paths or content are part of this private protocol.
++  public let attachments: [String]
++}
++
++public struct PersonaStackReceivePage: Codable, Sendable {
++  public let messages: [PersonaStackMessage]
++  public let next_rowid: String
++  public let has_more: Bool
++  public let stop_reason: PersonaStackStopReason
++}
++
++public struct PersonaStackRecentPage: Codable, Sendable {
++  public let messages: [PersonaStackMessage]
++  public let truncated: Bool
++  public let stop_reason: PersonaStackStopReason
++}
++
++private struct PersonaStackDecodedMessage {
++  let payload: PersonaStackMessage
++  let semantic: Message
++}
++
++private struct PersonaStackTextState {
++  let text: String
++  let truncated: Bool
++  let editedAt: Date?
++  let unsentAt: Date?
++}
++
++private enum PersonaStackPreviewDecision: Equatable { case keep, suppress, deferPage }
++
++// Conservative accounting charges both fixed metadata queries even for a missing
++// row. Participant records share this budget across all exact selected IDs.
++private final class PersonaStackMetadataBudget {
++  private(set) var remaining = 512
++  func requireRoom() throws {
++    guard remaining > 0 else { throw PersonaStackReadFailure.payloadTooLarge }
++  }
++  func consume(_ count: Int = 1) throws {
++    guard count <= remaining else { throw PersonaStackReadFailure.payloadTooLarge }
++    remaining -= count
++  }
++}
++
++// This guard owns the only pending interrupt. Cancellation waits for an interrupt
++// already in progress, so it cannot interrupt the next caller on the store queue.
++private final class PersonaStackSQLBudget: @unchecked Sendable {
++  private let lock = NSLock()
++  private let connection: Connection
++  private var active = true
++  private var work: DispatchWorkItem?
++  let started = DispatchTime.now().uptimeNanoseconds
++  init(_ connection: Connection) {
++    self.connection = connection
++    let item = DispatchWorkItem { [weak self] in self?.interruptIfActive() }
++    work = item
++    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1, execute: item)
++  }
++  var elapsed: Bool { DispatchTime.now().uptimeNanoseconds - started >= 1_000_000_000 }
++  func finish() {
++    lock.lock(); defer { lock.unlock() }
++    active = false; work?.cancel(); work = nil
++  }
++  private func interruptIfActive() {
++    lock.lock(); defer { lock.unlock() }
++    if active { connection.interrupt() }
++  }
++}
++
++extension MessageStore {
++  public static let personaStackAdapterRevision = 2
++  private static let personaStackPhysicalLimit = 512
++  private static let personaStackFieldLimit = 1 << 20
++  private static let personaStackOutputLimit = 1 << 20
++
++  public static func personaStackRowID(_ value: String, positive: Bool = false) throws -> Int64 {
++    guard let parsed = Int64(value), parsed >= (positive ? 1 : 0), String(parsed) == value else {
++      throw PersonaStackReadFailure.invalidArguments
++    }
++    return parsed
++  }
++
++  private func personaStackRead<T>(_ body: (Connection, PersonaStackSQLBudget) throws -> T) throws -> T {
++    try withConnection { db in
++      let budget = PersonaStackSQLBudget(db)
++      let oldTimeout = db.busyTimeout
++      db.busyTimeout = 0.05
++      defer { budget.finish(); db.busyTimeout = oldTimeout }
++      // SQLite.swift transaction closures run on its connection queue. Keep
++      // this closure on MessageStore's queue so its metadata helpers can reenter.
++      try db.execute("BEGIN DEFERRED TRANSACTION")
++      do {
++        let result = try body(db, budget)
++        try db.execute("COMMIT")
++        return result
++      } catch {
++        budget.finish()
++        try? db.execute("ROLLBACK")
++        throw error
++      }
++    }
++  }
++
++  public func personaStackChats(after: Int64 = 0, upper: Int64? = nil, query: String = "", limit: Int = 50) throws -> PersonaStackChatPage {
++    guard after >= 0, (1...50).contains(limit), query.count <= 128 else {
++      throw PersonaStackReadFailure.invalidArguments
++    }
++    return try personaStackRead { db, budget in
++      let ceiling = try upper ?? (db.scalar("SELECT IFNULL(MAX(ROWID), 0) FROM chat") as? Int64 ?? 0)
++      guard ceiling >= after else { throw PersonaStackReadFailure.invalidArguments }
++      let rows = try db.prepareRowIterator("SELECT ROWID AS id FROM chat WHERE ROWID > ? AND ROWID <= ? ORDER BY ROWID LIMIT 512", bindings: [after, ceiling])
++      var output: [PersonaStackChat] = []
++      var cursor = after
++      var examined = 0
++      var bytes = 512
++      var reason = PersonaStackStopReason.caughtUp
++      while let row = try rows.failableNext() {
++        if budget.elapsed { reason = .timeLimit; break }
++        let rowID = try int64Value(row, "id") ?? 0
++        guard let chat = try personaStackChat(rowID, db: db) else { cursor = rowID; examined += 1; continue }
++        let matches = query.isEmpty || ([chat.name] + chat.participants).contains { $0.localizedCaseInsensitiveContains(query) }
++        if matches {
++          let size = try JSONEncoder().encode(chat).count
++          if bytes + size > Self.personaStackOutputLimit || output.count == limit {
++            reason = .outputLimit; break
++          }
++          output.append(chat); bytes += size
++        }
++        cursor = rowID; examined += 1
++      }
++      let more = (try db.scalar("SELECT EXISTS(SELECT 1 FROM chat WHERE ROWID > ? AND ROWID <= ?)", cursor, ceiling) as? Int64 ?? 0) != 0
++      if more && reason == .caughtUp { reason = .scanLimit }
++      return PersonaStackChatPage(chats: output, next_chat_rowid: String(cursor), upper_chat_rowid: String(ceiling), has_more: more, stop_reason: reason)
++    }
++  }
++
++  public func personaStackChatMetadata(chatIDs: [Int64]) throws -> PersonaStackChatMetadata {
++    guard (1...32).contains(chatIDs.count), Set(chatIDs).count == chatIDs.count,
++          chatIDs.allSatisfy({ $0 > 0 }) else { throw PersonaStackReadFailure.invalidArguments }
++    return try personaStackRead { db, timeBudget in
++      let rowBudget = PersonaStackMetadataBudget()
++      var chats: [PersonaStackChat] = []
++      var bytes = 32
++      for chatID in chatIDs {
++        guard !timeBudget.elapsed else { throw PersonaStackReadFailure.timeLimit }
++        let candidate = try personaStackChat(chatID, db: db, metadataBudget: rowBudget)
++        let chat: PersonaStackChat
++        if let candidate, candidate.available, !candidate.guid.isEmpty { chat = candidate }
++        else { chat = Self.personaStackUnavailableChat(chatID) }
++        bytes += try JSONEncoder().encode(chat).count + 1
++        guard bytes <= Self.personaStackOutputLimit else { throw PersonaStackReadFailure.payloadTooLarge }
++        chats.append(chat)
++      }
++      guard !timeBudget.elapsed else { throw PersonaStackReadFailure.timeLimit }
++      return PersonaStackChatMetadata(chats: chats)
++    }
++  }
++
++  private static func personaStackUnavailableChat(_ chatID: Int64) -> PersonaStackChat {
++    PersonaStackChat(id: String(chatID), guid: "", name: "", service: "", is_group: false,
++                     available: false, participants: [], account_id: nil, account_login: nil)
++  }
++
++  // Identity queries never select message content. A single read transaction
++  // samples all requested chat anchors and the global insertion boundary.
++  public func personaStackCheckpoint(chatIDs: [Int64], anchors: [PersonaStackAnchor] = []) throws -> PersonaStackCheckpoint {
++    guard (1...32).contains(chatIDs.count), Set(chatIDs).count == chatIDs.count, chatIDs.allSatisfy({ $0 > 0 }), anchors.count <= 32 else {
++      throw PersonaStackReadFailure.invalidArguments
++    }
++    var parsedAnchors: [Int64: (Int64, String)] = [:]
++    for anchor in anchors {
++      let chat = try Self.personaStackRowID(anchor.chat_id, positive: true)
++      let row = try Self.personaStackRowID(anchor.rowid)
++      guard chatIDs.contains(chat), parsedAnchors[chat] == nil, anchor.guid.utf8.count <= 256 else { throw PersonaStackReadFailure.invalidArguments }
++      parsedAnchors[chat] = (row, anchor.guid)
++    }
++    return try personaStackRead { db, budget in
++      var result: PersonaStackCheckpoint?
++      do {
++        let high = try db.scalar("SELECT IFNULL(MAX(ROWID), 0) FROM message") as? Int64 ?? 0
++        var chats: [PersonaStackChatCheckpoint] = []
++        for chatID in chatIDs {
++          guard !budget.elapsed else { throw PersonaStackReadFailure.timeLimit }
++          let info = try personaStackChatInfo(chatID, db: db)
++          let available = info?.service.caseInsensitiveCompare("iMessage") == .orderedSame
++          var tail: Int64 = 0
++          var guid = ""
++          if available {
++            let rows = try db.prepareRowIterator("SELECT m.ROWID AS id, CASE WHEN length(CAST(m.guid AS BLOB)) <= 256 THEN IFNULL(m.guid, '') ELSE '' END AS guid FROM message m JOIN chat_message_join j ON j.message_id = m.ROWID WHERE j.chat_id = ? ORDER BY m.ROWID DESC LIMIT 1", bindings: [chatID])
++            if let row = try rows.failableNext() { tail = try int64Value(row, "id") ?? 0; guid = try stringValue(row, "guid") }
++          }
++          var matches: Bool?
++          if let (rowID, oldGUID) = parsedAnchors[chatID] {
++            if rowID == 0 { matches = available && oldGUID.isEmpty }
++            else {
++              let found = try db.scalar("SELECT m.guid FROM message m JOIN chat_message_join j ON j.message_id = m.ROWID WHERE j.chat_id = ? AND m.ROWID = ? LIMIT 1", chatID, rowID) as? String
++              matches = available && found == oldGUID
++            }
++          }
++          chats.append(PersonaStackChatCheckpoint(chat_id: String(chatID), guid: info?.guid ?? "", service: info?.service ?? "", available: available, tail_rowid: String(tail), tail_guid: guid, account_id: info?.accountID, account_login: info?.accountLogin, anchor_matches: matches))
++        }
++        result = PersonaStackCheckpoint(adapter_revision: Self.personaStackAdapterRevision, source_high_water: String(high), chats: chats, observed_at: ISO8601DateFormatter().string(from: Date()))
++      }
++      guard let result else { throw PersonaStackReadFailure.sourceUnavailable }
++      return result
++    }
++  }
++
++  public func personaStackReceive(chatID: Int64, after: Int64, through: Int64? = nil, limit: Int = 100) throws -> PersonaStackReceivePage {
++    guard chatID > 0, after >= 0, through.map({ $0 >= after }) ?? true, (1...100).contains(limit) else { throw PersonaStackReadFailure.invalidArguments }
++    return try personaStackRead { db, budget in
++      try personaStackRequireChat(chatID, db: db)
++      let sourceHigh = try db.scalar("SELECT IFNULL(MAX(ROWID), 0) FROM message") as? Int64 ?? 0
++      guard sourceHigh >= after else { throw PersonaStackReadFailure.sourceUnavailable }
++      let ceiling = min(through ?? sourceHigh, sourceHigh)
++      let rows = try db.prepareRowIterator("SELECT m.ROWID AS id FROM message m JOIN chat_message_join j ON j.message_id = m.ROWID WHERE j.chat_id = ? AND m.ROWID > ? AND m.ROWID <= ? ORDER BY m.ROWID LIMIT 512", bindings: [chatID, after, ceiling])
++      var output: [PersonaStackMessage] = []
++      var cursor = after
++      var bytes = 512
++      var reason = PersonaStackStopReason.caughtUp
++      var remaining = Self.personaStackPhysicalLimit
++      while let row = try rows.failableNext() {
++        if budget.elapsed { reason = .timeLimit; break }
++        if remaining == 0 { reason = .scanLimit; break }
++        remaining -= 1
++        let rowID = try int64Value(row, "id") ?? 0
++        if let record = try personaStackMessage(rowID, chatID: chatID, db: db) {
++          let decision = try personaStackPreview(record, db: db, remaining: &remaining)
++          if decision == .deferPage { reason = .scanLimit; break }
++          if decision == .keep {
++            let size = try JSONEncoder().encode(record.payload).count
++            if output.count == limit || bytes + size > Self.personaStackOutputLimit { reason = .outputLimit; break }
++            output.append(record.payload); bytes += size
++          }
++        }
++        cursor = rowID
++      }
++      let more = (try db.scalar("SELECT EXISTS(SELECT 1 FROM chat_message_join WHERE chat_id = ? AND message_id > ? AND message_id <= ?)", chatID, cursor, ceiling) as? Int64 ?? 0) != 0
++      if more && reason == .caughtUp { reason = .scanLimit }
++      return PersonaStackReceivePage(messages: output, next_rowid: String(cursor), has_more: more, stop_reason: reason)
++    }
++  }
++
++  public func personaStackRecent(chatID: Int64, limit: Int = 50) throws -> PersonaStackRecentPage {
++    guard chatID > 0, (1...100).contains(limit) else { throw PersonaStackReadFailure.invalidArguments }
++    return try personaStackRead { db, budget in
++      try personaStackRequireChat(chatID, db: db)
++      let rows = try db.prepareRowIterator("SELECT m.ROWID AS id FROM message m JOIN chat_message_join j ON j.message_id = m.ROWID WHERE j.chat_id = ? ORDER BY m.date DESC, m.ROWID DESC LIMIT 512", bindings: [chatID])
++      var output: [PersonaStackMessage] = []
++      var reason = PersonaStackStopReason.caughtUp
++      var bytes = 512
++      var remaining = Self.personaStackPhysicalLimit
++      var truncated = false
++      while let row = try rows.failableNext() {
++        if budget.elapsed { truncated = true; reason = .timeLimit; break }
++        if remaining == 0 { truncated = true; reason = .scanLimit; break }
++        remaining -= 1
++        if let record = try personaStackMessage(try int64Value(row, "id") ?? 0, chatID: chatID, db: db) {
++          let decision = try personaStackPreview(record, db: db, remaining: &remaining)
++          if decision == .deferPage { truncated = true; reason = .scanLimit; break }
++          if decision == .keep {
++            let size = try JSONEncoder().encode(record.payload).count
++            if output.count == limit || bytes + size > Self.personaStackOutputLimit { truncated = true; reason = .outputLimit; break }
++            output.append(record.payload); bytes += size
++          }
++        }
++      }
++      if remaining == 0 { truncated = true; reason = .scanLimit }
++      return PersonaStackRecentPage(messages: Array(output.reversed()), truncated: truncated, stop_reason: reason)
++    }
++  }
++
++  private func personaStackRequireChat(_ chatID: Int64, db: Connection) throws {
++    guard let info = try personaStackChatInfo(chatID, db: db), info.service.caseInsensitiveCompare("iMessage") == .orderedSame else { throw PersonaStackReadFailure.sourceUnavailable }
++  }
++
++  private func personaStackChat(_ chatID: Int64, db: Connection, metadataBudget: PersonaStackMetadataBudget? = nil) throws -> PersonaStackChat? {
++    guard let info = try personaStackChatInfo(chatID, db: db, metadataBudget: metadataBudget) else {
++      try metadataBudget?.consume()
++      let service = try db.scalar("SELECT CASE WHEN length(CAST(service_name AS BLOB)) <= 256 THEN service_name ELSE '' END FROM chat WHERE ROWID = ?", chatID) as? String
++      guard service?.caseInsensitiveCompare("iMessage") == .orderedSame else { return nil }
++      return PersonaStackChat(id: String(chatID), guid: "", name: "Unavailable conversation", service: "iMessage", is_group: false, available: false, participants: [], account_id: nil, account_login: nil)
++    }
++    guard info.service.caseInsensitiveCompare("iMessage") == .orderedSame else { return nil }
++    let rows = try db.prepareRowIterator("SELECT substr(h.id, 1, 257) AS participant FROM handle h JOIN chat_handle_join j ON j.handle_id = h.ROWID WHERE j.chat_id = ? ORDER BY h.ROWID LIMIT 101", bindings: [chatID])
++    var participants: [String] = []
++    while true {
++      try metadataBudget?.requireRoom()
++      guard let row = try rows.failableNext() else { break }
++      try metadataBudget?.consume()
++      let participant = try stringValue(row, "participant")
++      guard !participant.isEmpty, participant.utf8.count <= 256, participants.count < 100 else { return PersonaStackChat(id: String(chatID), guid: info.guid, name: info.name, service: "iMessage", is_group: true, available: false, participants: [], account_id: info.accountID, account_login: info.accountLogin) }
++      participants.append(participant)
++    }
++    guard info.name.utf8.count <= 256, info.guid.utf8.count <= 256 else { throw PersonaStackReadFailure.payloadTooLarge }
++    return PersonaStackChat(id: String(chatID), guid: info.guid, name: info.name, service: "iMessage", is_group: info.guid.contains(";+;") || info.identifier.contains(";+;"), available: true, participants: participants, account_id: info.accountID, account_login: info.accountLogin)
++  }
++
++  private func personaStackChatInfo(_ chatID: Int64, db: Connection, metadataBudget: PersonaStackMetadataBudget? = nil) throws -> ChatInfo? {
++    try metadataBudget?.consume(2)
++    var fields = ["guid", "display_name", "chat_identifier", "service_name"]
++    if schema.hasChatAccountIDColumn { fields.append("account_id") }
++    if schema.hasChatAccountLoginColumn { fields.append("account_login") }
++    if schema.hasChatLastAddressedHandleColumn { fields.append("last_addressed_handle") }
++    let checks = fields.map { "IFNULL(length(CAST(\($0) AS BLOB)), 0) <= 256" }.joined(separator: " AND ")
++    guard (try db.scalar("SELECT (\(checks)) FROM chat WHERE ROWID = ?", chatID) as? Int64) == 1 else { return nil }
++    return try chatInfo(chatID: chatID)
++  }
++
++  // Each proof examines at most 32 predecessors and shares the caller's 512
++  // physical-record budget. Unproven or unmatched URL content is retained.
++  private func personaStackPreview(_ record: PersonaStackDecodedMessage, db: Connection, remaining: inout Int) throws -> PersonaStackPreviewDecision {
++    guard isURLPreviewBalloon(record.semantic), !record.payload.text_truncated else { return .keep }
++    guard remaining > 0 else { return .deferPage }
++    let maximum = min(32, remaining)
++    let rows = try db.prepareRowIterator("SELECT message_id AS id FROM chat_message_join WHERE chat_id = ? AND message_id < ? ORDER BY message_id DESC LIMIT ?", bindings: [record.semantic.chatID, record.semantic.rowID, maximum])
++    var previews = [record.semantic]
++    while let row = try rows.failableNext() {
++      remaining -= 1
++      let prior: PersonaStackDecodedMessage?
++      do { prior = try personaStackMessage(try int64Value(row, "id") ?? 0, chatID: record.semantic.chatID, db: db) }
++      catch PersonaStackReadFailure.payloadTooLarge { return .keep }
++      guard let prior, !prior.payload.text_truncated else { return .keep }
++      if isURLPreviewBalloon(prior.semantic) { previews.append(prior.semantic); continue }
++      return previews.allSatisfy { canCoalesceURLPreview(textMessage: prior.semantic, previewMessage: $0) } ? .suppress : .keep
++    }
++    return .keep
++  }
++
++  private func personaStackBoundedColumn(_ expression: String) -> String {
++    "CASE WHEN IFNULL(length(CAST(\(expression) AS BLOB)), 0) <= 256 THEN IFNULL(\(expression), '') ELSE '' END"
++  }
++
++  private func personaStackText(_ row: Row) throws -> PersonaStackTextState {
++    let raw = try stringValue(row, "text")
++    let edited = (try int64Value(row, "edited") ?? 0) > 0 ? try appleDate(from: int64Value(row, "edited")) : nil
++    let unsent = (try int64Value(row, "retracted") ?? 0) > 0 ? try appleDate(from: int64Value(row, "retracted")) : nil
++    let body = try dataValue(row, "body")
++    let resolved = unsent != nil ? "" : ((raw.isEmpty || (edited != nil && !body.isEmpty)) ? TypedStreamParser.parseAttributedBody(body) : raw)
++    var text = ""
++    var bytes = 0
++    for character in resolved {
++      let size = String(character).utf8.count
++      if bytes + size > 16_384 { break }
++      text.append(character); bytes += size
++    }
++    return PersonaStackTextState(text: text, truncated: text != resolved, editedAt: edited, unsentAt: unsent)
++  }
++
++  private func personaStackSender(_ row: Row, outgoing: Bool) throws -> String {
++    let handle = try stringValue(row, "handle")
++    let caller = try stringValue(row, "caller")
++    // h.id is the recipient for outgoing rows, never a fallback local identity.
++    if outgoing && caller.isEmpty { return "" }
++    if !outgoing && handle.isEmpty { return "" }
++    return try stringValue(row, "sender")
++  }
++
++  private func personaStackMessage(_ rowID: Int64, chatID: Int64, db: Connection) throws -> PersonaStackDecodedMessage? {
++    let body = schema.hasAttributedBody ? "m.attributedBody" : "NULL"
++    let reaction = schema.hasReactionColumns ? "m.associated_message_type" : "0"
++    let edited = schema.hasDateEditedColumn ? "m.date_edited" : "0"
++    let retracted = schema.hasDateRetractedColumn ? "m.date_retracted" : "0"
++    let balloon = schema.hasBalloonBundleIDColumn ? "m.balloon_bundle_id" : "''"
++    let caller = schema.hasDestinationCallerID ? "m.destination_caller_id" : "NULL"
++    let senderSQL = Self.senderSQL(destinationCallerColumn: caller)
++    let sizeRows = try db.prepareRowIterator("SELECT IFNULL(m.service, '') AS service, \(reaction) AS reaction, \(personaStackBoundedColumn(balloon)) AS balloon, length(CAST(IFNULL(m.text, '') AS BLOB)) AS text_size, IFNULL(length(\(body)), 0) AS body_size FROM message m JOIN chat_message_join j ON j.message_id = m.ROWID WHERE j.chat_id = ? AND m.ROWID = ? LIMIT 1", bindings: [chatID, rowID])
++    guard let sizeRow = try sizeRows.failableNext() else { throw PersonaStackReadFailure.sourceUnavailable }
++    let service = try stringValue(sizeRow, "service")
++    let associated = try intValue(sizeRow, "reaction") ?? 0
++    guard service.caseInsensitiveCompare("iMessage") == .orderedSame, !(2000...3999).contains(associated) else { return nil }
++    guard (try intValue(sizeRow, "text_size") ?? 0) <= Self.personaStackFieldLimit, (try intValue(sizeRow, "body_size") ?? 0) <= Self.personaStackFieldLimit else { throw PersonaStackReadFailure.payloadTooLarge }
++    let rows = try db.prepareRowIterator("SELECT IFNULL(m.guid, '') AS guid, IFNULL(m.text, '') AS text, \(body) AS body, m.date AS date, \(edited) AS edited, \(retracted) AS retracted, m.is_from_me AS is_from_me, m.handle_id AS handle_id, \(personaStackBoundedColumn("h.id")) AS handle, \(personaStackBoundedColumn(caller)) AS caller, \(personaStackBoundedColumn(senderSQL)) AS sender, (SELECT COUNT(*) FROM message_attachment_join a WHERE a.message_id = m.ROWID) AS attachments FROM message m JOIN chat_message_join j ON j.message_id = m.ROWID LEFT JOIN handle h ON h.ROWID = m.handle_id WHERE j.chat_id = ? AND m.ROWID = ? LIMIT 1", bindings: [chatID, rowID])
++    guard let row = try rows.failableNext() else { throw PersonaStackReadFailure.sourceUnavailable }
++    let text = try personaStackText(row)
++    let outgoing = try boolValue(row, "is_from_me")
++    let sender = try personaStackSender(row, outgoing: outgoing)
++    let guid = try stringValue(row, "guid")
++    let date = try appleDate(from: int64Value(row, "date"))
++    guard !guid.isEmpty, guid.utf8.count <= 256 else { throw PersonaStackReadFailure.payloadTooLarge }
++    let attachments = text.unsentAt == nil ? (try intValue(row, "attachments") ?? 0) : 0
++    let payload = PersonaStackMessage(rowid: String(rowID), guid: guid, chat_id: String(chatID), text: text.text, text_truncated: text.truncated, is_from_me: outgoing, date: ISO8601DateFormatter().string(from: date), sender: sender, service: "iMessage", attachment_count: attachments, edited_at: text.editedAt.map { ISO8601DateFormatter().string(from: $0) }, unsent_at: text.unsentAt.map { ISO8601DateFormatter().string(from: $0) }, attachments: [])
++    let bundle = try stringValue(sizeRow, "balloon")
++    let semantic = Message(rowID: rowID, chatID: chatID, sender: sender, text: text.text, date: date, isFromMe: outgoing, service: "iMessage", handleID: try int64Value(row, "handle_id"), attachmentsCount: attachments, guid: guid, balloonBundleID: bundle.isEmpty ? nil : bundle)
++    return PersonaStackDecodedMessage(payload: payload, semantic: semantic)
++  }
++}
+--- /dev/null
++++ b/Sources/IMsgCore/PersonaStackAppleScriptTransport.swift
+@@ -0,0 +1,101 @@
++import Foundation
++
++struct PersonaStackTextInvocation: Sendable {
++  let source: String
++  let arguments: [String]
++}
++
++/// Public AppleScript executes in the already owned provider process. No helper
++/// process can escape its process group or survive the host's deadline cleanup.
++public enum PersonaStackAppleScriptTransport {
++  static let source = """
++    on personastacksend(chatGUID, messageText, expectedAccountID)
++      set dispatchStarted to false
++      try
++        tell application "/System/Applications/Messages.app"
++          set targetChat to get chat id chatGUID
++          considering case
++            if (id of targetChat) is not chatGUID then return "PSTACK_NOT_STARTED"
++          end considering
++          set targetAccount to account of targetChat
++          considering case
++            if (id of targetAccount) is not expectedAccountID then return "PSTACK_NOT_STARTED"
++          end considering
++          if (service type of targetAccount) is not iMessage then return "PSTACK_NOT_STARTED"
++          if (enabled of targetAccount) is not true then return "PSTACK_NOT_STARTED"
++          if (connection status of targetAccount) is not connected then return "PSTACK_NOT_STARTED"
++          set dispatchStarted to true
++          send messageText to targetChat
++        end tell
++        return "PSTACK_SUBMITTED"
++      on error
++        if dispatchStarted then
++          return "PSTACK_OUTCOME_UNKNOWN"
++        end if
++        return "PSTACK_NOT_STARTED"
++      end try
++    end personastacksend
++    """
++
++  static func prepare(_ options: MessageSendOptions, expectedAccountID: String) throws -> PersonaStackTextInvocation {
++    guard !expectedAccountID.isEmpty, expectedAccountID.utf8.count <= 256,
++          !expectedAccountID.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
++          options.service == .imessage, !options.allowSMSFallback,
++          !options.chatGUID.isEmpty, options.chatGUID.utf8.count <= 256,
++          options.chatIdentifier.isEmpty, options.recipient.isEmpty,
++          options.attachmentPath.isEmpty, options.directParticipantTarget == nil,
++          !options.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
++          options.text.utf8.count <= 16_384 else {
++      throw failure(.notStarted, "A fixed selected iMessage conversation and bounded text are required.")
++    }
++    return PersonaStackTextInvocation(source: source, arguments: [options.chatGUID, options.text, expectedAccountID])
++  }
++
++  public static func send(_ options: MessageSendOptions, expectedAccountID: String) async throws {
++    let invocation = try prepare(options, expectedAccountID: expectedAccountID)
++    #if os(macOS)
++      try await execute(invocation)
++    #else
++      _ = invocation
++      throw failure(.notStarted, "Messages automation requires macOS.")
++    #endif
++  }
++
++  #if os(macOS)
++    @MainActor
++    private static func execute(_ invocation: PersonaStackTextInvocation) throws {
++      guard let script = NSAppleScript(source: invocation.source) else {
++        throw failure(.notStarted, "The fixed Messages script could not be loaded.")
++      }
++      var error: NSDictionary?
++      guard script.compileAndReturnError(&error) else {
++        throw failure(.notStarted, "The fixed Messages script could not be compiled.")
++      }
++      // Invoke a handler in this script, with data descriptors for all three values.
++      // No user-provided text is ever interpolated into AppleScript source.
++      let arguments = NSAppleEventDescriptor.list()
++      for (offset, argument) in invocation.arguments.enumerated() {
++        arguments.insert(NSAppleEventDescriptor(string: argument), at: offset + 1)
++      }
++      let event = NSAppleEventDescriptor(eventClass: 0x61736372, eventID: 0x70736272,
++        targetDescriptor: nil, returnID: -1, transactionID: 0)
++      event.setParam(NSAppleEventDescriptor(string: "personastacksend"), forKeyword: 0x736e616d)
++      event.setParam(arguments, forKeyword: 0x2d2d2d2d)
++      error = nil
++      let result: NSAppleEventDescriptor? = script.executeAppleEvent(event, error: &error)
++      guard error == nil else {
++        throw failure(.mayHaveCompleted, "Messages execution ended without a confirmed dispatch result.")
++      }
++      switch result?.stringValue {
++      case "PSTACK_SUBMITTED": return
++      case "PSTACK_NOT_STARTED": throw failure(.notStarted, "The selected Messages conversation was unavailable before dispatch.")
++      default: throw failure(.mayHaveCompleted, "Messages may have accepted the text.")
++      }
++    }
++  #endif
++
++  private static func failure(_ disposition: DeliveryDisposition, _ detail: String) -> DeliveryFailure {
++    DeliveryFailure(disposition: disposition, transport: .appleScript,
++                    operation: "personastack.send", detail: detail)
++  }
++}
+--- a/Sources/imsg/RPCServer.swift
++++ b/Sources/imsg/RPCServer.swift
+@@ -1,5 +1,7 @@
+ import Foundation
+ import IMsgCore
++
++typealias PersonaStackTextSender = @Sendable (MessageSendOptions, String) async throws -> Void
+ 
+ typealias SentMessageResolver = (
+   _ store: MessageStore,
+@@ -52,6 +54,7 @@
+   let output: RPCOutput
+   let subscriptions: SubscriptionStore
+   let verbose: Bool
++  let personaStackSendMessage: PersonaStackTextSender
+   let sendMessage: (MessageSendOptions) throws -> MessageSendOptions
+   let resolveSentMessage: SentMessageResolver
+   let bridgeInvoker: BridgeInvoker
+@@ -80,6 +83,7 @@
+     store: MessageStore,
+     verbose: Bool,
+     output: RPCOutput = RPCWriter(),
++    sendPersonaStackMessage: @escaping PersonaStackTextSender = { try await PersonaStackAppleScriptTransport.send($0, expectedAccountID: $1) },
+     sendMessage: @escaping (MessageSendOptions) throws -> MessageSendOptions = {
+       try MessageSender().sendResolvingRoute($0)
+     },
+@@ -130,6 +134,7 @@
+     self.subscriptions = SubscriptionStore(limit: 64)
+     self.verbose = verbose
+     self.output = output
++    self.personaStackSendMessage = sendPersonaStackMessage
+     self.sendMessage = sendMessage
+     self.resolveSentMessage = resolveSentMessage
+     self.bridgeInvoker = invokeBridge
+@@ -154,6 +159,7 @@
+     verbose: Bool,
+     output: RPCOutput = RPCWriter(),
+     storeFactory: @escaping RPCMessageStoreFactory = { try MessageStore(path: $0) },
++    sendPersonaStackMessage: @escaping PersonaStackTextSender = { try await PersonaStackAppleScriptTransport.send($0, expectedAccountID: $1) },
+     sendMessage: @escaping (MessageSendOptions) throws -> MessageSendOptions = {
+       try MessageSender().sendResolvingRoute($0)
+     },
+@@ -200,6 +206,7 @@
+     self.subscriptions = SubscriptionStore(limit: 64)
+     self.verbose = verbose
+     self.output = output
++    self.personaStackSendMessage = sendPersonaStackMessage
+     self.sendMessage = sendMessage
+     self.resolveSentMessage = resolveSentMessage
+     self.bridgeInvoker = invokeBridge
+--- a/Sources/imsg/RPCMethodDescriptors.swift
++++ b/Sources/imsg/RPCMethodDescriptors.swift
+@@ -44,6 +44,8 @@
+ 
+ enum RPCDispatchRoute: Sendable, Equatable {
+   case initialize, status, chatsList, chatsGet, messagesStats, messagesHistory, messagesSearch
++  case personaStackInitialize, personaStackStatus, personaStackSend
++  case personaStackChats, personaStackChatMetadata, personaStackCheckpoint, personaStackReceive, personaStackRecent
+   case messagesAfter, watchSubscribe, bridgeEventsSubscribe, watchUnsubscribe
+   case send, sendTracked, sendRich, sendAttachment
+   case sendMultipart, sendSticker, messagesScheduled, pollSend, pollVote, pollUnvote
+@@ -105,6 +107,14 @@
+ }
+ 
+ let rpcMethodDescriptors: [RPCMethodDescriptor] = [
++  RPCMethodDescriptor("personastack.initialize", route: .personaStackInitialize, lane: .control),
++  RPCMethodDescriptor("personastack.status", route: .personaStackStatus, lane: .read),
++  RPCMethodDescriptor("personastack.send", route: .personaStackSend, lane: .mutation, database: [.ready]),
++  RPCMethodDescriptor("personastack.chats.page", route: .personaStackChats, lane: .read, database: [.ready]),
++  RPCMethodDescriptor("personastack.chatMetadata", route: .personaStackChatMetadata, lane: .read, database: [.ready]),
++  RPCMethodDescriptor("personastack.source_checkpoint", route: .personaStackCheckpoint, lane: .read, database: [.ready]),
++  RPCMethodDescriptor("personastack.receive_page", route: .personaStackReceive, lane: .read, database: [.ready]),
++  RPCMethodDescriptor("personastack.recent_messages", route: .personaStackRecent, lane: .read, database: [.ready]),
+   RPCMethodDescriptor("initialize", route: .initialize, lane: .control),
+   RPCMethodDescriptor("status", route: .status, lane: .read),
+   RPCMethodDescriptor("watch.unsubscribe", route: .watchUnsubscribe, lane: .control),
+--- a/Sources/imsg/RPCServer+Dispatch.swift
++++ b/Sources/imsg/RPCServer+Dispatch.swift
+@@ -25,6 +25,22 @@
+         return .completed
+       }
+       switch route {
++      case .personaStackInitialize:
++        try await handlePersonaStackInitialize(id: id, params: params)
++      case .personaStackStatus:
++        try await handlePersonaStackStatus(id: id, params: params)
++      case .personaStackSend:
++        try await handlePersonaStackSend(id: id, params: params)
++      case .personaStackChats:
++        try await handlePersonaStackChats(id: id, params: params)
++      case .personaStackChatMetadata:
++        try await handlePersonaStackChatMetadata(id: id, params: params)
++      case .personaStackCheckpoint:
++        try await handlePersonaStackCheckpoint(id: id, params: params)
++      case .personaStackReceive:
++        try await handlePersonaStackReceive(id: id, params: params)
++      case .personaStackRecent:
++        try await handlePersonaStackRecent(id: id, params: params)
+       case .initialize:
+         try await handleInitialize(id: id, params: params)
+       case .status:
+@@ -119,6 +135,10 @@
+       if !request.isNotification {
+         output.sendError(id: id, error: err)
+       }
++    } catch let err as PersonaStackReadFailure {
++      if !request.isNotification {
++        output.sendError(id: id, error: err == .invalidArguments ? RPCError.invalidParams(err.rawValue) : RPCError.internalError(err.rawValue))
++      }
+     } catch let err as IMsgError {
+       guard !request.isNotification else { return .completed }
+       if err.isCallerCausedRPCError {
+--- /dev/null
++++ b/Sources/imsg/RPCServer+PersonaStackHandlers.swift
+@@ -0,0 +1,115 @@
++import Foundation
++import IMsgCore
++
++extension RPCServer {
++  func handlePersonaStackChats(id: Any?, params raw: [String: Any]) async throws {
++    let params = try RPCParameters(raw, method: "personastack.chats.page", supportedKeys: ["after_chat_rowid", "upper_chat_rowid", "query", "limit"])
++    let after = try personaStackID(params, "after_chat_rowid", defaultValue: "0")
++    let upper = params.contains("upper_chat_rowid") ? try personaStackID(params, "upper_chat_rowid") : nil
++    let store = try await databaseResources.require().store
++    try respondPersonaStack(id: id, result: store.personaStackChats(after: after, upper: upper, query: params.string("query") ?? "", limit: params.integer("limit") ?? 50))
++  }
++
++  func handlePersonaStackChatMetadata(id: Any?, params raw: [String: Any]) async throws {
++    let params = try RPCParameters(raw, method: "personastack.chatMetadata", supportedKeys: ["chat_ids"])
++    guard let IDs = try params.stringArray("chat_ids"), (1...32).contains(IDs.count) else {
++      throw RPCError.invalidParams("chat_ids is required")
++    }
++    let parsed: [Int64]
++    do { parsed = try IDs.map { try MessageStore.personaStackRowID($0, positive: true) } }
++    catch { throw RPCError.invalidParams("chat_ids must be canonical positive decimal IDs") }
++    guard Set(parsed).count == parsed.count else { throw RPCError.invalidParams("chat_ids must be unique") }
++    let store = try await databaseResources.require().store
++    try respondPersonaStack(id: id, result: store.personaStackChatMetadata(chatIDs: parsed))
++  }
++
++  func handlePersonaStackCheckpoint(id: Any?, params raw: [String: Any]) async throws {
++    let params = try RPCParameters(raw, method: "personastack.source_checkpoint", supportedKeys: ["chat_ids", "anchors"])
++    guard let chatIDs = try params.stringArray("chat_ids"), (1...32).contains(chatIDs.count) else { throw RPCError.invalidParams("chat_ids is required") }
++    let anchors: [PersonaStackAnchor]
++    if let values = try params.objectArray("anchors") {
++      guard values.count <= 32 else { throw RPCError.invalidParams("too many anchors") }
++      anchors = try values.map { value in
++        let entry = try RPCParameters(value, method: "anchor", supportedKeys: ["chat_id", "rowid", "guid"])
++        guard let chat = try entry.string("chat_id"), let row = try entry.string("rowid"), let guid = try entry.string("guid") else { throw RPCError.invalidParams("anchor fields are required") }
++        return PersonaStackAnchor(chat_id: chat, rowid: row, guid: guid)
++      }
++    } else { anchors = [] }
++    let store = try await databaseResources.require().store
++    let parsed = try chatIDs.map { try MessageStore.personaStackRowID($0, positive: true) }
++    try respondPersonaStack(id: id, result: store.personaStackCheckpoint(chatIDs: parsed, anchors: anchors))
++  }
++
++  func handlePersonaStackReceive(id: Any?, params raw: [String: Any]) async throws {
++    let params = try RPCParameters(raw, method: "personastack.receive_page", supportedKeys: ["chat_id", "since_rowid", "through_rowid", "limit"])
++    let store = try await databaseResources.require().store
++    let upper = params.contains("through_rowid") ? try personaStackID(params, "through_rowid") : nil
++    try respondPersonaStack(id: id, result: store.personaStackReceive(chatID: personaStackID(params, "chat_id", positive: true), after: personaStackID(params, "since_rowid"), through: upper, limit: params.integer("limit") ?? 100))
++  }
++
++  func handlePersonaStackRecent(id: Any?, params raw: [String: Any]) async throws {
++    let params = try RPCParameters(raw, method: "personastack.recent_messages", supportedKeys: ["chat_id", "limit"])
++    let store = try await databaseResources.require().store
++    try respondPersonaStack(id: id, result: store.personaStackRecent(chatID: personaStackID(params, "chat_id", positive: true), limit: params.integer("limit") ?? 50))
++  }
++
++  private func personaStackID(_ params: RPCParameters, _ field: String, defaultValue: String? = nil, positive: Bool = false) throws -> Int64 {
++    guard let value = try params.string(field) ?? defaultValue else { throw RPCError.invalidParams("\(field) is required") }
++    do { return try MessageStore.personaStackRowID(value, positive: positive) }
++    catch { throw RPCError.invalidParams("\(field) must be a canonical decimal cursor") }
++  }
++
++  private func respondPersonaStack<T: Encodable>(id: Any?, result: T) throws {
++    let data = try JSONEncoder().encode(result)
++    guard data.count <= 1 << 20, let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw RPCError.internalError("payload_too_large") }
++    respond(id: id, result: object)
++  }
++}
++
++extension RPCServer {
++  // This readiness path never consults the optional IMCore bridge or Contacts.
++  // The host separately verifies the active account through public Apple Events.
++  func handlePersonaStackInitialize(id: Any?, params raw: [String: Any]) async throws {
++    let params = try RPCParameters(raw, method: "personastack.initialize", supportedKeys: ["protocol_version"])
++    if let version = try params.integer("protocol_version"), version != kRPCProtocolVersion {
++      throw RPCError.invalidParams("unsupported protocol_version")
++    }
++    await respondPersonaStackReadiness(id: id)
++  }
++
++  func handlePersonaStackStatus(id: Any?, params raw: [String: Any]) async throws {
++    _ = try RPCParameters(raw, method: "personastack.status", supportedKeys: [])
++    await respondPersonaStackReadiness(id: id)
++  }
++
++  private func respondPersonaStackReadiness(id: Any?) async {
++    let ready = await databaseResources.available() != nil
++    var methods = ["personastack.initialize", "personastack.status"]
++    if ready {
++      methods += ["personastack.chats.page", "personastack.chatMetadata", "personastack.source_checkpoint", "personastack.receive_page", "personastack.recent_messages", "personastack.send"]
++    }
++    respond(id: id, result: ["protocol_version": kRPCProtocolVersion,
++                           "personastack_adapter_revision": MessageStore.personaStackAdapterRevision,
++                           "database": ["ready": ready], "methods": methods])
++  }
++
++  // A dispatch acknowledgement is deliberately not a local message receipt.
++  // Native confirmation reads only the bounded, selected-chat post-tail window.
++  func handlePersonaStackSend(id: Any?, params raw: [String: Any]) async throws {
++    let params = try RPCParameters(raw, method: "personastack.send", supportedKeys: ["chat_id", "chat_guid", "expected_account_id", "text"])
++    let chatID = try personaStackID(params, "chat_id", positive: true)
++    guard let account = try params.string("expected_account_id"), !account.isEmpty, account.utf8.count <= 256,
++          !account.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
++          let guid = try params.string("chat_guid"), !guid.isEmpty, guid.utf8.count <= 256,
++          let text = try params.string("text"), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
++          text.utf8.count <= 16_384 else { throw RPCError.invalidParams("A selected chat and bounded text are required") }
++    let store = try await databaseResources.require().store
++    let proof = try store.personaStackCheckpoint(chatIDs: [chatID])
++    guard let chat = proof.chats.first, chat.available, chat.guid == guid else {
++      throw RPCError.invalidParams("Selected conversation is unavailable or changed")
++    }
++    try await personaStackSendMessage(MessageSendOptions(recipient: "", text: text,
++      service: .imessage, chatGUID: guid, allowSMSFallback: false), account)
++    respond(id: id, result: ["submitted": true, "transport": "applescript", "service": "iMessage", "chat_guid": guid])
++  }
++}
+--- /dev/null
++++ b/TestsPersonaStack/PersonaStackReadTests.swift
+@@ -0,0 +1,548 @@
++import Foundation
++import SQLite
++import Testing
++@testable import IMsgCore
++@testable import imsg
++
++private func personaStackFixture() throws -> (URL, Connection, MessageStore) {
++  let dir = FileManager.default.temporaryDirectory.appendingPathComponent("personastack-read-\(UUID().uuidString)")
++  try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
++  let url = dir.appendingPathComponent("chat.db")
++  let db = try Connection(url.path)
++  try db.execute("""
++    CREATE TABLE message(ROWID INTEGER PRIMARY KEY, handle_id INTEGER, text TEXT, attributedBody BLOB, guid TEXT,
++      date INTEGER, is_from_me INTEGER, service TEXT, associated_message_type INTEGER, associated_message_guid TEXT, balloon_bundle_id TEXT, date_edited INTEGER, date_retracted INTEGER, destination_caller_id TEXT);
++    CREATE TABLE chat(ROWID INTEGER PRIMARY KEY, chat_identifier TEXT, guid TEXT, display_name TEXT, service_name TEXT);
++    CREATE TABLE handle(ROWID INTEGER PRIMARY KEY, id TEXT);
++    CREATE TABLE chat_handle_join(chat_id INTEGER, handle_id INTEGER);
++    CREATE TABLE chat_message_join(chat_id INTEGER, message_id INTEGER);
++    CREATE INDEX chat_message_scan ON chat_message_join(chat_id, message_id);
++    CREATE TABLE attachment(ROWID INTEGER PRIMARY KEY, filename TEXT);
++    CREATE TABLE message_attachment_join(message_id INTEGER, attachment_id INTEGER);
++    INSERT INTO chat VALUES(1, '+15550000001', 'iMessage;-;test', 'Chosen', 'iMessage');
++    INSERT INTO chat VALUES(2, '+15550000002', 'SMS;-;test', 'Other', 'SMS');
++    INSERT INTO handle VALUES(1, '+15550000001');
++    INSERT INTO chat_handle_join VALUES(1,1);
++    """)
++  return (dir, db, try MessageStore(path: url.path))
++}
++
++private func insertPersonaStackMessage(_ db: Connection, row: Int64, text: String = "hello", chat: Int64 = 1, service: String = "iMessage", reaction: Int = 0) throws {
++  try db.run("INSERT INTO message(ROWID,handle_id,text,guid,date,is_from_me,service,associated_message_type) VALUES(?,1,?,?,1000000000,0,?,?)", row, text, "guid-\(row)", service, reaction)
++  try db.run("INSERT INTO chat_message_join VALUES(?,?)", chat, row)
++}
++
++@Test func personaStackDecimalCursorsAreExactAndCanonical() throws {
++  #expect(try MessageStore.personaStackRowID("9007199254740993") == 9_007_199_254_740_993)
++  #expect(try MessageStore.personaStackRowID(String(Int64.max)) == Int64.max)
++  for invalid in ["01", "-1", "+1", "1.0", "9223372036854775808", " 1"] {
++    #expect(throws: PersonaStackReadFailure.invalidArguments) { try MessageStore.personaStackRowID(invalid) }
++  }
++}
++
++@Test func personaStackCheckpointUsesRowOrderAndPerChatAvailability() throws {
++  let (dir, db, store) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  try insertPersonaStackMessage(db, row: 9_007_199_254_740_993)
++  try insertPersonaStackMessage(db, row: Int64.max, chat: 2, service: "SMS")
++  let result = try store.personaStackCheckpoint(chatIDs: [1, 999], anchors: [PersonaStackAnchor(chat_id: "1", rowid: "9007199254740993", guid: "guid-9007199254740993")])
++  #expect(result.source_high_water == String(Int64.max))
++  #expect(result.chats[0].tail_rowid == "9007199254740993")
++  #expect(result.chats[0].anchor_matches == true)
++  #expect(result.chats[1].available == false)
++}
++
++@Test func personaStackPickerSearchContinuesBeyondOneThousandChats() throws {
++  let (dir, db, store) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  try db.transaction {
++    for id in 3...1100 { try db.run("INSERT INTO chat VALUES(?, ?, ?, ?, 'iMessage')", id, "chat-\(id)", "iMessage;-;\(id)", id == 1099 ? "Find me" : "Earlier") }
++  }
++  var cursor: Int64 = 0
++  var found: [PersonaStackChat] = []
++  var more = true
++  while more {
++    let page = try store.personaStackChats(after: cursor, query: "Find me")
++    cursor = try MessageStore.personaStackRowID(page.next_chat_rowid)
++    found += page.chats; more = page.has_more
++  }
++  #expect(found.map(\.id) == ["1099"])
++}
++
++@Test func personaStackReceiveProgressesFilteredRowsWithoutLeakingSMS() throws {
++  let (dir, db, store) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  try db.transaction {
++    for row in 1...520 { try insertPersonaStackMessage(db, row: Int64(row), service: row == 520 ? "iMessage" : "SMS") }
++  }
++  let first = try store.personaStackReceive(chatID: 1, after: 0)
++  #expect(first.messages.isEmpty)
++  #expect(first.next_rowid == "512")
++  #expect(first.has_more)
++  #expect(first.stop_reason == .scanLimit)
++  let second = try store.personaStackReceive(chatID: 1, after: 512)
++  #expect(second.messages.map(\.guid) == ["guid-520"])
++  #expect(second.next_rowid == "520")
++}
++
++@Test func personaStackOutputLimitNeverConsumesOmittedMessage() throws {
++  let (dir, db, store) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  try insertPersonaStackMessage(db, row: 1)
++  try insertPersonaStackMessage(db, row: 2)
++  let page = try store.personaStackReceive(chatID: 1, after: 0, limit: 1)
++  #expect(page.next_rowid == "1")
++  #expect(page.messages.count == 1)
++  #expect(page.has_more)
++  #expect(try store.personaStackReceive(chatID: 1, after: 1).messages.map(\.guid) == ["guid-2"])
++}
++
++@Test func personaStackOversizedBodyFailsBeforeTextDecode() throws {
++  let (dir, db, store) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  try insertPersonaStackMessage(db, row: 1)
++  try db.run("UPDATE message SET attributedBody = zeroblob(1048577) WHERE ROWID = 1")
++  #expect(throws: PersonaStackReadFailure.payloadTooLarge) { try store.personaStackReceive(chatID: 1, after: 0) }
++}
++
++@Test func personaStackRecentWindowHasNoUnselectedBodiesOrPaths() throws {
++  let (dir, db, store) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  try insertPersonaStackMessage(db, row: 1, text: "selected")
++  try insertPersonaStackMessage(db, row: 2, text: "private other", chat: 2, service: "SMS")
++  let page = try store.personaStackRecent(chatID: 1)
++  let json = String(decoding: try JSONEncoder().encode(page), as: UTF8.self)
++  #expect(json.contains("selected"))
++  #expect(!json.contains("private other"))
++  #expect(!json.contains("path"))
++  #expect(!page.truncated)
++}
++
++@Test func personaStackReceiveRejectsSourceRegressionAndFiltersReactions() throws {
++  let (dir, db, store) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  try insertPersonaStackMessage(db, row: 1, reaction: 2001)
++  try insertPersonaStackMessage(db, row: 2)
++  let page = try store.personaStackReceive(chatID: 1, after: 0)
++  #expect(page.messages.map(\.guid) == ["guid-2"])
++  #expect(page.next_rowid == "2")
++  #expect(throws: PersonaStackReadFailure.sourceUnavailable) { try store.personaStackReceive(chatID: 1, after: 3) }
++}
++
++@Test func personaStackUnsentTextIsNotReturnedAsCurrentContent() throws {
++  let (dir, db, store) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  try insertPersonaStackMessage(db, row: 1, text: "unsent private text")
++  try db.run("UPDATE message SET date_retracted = 2000000000 WHERE ROWID = 1")
++  let page = try store.personaStackRecent(chatID: 1)
++  #expect(page.messages[0].text.isEmpty)
++  #expect(page.messages[0].unsent_at != nil)
++}
++
++@Test func personaStackDirectChatIsNotClassifiedFromParticipantCount() throws {
++  let (dir, db, store) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  try db.run("INSERT INTO handle VALUES(2, 'me@example.com')")
++  try db.run("INSERT INTO chat_handle_join VALUES(1, 2)")
++  let page = try store.personaStackChats()
++  #expect(page.chats[0].participants.count == 2)
++  #expect(!page.chats[0].is_group)
++}
++
++private final class PersonaStackRPCState: @unchecked Sendable {
++  private let lock = NSLock()
++  private var counts: [String: Int] = [:]
++  private var statements: [String] = []
++  private var sentOptions: MessageSendOptions?
++  func count(_ key: String) { lock.lock(); defer { lock.unlock() }; counts[key, default: 0] += 1 }
++  func countFor(_ key: String) -> Int { lock.lock(); defer { lock.unlock() }; return counts[key, default: 0] }
++  func trace(_ sql: String) { lock.lock(); defer { lock.unlock() }; statements.append(sql) }
++  var queries: [String] { lock.lock(); defer { lock.unlock() }; return statements }
++  func sent(_ options: MessageSendOptions) { lock.lock(); defer { lock.unlock() }; sentOptions = options; counts["send", default: 0] += 1 }
++  var options: MessageSendOptions? { lock.lock(); defer { lock.unlock() }; return sentOptions }
++}
++
++private final class PersonaStackRPCOutput: RPCOutput, @unchecked Sendable {
++  private let lock = NSLock()
++  private var resultStorage: [[String: Any]] = []
++  private var errorStorage: [[String: Any]] = []
++  var results: [[String: Any]] { lock.lock(); defer { lock.unlock() }; return resultStorage }
++  var errors: [[String: Any]] { lock.lock(); defer { lock.unlock() }; return errorStorage }
++  func sendResponse(id: Any, result: Any) { lock.lock(); defer { lock.unlock() }; resultStorage.append(result as? [String: Any] ?? [:]) }
++  func sendError(id: Any?, error: RPCError) { lock.lock(); defer { lock.unlock() }; errorStorage.append(error.asDictionary()) }
++  func sendNotification(method: String, params: Any) {}
++  func flush() {}
++}
++
++private final class PersonaStackContactSpy: ContactResolving, Sendable {
++  let state: PersonaStackRPCState
++  init(_ state: PersonaStackRPCState) { self.state = state }
++  var contactsUnavailable: Bool { state.count("contacts"); return false }
++  var cached: any ContactResolving { state.count("contacts"); return self }
++  func displayName(for handle: String) -> String? { state.count("contacts"); return nil }
++  func displayNames(for handles: [String]) -> [String: String] { state.count("contacts"); return [:] }
++  func searchByName(_ query: String) -> [ContactMatch] { state.count("contacts"); return [] }
++}
++
++@Test func personaStackPrivateReadinessDoesNotProbeExistingReadyBridgeOrContacts() async throws {
++  let (dir, _, store) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  let output = PersonaStackRPCOutput()
++  let state = PersonaStackRPCState()
++  let server = RPCServer(store: store, verbose: false, output: output,
++    invokeBridge: { _, _ in state.count("bridgeIPC"); throw PersonaStackReadFailure.sourceUnavailable },
++    isBridgeReady: { state.count("bridgeReady"); return true }, contactResolver: PersonaStackContactSpy(state))
++  for method in ["personastack.initialize", "personastack.status"] {
++    let data = try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": method, "method": method, "params": [:]])
++    _ = await server.handleLine(String(decoding: data, as: UTF8.self))
++  }
++  #expect(output.errors.isEmpty)
++  #expect(output.results.count == 2)
++  #expect(state.countFor("bridgeReady") == 0)
++  #expect(state.countFor("bridgeIPC") == 0)
++  #expect(state.countFor("contacts") == 0)
++  for result in output.results {
++    #expect(result["protocol_version"] as? Int == 1)
++    #expect(result["personastack_adapter_revision"] as? Int == 2)
++    #expect((result["database"] as? [String: Bool])?["ready"] == true)
++    #expect(result["bridge"] == nil)
++    #expect(result["contacts"] == nil)
++    #expect((result["methods"] as? [String])?.allSatisfy { $0.hasPrefix("personastack.") } == true)
++  }
++}
++
++@Test func personaStackPrivateSendBypassesUnboundedFutureDatedReceiptSearch() async throws {
++  let (dir, db, _) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  try db.transaction {
++    for row in 1...1_000 { try insertPersonaStackMessage(db, row: Int64(row), text: "not the new message") }
++  }
++  try db.run("UPDATE message SET text = CAST(zeroblob(2097152) AS TEXT), date = ?, is_from_me = 1 WHERE ROWID = 1000", Int64.max)
++  let store = try MessageStore(connection: db, path: dir.appendingPathComponent("chat.db").path)
++  let state = PersonaStackRPCState()
++  db.trace { state.trace($0) }
++  let output = PersonaStackRPCOutput()
++  let server = RPCServer(store: store, verbose: false, output: output,
++    sendPersonaStackMessage: { options, account in #expect(account == "local-account"); state.sent(options) },
++    sendMessage: { _ in state.count("upstreamProcessSend"); throw PersonaStackReadFailure.sourceUnavailable },
++    resolveSentMessage: { _, _, _, _ in state.count("unboundedReceipt"); throw PersonaStackReadFailure.sourceUnavailable },
++    invokeBridge: { _, _ in state.count("bridgeIPC"); throw PersonaStackReadFailure.sourceUnavailable },
++    isBridgeReady: { state.count("bridgeReady"); return true }, contactResolver: PersonaStackContactSpy(state))
++  let line = #"{"jsonrpc":"2.0","id":"send","method":"personastack.send","params":{"chat_id":"1","chat_guid":"iMessage;-;test","expected_account_id":"local-account","text":"new explicit message"}}"#
++  _ = await server.handleLine(line)
++  #expect(output.errors.isEmpty)
++  #expect(state.countFor("send") == 1)
++  #expect(state.countFor("unboundedReceipt") == 0)
++  #expect(state.countFor("upstreamProcessSend") == 0)
++  #expect(state.countFor("bridgeIPC") == 0)
++  #expect(state.countFor("bridgeReady") == 0)
++  #expect(state.countFor("contacts") == 0)
++  #expect(state.options?.chatGUID == "iMessage;-;test")
++  #expect(state.options?.service == .imessage)
++  #expect(state.options?.allowSMSFallback == false)
++  #expect(state.options?.attachmentPath.isEmpty == true)
++  #expect(output.results.first?["submitted"] as? Bool == true)
++  #expect(output.results.first?["guid"] == nil)
++  #expect(output.results.first?["message_id"] == nil)
++  #expect(!state.queries.contains { $0.contains("m.text") || $0.contains("attributedBody") })
++}
++
++@Test func personaStackPrivateSendRejectsTransportOverridesAndChangedChatBeforeDispatch() async throws {
++  let (dir, _, store) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  let cases: [[String: Any]] = [
++    ["chat_id": "1", "chat_guid": "iMessage;-;test", "expected_account_id": "local-account", "text": "hello", "transport": "bridge"],
++    ["chat_id": "1", "chat_guid": "changed-guid", "expected_account_id": "local-account", "text": "hello"],
++    ["chat_id": "1", "chat_guid": "iMessage;-;test", "expected_account_id": "local-account", "text": "hello", "allow_sms_fallback": true]
++  ]
++  for params in cases {
++    let state = PersonaStackRPCState()
++    let output = PersonaStackRPCOutput()
++    let server = RPCServer(store: store, verbose: false, output: output, sendPersonaStackMessage: { options, account in #expect(account == "local-account"); state.sent(options) })
++    let data = try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": "denied", "method": "personastack.send", "params": params])
++    _ = await server.handleLine(String(decoding: data, as: UTF8.self))
++    #expect(output.errors.count == 1)
++    #expect(state.countFor("send") == 0)
++  }
++}
++
++@Test func personaStackPrivateStatusDegradesWithoutPrivateFallbackWhenDatabaseIsMissing() async throws {
++  let output = PersonaStackRPCOutput()
++  let state = PersonaStackRPCState()
++  let server = RPCServer(databasePath: "/nonexistent/personastack-synthetic-chat.db", verbose: false, output: output,
++    invokeBridge: { _, _ in state.count("bridgeIPC"); throw PersonaStackReadFailure.sourceUnavailable },
++    isBridgeReady: { state.count("bridgeReady"); return true }, contactResolver: PersonaStackContactSpy(state))
++  _ = await server.handleLine(#"{"jsonrpc":"2.0","id":"status","method":"personastack.status","params":{}}"#)
++  #expect(output.errors.isEmpty)
++  #expect((output.results.first?["database"] as? [String: Bool])?["ready"] == false)
++  #expect(output.results.first?["methods"] as? [String] == ["personastack.initialize", "personastack.status"])
++  #expect(state.countFor("bridgeReady") == 0)
++  #expect(state.countFor("bridgeIPC") == 0)
++  #expect(state.countFor("contacts") == 0)
++}
++
++@Test func personaStackInProcessAppleScriptKeepsTextInTypedArguments() throws {
++  let payload = "hello\" & do shell script \"unexpected\"\n😀"
++  let invocation = try PersonaStackAppleScriptTransport.prepare(MessageSendOptions(
++    recipient: "", text: payload, service: .imessage, chatGUID: "iMessage;-;test", allowSMSFallback: false), expectedAccountID: "local-account")
++  #expect(invocation.arguments == ["iMessage;-;test", payload, "local-account"])
++  #expect(!invocation.source.contains(payload))
++  #expect(!invocation.source.contains("do shell script"))
++  #expect(invocation.source.contains("send messageText to targetChat"))
++}
++
++@Test func personaStackInProcessAppleScriptRejectsAnyAlternateRouteBeforeExecution() throws {
++  var options = MessageSendOptions(recipient: "", text: "hello", service: .imessage,
++                                  chatGUID: "iMessage;-;test", allowSMSFallback: false)
++  options.allowSMSFallback = true
++  #expect(throws: DeliveryFailure.self) { try PersonaStackAppleScriptTransport.prepare(options, expectedAccountID: "local-account") }
++  options.allowSMSFallback = false
++  options.recipient = "new-recipient"
++  #expect(throws: DeliveryFailure.self) { try PersonaStackAppleScriptTransport.prepare(options, expectedAccountID: "local-account") }
++}
++
++#if !os(macOS)
++  @Test func personaStackInProcessAppleScriptFailsBeforeDispatchOnOtherPlatforms() async {
++    do {
++      try await PersonaStackAppleScriptTransport.send(MessageSendOptions(recipient: "", text: "hello",
++        service: .imessage, chatGUID: "iMessage;-;test", allowSMSFallback: false), expectedAccountID: "local-account")
++      Issue.record("Messages transport unexpectedly executed on another platform")
++    } catch let error as DeliveryFailure {
++      #expect(error.disposition == .notStarted)
++      #expect(error.retrySafe)
++    } catch { Issue.record("Unexpected transport error") }
++  }
++#endif
++
++@Test func personaStackInProcessAppleScriptFencesLiveChatAndAccountBeforeDispatch() throws {
++  let invocation = try PersonaStackAppleScriptTransport.prepare(MessageSendOptions(recipient: "", text: "hello",
++    service: .imessage, chatGUID: "iMessage;-;test", allowSMSFallback: false), expectedAccountID: "local-account")
++  let dispatch = try #require(invocation.source.range(of: "set dispatchStarted to true"))
++  for check in ["if (id of targetChat) is not chatGUID", "set targetAccount to account of targetChat", "if (id of targetAccount) is not expectedAccountID",
++                "if (service type of targetAccount) is not iMessage", "if (enabled of targetAccount) is not true",
++                "if (connection status of targetAccount) is not connected"] {
++    let guardRange = try #require(invocation.source.range(of: check))
++    #expect(guardRange.lowerBound < dispatch.lowerBound)
++  }
++  #expect(invocation.source.contains("considering case"))
++  #expect(invocation.source.contains(#"tell application "/System/Applications/Messages.app""#))
++}
++
++@Test func personaStackRequiredPublicAccountIdentityCannotBeEmptyOrControlled() throws {
++  let options = MessageSendOptions(recipient: "", text: "hello", service: .imessage,
++                                   chatGUID: "iMessage;-;test", allowSMSFallback: false)
++  for invalid in ["", "account\nother", "account\u{0}other", String(repeating: "a", count: 257)] {
++    #expect(throws: DeliveryFailure.self) { try PersonaStackAppleScriptTransport.prepare(options, expectedAccountID: invalid) }
++  }
++  let invocation = try PersonaStackAppleScriptTransport.prepare(options, expectedAccountID: "local-account")
++  #expect(invocation.arguments[2] == "local-account")
++  let check = try #require(invocation.source.range(of: "if (id of targetAccount) is not expectedAccountID"))
++  let dispatch = try #require(invocation.source.range(of: "set dispatchStarted to true"))
++  #expect(check.lowerBound < dispatch.lowerBound)
++}
++
++@Test func personaStackDocumentedSemanticParityMatrixMatchesBoundedSupportedContent() throws {
++  for scenario in ["normal", "outgoing", "unmatched-url", "matched-url", "tombstone"] {
++    let (dir, db, store) = try personaStackFixture()
++    defer { try? FileManager.default.removeItem(at: dir) }
++    let url = "https://example.com"
++    try insertPersonaStackMessage(db, row: 1, text: scenario == "matched-url" ? "Look at \(url)" : "hello")
++    if scenario == "outgoing" {
++      try db.run("UPDATE message SET is_from_me = 1, destination_caller_id = 'local-account'")
++    }
++    if scenario == "unmatched-url" {
++      try db.run("UPDATE message SET balloon_bundle_id = ?, text = ?", MessageStore.urlPreviewBalloonBundleID, url)
++    }
++    if scenario == "matched-url" {
++      try insertPersonaStackMessage(db, row: 2, text: url)
++      try db.run("UPDATE message SET balloon_bundle_id = ? WHERE ROWID = 2", MessageStore.urlPreviewBalloonBundleID)
++    }
++    if scenario == "tombstone" { try db.run("UPDATE message SET date_retracted = 2000000000") }
++    let upstream = try store.messagesAfterPage(afterRowID: 0, chatID: 1, limit: 100)
++    let actual = try store.personaStackReceive(chatID: 1, after: 0)
++    #expect(actual.messages.map { "\($0.guid)|\($0.text)|\($0.sender)" } == upstream.messages.map { "\($0.guid)|\($0.text)|\($0.sender)" })
++  }
++}
++
++@Test func personaStackUnmatchedURLAndMatchedPageBoundaryRemainSafe() throws {
++  let (dir, db, store) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  try insertPersonaStackMessage(db, row: 1, text: "Look https://example.com")
++  try insertPersonaStackMessage(db, row: 2, text: "https://example.com")
++  try insertPersonaStackMessage(db, row: 3, text: "https://different.example")
++  try db.run("UPDATE message SET balloon_bundle_id = ? WHERE ROWID IN (2, 3)", MessageStore.urlPreviewBalloonBundleID)
++  let first = try store.personaStackReceive(chatID: 1, after: 0, limit: 1)
++  #expect(first.messages.map(\.guid) == ["guid-1"])
++  #expect(first.next_rowid == "2")
++  let second = try store.personaStackReceive(chatID: 1, after: 2)
++  #expect(second.messages.map(\.text) == ["https://different.example"])
++  #expect(try store.personaStackReceive(chatID: 1, after: 1).messages.map(\.guid) == ["guid-3"])
++  #expect(try store.personaStackRecent(chatID: 1).messages.map(\.guid) == ["guid-1", "guid-3"])
++}
++
++@Test func personaStackSenderMatrixNeverReportsRecipientAsLocalIdentity() throws {
++  let (dir, db, store) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  for row in 1...5 { try insertPersonaStackMessage(db, row: Int64(row)) }
++  try db.run("UPDATE message SET destination_caller_id = 'local-account' WHERE ROWID IN (1, 2, 4, 5)")
++  try db.run("UPDATE message SET is_from_me = 1 WHERE ROWID IN (2, 3, 4)")
++  try db.run("UPDATE message SET handle_id = NULL WHERE ROWID IN (4, 5)")
++  let page = try store.personaStackReceive(chatID: 1, after: 0)
++  #expect(page.messages.map(\.sender) == ["+15550000001", "local-account", "", "local-account", ""])
++}
++
++@Test func personaStackMissingLocalIdentityColumnIsExplicitlyUnknown() throws {
++  let (dir, db, _) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  try insertPersonaStackMessage(db, row: 1)
++  try db.run("UPDATE message SET is_from_me = 1")
++  try db.run("ALTER TABLE message DROP COLUMN destination_caller_id")
++  let store = try MessageStore(path: dir.appendingPathComponent("chat.db").path)
++  #expect(try store.personaStackReceive(chatID: 1, after: 0).messages.first?.sender == "")
++}
++
++@Test func personaStackUnavailableConversationAndUnsentBoundaryAreExplicit() throws {
++  let (dir, db, store) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  try insertPersonaStackMessage(db, row: 1, text: "prior text")
++  try db.run("UPDATE message SET date_retracted = 2000000000")
++  #expect(try store.personaStackRecent(chatID: 1).messages.first?.text == "")
++  #expect(try store.personaStackCheckpoint(chatIDs: [1, 999]).chats.map(\.available) == [true, false])
++  #expect(throws: PersonaStackReadFailure.sourceUnavailable) { try store.personaStackReceive(chatID: 999, after: 0) }
++  #expect(try store.personaStackReceive(chatID: 1, after: 1).messages.isEmpty)
++}
++
++@Test func personaStackPrivateSendRequiresBoundedAccountBeforeAnyProtectedRead() async throws {
++  let (dir, db, _) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  let store = try MessageStore(connection: db, path: dir.appendingPathComponent("chat.db").path)
++  let state = PersonaStackRPCState()
++  db.trace { state.trace($0) }
++  for account in [nil, "", "account\nother", String(repeating: "a", count: 257)] as [String?] {
++    let output = PersonaStackRPCOutput()
++    let server = RPCServer(store: store, verbose: false, output: output,
++      sendPersonaStackMessage: { _, _ in state.count("send") })
++    var params: [String: Any] = ["chat_id": "1", "chat_guid": "iMessage;-;test", "text": "hello"]
++    params["expected_account_id"] = account
++    let data = try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": "denied", "method": "personastack.send", "params": params])
++    _ = await server.handleLine(String(decoding: data, as: UTF8.self))
++    #expect(output.errors.count == 1)
++  }
++  #expect(state.countFor("send") == 0)
++  #expect(state.queries.isEmpty)
++}
++
++@Test func personaStackURLProofSharesPhysicalBudgetAndNeverConsumesDeferredRow() throws {
++  let (dir, db, store) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  try db.transaction {
++    for row in 1...509 { try insertPersonaStackMessage(db, row: Int64(row), service: "SMS") }
++    try insertPersonaStackMessage(db, row: 510, text: "https://example.com")
++    try insertPersonaStackMessage(db, row: 511, text: "https://example.com")
++    try insertPersonaStackMessage(db, row: 512, text: "https://different.example")
++    try db.run("UPDATE message SET balloon_bundle_id = ? WHERE ROWID IN (511, 512)", MessageStore.urlPreviewBalloonBundleID)
++  }
++  let first = try store.personaStackReceive(chatID: 1, after: 0)
++  #expect(first.next_rowid == "511")
++  #expect(first.messages.map(\.guid) == ["guid-510"])
++  #expect(first.stop_reason == .scanLimit)
++  #expect(first.has_more)
++  let resumed = try store.personaStackReceive(chatID: 1, after: 511)
++  #expect(resumed.messages.map(\.guid) == ["guid-512"])
++  #expect(resumed.next_rowid == "512")
++}
++
++@Test func personaStackChatMetadataRefreshesExactOrderWithoutMessageOrInventoryQueries() throws {
++  let (dir, db, _) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  try db.run("ALTER TABLE chat ADD COLUMN account_id TEXT")
++  try db.run("ALTER TABLE chat ADD COLUMN account_login TEXT")
++  try db.run("UPDATE chat SET display_name = 'Renamed', guid = 'iMessage;+;group', account_id = 'hint-only', account_login = 'login-hint' WHERE ROWID = 1")
++  try db.run("INSERT INTO handle VALUES(2, '+15550000002')")
++  try db.run("INSERT INTO chat_handle_join VALUES(1, 2)")
++  try db.run("INSERT INTO chat(ROWID,chat_identifier,guid,display_name,service_name) VALUES(9007199254740993,'other','iMessage;-;exact','Exact','iMessage')")
++  try insertPersonaStackMessage(db, row: 1)
++  try db.run("UPDATE message SET text = CAST(zeroblob(2097152) AS TEXT)")
++  let store = try MessageStore(connection: db, path: dir.appendingPathComponent("chat.db").path)
++  let state = PersonaStackRPCState()
++  db.trace { state.trace($0) }
++  let result = try store.personaStackChatMetadata(chatIDs: [9_007_199_254_740_993, 1])
++  #expect(result.chats.map(\.id) == ["9007199254740993", "1"])
++  #expect(result.chats[1].name == "Renamed")
++  #expect(result.chats[1].participants == ["+15550000001", "+15550000002"])
++  #expect(result.chats[1].is_group)
++  #expect(result.chats[1].account_id == "hint-only")
++  #expect(result.chats[1].account_login == "login-hint")
++  #expect(try JSONEncoder().encode(result).count <= 1 << 20)
++  #expect(!state.queries.contains { $0.contains("message") || $0.contains("MAX(") })
++}
++
++@Test func personaStackChatMetadataUnavailableResultsKeepExactRequestedCardinality() throws {
++  let (dir, db, store) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  try db.run("INSERT INTO chat VALUES(3, 'large', 'iMessage;-;large', ?, 'iMessage')", String(repeating: "x", count: 257))
++  try db.run("INSERT INTO chat VALUES(4, 'members', 'iMessage;+;members', 'Members', 'iMessage')")
++  try db.transaction {
++    for value in 2...102 {
++      try db.run("INSERT INTO handle VALUES(?, ?)", value, "participant-\(value)")
++      try db.run("INSERT INTO chat_handle_join VALUES(4, ?)", value)
++    }
++  }
++  try db.run("INSERT INTO chat VALUES(5, 'invalid', '', 'Missing GUID', 'iMessage')")
++  try db.run("INSERT INTO chat VALUES(6, 'invalid', 'iMessage;-;empty-handle', 'Missing participant', 'iMessage')")
++  try db.run("INSERT INTO handle VALUES(103, '')")
++  try db.run("INSERT INTO chat_handle_join VALUES(6, 103)")
++  let result = try store.personaStackChatMetadata(chatIDs: [999, 2, 3, 4, 5, 6, 1])
++  #expect(result.chats.map(\.id) == ["999", "2", "3", "4", "5", "6", "1"])
++  for chat in result.chats.prefix(6) {
++    #expect(!chat.available && !chat.is_group)
++    #expect(chat.guid.isEmpty && chat.name.isEmpty && chat.service.isEmpty && chat.participants.isEmpty)
++    #expect(chat.account_id == nil && chat.account_login == nil)
++  }
++  #expect(result.chats[6].available)
++}
++
++@Test func personaStackChatMetadataSharesPhysicalBudgetAndNeverReturnsPartialSuccess() async throws {
++  let (dir, db, store) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  try db.transaction {
++    for chat in 3...8 {
++      try db.run("INSERT INTO chat VALUES(?, 'group', ?, 'Group', 'iMessage')", chat, "iMessage;+;\(chat)")
++      for member in 1...100 { try db.run("INSERT INTO chat_handle_join VALUES(?, ?)", chat, member) }
++    }
++    for member in 2...100 { try db.run("INSERT INTO handle VALUES(?, ?)", member, "participant-\(member)") }
++  }
++  #expect(try store.personaStackChatMetadata(chatIDs: [3, 4, 5, 6, 7]).chats.count == 5)
++  #expect(throws: PersonaStackReadFailure.payloadTooLarge) { try store.personaStackChatMetadata(chatIDs: [3, 4, 5, 6, 7, 8]) }
++  let output = PersonaStackRPCOutput()
++  let server = RPCServer(store: store, verbose: false, output: output)
++  _ = await server.handleLine(#"{"jsonrpc":"2.0","id":"bounded","method":"personastack.chatMetadata","params":{"chat_ids":["3","4","5","6","7","8"]}}"#)
++  #expect(output.results.isEmpty)
++  #expect(output.errors.count == 1)
++}
++
++@Test func personaStackChatMetadataRPCCatalogAndValidationAreFinite() async throws {
++  let (dir, _, store) = try personaStackFixture()
++  defer { try? FileManager.default.removeItem(at: dir) }
++  let cases: [[String: Any]] = [[:], ["chat_ids": []], ["chat_ids": ["0"]], ["chat_ids": ["01"]],
++    ["chat_ids": ["9223372036854775808"]], ["chat_ids": ["1", "1"]], ["chat_ids": [1]],
++    ["chat_ids": (1...33).map(String.init)], ["chat_ids": ["1"], "query": "unexpected"]]
++  for params in cases {
++    let output = PersonaStackRPCOutput()
++    let server = RPCServer(store: store, verbose: false, output: output)
++    let data = try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": "invalid", "method": "personastack.chatMetadata", "params": params])
++    _ = await server.handleLine(String(decoding: data, as: UTF8.self))
++    #expect(output.results.isEmpty)
++    #expect(output.errors.first?["code"] as? Int == -32602)
++  }
++  let output = PersonaStackRPCOutput()
++  let server = RPCServer(store: store, verbose: false, output: output)
++  _ = await server.handleLine(#"{"jsonrpc":"2.0","id":"metadata","method":"personastack.chatMetadata","params":{"chat_ids":["1","999"]}}"#)
++  #expect(output.errors.isEmpty)
++  let chats = try #require(output.results.first?["chats"] as? [[String: Any]])
++  #expect(chats.compactMap { $0["id"] as? String } == ["1", "999"])
++  _ = await server.handleLine(#"{"jsonrpc":"2.0","id":"ready","method":"personastack.initialize","params":{}}"#)
++  #expect(output.results.last?["personastack_adapter_revision"] as? Int == 2)
++  #expect((output.results.last?["methods"] as? [String])?.contains("personastack.chatMetadata") == true)
++  #expect(try store.personaStackCheckpoint(chatIDs: [1]).adapter_revision == 2)
++}

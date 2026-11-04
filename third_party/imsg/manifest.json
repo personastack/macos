@@ -1,0 +1,87 @@
+{
+  "upstream_repository": "https://github.com/openclaw/imsg",
+  "upstream_version": "0.19.1",
+  "upstream_commit": "41de9c8b58ffbff2beff9ce3992192d5c11a753e",
+  "source_archive_url": "https://codeload.github.com/openclaw/imsg/tar.gz/41de9c8b58ffbff2beff9ce3992192d5c11a753e",
+  "source_archive_sha256": "83d3dd3e76d1bc45c9dc6f5b04bb864de92b111c9af6a82f904c69f23dce8fb5",
+  "source_archive_max_bytes": 16777216,
+  "license": "MIT",
+  "adapter_revision": 2,
+  "patches": [
+    {
+      "path": "patches/0001-personastack-bounded-rpc.patch",
+      "sha256": "1b6dc9f7156a697fc56a2c6965707db0e19c37b4bd1aab058426ef8d2813eef2"
+    }
+  ],
+  "package_resolved_sha256": "0dc6bce82fa541a21646448585f859130655e9bfeb1b8b1ce2bd0cfc2d64fd6f",
+  "artifact_status": "not_built",
+  "artifact_sha256": null,
+  "production_qualified": false,
+  "build_swift_tools_version": "6.2",
+  "notices": {
+    "imsg-MIT-LICENSE.txt": {
+      "path": "LICENSE",
+      "sha256": "14293556b79940745123d0160c71d27ed0e9fe9b8a848093f3ed78f4853caafe",
+      "sources": [
+        {
+          "component": "imsg",
+          "version": "0.19.1",
+          "revision": "41de9c8b58ffbff2beff9ce3992192d5c11a753e",
+          "url": "https://raw.githubusercontent.com/openclaw/imsg/41de9c8b58ffbff2beff9ce3992192d5c11a753e/LICENSE"
+        },
+        {
+          "component": "Commander",
+          "version": "0.3.0",
+          "revision": "3f5a3cb1f19ce7ca79fdc2111a09dfb3da200c1c",
+          "url": "https://raw.githubusercontent.com/steipete/Commander/3f5a3cb1f19ce7ca79fdc2111a09dfb3da200c1c/LICENSE"
+        }
+      ]
+    },
+    "imsg-PhoneNumberKit-MIT-LICENSE.txt": {
+      "path": "licenses/PhoneNumberKit-MIT-LICENSE.txt",
+      "sha256": "e6f07569b53be94c65ac14a1b87f7292dad4076da49b934ca0ee1c1e1007852b",
+      "sources": [
+        {
+          "component": "PhoneNumberKit",
+          "version": "5.0.12",
+          "revision": "df3bcccd1d88ba96fb89cccf51b84b7b6f7f53fe",
+          "url": "https://raw.githubusercontent.com/PhoneNumberKit/PhoneNumberKit/df3bcccd1d88ba96fb89cccf51b84b7b6f7f53fe/LICENSE"
+        }
+      ]
+    },
+    "imsg-SQLite.swift-MIT-LICENSE.txt": {
+      "path": "licenses/SQLite.swift-MIT-LICENSE.txt",
+      "sha256": "54309d83b514af75deacb70285d5debe8c74ddfd7ca2d1990ae14a0255aceeba",
+      "sources": [
+        {
+          "component": "SQLite.swift",
+          "version": "0.17.0",
+          "revision": "4114679379eeb4538638f49ec14e1854dd9cf73c",
+          "url": "https://raw.githubusercontent.com/stephencelis/SQLite.swift/4114679379eeb4538638f49ec14e1854dd9cf73c/LICENSE.txt"
+        }
+      ]
+    },
+    "imsg-libphonenumber-APACHE-LICENSE.txt": {
+      "path": "licenses/libphonenumber-APACHE-LICENSE.txt",
+      "sha256": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9",
+      "sources": [
+        {
+          "component": "libphonenumber metadata",
+          "version": "9.0.41",
+          "revision": "b68df884d42d5e9860fc1956a99ce6afae361100",
+          "url": "https://raw.githubusercontent.com/google/libphonenumber/b68df884d42d5e9860fc1956a99ce6afae361100/LICENSE"
+        }
+      ]
+    }
+  },
+  "metadata_provenance": {
+    "component": "libphonenumber",
+    "version": "9.0.41",
+    "revision": "b68df884d42d5e9860fc1956a99ce6afae361100",
+    "source_path": "resources/PhoneNumberMetadata.xml",
+    "source_sha256": "9d3b07b53c7e8a437ddc316249620b51d4090987026f9e8ffb9743aab4e4d5a6",
+    "copyright": "Copyright (C) 2009 The Libphonenumber Authors",
+    "notice_file": null,
+    "packaged_resource_sha256": "045511d60a104d55e95045946b58ff9578dde512b8ae2a84f730b5f069525f4a"
+  }
+}

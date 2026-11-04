@@ -67,6 +67,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 #if DEBUG
     private var proxyFactoryForTesting: ((CuaDriverInstallation, URL, Int32) -> CuaMCPProxy)?
     private var reconnectAttemptForTesting: (() async throws -> Void)?
+    private var scheduleReconnectForTesting = true
     private var beforeCuaPublicationForTesting: (() async -> Void)?
 #endif
     private var cuaStartup: (id: UUID, task: Task<Void, Error>)?
@@ -83,7 +84,19 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private var executor = DesktopControlCommandExecutor()
     private var lifecycleGeneration = UUID()
     private var lockGeneration = UUID()
-    private var setupMayRunUnconfigured = false
+    // Connection intent never grants provider or workspace authorization.
+    private var desktopControlSetupGeneration: UUID?
+    private struct IMessageSetupRelayIntent: Equatable {
+        let localGeneration: UUID
+        let setupReferenceSHA256: String
+        let journeyGeneration: Int64
+        let expiresAt: Date
+    }
+    private var iMessageSetupIntent: IMessageSetupRelayIntent?
+    private var relayConfigurationState: DesktopControlConfigurationState?
+    private var relayAuthorityReadSucceeded = false
+    private var relayStateReadID = UUID()
+    private var relayNow: () -> Date = Date.init
     private var disconnecting = false
     private var environmentSwitchPending = false
     private var repairInProgress = false
@@ -444,14 +457,21 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     func resume(generation: UUID) async throws {
         try requireCurrentLifecycle(generation)
         guard !disconnecting, !environmentSwitchPending else { throw CancellationError() }
-        setupMayRunUnconfigured = false
+        desktopControlSetupGeneration = nil
         guard let installation = try await savedInstallationForStartup(generation: generation) else {
             throw DesktopControlEnrollmentError.installationMissing
         }
         if await stopIfNoActiveConfiguration(installation: installation, generation: generation) { return }
         try requireCurrentLifecycle(generation)
         guard !disconnecting else { return }
-        try await startCua(startPaused: false, generation: generation)
+        paused = false
+        if desktopControlStartupIntended {
+            try await startCua(startPaused: false, generation: generation)
+        } else {
+            await stopInactiveDesktopControl(generation: generation)
+            try requireCurrentLifecycle(generation)
+            await connect(installation: installation, expectedGeneration: generation)
+        }
     }
 
     func resumeForSetup(generation: UUID) async throws {
@@ -459,8 +479,82 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         guard !disconnecting, !environmentSwitchPending else { throw CancellationError() }
         guard sessionLock.isAwakeAndActive else { throw CancellationError() }
         try requireCurrentLifecycle(generation)
-        setupMayRunUnconfigured = true
+        desktopControlSetupGeneration = generation
         try await startCua(startPaused: false, generation: generation)
+    }
+
+    /// Only the authenticated native coordinator may supply the API journey receipt.
+    /// This intent keeps setup metadata transport alive. It grants no provider access.
+    func resumeForIMessageSetup(generation: UUID, setupReferenceSHA256: String,
+                               journeyGeneration: Int64, expiresAt: Date) async throws {
+        try requireCurrentLifecycle(generation)
+        let now = relayNow()
+        guard !disconnecting, !environmentSwitchPending, sessionLock.isAwakeAndActive,
+              Self.isCanonicalSetupReferenceDigest(setupReferenceSHA256), journeyGeneration > 0,
+              expiresAt > now, expiresAt.timeIntervalSince(now) <= 24 * 60 * 60 else {
+            throw DesktopControlEnrollmentError.invalidRequest
+        }
+        if let current = iMessageSetupIntent, current.setupReferenceSHA256 == setupReferenceSHA256 {
+            guard expiresAt == current.expiresAt, journeyGeneration >= current.journeyGeneration else {
+                throw DesktopControlEnrollmentError.invalidRequest
+            }
+        }
+        guard let installation = try await savedInstallationForStartup(generation: generation) else {
+            throw DesktopControlEnrollmentError.installationMissing
+        }
+        try requireCurrentLifecycle(generation)
+        let configuration = try configurationProvider()
+        try installation.requireEnvironment(configuration.appPageURL, configuration: configuration)
+        guard expiresAt > relayNow() else { throw DesktopControlEnrollmentError.invalidRequest }
+        if let current = iMessageSetupIntent, current.setupReferenceSHA256 == setupReferenceSHA256 {
+            guard expiresAt == current.expiresAt, journeyGeneration >= current.journeyGeneration else {
+                throw DesktopControlEnrollmentError.invalidRequest
+            }
+        }
+        iMessageSetupIntent = IMessageSetupRelayIntent(localGeneration: generation,
+            setupReferenceSHA256: setupReferenceSHA256, journeyGeneration: journeyGeneration, expiresAt: expiresAt)
+        // Do not touch CUA, Desktop Control pause, or another family's setup intent.
+        await connect(installation: installation, expectedGeneration: generation)
+    }
+
+    func finishIMessageSetupIfIdle(generation: UUID, setupReferenceSHA256: String,
+                                  journeyGeneration: Int64, expiresAt: Date) async throws {
+        guard !disconnecting, !environmentSwitchPending else { throw CancellationError() }
+        let receipt = IMessageSetupRelayIntent(localGeneration: generation,
+            setupReferenceSHA256: setupReferenceSHA256, journeyGeneration: journeyGeneration, expiresAt: expiresAt)
+        guard iMessageSetupIntent == receipt else { return }
+        iMessageSetupIntent = nil
+        // A Desktop Control pause/resume may have advanced the shared lifecycle.
+        // The exact iMessage receipt fences release independently of that family.
+        try await reconcileRelayIntent(generation: lifecycleGeneration)
+    }
+
+    private static func isCanonicalSetupReferenceDigest(_ value: String) -> Bool {
+        guard value.utf8.count == 43,
+              value.utf8.allSatisfy({ (65...90).contains($0) || (97...122).contains($0)
+                  || (48...57).contains($0) || $0 == 45 || $0 == 95 }),
+              let data = Data(base64Encoded: value.replacingOccurrences(of: "-", with: "+")
+                  .replacingOccurrences(of: "_", with: "/") + "="), data.count == 32 else { return false }
+        return data.base64EncodedString().replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "") == value
+    }
+
+    private var desktopControlConnectionIntended: Bool {
+        desktopControlSetupGeneration != nil || relayConfigurationState?.hasActiveConfig == true
+            || relayStateReader == nil || (relayConfigurationState == nil && (proxy != nil || startingProxy != nil))
+    }
+
+    private var desktopControlStartupIntended: Bool {
+        desktopControlSetupGeneration != nil || relayStateReader == nil
+            || (relayAuthorityReadSucceeded && relayConfigurationState?.hasActiveConfig == true)
+    }
+
+    private var temporaryRelayConnectionIntended: Bool {
+        desktopControlSetupGeneration != nil || iMessageSetupIntent.map { $0.expiresAt > relayNow() } == true
+    }
+
+    private var relayConnectionIntended: Bool {
+        temporaryRelayConnectionIntended || relayConfigurationState?.hasActiveRelayCapability == true
     }
 
     func beginRepair(expectedGeneration: UUID? = nil) throws -> UUID {
@@ -484,7 +578,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private func startPaused(generation: UUID) async throws {
         try requireCurrentLifecycle(generation)
         guard !disconnecting, !environmentSwitchPending else { throw CancellationError() }
-        setupMayRunUnconfigured = false
+        desktopControlSetupGeneration = nil
         guard let installation = try await savedInstallationForStartup(generation: generation) else {
             throw DesktopControlEnrollmentError.installationMissing
         }
@@ -555,7 +649,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         lifecycleGeneration = UUID()
         let generation = lifecycleGeneration
         disconnecting = true
-        setupMayRunUnconfigured = false
+        desktopControlSetupGeneration = nil
+        iMessageSetupIntent = nil
+        relayConfigurationState = nil
+        relayAuthorityReadSucceeded = false
         reconnectTask?.cancel()
         reconnectTask = nil
         gatewayAttemptID = UUID()
@@ -582,7 +679,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         disconnecting = true
         environmentSwitchPending = true
         lastSuccessfulConnection = nil
-        setupMayRunUnconfigured = false
+        desktopControlSetupGeneration = nil
+        iMessageSetupIntent = nil
+        relayConfigurationState = nil
+        relayAuthorityReadSucceeded = false
         reconnectTask?.cancel()
         reconnectTask = nil
         gatewayAttemptID = UUID()
@@ -631,6 +731,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         guard !disconnecting else { throw CancellationError() }
         disconnecting = true
         lifecycleGeneration = UUID()
+        desktopControlSetupGeneration = nil
+        iMessageSetupIntent = nil
+        relayConfigurationState = nil
+        relayAuthorityReadSucceeded = false
         paused = true
         readiness = "paused"
         return lifecycleGeneration
@@ -725,6 +829,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func beginReconnectLoop(for installation: DesktopControlInstallation) {
+#if DEBUG
+        guard scheduleReconnectForTesting else { return }
+#endif
         guard !environmentSwitchPending, reconnectTask == nil else { return }
         activeInstallation = installation
         let loopID = UUID()
@@ -760,21 +867,23 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private func reconnectIfNeeded(_ installation: DesktopControlInstallation, loopID: UUID) async -> Bool {
         let connected = await gateway?.isConnected() ?? false
         guard !Task.isCancelled, reconnectLoopID == loopID, !disconnecting else { return false }
-        if connected { return true }
         let generation = lifecycleGeneration
-        if !setupMayRunUnconfigured {
-            do {
-                let hasActiveConfig = try await hasActiveConfig(for: installation)
-                guard !Task.isCancelled, reconnectLoopID == loopID, !disconnecting else { return false }
-                guard generation == lifecycleGeneration else { return true }
-                if !hasActiveConfig {
-                    try? await stopIdleRelay(expectedLifecycle: generation)
-                    return false
-                }
-            } catch {
-                // Preserve retries when configuration authority is temporarily unreachable.
+        do {
+            _ = try await refreshRelayConfiguration(installation: installation, generation: generation)
+            guard !Task.isCancelled, reconnectLoopID == loopID, !disconnecting else { return false }
+            guard generation == lifecycleGeneration else { return true }
+            if !relayConnectionIntended {
+                try? await stopIdleRelay(expectedLifecycle: generation)
+                return false
             }
+            if !desktopControlConnectionIntended {
+                await stopInactiveDesktopControl(generation: generation)
+            }
+        } catch {
+            // Authority failure preserves the shared socket and retries. It cannot start CUA.
+            _ = temporaryRelayConnectionIntended
         }
+        if connected { return true }
         guard !Task.isCancelled, reconnectLoopID == loopID, !disconnecting else { return false }
         guard generation == lifecycleGeneration else { return true }
         do {
@@ -907,7 +1016,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         guard !disconnecting, !environmentSwitchPending else { throw CancellationError() }
         let generation = lifecycleGeneration
         let configuration = try configurationProvider()
-        setupMayRunUnconfigured = false
+        desktopControlSetupGeneration = nil
         let saved = try await readSavedInstallation()
         try Task.checkCancellation()
         guard generation == lifecycleGeneration, !disconnecting, !environmentSwitchPending,
@@ -918,19 +1027,22 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             try await stopIdleRelay(expectedLifecycle: generation)
             return
         }
-        let hasActiveConfig = try await hasActiveConfig(for: installation)
+        let state = try await refreshRelayConfiguration(installation: installation, generation: generation)
         try Task.checkCancellation()
         guard generation == lifecycleGeneration, !disconnecting, !environmentSwitchPending,
               try configurationProvider() == configuration else { throw CancellationError() }
-        if !hasActiveConfig { try await stopIdleRelay(expectedLifecycle: generation) }
+        if !state.hasActiveRelayCapability && !temporaryRelayConnectionIntended {
+            try await stopIdleRelay(expectedLifecycle: generation)
+        } else if !desktopControlConnectionIntended {
+            await stopInactiveDesktopControl(generation: generation)
+        }
     }
 
     private func stopIfNoActiveConfiguration(installation: DesktopControlInstallation, generation: UUID) async -> Bool {
-        guard let relayStateReader else { return false }
         do {
-            let hasActiveConfig = try await relayStateReader.hasActiveConfig(installation: installation, appURL: LaunchConfiguration.selectedURL())
+            let state = try await refreshRelayConfiguration(installation: installation, generation: generation)
             guard generation == lifecycleGeneration else { return false }
-            if !hasActiveConfig {
+            if !state.hasActiveRelayCapability && !temporaryRelayConnectionIntended {
                 try? await stopIdleRelay(expectedLifecycle: generation)
                 return true
             }
@@ -1004,20 +1116,64 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         return saved
     }
 
-    private func hasActiveConfig(for installation: DesktopControlInstallation) async throws -> Bool {
-        guard let relayStateReader else { return true }
-        return try await relayStateReader.hasActiveConfig(installation: installation, appURL: LaunchConfiguration.selectedURL())
+    @discardableResult
+    private func refreshRelayConfiguration(installation: DesktopControlInstallation,
+                                           generation: UUID) async throws -> DesktopControlConfigurationState {
+        let configuration = try configurationProvider()
+        try installation.requireEnvironment(configuration.appPageURL, configuration: configuration)
+        let readID = UUID()
+        relayStateReadID = readID
+        let state: DesktopControlConfigurationState
+        if let relayStateReader {
+            do {
+                state = try await relayStateReader.configurationState(installation: installation, appURL: configuration.appPageURL)
+            } catch {
+                if generation == lifecycleGeneration, relayStateReadID == readID { relayAuthorityReadSucceeded = false }
+                throw error
+            }
+        } else {
+            state = .init(hasActiveConfig: true, hasConfig: true)
+        }
+        try Task.checkCancellation()
+        try requireCurrentLifecycle(generation)
+        guard !disconnecting, !environmentSwitchPending, relayStateReadID == readID,
+              try configurationProvider() == configuration,
+              activeInstallation == installation else { throw CancellationError() }
+        relayConfigurationState = state
+        relayAuthorityReadSucceeded = true
+        return state
+    }
+
+    private func reconcileRelayIntent(generation: UUID) async throws {
+        guard let installation = activeInstallation else {
+            if !temporaryRelayConnectionIntended { try await stopIdleRelay(expectedLifecycle: generation) }
+            return
+        }
+        _ = try await refreshRelayConfiguration(installation: installation, generation: generation)
+        if !relayConnectionIntended { try await stopIdleRelay(expectedLifecycle: generation) }
+        else if !desktopControlConnectionIntended { await stopInactiveDesktopControl(generation: generation) }
+    }
+
+    private func stopInactiveDesktopControl(generation: UUID) async {
+        guard generation == lifecycleGeneration, !desktopControlConnectionIntended else { return }
+        let wasPaused = paused
+        if cuaStartup != nil { try? await drainCuaStartup(generation: generation) }
+        guard generation == lifecycleGeneration, !desktopControlConnectionIntended else { return }
+        if proxy != nil || startingProxy != nil || executor.currentLease != nil || executor.needsSessionCleanup {
+            await stopLocalControl(generation: generation)
+        }
+        guard generation == lifecycleGeneration else { return }
+        paused = wasPaused
+        capabilitiesVerified = false
+        readiness = executorCleanupFailed ? "cua_unavailable" : (wasPaused ? "paused" : "unknown")
+        await gateway?.setReadiness(readiness)
     }
 
     private func reconcileRelayAfterConfigRevocation(connectionID: UUID) async {
-        guard gatewayConnectionID == connectionID, !disconnecting, !environmentSwitchPending,
-              !setupMayRunUnconfigured, let installation = activeInstallation else { return }
+        guard gatewayConnectionID == connectionID, !disconnecting, !environmentSwitchPending else { return }
         let generation = lifecycleGeneration
-        do {
-            let hasActiveConfig = try await hasActiveConfig(for: installation)
-            guard gatewayConnectionID == connectionID, generation == lifecycleGeneration else { return }
-            if !hasActiveConfig { try? await stopIdleRelay(expectedLifecycle: generation) }
-        } catch {
+        do { try await reconcileRelayIntent(generation: generation) }
+        catch {
             // A failed read must not stop a relay another workspace may still use.
         }
     }
@@ -1026,7 +1182,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         guard lifecycleGeneration == expectedLifecycle, !disconnecting, !environmentSwitchPending else { throw CancellationError() }
         lifecycleGeneration = UUID()
         let generation = lifecycleGeneration
-        setupMayRunUnconfigured = false
+        desktopControlSetupGeneration = nil
+        iMessageSetupIntent = nil
+        relayConfigurationState = nil
+        relayAuthorityReadSucceeded = false
         reconnectTask?.cancel()
         reconnectTask = nil
         gatewayAttemptID = UUID()
@@ -1266,6 +1425,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         guard !Task.isCancelled else { return nil }
         sessionLock.reconcile()
         let generation = lifecycleGeneration
+        guard desktopControlConnectionIntended else {
+            await stopInactiveDesktopControl(generation: generation)
+            return readiness
+        }
         if (executorCleanupFailed || executor.needsSessionCleanup) && !executorCleanupInProgress {
             if paused { await stopLocalControl(generation: generation) }
             else { await cleanupExecutor() }
@@ -1290,6 +1453,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             proxy = nil
             tools = []
             capabilitiesVerified = false
+            guard desktopControlStartupIntended else { return "unknown" }
             do { try await startCua(startPaused: false, generation: generation) }
             catch { return Self.readiness(for: error) }
         }
@@ -1317,6 +1481,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let isStatus = frame.operation == "desktop_control_status"
         let cleanup = ["desktop_control_release", "desktop_control_revoke_config", "desktop_control_revoke_binding"].contains(frame.operation ?? "")
         if !isStatus && !cleanup {
+            guard desktopControlConnectionIntended else {
+                return Self.failure(for: frame, code: "desktop_executor_unavailable")
+            }
             guard !paused else { return Self.failure(for: frame, code: "desktop_paused") }
             guard !executorCleanupInProgress, !executorCleanupFailed, controlSessionIsUsable else {
                 return Self.failure(for: frame, code: "desktop_executor_unavailable")
@@ -1355,6 +1522,11 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func refreshStatusReadiness(generation: UUID, connectionID: UUID) async -> Bool {
+        guard desktopControlConnectionIntended else {
+            return generation == lifecycleGeneration
+                && Self.acceptsCommand(connectionID: connectionID, currentConnectionID: gatewayConnectionID,
+                                       disconnecting: disconnecting || environmentSwitchPending)
+        }
         guard !executorCleanupInProgress, !executorCleanupFailed, controlSessionIsUsable,
               executor.currentLease == nil, !executor.nativeVerificationInProgress else { return true }
         // Busy status must not queue behind a long CUA action. Heartbeats keep
@@ -1420,6 +1592,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                                sessionMonitor: DesktopControlSessionLock? = nil,
                                cleanupInProgress: Bool = false, cleanupFailed: Bool = false,
                                relayStateReader: (any DesktopControlRelayStateReading)? = nil,
+                               scheduleReconnect: Bool = true,
                                preferences: UserDefaults = .standard,
                                configurationProvider: @escaping () throws -> DesktopEnvironmentConfiguration = { .production }) -> DesktopControlRuntime {
         let monitor = sessionMonitor ?? DesktopControlSessionLock(observeSystem: false, snapshotReader: { .unknown })
@@ -1430,6 +1603,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         runtime.proxy = proxy
         runtime.proxyFactoryForTesting = proxyFactory
         runtime.beforeCuaPublicationForTesting = beforeCuaPublication
+        runtime.scheduleReconnectForTesting = scheduleReconnect
         runtime.gatewayConnectionID = connectionID
         runtime.activeInstallation = installation
         runtime.gatewayConnected = connected
@@ -1440,10 +1614,21 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         if let sessionLockState { monitor.receive(sessionLockState) }
         return runtime
     }
+    func setRelayClockForTesting(_ now: @escaping () -> Date) { relayNow = now }
+    func setRelayConnectionAttemptForTesting(_ attempt: @escaping () async throws -> Void) {
+        reconnectAttemptForTesting = attempt
+    }
+    func reconcileRelayForTesting() async throws { try await reconcileRelayIntent(generation: lifecycleGeneration) }
+    func reconnectRelayForTesting() async -> Bool {
+        guard let installation = activeInstallation else { return false }
+        return await reconnectIfNeeded(installation, loopID: reconnectLoopID)
+    }
+    var hasIMessageSetupIntentForTesting: Bool { iMessageSetupIntent.map { $0.expiresAt > relayNow() } == true }
+    var hasDesktopControlIntentForTesting: Bool { desktopControlConnectionIntended }
     func startReconnectLoopForTesting(installation: DesktopControlInstallation,
                                       allowUnconfigured: Bool = true,
                                       attempt: @escaping () async throws -> Void) {
-        setupMayRunUnconfigured = allowUnconfigured
+        desktopControlSetupGeneration = allowUnconfigured ? lifecycleGeneration : nil
         reconnectAttemptForTesting = attempt
         beginReconnectLoop(for: installation)
     }

@@ -36,3 +36,28 @@ grep -Fq '(runtime)' "$verification_dir/helper-details"
 grep -q '^Timestamp=' "$verification_dir/helper-details"
 
 sh "$root_dir/scripts/verify-lima-runtime.sh" "$bundle" "$certificate"
+
+if [ -f "$bundle/Contents/Resources/imsg-provider-manifest.json" ]; then
+  provider="$bundle/Contents/MacOS/imsg"
+  python3 "$root_dir/third_party/imsg/bundle.py" --app-bundle "$bundle" --verify-existing
+  codesign --verify --strict "$provider"
+  codesign --display --verbose=4 "$provider" > "$verification_dir/imsg-details" 2>&1
+  codesign --display --extract-certificates="$verification_dir/imsg-certificate" "$provider" >/dev/null 2>&1
+  cmp "$certificate" "$verification_dir/imsg-certificate0"
+  grep -Fxq 'Identifier=ai.personastack.desktop.imsg' "$verification_dir/imsg-details"
+  grep -Fxq 'TeamIdentifier=5T2T8KL852' "$verification_dir/imsg-details"
+  grep -Fq '(runtime)' "$verification_dir/imsg-details"
+  grep -q '^Timestamp=' "$verification_dir/imsg-details"
+  codesign --display --entitlements - --xml "$provider" > "$verification_dir/imsg-entitlements.plist" 2>/dev/null
+  python3 - "$verification_dir/imsg-entitlements.plist" <<'PY'
+import plistlib
+import sys
+with open(sys.argv[1], "rb") as source:
+    entitlements = plistlib.load(source)
+if entitlements != {"com.apple.security.automation.apple-events": True}:
+    raise SystemExit("The iMessage provider has unexpected Apple Events entitlements.")
+PY
+elif [ -e "$bundle/Contents/MacOS/imsg" ]; then
+  printf '%s\n' 'The iMessage provider has no pinned artifact receipt.' >&2
+  exit 1
+fi

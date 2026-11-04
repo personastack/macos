@@ -986,6 +986,10 @@ private actor PausedReconnectAuthority: DesktopControlRelayStateReading {
             entered = nil
         }
     }
+    func configurationState(installation: DesktopControlInstallation, appURL: URL) async throws -> DesktopControlConfigurationState {
+        let active = try await hasActiveConfig(installation: installation, appURL: appURL)
+        return .init(hasActiveConfig: active, hasConfig: active)
+    }
     func waitForRead() async {
         if read != nil { return }
         await withCheckedContinuation { entered = $0 }

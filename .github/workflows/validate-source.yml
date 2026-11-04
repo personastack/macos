@@ -28,7 +28,7 @@ jobs:
             scheduling=(--no-parallel)
           fi
           swift test --triple arm64-apple-macosx14.0 --disable-xctest --skip-update -j 2 "${scheduling[@]}" \
-            --filter '(AgentBridge|LocalSession|[Cc]ua|[Dd]esktop|Termination|Quit|[Cc]oncern|[Nn]otification|MainWebView|MainWindow|ChatWindow|StackPopout|PopoutWindow|[Nn]avigation|ServerSettings|[Hh]arness)'
+            --filter '(AgentBridge|LocalSession|[Cc]ua|[Dd]esktop|Termination|Quit|[Cc]oncern|[Nn]otification|MainWebView|MainWindow|ChatWindow|StackPopout|PopoutWindow|[Nn]avigation|ServerSettings|[Hh]arness|[Ii]Message|[Cc]redential)'
       - name: Build ARM64 app without signing
         run: |
           swift build --scratch-path build/validation-arm64 \

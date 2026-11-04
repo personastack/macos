@@ -16,6 +16,11 @@ enum DesktopEntryPoint {
             }
             return
         }
+        if CommandLine.arguments == [CommandLine.arguments[0], "--imessage-provider-probe"] {
+            guard DesktopApplicationInstanceLock.acquireOrActivateExisting() else { return }
+            IMessageProviderProbeApp.main()
+            return
+        }
         if DesktopCrashRecoverySupervisor.dispatchSupervisorIfRequested() { return }
 
         if !CommandLine.arguments.contains(DesktopCrashRecoverySupervisor.recoveryLaunchArgument) {
