@@ -34,3 +34,5 @@ grep -Fxq 'Identifier=ai.personastack.desktop.agent-bridge' "$verification_dir/h
 grep -Fxq 'TeamIdentifier=5T2T8KL852' "$verification_dir/helper-details"
 grep -Fq '(runtime)' "$verification_dir/helper-details"
 grep -q '^Timestamp=' "$verification_dir/helper-details"
+
+sh "$root_dir/scripts/verify-lima-runtime.sh" "$bundle" "$certificate"

@@ -11,6 +11,7 @@ python3 "$root_dir/scripts/communication_profile.py" embed "$bundle"
 
 # Validate dependency lookup before signing any nested code.
 sh "$root_dir/scripts/verify-sparkle-runtime.sh" "$bundle"
+python3 "$root_dir/scripts/lima_runtime.py" verify-unsigned "$bundle"
 
 sign() {
   codesign --force --timestamp --options runtime \
@@ -30,6 +31,10 @@ if [ -d "$framework" ]; then
 fi
 sign --identifier ai.personastack.desktop.harness-hook "$bundle/Contents/MacOS/PersonaStackHarnessHook"
 sign --identifier ai.personastack.desktop.agent-bridge "$bundle/Contents/MacOS/PersonaStackAgentBridge"
+sign --identifier ai.personastack.desktop.lima \
+  --entitlements "$root_dir/Resources/Lima.entitlements" \
+  "$bundle/Contents/Resources/LocalCluster/lima/bin/limactl"
+python3 "$root_dir/scripts/lima_runtime.py" seal "$bundle"
 sign --identifier ai.personastack.desktop \
   --entitlements "$root_dir/Resources/Release.entitlements" "$bundle"
 "$root_dir/scripts/verify-app-signature.sh" "$bundle"

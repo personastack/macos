@@ -35,9 +35,17 @@ make_bundle() {
 PLIST
 }
 
-make_bundle first /usr/bin/true 1.0.0
-make_bundle second /usr/bin/false 1.0.1
+# Prepare once. Each signing fixture gets its own unsigned runtime copy.
+# Reuse the verified ARM64 launcher as inert fixture app/helper code. No host
+# universal executable or additional compilation is needed for identity tests.
+mkdir "$fixture_dir/runtime.app"
+python3 "$root_dir/scripts/lima_runtime.py" prepare "$fixture_dir/runtime.app"
+runtime_resources="$fixture_dir/runtime.app/Contents/Resources/LocalCluster"
+fixture_executable="$runtime_resources/lima/bin/limactl"
+make_bundle first "$fixture_executable" 1.0.0
+make_bundle second "$fixture_executable" 1.0.1
 for name in first second; do
+  cp -R "$runtime_resources" "$fixture_dir/$name.app/Contents/Resources/LocalCluster"
   "$root_dir/scripts/sign-app.sh" "$fixture_dir/$name.app"
   codesign --display -r- "$fixture_dir/$name.app" 2>&1 | sed -n 's/^designated => //p' > "$fixture_dir/$name.requirement"
 done
@@ -80,7 +88,7 @@ if sys.argv[1] not in keychains:
     subprocess.run(["security", "list-keychains", "-d", "user", "-s", *keychains, sys.argv[1]], check=True)
 PYTHON
 foreign_identity=$("$openssl_bin" x509 -in "$fixture_dir/certificate.pem" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')
-make_bundle foreign /usr/bin/true 1.0.2
+cp -R "$fixture_dir/first.app" "$fixture_dir/foreign.app"
 codesign --force --timestamp=none --identifier ai.personastack.desktop \
   --keychain "$fixture_dir/foreign.keychain-db" --sign "$foreign_identity" "$fixture_dir/foreign.app"
 if codesign --verify --strict -R "=$(cat "$fixture_dir/first.requirement")" "$fixture_dir/foreign.app" >/dev/null 2>&1; then

@@ -55,6 +55,7 @@ cp "$arm64_binary" "$bundle_dir/Contents/MacOS/PersonaStack"
 cp "$(dirname "$arm64_binary")/PersonaStackHarnessHook" "$bundle_dir/Contents/MacOS/PersonaStackHarnessHook"
 chmod 755 "$bundle_dir/Contents/MacOS/PersonaStackHarnessHook"
 cp "$agent_bridge_build_dir/PersonaStackAgentBridge" "$bundle_dir/Contents/MacOS/PersonaStackAgentBridge"
+python3 "$root_dir/scripts/lima_runtime.py" prepare "$bundle_dir"
 if [ "$configuration" = release ]; then
   : "${PERSONASTACK_INSTALLER_SIGNING_IDENTITY:?Developer ID Installer identity is required for the main installer}"
 fi
