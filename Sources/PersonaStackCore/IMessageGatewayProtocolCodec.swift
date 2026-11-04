@@ -23,11 +23,21 @@ private struct IMessageGatewayAnyKey: CodingKey {
     init?(intValue: Int) { return nil }
 }
 
+/// Strict finite HTTP documents reuse the gateway's bounded lexer. Typed
+/// decoders still own each document's required and optional field contracts.
+public enum IMessageJSONDocument {
+    public static func validate(data: Data, maximumBytes: Int) throws {
+        var inspection = try IMessageGatewayJSONInspection(data, maximumBytes: maximumBytes, strictDocument: true)
+        _ = try inspection.inspect()
+    }
+}
+
 /// A bounded lexical check for the iMessage branch only. It remembers duplicate
 /// keys and non-integer tokens without decoding a dynamic JSON object or Double.
 /// Legacy frames retain their existing optional/null/duplicate decoding behavior.
 internal struct IMessageGatewayJSONInspection {
     private let bytes: [UInt8]
+    private let strictDocument: Bool
     private var index = 0
     private var selected = false
     private var duplicate = false
@@ -37,30 +47,32 @@ internal struct IMessageGatewayJSONInspection {
     private var negotiationSeen = false
     private var invalidNegotiation = false
 
-    init(_ data: Data) throws {
-        guard data.count <= DesktopControlFrameCodec.maximumFrameBytes else { throw IMessageGatewayWireError.frameTooLarge }
+    init(_ data: Data, maximumBytes: Int = DesktopControlFrameCodec.maximumFrameBytes, strictDocument: Bool = false) throws {
+        guard maximumBytes > 0, maximumBytes <= DesktopControlFrameCodec.maximumFrameBytes,
+              data.count <= maximumBytes else { throw IMessageGatewayWireError.frameTooLarge }
         guard String(data: data, encoding: .utf8) != nil else { throw IMessageGatewayWireError.invalidFrame }
         bytes = Array(data)
+        self.strictDocument = strictDocument
     }
 
     mutating func inspect() throws -> Bool {
         try value(depth: 0)
         whitespace()
         guard index == bytes.count else { throw IMessageGatewayWireError.invalidFrame }
-        guard !invalidNegotiation else { throw IMessageGatewayWireError.invalidFrame }
-        if selected && (duplicate || null || nonInteger || excessiveDepth) { throw IMessageGatewayWireError.invalidFrame }
+        guard strictDocument || !invalidNegotiation else { throw IMessageGatewayWireError.invalidFrame }
+        if (strictDocument || selected) && (duplicate || null || nonInteger || excessiveDepth) { throw IMessageGatewayWireError.invalidFrame }
         return selected
     }
 
     private mutating func value(depth: Int) throws {
-        guard depth <= 512 else { throw IMessageGatewayWireError.invalidFrame }
+        guard depth <= (strictDocument ? 32 : 512) else { throw IMessageGatewayWireError.invalidFrame }
         excessiveDepth = excessiveDepth || depth > 32
         whitespace()
         guard index < bytes.count else { throw IMessageGatewayWireError.invalidFrame }
         switch bytes[index] {
         case 0x7b: try object(depth: depth)
         case 0x5b: try array(depth: depth)
-        case 0x22: _ = try string(decode: false)
+        case 0x22: _ = try string(decode: strictDocument)
         case 0x74: try literal("true")
         case 0x66: try literal("false")
         case 0x6e: null = true; try literal("null")
@@ -80,14 +92,14 @@ internal struct IMessageGatewayJSONInspection {
             whitespace()
             guard consume(0x3a) else { throw IMessageGatewayWireError.invalidFrame }
             whitespace()
-            if depth == 0, key.lowercased() == "imessage" { selected = true }
-            if depth == 0, key.lowercased() == "imessage_protocol_version" {
+            if !strictDocument, depth == 0, key.lowercased() == "imessage" { selected = true }
+            if !strictDocument, depth == 0, key.lowercased() == "imessage_protocol_version" {
                 let start = index
                 try value(depth: depth + 1)
                 let token = String(decoding: bytes[start..<index], as: UTF8.self)
                 invalidNegotiation = invalidNegotiation || negotiationSeen || (token != "null" && Int64(token) == nil)
                 negotiationSeen = true
-            } else if depth == 0, key.lowercased() == "type", index < bytes.count, bytes[index] == 0x22 {
+            } else if !strictDocument, depth == 0, key.lowercased() == "type", index < bytes.count, bytes[index] == 0x22 {
                 if try string(decode: true) == "imessage" { selected = true }
             } else { try value(depth: depth + 1) }
             whitespace()

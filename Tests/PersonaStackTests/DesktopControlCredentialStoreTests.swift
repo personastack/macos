@@ -5,10 +5,12 @@ import PersonaStackCore
 import Testing
 @testable import PersonaStack
 
-private func credentialFixture(_ configuration: DesktopEnvironmentConfiguration = .production) throws -> DesktopControlInstallation {
+private func credentialFixture(_ configuration: DesktopEnvironmentConfiguration = .production,
+                               proof: Data = Data(repeating: 0x42, count: 32),
+                               installationID: String = "fixture-mac") throws -> DesktopControlInstallation {
     let data = try JSONSerialization.data(withJSONObject: [
-        "installation_id": "fixture-mac",
-        "machine_credential": Data(repeating: 0x42, count: 32).base64EncodedString(),
+        "installation_id": installationID,
+        "machine_credential": proof.base64EncodedString(),
         "gateway_websocket_url": configuration.gatewayWebsocketURL.absoluteString,
         "environment_origin": configuration.appOrigin,
     ])
@@ -259,24 +261,21 @@ private func prepareDiskPending(_ store: FileDesktopControlCredentialStore, refe
     #expect(throws: IMessagePendingEnrollmentError.scopeMismatch) { try fixture.store().loadPendingEnrollment() }
 }
 
-@Test func iMessageDiskPendingEnrollmentExpiryKeepsRecoveryProofAndExplicitClearPreservesInstallation() throws {
+@Test func iMessageDiskPendingEnrollmentExpiryKeepsRecoveryProofUntilCanonicalInstallationIsSaved() throws {
     let fixture = DiskCredentialFixture()
     let store = fixture.store(random: { fixture.nextProof() })
     let pending = try prepareDiskPending(store)
     let originalInstallation = try Data(contentsOf: fixture.file())
     #expect(throws: IMessagePendingEnrollmentError.expired) { try prepareDiskPending(store, now: pending.expiry) }
     #expect(try store.loadPendingEnrollment() == pending)
-    #expect(try store.clearPendingEnrollment(matching: pending))
-    #expect(try store.loadPendingEnrollment() == nil)
+    #expect(throws: DesktopControlEnrollmentError.installationMissing) { try store.clearPendingEnrollment(matching: pending) }
+    #expect(try store.loadPendingEnrollment() == pending)
     #expect(try Data(contentsOf: fixture.file()) == originalInstallation)
-    let replacement = try prepareDiskPending(store, user: "another-user")
-    #expect(replacement.machineCredential != pending.machineCredential)
-    #expect(try store.clearPendingEnrollment(matching: pending) == false)
-    #expect(try store.loadPendingEnrollment() == replacement)
-    let installed = try credentialFixture()
-    try store.save(installed)
+    let installed = try credentialFixture(proof: pending.credentialBytes)
+    #expect(try store.completePendingEnrollment(matching: pending, installation: installed))
     let installedData = try Data(contentsOf: fixture.file())
-    #expect(try store.clearPendingEnrollment(matching: replacement))
+    #expect(try store.loadPendingEnrollment() == nil)
+    #expect(try store.clearPendingEnrollment(matching: pending) == false)
     #expect(try Data(contentsOf: fixture.file()) == installedData)
     #expect(try store.load() == installed)
 }
@@ -355,11 +354,262 @@ func iMessageDiskPendingEnrollmentRejectsUnsafeRecords(kind: String) throws {
     #expect(try Data(contentsOf: fixture.file()) == installation)
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fixture.directory.path)
     let pending = try prepareDiskPending(store)
+    try store.save(credentialFixture(proof: pending.credentialBytes))
+    let savedInstallation = try Data(contentsOf: fixture.file())
     let persisted = try Data(contentsOf: fixture.pendingFile())
     try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: fixture.directory.path)
     #expect(throws: DesktopControlEnrollmentError.credentialStoreUnavailable) { try store.clearPendingEnrollment(matching: pending) }
     #expect(try Data(contentsOf: fixture.pendingFile()) == persisted)
+    #expect(try Data(contentsOf: fixture.file()) == savedInstallation)
+}
+
+private func recoveryScopeFixture(user: String = "natural-user", workspace: String = "workspace",
+                                  origin: String = DesktopEnvironmentConfiguration.production.appOrigin) throws -> IMessageHostedNativeScope {
+    try JSONDecoder().decode(IMessageHostedNativeScope.self, from: JSONSerialization.data(withJSONObject: [
+        "natural_user_id": user, "workspace_id": workspace, "app_origin": origin,
+    ]))
+}
+
+private func recoveryJourneyFixture(reference: String? = nil,
+                                    expiry: String = "2031-01-02T03:04:05Z") throws -> IMessageHostedJourney {
+    let locator = reference ?? Data(repeating: 2, count: 32).base64EncodedString().replacingOccurrences(of: "=", with: "")
+    return try JSONDecoder().decode(IMessageHostedJourney.self, from: JSONSerialization.data(withJSONObject: [
+        "setup_reference": locator, "generation": 1, "expires_at": expiry, "mac_verified": false,
+    ]))
+}
+
+@Test func iMessageDiskPendingEnrollmentRecoveryAfterExpiredJourneyPreservesExactSecretAcrossRelaunch() throws {
+    let fixture = DiskCredentialFixture()
+    let old = try prepareDiskPending(fixture.store(random: { fixture.nextProof() }))
+    let installedData = try Data(contentsOf: fixture.file())
+    let store = fixture.store(random: { fixture.nextProof() })
+    let scope = try recoveryScopeFixture()
+    let journey = try recoveryJourneyFixture()
+    let recovered = try store.recoverPendingEnrollment(matching: old, verifiedScope: scope, journey: journey, now: old.expiry)
+    #expect(recovered.setupReference == journey.setupReference)
+    #expect(recovered.expiresAt == journey.expiresAt)
+    #expect(recovered.naturalUserID == old.naturalUserID)
+    #expect(recovered.workspaceID == old.workspaceID)
+    #expect(recovered.environmentIdentity == old.environmentIdentity)
+    #expect(recovered.credentialBytes == old.credentialBytes)
+    #expect(recovered.credentialSHA256 == old.credentialSHA256)
+    #expect(try fixture.store().loadPendingEnrollment() == recovered)
+    #expect(try store.recoverPendingEnrollment(matching: recovered, verifiedScope: scope, journey: journey, now: old.expiry) == recovered)
+    #expect(try store.clearPendingEnrollment(matching: old) == false)
+    #expect(try Data(contentsOf: fixture.file()) == installedData)
+    #expect(fixture.generations == 1)
+}
+
+@Test(arguments: ["user", "workspace", "origin", "profile"])
+func iMessageDiskPendingEnrollmentRecoveryRejectsScopeSwitchWithoutChangingProof(kind: String) throws {
+    let fixture = DiskCredentialFixture()
+    let pending = try prepareDiskPending(fixture.store(random: { fixture.nextProof() }))
+    let original = try Data(contentsOf: fixture.pendingFile())
+    let alternate = try DesktopEnvironmentConfiguration(appURL: "https://alternate.example",
+        gatewayURL: "https://gateway.alternate.example", mcpURL: "https://mcp.alternate.example")
+    let scope = try recoveryScopeFixture(user: kind == "user" ? "another-user" : "natural-user",
+        workspace: kind == "workspace" ? "another-workspace" : "workspace",
+        origin: kind == "origin" ? alternate.appOrigin : DesktopEnvironmentConfiguration.production.appOrigin)
+    let store = fixture.store(kind == "profile" ? alternate : .production, random: { fixture.nextProof() })
+    #expect(throws: IMessagePendingEnrollmentError.scopeMismatch) {
+        try store.recoverPendingEnrollment(matching: pending, verifiedScope: scope,
+            journey: recoveryJourneyFixture(), now: diskPendingNow)
+    }
+    #expect(try Data(contentsOf: fixture.pendingFile()) == original)
+    #expect(!FileManager.default.fileExists(atPath: fixture.pendingFile(alternate).path))
+    #expect(fixture.generations == 1)
+}
+
+@Test func iMessageDiskPendingEnrollmentRecoveryRejectsExpiredOrRenewedOriginalJourneyAndStaleRecord() throws {
+    let fixture = DiskCredentialFixture()
+    let store = fixture.store(random: { fixture.nextProof() })
+    let pending = try prepareDiskPending(store)
+    let original = try Data(contentsOf: fixture.pendingFile())
+    let scope = try recoveryScopeFixture()
+    #expect(throws: IMessagePendingEnrollmentError.expired) {
+        try store.recoverPendingEnrollment(matching: pending, verifiedScope: scope,
+            journey: recoveryJourneyFixture(expiry: "2020-01-02T03:04:05Z"), now: diskPendingNow)
+    }
+    #expect(throws: IMessagePendingEnrollmentError.conflictingJourney) {
+        try store.recoverPendingEnrollment(matching: pending, verifiedScope: scope,
+            journey: recoveryJourneyFixture(reference: pending.setupReference), now: diskPendingNow)
+    }
+    #expect(try Data(contentsOf: fixture.pendingFile()) == original)
+    let journey = try recoveryJourneyFixture()
+    let recovered = try store.recoverPendingEnrollment(matching: pending, verifiedScope: scope, journey: journey, now: diskPendingNow)
+    let replacement = try Data(contentsOf: fixture.pendingFile())
+    #expect(throws: IMessagePendingEnrollmentError.conflictingJourney) {
+        try store.recoverPendingEnrollment(matching: pending, verifiedScope: scope, journey: journey, now: diskPendingNow)
+    }
+    #expect(try store.completePendingEnrollment(matching: pending, installation: credentialFixture(proof: pending.credentialBytes)) == false)
+    #expect(try Data(contentsOf: fixture.pendingFile()) == replacement)
+    #expect(try store.loadPendingEnrollment() == recovered)
+    #expect(try store.load() == nil)
+    #expect(fixture.generations == 1)
+}
+
+@Test func iMessageDiskPendingEnrollmentRecoveryPreservesExistingInstallationAndFailedWrite() throws {
+    let fixture = DiskCredentialFixture()
+    let store = fixture.store(random: { fixture.nextProof() })
+    let pending = try prepareDiskPending(store)
+    let original = try Data(contentsOf: fixture.pendingFile())
+    let scope = try recoveryScopeFixture()
+    let journey = try recoveryJourneyFixture()
+    #expect(geteuid() != 0)
+    try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: fixture.directory.path)
+    defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fixture.directory.path) }
+    #expect(throws: DesktopControlEnrollmentError.credentialStoreUnavailable) {
+        try store.recoverPendingEnrollment(matching: pending, verifiedScope: scope, journey: journey, now: diskPendingNow)
+    }
+    #expect(try Data(contentsOf: fixture.pendingFile()) == original)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fixture.directory.path)
+    let installed = try credentialFixture()
+    try store.save(installed)
+    let installedData = try Data(contentsOf: fixture.file())
+    #expect(throws: IMessagePendingEnrollmentError.installationPresent) {
+        try store.recoverPendingEnrollment(matching: pending, verifiedScope: scope, journey: journey, now: diskPendingNow)
+    }
+    #expect(try Data(contentsOf: fixture.pendingFile()) == original)
+    #expect(try Data(contentsOf: fixture.file()) == installedData)
+    #expect(fixture.generations == 1)
+}
+
+@Test func iMessageDiskPendingEnrollmentCompletionSavesCanonicalInstallationBeforeClearingProof() throws {
+    let fixture = DiskCredentialFixture()
+    let store = fixture.store(random: { fixture.nextProof() })
+    let pending = try prepareDiskPending(store)
+    let installation = try credentialFixture(proof: pending.credentialBytes)
+    #expect(try store.completePendingEnrollment(matching: pending, installation: installation))
+    #expect(try fixture.store().load() == installation)
+    #expect(try fixture.store().loadPendingEnrollment() == nil)
+    #expect(try store.completePendingEnrollment(matching: pending, installation: installation) == false)
+    #expect(fixture.generations == 1)
+}
+
+@Test(arguments: ["proof", "environment", "existing-installation"])
+func iMessageDiskPendingEnrollmentCompletionRejectsForeignInstallationWithoutClearingProof(kind: String) throws {
+    let fixture = DiskCredentialFixture()
+    let store = fixture.store(random: { fixture.nextProof() })
+    let pending = try prepareDiskPending(store)
+    let original = try Data(contentsOf: fixture.pendingFile())
+    let installation = try credentialFixture(kind == "environment" ? .lan : .production,
+        proof: kind == "proof" ? Data(repeating: 99, count: 32) : pending.credentialBytes)
+    if kind == "existing-installation" {
+        try store.save(credentialFixture(proof: pending.credentialBytes, installationID: "other-installation"))
+    }
+    let installedData = try Data(contentsOf: fixture.file())
+    if kind == "proof" {
+        #expect(throws: IMessagePendingEnrollmentError.scopeMismatch) { try store.completePendingEnrollment(matching: pending, installation: installation) }
+    } else if kind == "environment" {
+        #expect(throws: DesktopControlEnrollmentError.invalidRequest) { try store.completePendingEnrollment(matching: pending, installation: installation) }
+    } else {
+        #expect(throws: IMessagePendingEnrollmentError.installationPresent) { try store.completePendingEnrollment(matching: pending, installation: installation) }
+    }
+    #expect(try Data(contentsOf: fixture.pendingFile()) == original)
+    #expect(try Data(contentsOf: fixture.file()) == installedData)
+}
+
+@Test func iMessageDiskPendingEnrollmentCompletionFailedSaveAndForeignClearPreserveProof() throws {
+    let fixture = DiskCredentialFixture()
+    let store = fixture.store(random: { fixture.nextProof() })
+    let pending = try prepareDiskPending(store)
+    let original = try Data(contentsOf: fixture.pendingFile())
+    let installedData = try Data(contentsOf: fixture.file())
+    #expect(geteuid() != 0)
+    try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: fixture.directory.path)
+    defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fixture.directory.path) }
+    #expect(throws: DesktopControlEnrollmentError.credentialStoreUnavailable) {
+        try store.completePendingEnrollment(matching: pending, installation: credentialFixture(proof: pending.credentialBytes))
+    }
+    #expect(try Data(contentsOf: fixture.pendingFile()) == original)
+    #expect(try Data(contentsOf: fixture.file()) == installedData)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fixture.directory.path)
+    try store.save(credentialFixture())
+    #expect(throws: IMessagePendingEnrollmentError.scopeMismatch) { try store.clearPendingEnrollment(matching: pending) }
+    #expect(try Data(contentsOf: fixture.pendingFile()) == original)
+    try store.save(credentialFixture(proof: pending.credentialBytes))
+    #expect(try store.clearPendingEnrollment(matching: pending))
+    #expect(try store.loadPendingEnrollment() == nil)
+}
+
+@Test func iMessageDiskPendingEnrollmentRevokedProofRequiresExplicitCurrentResetBeforeNewSecret() async throws {
+    let fixture = DiskCredentialFixture()
+    let store = fixture.store(random: { fixture.nextProof() })
+    let pending = try prepareDiskPending(store)
+    let generation = UUID()
+    let receipt = try await machineResetReceiptFixture(pending: pending, generation: generation)
+    let original = try Data(contentsOf: fixture.pendingFile())
+    let installation = try Data(contentsOf: fixture.file())
+    let draft = try diskSetupDraftFixture()
+    try store.saveSetupDraft(draft, now: diskPendingNow)
+    let draftData = try Data(contentsOf: fixture.setupDraftFile())
+    #expect(throws: IMessagePendingEnrollmentError.scopeMismatch) {
+        try store.discardPendingEnrollment(matching: receipt, explicitStartAgain: false, currentGeneration: generation)
+    }
+    #expect(throws: IMessagePendingEnrollmentError.scopeMismatch) {
+        try store.discardPendingEnrollment(matching: receipt, explicitStartAgain: true, currentGeneration: UUID())
+    }
+    #expect(try Data(contentsOf: fixture.pendingFile()) == original)
+    #expect(fixture.generations == 1)
+    #expect(try store.discardPendingEnrollment(matching: receipt, explicitStartAgain: true, currentGeneration: generation))
+    #expect(try store.loadPendingEnrollment() == nil)
+    #expect(try Data(contentsOf: fixture.setupDraftFile()) == draftData)
     #expect(try Data(contentsOf: fixture.file()) == installation)
+    let freshReference = Data(repeating: 4, count: 32).base64EncodedString().replacingOccurrences(of: "=", with: "")
+    let replacement = try prepareDiskPending(store, reference: freshReference)
+    #expect(replacement.credentialBytes != pending.credentialBytes)
+    #expect(fixture.generations == 2)
+    #expect(try store.discardPendingEnrollment(matching: receipt, explicitStartAgain: true, currentGeneration: generation) == false)
+    #expect(try store.loadPendingEnrollment() == replacement)
+}
+
+@Test func iMessageDiskPendingEnrollmentResetPreservesNewerJourneyAndForeignProfile() async throws {
+    let fixture = DiskCredentialFixture()
+    let store = fixture.store(random: { fixture.nextProof() })
+    let pending = try prepareDiskPending(store)
+    let generation = UUID()
+    let receipt = try await machineResetReceiptFixture(pending: pending, generation: generation)
+    let alternate = try DesktopEnvironmentConfiguration(appURL: "https://alternate.example",
+        gatewayURL: "https://gateway.alternate.example", mcpURL: "https://mcp.alternate.example")
+    let other = try prepareDiskPending(fixture.store(alternate, random: { fixture.nextProof() }))
+    let alternateData = try Data(contentsOf: fixture.pendingFile(alternate))
+    #expect(throws: IMessagePendingEnrollmentError.scopeMismatch) {
+        try fixture.store(alternate).discardPendingEnrollment(matching: receipt, explicitStartAgain: true, currentGeneration: generation)
+    }
+    let recovered = try store.recoverPendingEnrollment(matching: pending, verifiedScope: recoveryScopeFixture(),
+        journey: recoveryJourneyFixture(), now: diskPendingNow)
+    let replacement = try Data(contentsOf: fixture.pendingFile())
+    #expect(try store.discardPendingEnrollment(matching: receipt, explicitStartAgain: true, currentGeneration: generation) == false)
+    #expect(try Data(contentsOf: fixture.pendingFile()) == replacement)
+    #expect(try store.loadPendingEnrollment() == recovered)
+    #expect(try Data(contentsOf: fixture.pendingFile(alternate)) == alternateData)
+    #expect(try fixture.store(alternate).loadPendingEnrollment() == other)
+}
+
+@Test func iMessageDiskPendingEnrollmentResetPreservesInstalledCredentialAndFailedDiscard() async throws {
+    let fixture = DiskCredentialFixture()
+    let store = fixture.store(random: { fixture.nextProof() })
+    let pending = try prepareDiskPending(store)
+    let generation = UUID()
+    let receipt = try await machineResetReceiptFixture(pending: pending, generation: generation)
+    let original = try Data(contentsOf: fixture.pendingFile())
+    #expect(geteuid() != 0)
+    try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: fixture.directory.path)
+    defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fixture.directory.path) }
+    #expect(throws: DesktopControlEnrollmentError.credentialStoreUnavailable) {
+        try store.discardPendingEnrollment(matching: receipt, explicitStartAgain: true, currentGeneration: generation)
+    }
+    #expect(try Data(contentsOf: fixture.pendingFile()) == original)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fixture.directory.path)
+    let installed = try credentialFixture()
+    try store.save(installed)
+    let installedData = try Data(contentsOf: fixture.file())
+    #expect(throws: IMessagePendingEnrollmentError.installationPresent) {
+        try store.discardPendingEnrollment(matching: receipt, explicitStartAgain: true, currentGeneration: generation)
+    }
+    #expect(try Data(contentsOf: fixture.file()) == installedData)
+    #expect(try Data(contentsOf: fixture.pendingFile()) == original)
+    #expect(fixture.generations == 1)
 }
 
 private func diskSetupDraftFixture(_ configuration: DesktopEnvironmentConfiguration = .production,

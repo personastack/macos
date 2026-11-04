@@ -245,7 +245,8 @@ private actor IMessageFakeTransport: IMessageRPCTransport {
 @Test func iMessageRPCClientBoundsMetadataDeadlineAndOutputWithoutRetry() async throws {
     for mode in [IMessageFakeTransport.Mode.metadataNoResponse, .metadataOversized] {
         let transport = IMessageFakeTransport(mode: mode)
-        let client = IMessageRPCClient(transport: transport, readTimeoutSeconds: mode == .metadataNoResponse ? 0.02 : 2, sendTimeoutSeconds: 1)
+        // Initialization shares this timeout. Keep it usable during parallel test scheduling.
+        let client = IMessageRPCClient(transport: transport, readTimeoutSeconds: mode == .metadataNoResponse ? 1 : 2, sendTimeoutSeconds: 1)
         _ = try await client.start()
         let error: IMessageRPCError = mode == .metadataNoResponse ? .deadlineExceeded : .frameTooLarge
         await #expect(throws: error) { try await client.chatMetadata(chatIDs: [IMessageRowID(42)]) }

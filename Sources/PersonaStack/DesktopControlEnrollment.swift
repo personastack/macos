@@ -32,6 +32,25 @@ struct DesktopControlInstallation: Codable, Equatable, Sendable {
         self.gatewayWebsocketURL = gatewayURL
     }
 
+    /// Native iMessage enrollment returns metadata only. The retained credential
+    /// never passes through a credential-bearing response or temporary JSON.
+    init(installationID: String, machineCredential: String, gatewayWebsocketURL: URL,
+         configuration: DesktopEnvironmentConfiguration) throws {
+        guard !installationID.isEmpty, installationID.utf8.count <= 256,
+              installationID == installationID.trimmingCharacters(in: .whitespacesAndNewlines),
+              !installationID.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+              (43...44).contains(machineCredential.utf8.count),
+              let credential = Self.decodeCredential(machineCredential), credential.count == 32,
+              Self.validGatewayURL(gatewayWebsocketURL),
+              gatewayWebsocketURL.absoluteString == configuration.gatewayWebsocketURL.absoluteString else {
+            throw DesktopControlEnrollmentError.invalidResponse
+        }
+        self.installationID = installationID
+        self.machineCredential = machineCredential
+        self.gatewayWebsocketURL = gatewayWebsocketURL
+        try bindEnvironment(configuration.appPageURL, configuration: configuration)
+    }
+
     mutating func bindEnvironment(_ appURL: URL, configuration: DesktopEnvironmentConfiguration? = nil) throws {
         let origin = try DesktopControlEnvironment.origin(appURL)
         guard DesktopControlEnvironment.allowsGateway(gatewayWebsocketURL, for: origin, configuration: configuration) else {

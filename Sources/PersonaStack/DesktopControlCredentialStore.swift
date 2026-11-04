@@ -105,6 +105,41 @@ struct FileDesktopControlCredentialStore: DesktopControlCredentialStoring {
         return pending
     }
 
+    /// Only the trusted native hosted client supplies these canonical responses.
+    /// A fresh journey changes its locator and expiry, never the machine proof.
+    func recoverPendingEnrollment(matching expected: IMessagePendingEnrollment,
+                                  verifiedScope: IMessageHostedNativeScope, journey: IMessageHostedJourney,
+                                  now: Date = Date()) throws -> IMessagePendingEnrollment {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        let configuration = try configurationProvider()
+        try expected.requireEnvironment(configuration.preferenceIdentity)
+        guard verifiedScope.appOrigin == configuration.appOrigin,
+              verifiedScope.naturalUserID == expected.naturalUserID,
+              verifiedScope.workspaceID == expected.workspaceID else {
+            throw IMessagePendingEnrollmentError.scopeMismatch
+        }
+        guard journey.generation > 0 else { throw IMessagePendingEnrollmentError.invalidRecord }
+        let recovered = try IMessagePendingEnrollment(setupReference: journey.setupReference,
+            naturalUserID: verifiedScope.naturalUserID, workspaceID: verifiedScope.workspaceID,
+            environmentIdentity: configuration.preferenceIdentity, expiresAt: journey.expiresAt,
+            credentialBytes: expected.credentialBytes)
+        try recovered.requireUsable(now: now)
+        guard let current = try readPendingEnrollment(configuration), current == expected else {
+            throw IMessagePendingEnrollmentError.conflictingJourney
+        }
+        guard try loadInstallation(configuration) == nil else { throw IMessagePendingEnrollmentError.installationPresent }
+        if recovered.setupReference == expected.setupReference {
+            guard recovered == expected else { throw IMessagePendingEnrollmentError.conflictingJourney }
+            return expected
+        }
+        try writeRecord(try JSONEncoder().encode(recovered), configuration: configuration, kind: .pendingIMessage)
+        guard try readPendingEnrollment(configuration) == recovered else {
+            throw DesktopControlEnrollmentError.credentialStoreUnavailable
+        }
+        return recovered
+    }
+
     @discardableResult
     func clearPendingEnrollment(matching expected: IMessagePendingEnrollment) throws -> Bool {
         Self.lock.lock()
@@ -112,8 +147,71 @@ struct FileDesktopControlCredentialStore: DesktopControlCredentialStoring {
         let configuration = try configurationProvider()
         try expected.requireEnvironment(configuration.preferenceIdentity)
         guard let current = try readPendingEnrollment(configuration), current == expected else { return false }
+        guard let installation = try loadInstallation(configuration) else {
+            throw DesktopControlEnrollmentError.installationMissing
+        }
+        try requirePendingCredential(expected, installation: installation, configuration: configuration)
         try writeRecord(Data("null".utf8), configuration: configuration, kind: .pendingIMessage)
         return true
+    }
+
+    /// The installation must come from the native authenticated enrollment
+    /// response. Never clear unresolved proof after cancellation or expiry.
+    @discardableResult
+    func completePendingEnrollment(matching expected: IMessagePendingEnrollment,
+                                   installation: DesktopControlInstallation) throws -> Bool {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        let configuration = try configurationProvider()
+        try expected.requireEnvironment(configuration.preferenceIdentity)
+        guard let current = try readPendingEnrollment(configuration), current == expected else { return false }
+        try requirePendingCredential(expected, installation: installation, configuration: configuration)
+        if let saved = try loadInstallation(configuration), saved != installation {
+            throw IMessagePendingEnrollmentError.installationPresent
+        }
+        try writeFile(installation, configuration: configuration)
+        guard try loadInstallation(configuration) == installation else {
+            throw DesktopControlEnrollmentError.credentialStoreUnavailable
+        }
+        try writeRecord(Data("null".utf8), configuration: configuration, kind: .pendingIMessage)
+        return true
+    }
+
+    /// A server-confirmed revoked proof is discarded only after explicit Start
+    /// Again in the same live coordinator. Ordinary cancel/expiry cannot mint it.
+    @discardableResult
+    func discardPendingEnrollment(matching receipt: IMessageEnrollmentResetReceipt,
+                                  explicitStartAgain: Bool, currentGeneration: UUID) throws -> Bool {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        let configuration = try configurationProvider()
+        guard explicitStartAgain, currentGeneration == receipt.coordinatorGeneration,
+              receipt.environmentIdentity == configuration.preferenceIdentity,
+              receipt.verifiedScope.appOrigin == configuration.appOrigin,
+              receipt.verifiedScope.naturalUserID == receipt.pending.naturalUserID,
+              receipt.verifiedScope.workspaceID == receipt.pending.workspaceID else {
+            throw IMessagePendingEnrollmentError.scopeMismatch
+        }
+        try receipt.pending.requireEnvironment(configuration.preferenceIdentity)
+        guard let current = try readPendingEnrollment(configuration), current == receipt.pending else { return false }
+        guard try loadInstallation(configuration) == nil else { throw IMessagePendingEnrollmentError.installationPresent }
+        try writeRecord(Data("null".utf8), configuration: configuration, kind: .pendingIMessage)
+        guard try readPendingEnrollment(configuration) == nil else {
+            throw DesktopControlEnrollmentError.credentialStoreUnavailable
+        }
+        return true
+    }
+
+    private func requirePendingCredential(_ pending: IMessagePendingEnrollment,
+                                          installation: DesktopControlInstallation,
+                                          configuration: DesktopEnvironmentConfiguration) throws {
+        try installation.requireEnvironment(configuration.appPageURL, configuration: configuration)
+        var encoded = installation.machineCredential.replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        encoded += String(repeating: "=", count: (4 - encoded.count % 4) % 4)
+        guard Data(base64Encoded: encoded) == pending.credentialBytes else {
+            throw IMessagePendingEnrollmentError.scopeMismatch
+        }
     }
 
     private func readPendingEnrollment(_ configuration: DesktopEnvironmentConfiguration) throws -> IMessagePendingEnrollment? {
