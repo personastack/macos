@@ -110,6 +110,30 @@ func runtimeTestScope() Scope {
 	return Scope{AppOrigin: "https://my.personastack.ai", AccountID: "account-a", WorkspaceID: "workspace-a", DocumentID: "550e8400-e29b-41d4-a716-446655440000"}
 }
 
+func TestBundleVerificationPassesInlinePinnedRequirements(t *testing.T) {
+	t.Parallel()
+	fixture := newRuntimeFixture(t)
+	if err := fixture.runtime.verifyBundle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fixture.calls) != 3 {
+		t.Fatalf("unexpected signature operations: %+v", fixture.calls)
+	}
+	for index, identity := range []struct{ path, identifier string }{
+		{fixture.runtime.options.BundleDirectory, "ai.personastack.desktop"},
+		{fixture.runtime.lima, "ai.personastack.desktop.lima"},
+	} {
+		// codesign treats unprefixed requirement text as a filename. Keep the
+		// complete security requirement while selecting its inline-text form.
+		requirement := `=anchor apple generic and certificate leaf[subject.OU] = "5T2T8KL852" and certificate leaf = H"bbafb291a3d54ff75ea476a66b60878a81754e4d" and identifier "` + identity.identifier + `"`
+		want := []string{"--verify", "--strict", "--deep", "--test-requirement", requirement, identity.path}
+		call := fixture.calls[index]
+		if call.Operation != "verify_signature" || call.Executable != "/usr/bin/codesign" || !reflect.DeepEqual(call.Arguments, want) || call.Input != nil || call.Capture {
+			t.Fatalf("signature command %d does not preserve the inline pinned requirement: %+v", index, call)
+		}
+	}
+}
+
 func (fixture *runtimeFixture) Run(ctx context.Context, command nativeCommand) (commandOutput, error) {
 	fixture.calls = append(fixture.calls, command)
 	if command.Capture && command.Input != nil {

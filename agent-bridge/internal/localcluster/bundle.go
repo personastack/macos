@@ -40,7 +40,8 @@ func (runtime *Runtime) verifyBundle(ctx context.Context) error {
 	defer cancel()
 	for _, identity := range []struct{ path, identifier string }{{runtime.options.BundleDirectory, "ai.personastack.desktop"}, {runtime.lima, "ai.personastack.desktop.lima"}} {
 		requirement := `anchor apple generic and certificate leaf[subject.OU] = "5T2T8KL852" and certificate leaf = H"bbafb291a3d54ff75ea476a66b60878a81754e4d" and identifier "` + identity.identifier + `"`
-		_, err := runtime.command(ctx, "verify_signature", "/usr/bin/codesign", []string{"--verify", "--strict", "--deep", "--test-requirement", requirement, identity.path}, nil, false)
+		// codesign requires '=' to distinguish inline text from a requirement file.
+		_, err := runtime.command(ctx, "verify_signature", "/usr/bin/codesign", []string{"--verify", "--strict", "--deep", "--test-requirement", "=" + requirement, identity.path}, nil, false)
 		if err != nil {
 			return runtimeFailure(ctx, ReasonComponentUnverified, err)
 		}
