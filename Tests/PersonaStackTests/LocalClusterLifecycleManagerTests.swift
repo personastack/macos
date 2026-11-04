@@ -95,7 +95,8 @@ private actor LocalClusterLifecycleHTTP: LocalClusterHTTPTransport {
         }
         #expect(request.httpMethod == "POST")
         #expect(request.value(forHTTPHeaderField: "X-PersonaStack-Workspace-ID") == "ws-a")
-        let body = try #require(JSONSerialization.jsonObject(with: #require(request.httpBody)) as? [String: Any])
+        let requestBody = try #require(request.httpBody)
+        let body = try #require(try JSONSerialization.jsonObject(with: requestBody) as? [String: Any])
         #expect(body["expected_config_version"] as? Int64 == version)
         switch path {
         case "/user/kubernetes/clusters/cluster-own/stop":
@@ -292,7 +293,8 @@ private actor LocalClusterLifecycleControl: AgentBridgeControlTransport {
         #expect(lifecycle["local"] as? String == "running")
         #expect(lifecycle["failure"] == nil)
         #expect(rig.events.values == ["cloud-active", "local-resume"])
-        let bytes = try #require(rig.keychain.read(service: "ai.personastack.desktop.local-cluster-installation", account: "installation-ed25519-v1", interaction: .forbidden))
+        let retained = try rig.keychain.read(service: "ai.personastack.desktop.local-cluster-installation", account: "installation-ed25519-v1", interaction: .forbidden)
+        let bytes = try #require(retained)
         #expect(try LocalClusterInstallationKey(rawRepresentation: bytes).installationID == rig.fingerprint)
     }
     @Test func cloudRetirementFailureDoesNotClaimLocalFilesWereRetained() async throws {
@@ -405,7 +407,8 @@ private actor LocalClusterLifecycleControl: AgentBridgeControlTransport {
         #expect(lifecycle["local"] as? String == "stopped")
         #expect(lifecycle["available_actions"] as? [String] == ["install"])
         #expect(rig.events.values == ["key-write", "local-new_setup"])
-        let bytes = try #require(rig.keychain.read(service: "ai.personastack.desktop.local-cluster-installation", account: "installation-ed25519-v1", interaction: .forbidden))
+        let retained = try rig.keychain.read(service: "ai.personastack.desktop.local-cluster-installation", account: "installation-ed25519-v1", interaction: .forbidden)
+        let bytes = try #require(retained)
         #expect(try LocalClusterInstallationKey(rawRepresentation: bytes).installationID != rig.fingerprint)
     }
 }

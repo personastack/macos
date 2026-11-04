@@ -379,7 +379,9 @@ final class DesktopUpdater: NSObject, ObservableObject {
     /// Normal Quit with no staged installation never sends a helper operation.
     func allowsTermination() -> Bool {
         guard isReady, agentBridgeNeedsHandoff(), !isAgentBridgeReplacementPrepared else { return true }
-        statusMessage = "A staged update cannot replace active background agents on Quit. Use Restart Now to finish the update."
+        if !waitsForBackgroundAgents {
+            statusMessage = "A staged update cannot replace active background agents on Quit. Use Restart Now to finish the update."
+        }
         return false
     }
 

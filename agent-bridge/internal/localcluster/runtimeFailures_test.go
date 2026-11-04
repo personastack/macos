@@ -86,7 +86,7 @@ func TestRuntimeExpiredStopDoesNotDisableOrMutate(t *testing.T) {
 
 func TestNativeCustodyRejectsFIFOWithoutBlocking(t *testing.T) {
 	t.Parallel()
-	root := t.TempDir()
+	root := privateRuntimeTestDirectory(t)
 	err := os.Chmod(root, 0700)
 	if err != nil {
 		t.Fatal(err)

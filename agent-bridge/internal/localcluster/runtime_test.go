@@ -32,11 +32,8 @@ type runtimeFixture struct {
 
 func newRuntimeFixture(t *testing.T) *runtimeFixture {
 	t.Helper()
-	root, err := os.MkdirTemp("", "ps-runtime-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root := privateRuntimeTestDirectory(t)
+	var err error
 	fixture := &runtimeFixture{t: t}
 	options := RuntimeOptions{Root: filepath.Join(root, "r"), BundleDirectory: filepath.Join(root, "app.app"), Resources: VMResources{2, 2, 8}}
 	dependencies := runtimeDependencies{
@@ -56,6 +53,22 @@ func newRuntimeFixture(t *testing.T) *runtimeFixture {
 	}
 	writeTestBundle(t, options.BundleDirectory)
 	return fixture
+}
+
+func privateRuntimeTestDirectory(t *testing.T) string {
+	t.Helper()
+	// Native custody rejects symlinked ancestors, and Lima needs short sockets.
+	// macOS's default temporary directory can violate both constraints.
+	root, err := os.MkdirTemp("/tmp", "ps-runtime-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	canonical, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return canonical
 }
 
 func writeTestBundle(t *testing.T, bundle string) {

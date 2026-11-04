@@ -23,11 +23,16 @@ func TestLocalClusterSupportsLongAccountHomePath(t *testing.T) {
 func TestLocalClusterHelperPreparationDoesNotInstallOrCreateData(t *testing.T) {
 	t.Parallel()
 	// Keep this synthetic path below the real macOS Unix-socket limit.
-	directory, err := os.MkdirTemp("", "ps-mac-main-")
+	directory, err := os.MkdirTemp("/tmp", "ps-mac-main-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	canonical, err := filepath.EvalSymlinks(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory = canonical
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	manager, cluster, err := localClusterForBundle(ctx, filepath.Join(directory, "PersonaStack", "AgentBridge"), filepath.Join(directory, "PersonaStack.app"))

@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +13,18 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 
 
 class ARM64BuildTests(unittest.TestCase):
+    def test_release_gate_executes_every_managed_cluster_suite(self):
+        root = SCRIPTS.parent
+        workflow = (root / ".github/workflows/release.yml").read_text()
+        selection = re.search(r"--filter\s+'([^']+)'", workflow)
+        self.assertIsNotNone(selection, "native release test filter is missing")
+        suites = [suite
+                  for path in (root / "Tests/PersonaStackTests").glob("LocalCluster*Tests.swift")
+                  for suite in re.findall(r"@Suite[^\n]*\bstruct\s+(\w+)", path.read_text())]
+        self.assertTrue(suites, "managed-cluster native suites were not discovered")
+        uncovered = [suite for suite in suites if not re.search(selection.group(1), suite)]
+        self.assertEqual(uncovered, [], "release test gate skips managed-cluster suites")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="personastack-arm64-")
         self.addCleanup(self.temp.cleanup)

@@ -22,7 +22,7 @@ func (transport artifactTransport) RoundTrip(request *http.Request) (*http.Respo
 
 func TestArtifactDownloadVerifiesBeforeReuse(t *testing.T) {
 	t.Parallel()
-	root := t.TempDir()
+	root := privateRuntimeTestDirectory(t)
 	chmodErr := os.Chmod(root, 0700)
 	if chmodErr != nil {
 		t.Fatal(chmodErr)
@@ -94,7 +94,7 @@ func TestArtifactRedirectPolicy(t *testing.T) {
 
 func TestNativeCustodyRejectsLinksAndNonPrivateDirectories(t *testing.T) {
 	t.Parallel()
-	root := t.TempDir()
+	root := privateRuntimeTestDirectory(t)
 	chmodErr := os.Chmod(root, 0700)
 	if chmodErr != nil {
 		t.Fatal(chmodErr)
