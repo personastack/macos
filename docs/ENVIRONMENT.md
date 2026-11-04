@@ -4,7 +4,7 @@ This repository owns the Swift native client, its local Go agent bridge, native 
 
 ## Native account and subprocess inputs
 
-All rows here apply to the logged-in macOS client account in the selected environment. They are non-secret settings or local path/session metadata. They have no Kubernetes canonical binding.
+All rows here apply to the logged-in macOS client account in the selected environment. They are non-secret settings or local path/session metadata. These existing account and harness inputs are not Kubernetes deployment bindings. Managed local Kubernetes uses the private native settings and fixed child projection below.
 
 | Name | Consumer / purpose | Requiredness and unset behavior |
 | --- | --- | --- |
@@ -43,6 +43,23 @@ Sources are under `agent-bridge/internal/{runtime,hermessetup,openclawsetup,open
 | `BASH_ENV`, `ENV`, `NODE_OPTIONS`, `NODE_PATH` | OpenClaw launch environment filtering. | Removed for selected native launch with all ambient `OPENCLAW_*` keys before exact selected bindings are installed. Not accepted app configuration. | Potentially sensitive inherited inputs |
 
 Dynamic families: native Hermes launch removes ambient `API_SERVER_*`, `HERMES_PROFILE` and `HERMES_PROFILE_NAME`. OpenClaw selected launch removes all `OPENCLAW_*` globals before assigning exact state/config. `PERSONASTACK_CONNECTOR_LOCAL_MCP_*` is a diagnostic redaction pattern, not a dynamic environment reader. The message `HERMES_API_SERVER_KEY is required` is diagnostic text; no reader for that variable exists. The native credential file key is `API_SERVER_KEY`.
+
+## Managed local runtime settings and custody
+
+Managed Kubernetes adds no operator-provided environment credential, URL, command or kubeconfig input. The native helper owns one private runtime directory. Its `owner.json` records the retained App origin, account, workspace, bootstrapped state and local enabled intent. That local custody is separate from Hermes/OpenClaw bindings and Keychain entries. Cloud integration identity, credential issuance, assignment and worker storage remain API-owned. Native enrollment responses and guest Secret material never enter page messages or UserDefaults.
+
+Lima child commands receive fixed app-owned `HOME`, `LIMA_HOME` and `TMPDIR` directories. They receive `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `LANG=C` and `LC_ALL=C`. Ambient host credentials, the user's `~/.lima` and the user's `~/.kube` are not runtime inputs. Artifact paths, versions and resource limits come from native-owned descriptors. Page messages cannot override them.
+
+| Native setting | Owner and meaning | Absent behavior |
+| --- | --- | --- |
+| `agentBridge.backgroundDisabled` | UserDefaults mirror of explicit Hermes/OpenClaw background disable intent. It does not disable the local cluster. Helper startup uses its private shared disabled marker and actual cluster custody. Explicit native setup can clear that startup marker while retaining external disable intent and quiesced bindings. | No explicit external disable preference. |
+| `agentBridge.backgroundError` | Bounded native helper-registration or restore feedback. It carries no owner names, credentials or raw child output. | No saved feedback. |
+| `agentBridge.restoreAfterAppUpdate` | Existing native update handoff requests registration restore after replacement. A cluster-only restore preserves external disable intent and quiesced bindings. It may clear the shared startup disabled marker to launch the helper. | No replacement restore requested. |
+| `agentBridge.restoreLocalRuntimeAfterAppUpdate` | Native handoff captures the prior cluster enable intent before the first explicit Stop and update. Stop may save disabled intent before proving exit. Retries retain the original choice. The key is cleared only after successful restoration or cancellation. It grants no cloud scope or enrollment authority. | No cluster resume requested. |
+
+The existing helper `status` response advertises optional `local_cluster_control_version: 1`. Native code checks that typed capability before new runtime operations. Absence is the explicit compatibility case for the published pre-feature helper. Present malformed or unknown versions fail closed. Capability and runtime-query errors do not prove that a VM is absent. A typed `external_error` reports unavailable external Keychain custody without projecting an empty connection inventory. External operations retain their credential failure. The narrow local capability read ignores that independent inventory error so local Stop and Remove still work. Helper retirement remains blocked while external status is unknown. Startup installation-credential failure remains fixed for the helper lifetime. Restore login Keychain access and sign out of macOS, then sign back in to restart it. PersonaStack app sign-out does not restart the helper.
+
+Generic same-user runtime status contains local installed/running/Kubernetes availability, enabled intent, active-operation state and a finite safe reason. It contains no account, workspace, persona, path or credential metadata. False running alone cannot prove stopped when an operation or failed observation remains. The informational `local_data_removed` reason permits replacement only when installed, running, Kubernetes availability, enabled intent and active-operation state are all false. Stop, Resume and Remove Local Data use finite helper operations with bounded native polling. Menu removal requires native destructive confirmation. The runtime's single removal task owns initial Stop and stopped-process proof. Native code sends no separate Stop before removal or a partially erased retry. It reports local removal only after the exact removed-data status. It performs no cloud mutation or installation-key rotation. Timeout leaves status unknown until checked again. These settings do not add an installer journal or an exactly-once guarantee.
 
 ## Packaging and signing inputs
 
@@ -88,3 +105,10 @@ Tests also inject literal fake environment dictionaries for profile/projection b
 ## Maintenance
 
 Update this inventory when adding, changing or removing a reader, wrapper, generated child environment, workflow mapping or default. Keep `SPEC.md` linked here. This internal developer/operator reference changes no public customer workflow. No public-doc generation is required.
+
+
+### Native setup resource disclosure
+
+The existing unfiltered private helper `status` may include `local_cluster_requirements` only for an initialized local runtime. Its numeric fields are `cpus`, `memory_bytes`, `disk_bytes`, `initial_download_bytes`, and `minimum_host_memory_bytes`. Values come from Go runtime options and pinned installer artifact sizes. No environment variable or Swift fallback selects this budget. Native setup uses a separate strict requirements reader. Emergency control-version reads ignore this optional metadata so missing or malformed resource disclosure cannot block Stop or Remove.
+
+Fresh Install first enables/reads back the existing helper. It then checks physical RAM and active CPUs against the supplied minimum and obtains native consent before key creation, downloads or VM startup. The dialog describes the sparse virtual disk maximum, configured RAM/vCPUs, minimum physical RAM, initial runtime download and extra provider-image downloads. Cancel performs none of those setup effects. Existing-data Repair and ordinary Resume, Stop and Remove keep their existing flows. The dialog also explains background execution after app Quit/sign-out and the awake, network-connected, logged-in macOS requirement. These are conservative configuration policy inputs, not an available-RAM prediction or a claim that all minimum-sized Macs passed native acceptance.

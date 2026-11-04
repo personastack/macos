@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/personastack/agent-gateway/pkg/externalagentprotocol"
 	"github.com/personastack/macos/agent-bridge/internal/config"
+	"github.com/personastack/macos/agent-bridge/internal/localcluster"
 	"github.com/personastack/macos/agent-bridge/internal/mcp"
 	"github.com/personastack/macos/agent-bridge/internal/pairing"
 	"github.com/personastack/macos/agent-bridge/internal/runtime"
@@ -25,19 +26,22 @@ import (
 )
 
 type Controller struct {
-	Store        config.WritableStore
-	Seed         string
-	Environments func() ([]Environment, error)
-	Discover     func(runtime.AdapterKind, string) ([]targetinventory.Profile, []error)
-	Exchange     func(context.Context, Environment, pairing.Request) (pairing.Result, error)
-	Check        func(context.Context, config.Binding) (runtime.Detection, error)
-	Repair       func(context.Context, config.Binding, bool, bool, bool) error
-	Cleanup      func(config.Binding) error
-	Now          func() time.Time
-	Stop         func() error
-	Shutdown     func()
-	mu           sync.Mutex
-	preparations map[string]preparation
+	ExternalCredentialsUnavailable bool
+	LocalCluster                   *localcluster.Manager
+	LocalClusterRequirements       *localcluster.RuntimeRequirements
+	Store                          config.WritableStore
+	Seed                           string
+	Environments                   func() ([]Environment, error)
+	Discover                       func(runtime.AdapterKind, string) ([]targetinventory.Profile, []error)
+	Exchange                       func(context.Context, Environment, pairing.Request) (pairing.Result, error)
+	Check                          func(context.Context, config.Binding) (runtime.Detection, error)
+	Repair                         func(context.Context, config.Binding, bool, bool, bool) error
+	Cleanup                        func(config.Binding) error
+	Now                            func() time.Time
+	Stop                           func() error
+	Shutdown                       func()
+	mu                             sync.Mutex
+	preparations                   map[string]preparation
 }
 
 func strict(raw []byte, destination interface{}) error {
@@ -73,6 +77,26 @@ func (c *Controller) Dispatch(ctx context.Context, raw []byte) Response {
 	if !validUUID(request.RequestID) || len(request.Payload) == 0 || bytes.Equal(request.Payload, []byte("null")) {
 		return failed(response, "invalid_request", "request ID and payload required")
 	}
+	if localClusterOperation(request.Operation) {
+		if ctx.Err() != nil {
+			return operationExpired(response)
+		}
+		result, err := c.performLocalCluster(ctx, request)
+		if ctx.Err() != nil {
+			return operationExpired(response)
+		}
+		return completedResponse(response, request.Operation, result, err)
+	}
+	if c.ExternalCredentialsUnavailable {
+		if ctx.Err() != nil {
+			return operationExpired(response)
+		}
+		result, err := c.withoutExternalCredentials(request)
+		if ctx.Err() != nil {
+			return operationExpired(response)
+		}
+		return completedResponse(response, request.Operation, result, err)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if ctx.Err() != nil {
@@ -83,9 +107,44 @@ func (c *Controller) Dispatch(ctx context.Context, raw []byte) Response {
 	}
 	c.expirePreparations()
 	result, err := c.perform(ctx, request)
+	if request.Operation == "status" && c.LocalCluster != nil {
+		result.LocalClusterControlVersion = LocalClusterControlVersion
+	}
 	if ctx.Err() != nil {
 		return operationExpired(response)
 	}
+	return completedResponse(response, request.Operation, result, err)
+}
+
+const externalCredentialsMessage = "External runtime credentials are unavailable. Restore login Keychain access, then sign out of macOS and sign back in to reconnect external agents."
+
+func externalCredentialsError() *Error {
+	return &Error{Code: "credential_unavailable", Message: externalCredentialsMessage}
+}
+
+// Unfiltered status can advertise independent local IPC without inventing an
+// empty external inventory. All protected external work stays fenced.
+func (c *Controller) withoutExternalCredentials(request Request) (Result, error) {
+	if request.Operation != "status" {
+		return Result{}, externalCredentialsError()
+	}
+	payload := BindingPayload{}
+	err := strict(request.Payload, &payload)
+	if err != nil {
+		return Result{}, err
+	}
+	if payload.BindingKey != nil {
+		return Result{}, externalCredentialsError()
+	}
+	result := Result{ExternalError: externalCredentialsError()}
+	if c.LocalCluster != nil {
+		result.LocalClusterControlVersion = LocalClusterControlVersion
+		result.LocalClusterRequirements = c.LocalClusterRequirements
+	}
+	return result, nil
+}
+
+func completedResponse(response Response, operation string, result Result, err error) Response {
 	if err != nil {
 		code := "invalid_request"
 		if classified, ok := err.(*Error); ok {
@@ -93,7 +152,7 @@ func (c *Controller) Dispatch(ctx context.Context, raw []byte) Response {
 		}
 		return failed(response, code, diagnostic(err))
 	}
-	result.Operation = request.Operation
+	result.Operation = operation
 	response.Result = &result
 	encoded, err := json.Marshal(response)
 	if err != nil || len(encoded) > MaxBytes {
@@ -219,7 +278,7 @@ func (c *Controller) perform(ctx context.Context, r Request) (Result, error) {
 		if err != nil {
 			return Result{}, err
 		}
-		return c.stopBackground()
+		return c.stopBackground(ctx)
 	default:
 		return Result{}, issue("invalid_request", "Unknown local operation.")
 	}
@@ -420,6 +479,9 @@ func (c *Controller) status(ctx context.Context, p BindingPayload, probe bool) (
 		return Result{}, err
 	}
 	result := Result{Connections: []Connection{}}
+	if !probe && p.BindingKey == nil && c.LocalCluster != nil {
+		result.LocalClusterRequirements = c.LocalClusterRequirements
+	}
 	for _, b := range bindings {
 		row := Connection{ConnectionGeneration: b.ConnectionGeneration, BindingKey: b.Key(), PersonaID: string(b.PersonaID), RuntimeKind: b.RuntimeKind.String(), ReadinessState: b.ReadinessState.String(), ActiveRunID: b.ActiveRunID}
 		if validWorkspaceID(b.WorkspaceID) && b.AccountCandidateID != "" && b.ProfileCandidateID != "" {
@@ -580,13 +642,20 @@ func (c *Controller) quiesce(p BindingPayload, value bool) (Result, error) {
 	}
 	return result, nil
 }
-func (c *Controller) stopBackground() (Result, error) {
+func (c *Controller) stopBackground(ctx context.Context) (Result, error) {
 	admission, err := c.quiesce(BindingPayload{}, true)
 	if err != nil {
 		return Result{}, err
 	}
 	if len(admission.ActiveRunIDs) > 0 {
 		return Result{}, issue("busy", "Stop assigned runs before disabling background agents.")
+	}
+	keepService := false
+	if c.LocalCluster != nil {
+		keepService, err = c.LocalCluster.RetainForBackgroundStop(ctx)
+		if err != nil {
+			return Result{}, issue("service_unavailable", "Local runtime status is unavailable. Check again before stopping the background helper.")
+		}
 	}
 	if c.Stop != nil {
 		err := c.Stop()
@@ -595,7 +664,7 @@ func (c *Controller) stopBackground() (Result, error) {
 		}
 	}
 	disabled := true
-	return Result{Disabled: &disabled}, nil
+	return Result{Disabled: &disabled, KeepService: &keepService}, nil
 }
 
 func validPersonaID(value string) bool {

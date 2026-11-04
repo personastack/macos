@@ -140,7 +140,8 @@ func handleConnection(ctx context.Context, connection net.Conn, controller *Cont
 		return
 	}
 	_, _ = connection.Write(append(raw, '\n'))
-	if response.Result != nil && response.Result.Disabled != nil && *response.Result.Disabled && controller.Shutdown != nil {
+	if response.Result != nil && response.Result.Disabled != nil && *response.Result.Disabled &&
+		(response.Result.KeepService == nil || !*response.Result.KeepService) && controller.Shutdown != nil {
 		controller.Shutdown()
 	}
 }

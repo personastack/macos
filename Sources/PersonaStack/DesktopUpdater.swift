@@ -105,7 +105,7 @@ final class DesktopUpdater: NSObject, ObservableObject {
          confirmRestart: @escaping @MainActor () -> Bool = DesktopUpdater.confirmReadyRestart,
          presentApplicationsInstallInstruction: @escaping @MainActor (String) -> Void = DesktopUpdater.showApplicationsInstallInstruction,
          agentBridgeNeedsHandoff: @escaping @MainActor () -> Bool = { AgentBridgeUpdateHandoff.shared.needsHandoff },
-         prepareAgentBridgeUpdate: @escaping @MainActor () async throws -> Void = { try await AgentBridgeUpdateHandoff.shared.prepareReplacement() },
+         prepareAgentBridgeUpdate: @escaping @MainActor () async throws -> Void = DesktopUpdater.prepareAgentBridgeReplacement,
          cancelAgentBridgeUpdate: @escaping @MainActor () async throws -> Void = { try await AgentBridgeUpdateHandoff.shared.cancelReplacement() },
          cancelPermissionRestart: @escaping @MainActor () -> Void = {}) {
         self.updaterFactory = updaterFactory
@@ -331,6 +331,8 @@ final class DesktopUpdater: NSObject, ObservableObject {
             guard replacementGeneration == generation else { return false }
             waitsForBackgroundAgents = true
             switch error as? AgentBridgeFailure {
+            case .localRuntimeActive:
+                statusMessage = "Stop agents on this Mac from the PersonaStack menu, then retry Restart Now. Your local files are retained."
             case .busy:
                 statusMessage = "Finish or Stop assigned persona work, then retry Restart Now. Cancel the restart to resume background agents."
             default:
@@ -428,6 +430,23 @@ final class DesktopUpdater: NSObject, ObservableObject {
         alert.addButton(withTitle: "Later")
         alert.alertStyle = .informational
         return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    /// Both callers reach preparation only after an explicit restart decision.
+    /// Automatic downloads never consent to stopping a local VM.
+    static func prepareAgentBridgeReplacement() async throws {
+        do {
+            try await AgentBridgeUpdateHandoff.shared.prepareReplacement()
+        } catch AgentBridgeFailure.localRuntimeActive {
+            let alert = NSAlert()
+            alert.messageText = "Stop local agents and update PersonaStack?"
+            alert.informativeText = "This stops the local runtime and interrupts active agents on this Mac. Your local files are retained. The runtime resumes after the update."
+            alert.addButton(withTitle: "Stop and Update")
+            alert.addButton(withTitle: "Cancel")
+            alert.alertStyle = .warning
+            guard alert.runModal() == .alertFirstButtonReturn else { throw AgentBridgeFailure.localRuntimeActive }
+            try await AgentBridgeUpdateHandoff.shared.prepareReplacement(stoppingLocalRuntime: true)
+        }
     }
 
     static let applicationsInstallMessage = "This copy can't install updates from a read-only disk image or App Translocation. Quit PersonaStack, drag PersonaStack.app to Applications, then open it from Applications."

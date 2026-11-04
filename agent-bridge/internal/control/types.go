@@ -3,11 +3,15 @@ package control
 import (
 	"encoding/json"
 	"github.com/personastack/macos/agent-bridge/internal/config"
+	"github.com/personastack/macos/agent-bridge/internal/localcluster"
 	"github.com/personastack/macos/agent-bridge/internal/targetinventory"
 	"time"
 )
 
 const Version = 1
+
+// LocalClusterControlVersion advertises private IPC support, not product readiness.
+const LocalClusterControlVersion = 1
 const MaxBytes = 256 * 1024
 
 type Request struct {
@@ -77,6 +81,17 @@ type Result struct {
 	Quiesced           *bool              `json:"quiesced,omitempty"`
 	Disconnected       *bool              `json:"disconnected,omitempty"`
 	Disabled           *bool              `json:"disabled,omitempty"`
+
+	ExternalError *Error `json:"-"`
+
+	KeepService                *bool                             `json:"keep_service,omitempty"`
+	LocalClusterControlVersion int                               `json:"-"`
+	LocalClusterRequirements   *localcluster.RuntimeRequirements `json:"-"`
+
+	LocalCluster        *localcluster.Snapshot            `json:"local_cluster,omitempty"`
+	LocalClusterRuntime *localcluster.MachineStatus       `json:"-"`
+	LocalClusterStop    *localcluster.StopResult          `json:"-"`
+	LocalClusterBinding *localcluster.TargetBindingStatus `json:"-"`
 }
 type DiscoverPayload struct {
 	EnvironmentID string `json:"environment_id"`
@@ -136,6 +151,18 @@ type preparation struct {
 
 func (r Result) MarshalJSON() ([]byte, error) {
 	switch r.Operation {
+	case "local_cluster_binding":
+		return json.Marshal(r.LocalClusterBinding)
+	case "local_cluster_runtime_status":
+		return json.Marshal(r.LocalClusterRuntime)
+	case "local_cluster_runtime_stop":
+		return json.Marshal(r.LocalClusterStop)
+	case "local_cluster_runtime_resume", "local_cluster_remove":
+		if r.LocalClusterStop != nil {
+			return json.Marshal(r.LocalClusterStop)
+		}
+		type plain Result
+		return json.Marshal(plain(r))
 	case "discover":
 		if r.Profiles == nil {
 			r.Profiles = []Profile{}
@@ -145,12 +172,27 @@ func (r Result) MarshalJSON() ([]byte, error) {
 			DiscoveryStatus string    `json:"discovery_status"`
 		}{r.Profiles, r.DiscoveryStatus})
 	case "status", "check", "repair":
+		if r.Operation == "status" && r.ExternalError != nil {
+			return json.Marshal(struct {
+				LocalClusterControlVersion int                               `json:"local_cluster_control_version,omitempty"`
+				ExternalError              *Error                            `json:"external_error"`
+				LocalClusterRequirements   *localcluster.RuntimeRequirements `json:"local_cluster_requirements,omitempty"`
+			}{r.LocalClusterControlVersion, r.ExternalError, r.LocalClusterRequirements})
+		}
 		if r.Connections == nil {
 			r.Connections = []Connection{}
 		}
+		version := 0
+		var requirements *localcluster.RuntimeRequirements
+		if r.Operation == "status" {
+			version = r.LocalClusterControlVersion
+			requirements = r.LocalClusterRequirements
+		}
 		return json.Marshal(struct {
-			Connections []Connection `json:"connections"`
-		}{r.Connections})
+			Connections                []Connection                      `json:"connections"`
+			LocalClusterControlVersion int                               `json:"local_cluster_control_version,omitempty"`
+			LocalClusterRequirements   *localcluster.RuntimeRequirements `json:"local_cluster_requirements,omitempty"`
+		}{r.Connections, version, requirements})
 	case "quiesce", "resume":
 		if r.ActiveRunIDs == nil {
 			r.ActiveRunIDs = []string{}

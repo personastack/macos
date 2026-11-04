@@ -20,6 +20,19 @@ private final class AgentBridgeUpdaterState {
 }
 
 @Suite struct AgentBridgeUpdaterTests {
+    @Test @MainActor func activeLocalRuntimeDefersReplacementWithActionableFeedback() async {
+        let updater = DesktopUpdater(updaterFactory: { _, _ in AgentBridgeUpdaterClient() },
+            preferences: UserDefaults(suiteName: "AgentBridgeUpdaterTests." + UUID().uuidString)!,
+            presentReadyReminder: { _ in }, clearAvailableNotification: { _ in }, clearUpdateNotifications: { _ in },
+            agentBridgeNeedsHandoff: { true },
+            prepareAgentBridgeUpdate: { throw AgentBridgeFailure.localRuntimeActive }, cancelAgentBridgeUpdate: {})
+        updater.projectReady(version: "0.9.0", notifyWhenInactive: false)
+        #expect(!(await updater.prepareBackgroundAgentsForUpdate()))
+        #expect(updater.waitsForBackgroundAgents)
+        #expect(!updater.allowsTermination())
+        #expect(updater.statusMessage == "Stop agents on this Mac from the PersonaStack menu, then retry Restart Now. Your local files are retained.")
+    }
+
     @Test @MainActor func canceledPreparedReplacementBlocksQuitBeforeHelperResumes() async throws {
         var release: CheckedContinuation<Void, Never>?
         let updater = DesktopUpdater(updaterFactory: { _, _ in AgentBridgeUpdaterClient() },

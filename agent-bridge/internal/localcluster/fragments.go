@@ -1,25 +1,5 @@
 package localcluster
 
-// ConfigurationFragments holds deliberately incomplete configuration. No image
-// deployment, VM start, artifact download, enrollment, or consumer gate is emitted.
-type ConfigurationFragments struct {
-	LimaIsolation  string
-	K3s            string
-	Storage        string
-	PrepareStorage string
-}
-
-// Fragments returns the fixed single-node policy for the qualification fixture.
-// Resource budgets and runnable image references require real Mac qualification.
-func Fragments() ConfigurationFragments {
-	return ConfigurationFragments{
-		LimaIsolation:  limaIsolation,
-		K3s:            k3sConfiguration,
-		Storage:        storageConfiguration,
-		PrepareStorage: prepareStorage,
-	}
-}
-
 const limaIsolation = `vmType: vz
 arch: aarch64
 mounts: []
@@ -56,29 +36,6 @@ disable:
   - traefik
   - servicelb
   - local-storage
-`
-
-// No Deployment or helper Pod is emitted until approved image sources exist.
-// Upstream manifest/RBAC provenance is pinned by PinnedDescriptor.
-const storageConfiguration = `apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: personastack-local
-  annotations:
-    storageclass.kubernetes.io/is-default-class: "true"
-    defaultVolumeType: hostPath
-provisioner: rancher.io/local-path
-volumeBindingMode: Immediate
-reclaimPolicy: Delete
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: local-path-config
-  namespace: local-path-storage
-data:
-  config.json: |-
-    {"nodePathMap":[],"sharedFileSystemPath":"/var/lib/personastack/storage"}
 `
 
 // The selected Ubuntu disk supplies ext4. Refuse another filesystem rather than

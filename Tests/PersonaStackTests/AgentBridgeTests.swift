@@ -55,6 +55,11 @@ private final class AgentBridgeFixtureLifecycle: AgentBridgeUpdateLifecycle {
     var canQuiesce = true
     var busy = true
     var log: [String] = []
+    func localRuntimeSnapshot() async throws -> AgentBridgeLocalRuntimeSnapshot {
+        try JSONDecoder().decode(AgentBridgeLocalRuntimeSnapshot.self, from: Data(#"{"installed":false,"running":false,"kubernetes_available":false,"enabled":false,"installer_active":false}"#.utf8))
+    }
+    func stopLocalRuntime() async throws { Issue.record("Existing external lifecycle never stops a cluster") }
+    func resumeLocalRuntime() async throws { Issue.record("Existing external lifecycle never resumes a cluster") }
     func quiesce() async throws -> AgentBridgeAdmission {
         log.append("quiesce")
         guard canQuiesce else { throw AgentBridgeFailure.serviceUnavailable }

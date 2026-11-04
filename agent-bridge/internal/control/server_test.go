@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"github.com/google/uuid"
+	"github.com/personastack/macos/agent-bridge/internal/localcluster"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -14,6 +16,48 @@ type scriptedConnection struct {
 	input  *bytes.Reader
 	output bytes.Buffer
 	closed bool
+}
+
+func TestBackgroundStopRetainsHelperForActiveLocalSetup(t *testing.T) {
+	t.Parallel()
+	helper, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	release := make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	manager, err := localcluster.NewManager(helper, localClusterWorkflowFunc(func(ctx context.Context, _ localcluster.Scope, _ func(localcluster.Progress)) error {
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = manager.Start(clusterScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller, _, _ := fixture(t)
+	controller.LocalCluster = manager
+	stops, shutdowns := 0, 0
+	controller.Stop = func() error { stops++; return nil }
+	controller.Shutdown = func() { shutdowns++ }
+	connection := &scriptedConnection{input: bytes.NewReader([]byte(`{"version":1,"request_id":"` + uuid.NewString() + `","operation":"stop_background","payload":{}}` + "\n"))}
+	handleConnection(context.Background(), connection, controller)
+	var response Response
+	err = json.Unmarshal(connection.output.Bytes(), &response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Error != nil || response.Result == nil || response.Result.KeepService == nil || !*response.Result.KeepService {
+		t.Fatalf("external stop did not preserve active cluster helper: %+v", response)
+	}
+	if stops != 1 || shutdowns != 0 || !manager.Active() {
+		t.Fatalf("consumer stop affected local setup: stops=%d shutdowns=%d active=%t", stops, shutdowns, manager.Active())
+	}
 }
 
 func (c *scriptedConnection) Read(p []byte) (int, error)       { return c.input.Read(p) }
