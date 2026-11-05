@@ -4,10 +4,13 @@ public enum IMessageGatewayWireError: Error, Equatable, Sendable {
     case invalidFrame, frameTooLarge, resultTooLarge, correlationMismatch
 }
 
-public enum IMessageGatewayOperation: String, Codable, Sendable {
+public enum IMessageGatewayOperation: String, Codable, Hashable, Sendable {
     case prerequisites = "imessage_prerequisites"
     case setupConversations = "imessage_setup_conversations"
     case verifyConversations = "imessage_verify_conversations"
+    case status = "imessage_status", conversations = "imessage_conversations", conversation = "imessage_conversation"
+    case recentMessages = "imessage_recent_messages", sendMessage = "imessage_send_message"
+    case receivePage = "imessage_receive_page", sourceCheckpoint = "imessage_source_checkpoint"
 }
 
 public struct IMessageGatewaySetupScope: Codable, Equatable, Sendable {
@@ -36,28 +39,21 @@ public struct IMessageGatewaySetupScope: Codable, Equatable, Sendable {
     }
 }
 
-/// This unreleased wire admits setup metadata only. Config authority has no
-/// native representation until its separate execution owner is implemented.
+/// API-issued configured scopes and metadata-only setup scopes remain independent.
 public struct IMessageGatewaySnapshot: Codable, Equatable, Sendable {
     public let installationID: String
     public let revision: Int64
+    public let configs: [IMessageGatewayConfigScope]
     public let setupScope: IMessageGatewaySetupScope?
-    public init(installationID: String, revision: Int64, setupScope: IMessageGatewaySetupScope? = nil) {
-        self.installationID = installationID; self.revision = revision; self.setupScope = setupScope
+    public init(installationID: String, revision: Int64, configs: [IMessageGatewayConfigScope] = [], setupScope: IMessageGatewaySetupScope? = nil) {
+        self.installationID = installationID; self.revision = revision; self.configs = configs; self.setupScope = setupScope
     }
     public init(from decoder: Decoder) throws {
         let c = try gatewayContainer(decoder, CodingKeys.self, optional: [.setupScope])
         installationID = try c.decode(String.self, forKey: .installationID)
         revision = try c.decode(Int64.self, forKey: .revision)
-        let configs = try c.nestedUnkeyedContainer(forKey: .configs)
-        guard configs.isAtEnd else { throw IMessageGatewayWireError.invalidFrame }
+        configs = try c.decode([IMessageGatewayConfigScope].self, forKey: .configs)
         setupScope = try c.decodeIfPresent(IMessageGatewaySetupScope.self, forKey: .setupScope)
-    }
-    public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(installationID, forKey: .installationID); try c.encode(revision, forKey: .revision)
-        _ = c.nestedUnkeyedContainer(forKey: .configs)
-        try c.encodeIfPresent(setupScope, forKey: .setupScope)
     }
     enum CodingKeys: String, CodingKey, CaseIterable { case installationID = "installation_id", revision, configs, setupScope = "setup_scope" }
 }
@@ -73,25 +69,22 @@ public struct IMessageGatewayTarget: Codable, Equatable, Sendable {
     public let installationID: String
     public let workspaceID: String
     public let snapshotRevision: Int64
-    public init(installationID: String, workspaceID: String, snapshotRevision: Int64) {
+    public let configID: String?
+    public let configVersion: Int64?
+    public let accountGeneration: String?
+    public let sourceGeneration: String?
+    public init(installationID: String, workspaceID: String, snapshotRevision: Int64, configID: String? = nil,
+                configVersion: Int64? = nil, accountGeneration: String? = nil, sourceGeneration: String? = nil) {
         self.installationID = installationID; self.workspaceID = workspaceID; self.snapshotRevision = snapshotRevision
+        self.configID = gatewayNonempty(configID); self.configVersion = configVersion == 0 ? nil : configVersion
+        self.accountGeneration = gatewayNonempty(accountGeneration); self.sourceGeneration = gatewayNonempty(sourceGeneration)
     }
     public init(from decoder: Decoder) throws {
         let c = try gatewayContainer(decoder, CodingKeys.self, optional: [.configID, .configVersion, .accountGeneration, .sourceGeneration])
-        installationID = try c.decode(String.self, forKey: .installationID)
-        workspaceID = try c.decode(String.self, forKey: .workspaceID)
-        snapshotRevision = try c.decode(Int64.self, forKey: .snapshotRevision)
-        // Go accepts explicitly supplied zero optional fields. They confer no
-        // setup authority and canonical re-encoding omits them.
-        guard try c.decodeIfPresent(String.self, forKey: .configID) ?? "" == "",
-              try c.decodeIfPresent(Int64.self, forKey: .configVersion) ?? 0 == 0,
-              try c.decodeIfPresent(String.self, forKey: .accountGeneration) ?? "" == "",
-              try c.decodeIfPresent(String.self, forKey: .sourceGeneration) ?? "" == "" else { throw IMessageGatewayWireError.invalidFrame }
-    }
-    public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(installationID, forKey: .installationID); try c.encode(workspaceID, forKey: .workspaceID)
-        try c.encode(snapshotRevision, forKey: .snapshotRevision)
+        self.init(installationID: try c.decode(String.self, forKey: .installationID), workspaceID: try c.decode(String.self, forKey: .workspaceID),
+            snapshotRevision: try c.decode(Int64.self, forKey: .snapshotRevision), configID: try c.decodeIfPresent(String.self, forKey: .configID),
+            configVersion: try c.decodeIfPresent(Int64.self, forKey: .configVersion), accountGeneration: try c.decodeIfPresent(String.self, forKey: .accountGeneration),
+            sourceGeneration: try c.decodeIfPresent(String.self, forKey: .sourceGeneration))
     }
     enum CodingKeys: String, CodingKey, CaseIterable {
         case installationID = "installation_id", workspaceID = "workspace_id", snapshotRevision = "snapshot_revision"
@@ -114,19 +107,43 @@ public struct IMessageGatewaySetupCaller: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey, CaseIterable { case userID = "user_id", setupReference = "setup_reference", setupGeneration = "setup_generation" }
 }
 
+public enum IMessageGatewayCallerKind: String, Codable, Sendable {
+    case setupSession = "setup_session", personaMCP = "persona_mcp", streamAssignment = "stream_assignment", humanAction = "human_action"
+}
 public struct IMessageGatewayCaller: Codable, Equatable, Sendable {
-    public let setupSession: IMessageGatewaySetupCaller
-    public init(setupSession: IMessageGatewaySetupCaller) { self.setupSession = setupSession }
+    public let kind: IMessageGatewayCallerKind
+    public let setupSession: IMessageGatewaySetupCaller?
+    public let personaMCP: IMessageGatewayPersonaCaller?
+    public let streamAssignment: IMessageGatewayStreamCaller?
+    public let humanAction: IMessageGatewayHumanCaller?
+    public init(setupSession: IMessageGatewaySetupCaller) {
+        kind = .setupSession; self.setupSession = setupSession; personaMCP = nil; streamAssignment = nil; humanAction = nil
+    }
+    public init(personaMCP: IMessageGatewayPersonaCaller) {
+        kind = .personaMCP; setupSession = nil; self.personaMCP = personaMCP; streamAssignment = nil; humanAction = nil
+    }
+    public init(streamAssignment: IMessageGatewayStreamCaller) {
+        kind = .streamAssignment; setupSession = nil; personaMCP = nil; self.streamAssignment = streamAssignment; humanAction = nil
+    }
+    public init(humanAction: IMessageGatewayHumanCaller) {
+        kind = .humanAction; setupSession = nil; personaMCP = nil; streamAssignment = nil; self.humanAction = humanAction
+    }
     public init(from decoder: Decoder) throws {
-        let c = try gatewayContainer(decoder, CodingKeys.self)
-        guard try c.decode(String.self, forKey: .kind) == "setup_session" else { throw IMessageGatewayWireError.invalidFrame }
-        setupSession = try c.decode(IMessageGatewaySetupCaller.self, forKey: .setupSession)
+        let c = try gatewayContainer(decoder, CodingKeys.self, optional: [.setupSession, .personaMCP, .streamAssignment, .humanAction])
+        kind = try c.decode(IMessageGatewayCallerKind.self, forKey: .kind)
+        setupSession = try c.decodeIfPresent(IMessageGatewaySetupCaller.self, forKey: .setupSession)
+        personaMCP = try c.decodeIfPresent(IMessageGatewayPersonaCaller.self, forKey: .personaMCP)
+        streamAssignment = try c.decodeIfPresent(IMessageGatewayStreamCaller.self, forKey: .streamAssignment)
+        humanAction = try c.decodeIfPresent(IMessageGatewayHumanCaller.self, forKey: .humanAction)
+        let variants = [setupSession != nil, personaMCP != nil, streamAssignment != nil, humanAction != nil]
+        guard variants.filter({ $0 }).count == 1 else { throw IMessageGatewayWireError.invalidFrame }
+        let index: Int
+        switch kind { case .setupSession: index = 0; case .personaMCP: index = 1; case .streamAssignment: index = 2; case .humanAction: index = 3 }
+        guard variants[index] else { throw IMessageGatewayWireError.invalidFrame }
     }
-    public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode("setup_session", forKey: .kind); try c.encode(setupSession, forKey: .setupSession)
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case kind, setupSession = "setup_session", personaMCP = "persona_mcp", streamAssignment = "stream_assignment", humanAction = "human_action"
     }
-    enum CodingKeys: String, CodingKey, CaseIterable { case kind, setupSession = "setup_session" }
 }
 
 public struct IMessageGatewaySetupConversationsInput: Codable, Equatable, Sendable {
@@ -157,8 +174,9 @@ public enum IMessageGatewayCommandInput: Codable, Equatable, Sendable {
     case prerequisites
     case setupConversations(IMessageGatewaySetupConversationsInput)
     case verifyConversations(IMessageGatewayVerifyConversationsInput)
+    case configured(IMessageGatewayConfiguredInput)
     public var operation: IMessageGatewayOperation {
-        switch self { case .prerequisites: .prerequisites; case .setupConversations: .setupConversations; case .verifyConversations: .verifyConversations }
+        switch self { case .prerequisites: .prerequisites; case .setupConversations: .setupConversations; case .verifyConversations: .verifyConversations; case .configured(let value): IMessageGatewayOperation(rawValue: value.operationRawValue)! }
     }
     public init(from decoder: Decoder) throws {
         let c = try gatewayContainer(decoder, CodingKeys.self, optional: Set(CodingKeys.allCases))
@@ -167,6 +185,7 @@ public enum IMessageGatewayCommandInput: Codable, Equatable, Sendable {
         case .prerequisites: _ = try gatewayContainer(c.superDecoder(forKey: key), IMessageGatewayEmptyKeys.self); self = .prerequisites
         case .setupConversations: self = .setupConversations(try c.decode(IMessageGatewaySetupConversationsInput.self, forKey: key))
         case .verifyConversations: self = .verifyConversations(try c.decode(IMessageGatewayVerifyConversationsInput.self, forKey: key))
+        default: self = .configured(try IMessageGatewayConfiguredInput(from: decoder))
         }
     }
     public func encode(to encoder: Encoder) throws {
@@ -175,23 +194,29 @@ public enum IMessageGatewayCommandInput: Codable, Equatable, Sendable {
         case .prerequisites: _ = c.nestedContainer(keyedBy: IMessageGatewayEmptyKeys.self, forKey: .prerequisites)
         case .setupConversations(let input): try c.encode(input, forKey: .setupConversations)
         case .verifyConversations(let input): try c.encode(input, forKey: .verifyConversations)
+        case .configured(let value): try value.encode(to: encoder)
         }
     }
-    enum CodingKeys: String, CodingKey, CaseIterable { case prerequisites, setupConversations = "setup_conversations", verifyConversations = "verify_conversations" }
+    enum CodingKeys: String, CodingKey, CaseIterable { case prerequisites, setupConversations = "setup_conversations", verifyConversations = "verify_conversations"
+        case status, conversations, conversation, recentMessages = "recent_messages", sendMessage = "send_message"
+        case receivePage = "receive_page", sourceCheckpoint = "source_checkpoint"
+    }
 }
 
 public struct IMessageGatewayCommand: Codable, Equatable, Sendable {
     public let requestID: String
     public let authorizationID: String
+    public let sendAttemptID: String?
     public let deadlineAt: String
     public let target: IMessageGatewayTarget
     public let caller: IMessageGatewayCaller
     public let operation: IMessageGatewayOperation
     public let input: IMessageGatewayCommandInput
     public init(requestID: String, authorizationID: String, deadlineAt: String, target: IMessageGatewayTarget,
-                caller: IMessageGatewayCaller, input: IMessageGatewayCommandInput) {
+                caller: IMessageGatewayCaller, input: IMessageGatewayCommandInput, sendAttemptID: String? = nil) {
         self.requestID = requestID; self.authorizationID = authorizationID; self.deadlineAt = deadlineAt
         self.target = target; self.caller = caller; self.input = input; self.operation = input.operation
+        self.sendAttemptID = gatewayNonempty(sendAttemptID)
     }
     public init(from decoder: Decoder) throws {
         let c = try gatewayContainer(decoder, CodingKeys.self, optional: [.sendAttemptID])
@@ -199,11 +224,12 @@ public struct IMessageGatewayCommand: Codable, Equatable, Sendable {
         deadlineAt = try c.decode(String.self, forKey: .deadlineAt); target = try c.decode(IMessageGatewayTarget.self, forKey: .target)
         caller = try c.decode(IMessageGatewayCaller.self, forKey: .caller); operation = try c.decode(IMessageGatewayOperation.self, forKey: .operation)
         input = try c.decode(IMessageGatewayCommandInput.self, forKey: .input)
-        guard try c.decodeIfPresent(String.self, forKey: .sendAttemptID) ?? "" == "" else { throw IMessageGatewayWireError.invalidFrame }
+        sendAttemptID = gatewayNonempty(try c.decodeIfPresent(String.self, forKey: .sendAttemptID))
     }
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(requestID, forKey: .requestID); try c.encode(authorizationID, forKey: .authorizationID)
+        try c.encodeIfPresent(sendAttemptID, forKey: .sendAttemptID)
         try c.encode(deadlineAt, forKey: .deadlineAt); try c.encode(target, forKey: .target)
         try c.encode(caller, forKey: .caller); try c.encode(operation, forKey: .operation); try c.encode(input, forKey: .input)
     }
@@ -302,8 +328,9 @@ public enum IMessageGatewaySetupResult: Codable, Equatable, Sendable {
     case prerequisites(IMessageGatewayPrerequisitesResult)
     case conversationsPage(IMessageGatewayConversationsPageResult)
     case verification(IMessageGatewayVerificationResult)
+    case configured(IMessageGatewayConfiguredResult)
     public var operation: IMessageGatewayOperation {
-        switch self { case .prerequisites: .prerequisites; case .conversationsPage: .setupConversations; case .verification: .verifyConversations }
+        switch self { case .prerequisites: .prerequisites; case .conversationsPage: .setupConversations; case .verification: .verifyConversations; case .configured(let value): IMessageGatewayOperation(rawValue: value.operationRawValue)! }
     }
     public init(from decoder: Decoder) throws {
         let c = try gatewayContainer(decoder, CodingKeys.self, optional: Set(CodingKeys.allCases))
@@ -312,6 +339,7 @@ public enum IMessageGatewaySetupResult: Codable, Equatable, Sendable {
         case .prerequisites: self = .prerequisites(try c.decode(IMessageGatewayPrerequisitesResult.self, forKey: key))
         case .conversationsPage: self = .conversationsPage(try c.decode(IMessageGatewayConversationsPageResult.self, forKey: key))
         case .verification: self = .verification(try c.decode(IMessageGatewayVerificationResult.self, forKey: key))
+        default: self = .configured(try IMessageGatewayConfiguredResult(from: decoder))
         }
     }
     public func encode(to encoder: Encoder) throws {
@@ -320,9 +348,13 @@ public enum IMessageGatewaySetupResult: Codable, Equatable, Sendable {
         case .prerequisites(let value): try c.encode(value, forKey: .prerequisites)
         case .conversationsPage(let value): try c.encode(value, forKey: .conversationsPage)
         case .verification(let value): try c.encode(value, forKey: .verification)
+        case .configured(let value): try value.encode(to: encoder)
         }
     }
-    enum CodingKeys: String, CodingKey, CaseIterable { case prerequisites, conversationsPage = "conversations_page", verification }
+    enum CodingKeys: String, CodingKey, CaseIterable { case prerequisites, conversationsPage = "conversations_page", verification
+        case status, conversations, conversation, recentMessages = "recent_messages", sendMessage = "send_message"
+        case receivePage = "receive_page", sourceCheckpoint = "source_checkpoint"
+    }
 }
 
 public enum IMessageGatewayFailureCode: String, Codable, Sendable {
@@ -338,18 +370,20 @@ public struct IMessageGatewayFailure: Codable, Equatable, Sendable {
     public let code: IMessageGatewayFailureCode
     public let message: String
     public let retrySafe: Bool
-    public init(code: IMessageGatewayFailureCode, message: String, retrySafe: Bool = true) {
-        self.code = code; self.message = message; self.retrySafe = retrySafe
+    public let clientRequestID: String?
+    public init(code: IMessageGatewayFailureCode, message: String, retrySafe: Bool = true, clientRequestID: String? = nil) {
+        self.code = code; self.message = message; self.retrySafe = retrySafe; self.clientRequestID = gatewayNonempty(clientRequestID)
     }
     public init(from decoder: Decoder) throws {
         let c = try gatewayContainer(decoder, CodingKeys.self, optional: [.clientRequestID])
         code = try c.decode(IMessageGatewayFailureCode.self, forKey: .code); message = try c.decode(String.self, forKey: .message)
         retrySafe = try c.decode(Bool.self, forKey: .retrySafe)
-        guard try c.decodeIfPresent(String.self, forKey: .clientRequestID) ?? "" == "" else { throw IMessageGatewayWireError.invalidFrame }
+        clientRequestID = gatewayNonempty(try c.decodeIfPresent(String.self, forKey: .clientRequestID))
     }
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(code, forKey: .code); try c.encode(message, forKey: .message); try c.encode(retrySafe, forKey: .retrySafe)
+        try c.encodeIfPresent(clientRequestID, forKey: .clientRequestID)
     }
     enum CodingKeys: String, CodingKey, CaseIterable { case code, message, retrySafe = "retry_safe", clientRequestID = "client_request_id" }
 }

@@ -240,16 +240,22 @@ public actor IMessageRPCClient {
 
     /// Executes one send and verifies a new exact row in the selected chat.
     /// The caller must separately supply the current API-owned immediate-send grant.
-    public func send(chatID: IMessageRowID, text: String, expectedAccountID: String) async throws -> IMessageSendReceipt {
+    public func send(chatID: IMessageRowID, text: String, expectedAccountID: String, expectedChatGUID: String,
+                     deadline: Date, validateCurrent: @escaping @Sendable () async throws -> Bool) async throws -> IMessageSendReceipt {
         guard chatID.value > 0, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              text.utf8.count <= 16 * 1024, validAccountID(expectedAccountID) else { throw IMessageRPCError.invalidArguments }
+              text.utf8.count <= 16 * 1024, validAccountID(expectedAccountID), bounded(expectedChatGUID, maximum: 256, nonempty: true) else { throw IMessageRPCError.invalidArguments }
         guard !mutationInFlight else { throw IMessageRPCError.busy }
         mutationInFlight = true
-        mutationDeadline = Date().addingTimeInterval(sendTimeoutSeconds)
+        mutationDeadline = min(deadline, Date().addingTimeInterval(sendTimeoutSeconds))
+        let expectedGeneration = generation
         defer { mutationInFlight = false; mutationDeadline = nil; receiptDeadline = nil }
         let checkpoint = try await sourceCheckpoint(chatIDs: [chatID])
         guard let chat = checkpoint.chats.first, chat.available, chat.service == "iMessage",
-              bounded(chat.guid, maximum: 256, nonempty: true) else { throw IMessageRPCError.invalidResponse }
+              chat.guid == expectedChatGUID else { throw IMessageRPCError.invalidResponse }
+        guard try await validateCurrent() else { throw IMessageRPCError.cancelled }
+        try Task.checkCancellation()
+        guard expectedGeneration == generation, started, ready else { throw IMessageRPCError.cancelled }
+        guard deadline > Date() else { throw IMessageRPCError.deadlineExceeded }
         let result: SendResult = try await call(.send, params: SendParams(chatID: chatID, chatGUID: chat.guid, text: text, expectedAccountID: expectedAccountID),
             timeoutSeconds: sendTimeoutSeconds, keys: ["submitted", "transport", "service", "chat_guid"])
         do {
@@ -318,14 +324,13 @@ public actor IMessageRPCClient {
             let response = try JSONDecoder().decode(IMessageRPCResponse<Result>.self, from: raw)
             if let error = response.error {
                 let safe = error.data?.retrySafe ?? (error.code == -32602 || error.code == -32004)
-                if method == .send && !safe { throw IMessageRPCError.outcomeUnknown }
+                if method == .send { throw IMessageRPCError.outcomeUnknown }
                 throw IMessageRPCError.providerRejected(code: error.code, retrySafe: safe)
             }
             guard let result = response.result else { throw IMessageRPCError.invalidResponse }
             return result
         } catch {
             if method == .send {
-                if let known = error as? IMessageRPCError, case .providerRejected = known { throw known }
                 throw IMessageRPCError.outcomeUnknown
             }
             throw (error as? IMessageRPCError) ?? .invalidResponse

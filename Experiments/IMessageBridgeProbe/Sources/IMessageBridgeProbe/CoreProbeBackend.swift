@@ -81,7 +81,8 @@ public actor CoreProbeBackend: ProbeBackend {
             // The shared client also checks this public account inside its fixed
             // provider script immediately before the external mutation.
             try Task.checkCancellation()
-            receipt = try await client.send(chatID: row, text: text, expectedAccountID: target.accountID)
+            receipt = try await client.send(chatID: row, text: text, expectedAccountID: target.accountID, expectedChatGUID: before.chatGUID,
+                deadline: Date().addingTimeInterval(45), validateCurrent: { try await self.sendContextIsCurrent(requested, chatGUID: before.chatGUID) })
         }
         catch IMessageRPCError.providerRejected(_, let retrySafe) {
             return retrySafe ? .notStarted : .outcomeUnknown
@@ -110,7 +111,13 @@ public actor CoreProbeBackend: ProbeBackend {
 
     public func cancel() async { await invalidate() }
 
-    private struct SelectedCheckpoint {
+    private func sendContextIsCurrent(_ requested: ProbeTarget, chatGUID: String) async throws -> Bool {
+        try requireSelectedTarget(requested)
+        let account = try await checkedAccount(false)
+        return account.liveChatGUID == chatGUID
+    }
+
+    private struct SelectedCheckpoint: Sendable {
         let sourceHighWater: IMessageRowID
         let tailRowID: IMessageRowID
         let tailGUID: String

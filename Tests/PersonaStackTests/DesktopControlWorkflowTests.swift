@@ -274,3 +274,26 @@ private actor SuspendedReadiness {
     monitor.receiveNetworkAvailability(true)
     #expect(recoveries == 2)
 }
+
+
+@Test @MainActor func desktopSessionAvailabilityTransitionsDoNotDependOnScreenLockState() {
+    let snapshot = DesktopSessionSnapshotFixture(.locked)
+    let monitor = DesktopControlSessionLock(observeSystem: false, snapshotReader: { snapshot.value })
+    monitor.reconcile()
+    #expect(monitor.state == .locked && monitor.isAwakeAndActive)
+    var losses = 0, recoveries = 0
+    monitor.onLifecycleLoss = { losses += 1 }
+    monitor.onRecovery = { recoveries += 1 }
+    snapshot.value = .inactive
+    monitor.reconcile()
+    #expect(monitor.state == .locked && !monitor.isAwakeAndActive && losses == 1)
+    monitor.reconcile()
+    #expect(losses == 1)
+    snapshot.value = .locked
+    monitor.reconcile()
+    #expect(monitor.state == .locked && monitor.isAwakeAndActive && recoveries == 1)
+    monitor.reconcile()
+    #expect(losses == 1 && recoveries == 1)
+    monitor.receive(.locked)
+    #expect(losses == 1 && recoveries == 1)
+}

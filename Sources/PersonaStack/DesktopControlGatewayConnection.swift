@@ -205,6 +205,10 @@ actor DesktopControlGatewayConnection {
         }
     }
 
+    func hasIMessageBinding(_ connectionID: UUID) -> Bool {
+        connected && iMessageEnabled && iMessageConnectionID == connectionID
+    }
+
     func usesIMessageRuntime(_ runtime: IMessageRuntime) -> Bool {
         iMessageRuntime === runtime
     }
@@ -304,8 +308,8 @@ actor DesktopControlGatewayConnection {
         }
         let connectionID = iMessageConnectionID
         guard iMessageEnabled, let iMessageRuntime else {
-            try await sendIMessage(.failure(.init(code: .capabilityDisabled,
-                message: "This connection does not support Messages setup.")), requestID: requestID, connectionID: connectionID)
+            try await sendIMessage(.failure(Self.iMessageAdmissionFailure(.capabilityDisabled,
+                message: "This connection does not support Messages.", payload: payload)), requestID: requestID, connectionID: connectionID)
             return
         }
         switch payload {
@@ -314,7 +318,7 @@ actor DesktopControlGatewayConnection {
             try await sendIMessage(response, requestID: requestID, connectionID: connectionID)
         case .command(let command):
             guard Self.hasCapacity(for: nil, activeCount: commandTasks.count + iMessageRequestIDs.count) else {
-                try await sendIMessage(.failure(.init(code: .busy, message: "This Mac is handling other requests.")),
+                try await sendIMessage(.failure(Self.iMessageAdmissionFailure(.busy, message: "This Mac is handling other requests.", payload: payload)),
                     requestID: requestID, connectionID: connectionID)
                 return
             }
@@ -325,6 +329,14 @@ actor DesktopControlGatewayConnection {
             if let failure { await completeIMessage(.failure(failure), requestID: requestID, connectionID: connectionID) }
         default: throw DesktopControlGatewayConnectionError.invalidFrame
         }
+    }
+
+    private static func iMessageAdmissionFailure(_ code: IMessageGatewayFailureCode, message: String,
+                                                 payload: IMessageGatewayPayload) -> IMessageGatewayFailure {
+        let key: String?
+        if case .command(let command) = payload, case .configured(.sendMessage(let input)) = command.input { key = input.clientRequestID }
+        else { key = nil }
+        return .init(code: code, message: message, retrySafe: true, clientRequestID: key)
     }
 
     private func sendIMessage(_ payload: IMessageGatewayPayload, requestID: String, connectionID: UUID) async throws {

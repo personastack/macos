@@ -44,7 +44,7 @@ private func gatewayResultFrame(_ result: IMessageGatewaySetupResult) -> Desktop
         .replacingOccurrences(of: "\"setup_generation\":1", with: "\"setup_generation\":9223372036854775807"))
     guard case .command(let exact) = try #require(exactCommand.imessage) else { throw IMessageGatewayWireError.invalidFrame }
     #expect(exact.target.snapshotRevision == 9_007_199_254_740_993)
-    #expect(exact.caller.setupSession.setupGeneration == Int64.max)
+    #expect(exact.caller.setupSession?.setupGeneration == Int64.max)
     #expect(try DesktopControlFrameCodec.decode(DesktopControlFrameCodec.encode(exactCommand)) == exactCommand)
     try IMessageGatewayWire.validateSnapshotAck(frame, requestID: "request", revision: .max)
     #expect(throws: IMessageGatewayWireError.correlationMismatch) { try IMessageGatewayWire.validateSnapshotAck(frame, requestID: "other", revision: .max) }
@@ -63,12 +63,12 @@ private func gatewayResultFrame(_ result: IMessageGatewaySetupResult) -> Desktop
             let restored = try DesktopControlFrameCodec.decode(DesktopControlFrameCodec.encode(frame))
             #expect(restored.type == kind)
             #expect(restored.readiness == "paused")
-            #expect(IMessageGatewayWire.supports(protocolVersion: restored.imessageProtocolVersion) == (version == 1))
+            #expect(IMessageGatewayWire.supports(protocolVersion: restored.imessageProtocolVersion) == (version == 2))
         }
     }
     #expect(try gatewayDecode(#"{"version":1,"type":"ready","type":"ready","arguments":null}"#).arguments == nil)
     #expect(throws: IMessageGatewayWireError.invalidFrame) { try DesktopControlFrameCodec.encode(DesktopControlFrame(type: "ready", imessageProtocolVersion: -1)) }
-    #expect(throws: IMessageGatewayWireError.invalidFrame) { try DesktopControlFrameCodec.encode(DesktopControlFrame(type: "hello", imessageProtocolVersion: 1)) }
+    #expect(throws: IMessageGatewayWireError.invalidFrame) { try DesktopControlFrameCodec.encode(DesktopControlFrame(type: "hello", imessageProtocolVersion: 2)) }
     for token in ["1.0", "1e0", "true", "\"1\"", "1,\"imessage_protocol_version\":2"] {
         #expect(throws: (any Error).self) { try gatewayDecode("{\"version\":1,\"type\":\"ready\",\"imessage_protocol_version\":\(token)}") }
     }
@@ -230,8 +230,10 @@ private func gatewayResultFrame(_ result: IMessageGatewaySetupResult) -> Desktop
     let failure = DesktopControlFrame(type: "imessage", requestID: "request", imessage: .failure(.init(code: .permissionRequired, message: "Permission required")))
     #expect(try DesktopControlFrameCodec.decode(DesktopControlFrameCodec.encode(failure)) == failure)
     try IMessageGatewayWire.validateResult(failure, for: gatewayTypedCommand())
-    for value in [IMessageGatewayFailure(code: .busy, message: "Busy", retrySafe: false),
-                  .init(code: .outcomeUnknown, message: "Unknown"), .init(code: .statusUnavailable, message: "Unknown"),
+    let postDispatch = DesktopControlFrame(type: "imessage", requestID: "request", imessage: .failure(.init(code: .busy, message: "Busy", retrySafe: false)))
+    #expect(try DesktopControlFrameCodec.decode(DesktopControlFrameCodec.encode(postDispatch)) == postDispatch)
+    #expect(throws: IMessageGatewayWireError.correlationMismatch) { try IMessageGatewayWire.validateResult(postDispatch, for: gatewayTypedCommand()) }
+    for value in [IMessageGatewayFailure(code: .outcomeUnknown, message: "Unknown"), .init(code: .statusUnavailable, message: "Unknown"),
                   .init(code: .busy, message: "")] {
         #expect(throws: IMessageGatewayWireError.invalidFrame) {
             try DesktopControlFrameCodec.encode(DesktopControlFrame(type: "imessage", requestID: "request", imessage: .failure(value)))

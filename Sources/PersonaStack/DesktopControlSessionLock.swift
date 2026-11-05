@@ -34,24 +34,30 @@ final class DesktopControlSessionLock {
             })
         }
         observe(workspaceCenter, NSWorkspace.willSleepNotification) { monitor in
+            let wasAvailable = monitor.isAwakeAndActive
             monitor.sleeping = true
-            monitor.onLifecycleLoss?()
+            monitor.reportAvailabilityChange(previously: wasAvailable)
             monitor.publish(.locked)
         }
         observe(workspaceCenter, NSWorkspace.didWakeNotification) { monitor in
+            let wasAvailable = monitor.isAwakeAndActive
             monitor.sleeping = false
-            monitor.reconcile()
-            monitor.onRecovery?()
+            monitor.reconcileSnapshot()
+            monitor.reportAvailabilityChange(previously: wasAvailable)
+            if wasAvailable && monitor.isAwakeAndActive { monitor.onRecovery?() }
         }
         observe(workspaceCenter, NSWorkspace.sessionDidResignActiveNotification) { monitor in
+            let wasAvailable = monitor.isAwakeAndActive
             monitor.inactive = true
-            monitor.onLifecycleLoss?()
+            monitor.reportAvailabilityChange(previously: wasAvailable)
             monitor.publish(.locked)
         }
         observe(workspaceCenter, NSWorkspace.sessionDidBecomeActiveNotification) { monitor in
+            let wasAvailable = monitor.isAwakeAndActive
             monitor.inactive = false
-            monitor.reconcile()
-            monitor.onRecovery?()
+            monitor.reconcileSnapshot()
+            monitor.reportAvailabilityChange(previously: wasAvailable)
+            if wasAvailable && monitor.isAwakeAndActive { monitor.onRecovery?() }
         }
         observe(workspaceCenter, NSWorkspace.screensDidWakeNotification) { $0.onRecovery?() }
         if observeNetwork {
@@ -102,6 +108,18 @@ final class DesktopControlSessionLock {
     }
 
     func reconcile() {
+        let wasAvailable = isAwakeAndActive
+        reconcileSnapshot()
+        reportAvailabilityChange(previously: wasAvailable)
+    }
+
+    private func reportAvailabilityChange(previously wasAvailable: Bool) {
+        guard wasAvailable != isAwakeAndActive else { return }
+        if isAwakeAndActive { onRecovery?() }
+        else { onLifecycleLoss?() }
+    }
+
+    private func reconcileSnapshot() {
         switch snapshotReader() {
         case .locked:
             inactive = false
@@ -129,6 +147,7 @@ final class DesktopControlSessionLock {
     }
 
     func receive(_ value: State) {
+        let wasAvailable = isAwakeAndActive
         if value == .locked { observedLock = true }
         if value == .unlocked {
             // Recheck this user's console activity before applying a distributed
@@ -138,7 +157,7 @@ final class DesktopControlSessionLock {
             guard !sleeping, !inactive else { return }
         }
         publish(value)
-        if value == .unlocked { onRecovery?() }
+        if value == .unlocked && wasAvailable { onRecovery?() }
     }
 
     func receiveNetworkAvailability(_ available: Bool) {

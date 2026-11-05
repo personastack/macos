@@ -3,7 +3,7 @@ import Foundation
 /// Structural and correlation checks only. The API grants and native local
 /// intent checks remain required before any provider operation.
 public enum IMessageGatewayWire {
-    public static let protocolVersion = 1
+    public static let protocolVersion = 2
     public static let providerAdapterRevision = 2
     public static let maximumResultBytes = 1 << 20
     public static func supports(protocolVersion: Int?) -> Bool { protocolVersion == Self.protocolVersion }
@@ -26,13 +26,18 @@ public enum IMessageGatewayWire {
             guard value.requestID == requestID else { throw IMessageGatewayWireError.invalidFrame }
         case .result(let value): try validate(value)
         case .failure(let value):
-            guard value.retrySafe, ![.outcomeUnknown, .requestInProgress, .statusUnavailable].contains(value.code),
-                  (1...512).contains(value.message.unicodeScalars.count) else { throw IMessageGatewayWireError.invalidFrame }
+            guard (1...512).contains(value.message.unicodeScalars.count),
+                  !value.retrySafe || ![.outcomeUnknown, .requestInProgress, .statusUnavailable].contains(value.code),
+                  value.clientRequestID.map({ (1...128).contains($0.unicodeScalars.count) && !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) ?? true else {
+                throw IMessageGatewayWireError.invalidFrame
+            }
         }
     }
 
     public static func validate(_ snapshot: IMessageGatewaySnapshot) throws {
-        guard identifier(snapshot.installationID), snapshot.revision > 0 else { throw IMessageGatewayWireError.invalidFrame }
+        guard identifier(snapshot.installationID), snapshot.revision > 0,
+              Set(snapshot.configs.map(\.configID)).count == snapshot.configs.count else { throw IMessageGatewayWireError.invalidFrame }
+        for config in snapshot.configs { try IMessageConfiguredGatewayValidation.validate(config) }
         if let scope = snapshot.setupScope {
             guard canonical32(scope.setupReferenceSHA256), scope.generation > 0, identifier(scope.workspaceID), identifier(scope.userID) else {
                 throw IMessageGatewayWireError.invalidFrame
@@ -42,13 +47,16 @@ public enum IMessageGatewayWire {
     }
 
     public static func validate(_ command: IMessageGatewayCommand) throws {
-        let caller = command.caller.setupSession
         guard identifier(command.requestID), identifier(command.authorizationID), identifier(command.target.installationID),
-              identifier(command.target.workspaceID), command.target.snapshotRevision > 0, identifier(caller.userID),
-              caller.setupGeneration > 0, canonical32(caller.setupReference), command.input.operation == command.operation else {
+              identifier(command.target.workspaceID), command.target.snapshotRevision > 0, command.input.operation == command.operation else {
             throw IMessageGatewayWireError.invalidFrame
         }
         _ = try timestampKey(command.deadlineAt)
+        if case .configured(let input) = command.input { try validateConfiguredCommand(command, input: input); return }
+        guard command.caller.kind == .setupSession, let caller = command.caller.setupSession,
+              identifier(caller.userID), caller.setupGeneration > 0, canonical32(caller.setupReference), command.sendAttemptID == nil,
+              command.target.configID == nil, command.target.configVersion == nil, command.target.accountGeneration == nil,
+              command.target.sourceGeneration == nil else { throw IMessageGatewayWireError.invalidFrame }
         switch command.input {
         case .prerequisites: break
         case .setupConversations(let value):
@@ -58,6 +66,55 @@ public enum IMessageGatewayWire {
         case .verifyConversations(let value):
             guard (1...32).contains(value.conversationIDs.count), Set(value.conversationIDs).count == value.conversationIDs.count,
                   value.conversationIDs.allSatisfy(identifier) else { throw IMessageGatewayWireError.invalidFrame }
+        case .configured: throw IMessageGatewayWireError.invalidFrame
+        }
+    }
+
+    private static func validateConfiguredCommand(_ command: IMessageGatewayCommand, input: IMessageGatewayConfiguredInput) throws {
+        let target = command.target
+        guard let configID = target.configID, identifier(configID), (target.configVersion ?? 0) > 0,
+              target.accountGeneration.map(identifier) == true, target.sourceGeneration.map(identifier) == true else { throw IMessageGatewayWireError.invalidFrame }
+        let allowed: Set<IMessageGatewayOperation>
+        switch command.caller.kind {
+        case .setupSession: throw IMessageGatewayWireError.invalidFrame
+        case .personaMCP:
+            guard let caller = command.caller.personaMCP else { throw IMessageGatewayWireError.invalidFrame }
+            try IMessageConfiguredGatewayValidation.validate(caller)
+            allowed = [.status, .conversations, .conversation, .recentMessages, .sendMessage]
+        case .streamAssignment:
+            guard let caller = command.caller.streamAssignment else { throw IMessageGatewayWireError.invalidFrame }
+            try IMessageConfiguredGatewayValidation.validate(caller)
+            allowed = [.status, .recentMessages, .receivePage, .sourceCheckpoint]
+        case .humanAction:
+            guard let caller = command.caller.humanAction else { throw IMessageGatewayWireError.invalidFrame }
+            try IMessageConfiguredGatewayValidation.validate(caller)
+            allowed = caller.action == .check ? [.status] : [.sendMessage]
+        }
+        guard allowed.contains(command.operation) else { throw IMessageGatewayWireError.invalidFrame }
+        try validateConfiguredInput(input, configID: configID)
+        if case .sendMessage(let send) = input {
+            guard command.sendAttemptID.map(identifier) == true else { throw IMessageGatewayWireError.invalidFrame }
+            if let human = command.caller.humanAction {
+                guard human.conversationID == send.conversationID else { throw IMessageGatewayWireError.invalidFrame }
+            }
+        } else if command.sendAttemptID != nil { throw IMessageGatewayWireError.invalidFrame }
+    }
+    private static func validateConfiguredInput(_ input: IMessageGatewayConfiguredInput, configID: String) throws {
+        switch input {
+        case .status(let value), .conversations(let value):
+            try IMessageConfiguredGatewayValidation.validate(value)
+            guard value.integrationID == configID else { throw IMessageGatewayWireError.invalidFrame }
+        case .conversation(let value):
+            try IMessageConfiguredGatewayValidation.validate(value)
+            guard value.integrationID == configID else { throw IMessageGatewayWireError.invalidFrame }
+        case .recentMessages(let value):
+            try IMessageConfiguredGatewayValidation.validate(value)
+            guard value.integrationID == configID else { throw IMessageGatewayWireError.invalidFrame }
+        case .sendMessage(let value):
+            try IMessageConfiguredGatewayValidation.validate(value)
+            guard value.integrationID == configID else { throw IMessageGatewayWireError.invalidFrame }
+        case .receivePage(let value): try IMessageConfiguredGatewayValidation.validate(value)
+        case .sourceCheckpoint(let value): try IMessageConfiguredGatewayValidation.validate(value)
         }
     }
 
@@ -67,11 +124,9 @@ public enum IMessageGatewayWire {
             guard value.protocolVersion == 1, value.adapterRevision == providerAdapterRevision else { throw IMessageGatewayWireError.invalidFrame }
         case .conversationsPage(let value): try validatePage(value)
         case .verification(let value): try validateVerification(value)
+        case .configured(let value): try IMessageConfiguredGatewayValidation.validate(value)
         }
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.withoutEscapingSlashes]
-        let encoded = try encoder.encode(result)
-        guard goJSONBytes(encoded) <= maximumResultBytes else { throw IMessageGatewayWireError.resultTooLarge }
+        guard try IMessageConfiguredGatewayValidation.resultBytes(result) <= maximumResultBytes else { throw IMessageGatewayWireError.resultTooLarge }
     }
 
     public static func validateSnapshotAck(_ frame: DesktopControlFrame, requestID: String, revision: Int64) throws {
@@ -83,11 +138,21 @@ public enum IMessageGatewayWire {
     /// The App computes this digest from the canonical locator's UTF-8 text
     /// using CryptoKit. Passing a digest never establishes API or local consent.
     public static func validate(command: IMessageGatewayCommand, against snapshot: IMessageGatewaySnapshot,
-                                setupReferenceSHA256: String) throws {
+                                setupReferenceSHA256: String = "", humanTextSHA256: String? = nil) throws {
         try validate(command); try validate(snapshot)
-        let caller = command.caller.setupSession
-        guard canonical32(setupReferenceSHA256), let scope = snapshot.setupScope, scope.enabled,
-              snapshot.installationID == command.target.installationID, snapshot.revision == command.target.snapshotRevision,
+        guard snapshot.installationID == command.target.installationID, snapshot.revision == command.target.snapshotRevision else { throw IMessageGatewayWireError.correlationMismatch }
+        if case .configured(let input) = command.input {
+            guard let scope = snapshot.configs.first(where: { $0.configID == command.target.configID }),
+                  IMessageConfiguredGatewayValidation.matches(scope, configID: command.target.configID ?? "", workspaceID: command.target.workspaceID,
+                    configVersion: command.target.configVersion ?? 0, accountGeneration: command.target.accountGeneration ?? "",
+                    sourceGeneration: command.target.sourceGeneration ?? "", revision: snapshot.revision) else { throw IMessageGatewayWireError.correlationMismatch }
+            try IMessageConfiguredGatewayValidation.validate(input, in: scope)
+            if let human = command.caller.humanAction, human.action == .testSend {
+                guard humanTextSHA256 == human.textSHA256 else { throw IMessageGatewayWireError.correlationMismatch }
+            }
+            return
+        }
+        guard let caller = command.caller.setupSession, canonical32(setupReferenceSHA256), let scope = snapshot.setupScope, scope.enabled,
               scope.workspaceID == command.target.workspaceID, scope.userID == caller.userID,
               scope.generation == caller.setupGeneration, scope.setupReferenceSHA256 == setupReferenceSHA256,
               try timestampKey(scope.expiresAt) >= timestampKey(command.deadlineAt) else { throw IMessageGatewayWireError.correlationMismatch }
@@ -95,7 +160,7 @@ public enum IMessageGatewayWire {
 
     public static func validateSnapshotUnchanged(_ installed: IMessageGatewaySnapshot, _ authorized: IMessageGatewaySnapshot) throws {
         try validate(installed); try validate(authorized)
-        guard installed.installationID == authorized.installationID, installed.revision == authorized.revision else {
+        guard installed.installationID == authorized.installationID, installed.revision == authorized.revision, installed.configs == authorized.configs else {
             throw IMessageGatewayWireError.correlationMismatch
         }
         switch (installed.setupScope, authorized.setupScope) {
@@ -113,7 +178,14 @@ public enum IMessageGatewayWire {
         try validate(command); try validate(frame)
         guard frame.type == "imessage", frame.requestID == command.requestID else { throw IMessageGatewayWireError.correlationMismatch }
         guard let payload = frame.imessage else { throw IMessageGatewayWireError.correlationMismatch }
-        if case .failure = payload { return }
+        if case .failure(let failure) = payload {
+            if case .configured(.sendMessage(let input)) = command.input {
+                guard failure.clientRequestID == input.clientRequestID else { throw IMessageGatewayWireError.correlationMismatch }
+            } else {
+                guard failure.retrySafe, failure.clientRequestID == nil else { throw IMessageGatewayWireError.correlationMismatch }
+            }
+            return
+        }
         guard case .result(let result) = payload, result.operation == command.operation else { throw IMessageGatewayWireError.correlationMismatch }
         switch (command.input, result) {
         case (.setupConversations(let input), .conversationsPage(let page)):
@@ -123,6 +195,16 @@ public enum IMessageGatewayWire {
         case (.verifyConversations(let input), .verification(let value)):
             guard input.conversationIDs == value.conversations.map(\.conversationID) else { throw IMessageGatewayWireError.correlationMismatch }
         default: break
+        }
+    }
+
+    public static func validateResult(_ frame: DesktopControlFrame, for command: IMessageGatewayCommand,
+                                      snapshot: IMessageGatewaySnapshot, setupReferenceSHA256: String = "", humanTextSHA256: String? = nil) throws {
+        try validate(command: command, against: snapshot, setupReferenceSHA256: setupReferenceSHA256, humanTextSHA256: humanTextSHA256)
+        try validateResult(frame, for: command)
+        if case .configured(let input) = command.input, case .result(.configured(let result))? = frame.imessage {
+            guard let scope = snapshot.configs.first(where: { $0.configID == command.target.configID }) else { throw IMessageGatewayWireError.correlationMismatch }
+            try IMessageConfiguredGatewayValidation.validate(result, for: input, scope: scope, deadline: command.deadlineAt)
         }
     }
 
@@ -214,15 +296,7 @@ public enum IMessageGatewayWire {
         guard value.utf8.count == 43, let bytes = Data(base64Encoded: value.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/") + "="), bytes.count == 32 else { return false }
         return bytes.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "") == value
     }
-    private static func goJSONBytes(_ data: Data) -> Int {
-        let bytes = Array(data)
-        var count = bytes.count
-        for index in bytes.indices {
-            if [UInt8(0x3c), 0x3e, 0x26].contains(bytes[index]) { count += 5 }
-            if index + 2 < bytes.count, bytes[index] == 0xe2, bytes[index + 1] == 0x80, [UInt8(0xa8), 0xa9].contains(bytes[index + 2]) { count += 3 }
-        }
-        return count
-    }
+
 }
 
 extension DesktopControlFrame {

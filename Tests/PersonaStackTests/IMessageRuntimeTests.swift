@@ -434,3 +434,42 @@ func iMessageRuntimeRestorationRejectsChangedEvidenceWithoutRetainingAuthority(f
     await #expect(throws: IMessageSetupProviderError.accountChanged) { try await fixture.runtime.activateLocalSetup(fixture.intent) }
     #expect(await fixture.provider.stops > 0)
 }
+
+
+@Test func iMessageRuntimeFreshLocalIntentRejectsPriorSnapshotWithoutBlockingPrerequisitesOrBypassingReplayFence() async throws {
+    let fixture = IMessageRuntimeFixture()
+    await fixture.runtime.bind(connectionID: fixture.connectionID)
+    guard case .failure(let denied) = await fixture.runtime.install(fixture.snapshot(99), connectionID: fixture.connectionID) else {
+        Issue.record("Snapshot supplied local setup authority"); return
+    }
+    #expect(denied.code == .scopeDenied)
+    try await fixture.activate(consent: false)
+    guard case .result(.prerequisites(let ready)) = await fixture.dispatch(fixture.command("prerequisites")) else {
+        Issue.record("Fresh local prerequisite check was denied"); return
+    }
+    #expect(ready.databaseReady)
+    #expect(await fixture.enqueue(fixture.command("inventory", input: .setupConversations(.init())))?.code == .scopeDenied)
+    #expect(await fixture.runtime.install(fixture.snapshot(2, enabled: false), connectionID: fixture.connectionID) == .snapshotAck(.init(revision: 2)))
+    guard case .failure = await fixture.runtime.install(fixture.snapshot(), connectionID: fixture.connectionID) else {
+        Issue.record("Disabled setup accepted an old grant"); return
+    }
+    #expect(await fixture.runtime.install(fixture.snapshot(3), connectionID: fixture.connectionID) == .snapshotAck(.init(revision: 3)))
+    guard case .result(.prerequisites) = await fixture.dispatch(fixture.command("fresh", revision: 3)) else { Issue.record("Fresh API grant was denied"); return }
+    #expect(await fixture.provider.calls == [.prerequisites, .prerequisites])
+    await fixture.stop()
+}
+
+@Test func iMessageRuntimeConfiguredGrantRevisionNeverBecomesSetupReplayAuthority() async throws {
+    let fixture = IMessageRuntimeFixture()
+    try await fixture.activate(consent: false)
+    let configured = IMessageGatewaySnapshot(installationID: "mac", revision: 100, configs: [try configuredFixtureScope()])
+    #expect(await fixture.runtime.install(configured, connectionID: fixture.connectionID) == .snapshotAck(.init(revision: 100)))
+    try await fixture.runtime.setMetadataConsent(false, for: fixture.intent)
+    #expect(await fixture.runtime.install(fixture.snapshot(2), connectionID: fixture.connectionID) == .snapshotAck(.init(revision: 2)))
+    guard case .result(.prerequisites) = await fixture.dispatch(fixture.command("prerequisites", revision: 2)) else {
+        Issue.record("Unrelated configured revision denied setup"); return
+    }
+    #expect(await fixture.enqueue(fixture.command("metadata", revision: 2, input: .setupConversations(.init())))?.code == .scopeDenied)
+    #expect(await fixture.provider.calls == [.prerequisites])
+    await fixture.stop()
+}

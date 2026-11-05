@@ -3,7 +3,7 @@ import Testing
 @testable import PersonaStackCore
 
 private actor IMessageFakeTransport: IMessageRPCTransport {
-    enum Mode: Sendable { case partialLaunchFailure, metadataOversized, metadataLongUTF8, metadataUnavailableHint, metadataReversed, metadataMissing, metadataDuplicate, metadataForeign, metadataInvalidUnavailable, metadataWrongService, metadataNoResponse, missingMetadataMethod, normal, noStatus, bareSend, writeFailure, wrongChat, malformed, oldReceipt, wrongReceiptText, noReceipt, holdSend, oversized, incompatible, delayedLaunch, delayedTerminate, upstreamMethods, lateReceipt, incompleteReceipt, holdCheckpoint }
+    enum Mode: Sendable { case rejectedSend, partialLaunchFailure, metadataOversized, metadataLongUTF8, metadataUnavailableHint, metadataReversed, metadataMissing, metadataDuplicate, metadataForeign, metadataInvalidUnavailable, metadataWrongService, metadataNoResponse, missingMetadataMethod, normal, noStatus, bareSend, writeFailure, wrongChat, malformed, oldReceipt, wrongReceiptText, noReceipt, holdSend, oversized, incompatible, delayedLaunch, delayedTerminate, upstreamMethods, lateReceipt, incompleteReceipt, holdCheckpoint }
     let mode: Mode
     private var queued: [Data] = []
     private var waiting: CheckedContinuation<Data, Error>?
@@ -54,6 +54,10 @@ private actor IMessageFakeTransport: IMessageRPCTransport {
         if mode == .metadataNoResponse && request.method == "personastack.chatMetadata" { return }
         if mode == .metadataOversized && request.method == "personastack.chatMetadata" {
             emit(Data(repeating: 0x78, count: IMessageRPCClient.maximumChatMetadataResultBytes + 512)); return
+        }
+        if mode == .rejectedSend && request.method == "personastack.send" {
+            emit(Data("{\"jsonrpc\":\"2.0\",\"id\":\"\(request.id)\",\"error\":{\"code\":-32004,\"message\":\"Busy\",\"data\":{\"retry_safe\":true}}}\n".utf8))
+            return
         }
         if request.method == "personastack.send" {
             lastSentText = request.params?.text
@@ -260,7 +264,7 @@ private actor IMessageFakeTransport: IMessageRPCTransport {
     let transport = IMessageFakeTransport()
     let client = IMessageRPCClient(transport: transport)
     _ = try await client.start()
-    let receipt = try await client.send(chatID: IMessageRowID(42), text: "exact text\nsecond line", expectedAccountID: "account-1")
+    let receipt = try await client.send(chatID: IMessageRowID(42), text: "exact text\nsecond line", expectedAccountID: "account-1", expectedChatGUID: "iMessage;+;group", deadline: Date().addingTimeInterval(45), validateCurrent: { true })
     #expect(receipt.rowID == 9_007_199_254_740_993)
     let writes = await transport.writes
     let send = try #require(writes.first(where: { String(decoding: $0, as: UTF8.self).contains("\"method\":\"personastack.send\"") }))
@@ -282,7 +286,7 @@ private actor IMessageFakeTransport: IMessageRPCTransport {
         let client = IMessageRPCClient(transport: transport)
         _ = try await client.start()
         await #expect(throws: IMessageRPCError.outcomeUnknown) {
-            try await client.send(chatID: IMessageRowID(42), text: "test", expectedAccountID: "account-1")
+            try await client.send(chatID: IMessageRowID(42), text: "test", expectedAccountID: "account-1", expectedChatGUID: "iMessage;+;group", deadline: Date().addingTimeInterval(45), validateCurrent: { true })
         }
         #expect(await transport.writes.count == 3)
         await client.stop()
@@ -304,7 +308,7 @@ private actor IMessageFakeTransport: IMessageRPCTransport {
     let client = IMessageRPCClient(transport: transport)
     _ = try await client.start()
     await #expect(throws: IMessageRPCError.invalidArguments) {
-        try await client.send(chatID: IMessageRowID(42), text: "  \n", expectedAccountID: "account-1")
+        try await client.send(chatID: IMessageRowID(42), text: "  \n", expectedAccountID: "account-1", expectedChatGUID: "iMessage;+;group", deadline: Date().addingTimeInterval(45), validateCurrent: { true })
     }
     await #expect(throws: IMessageRPCError.invalidArguments) {
         try await client.sourceCheckpoint(chatIDs: [IMessageRowID(42), IMessageRowID(42)])
@@ -339,7 +343,7 @@ private actor IMessageFakeTransport: IMessageRPCTransport {
         let client = IMessageRPCClient(transport: transport, readTimeoutSeconds: 0.05, sendTimeoutSeconds: 0.1)
         _ = try await client.start()
         await #expect(throws: IMessageRPCError.outcomeUnknown) {
-            try await client.send(chatID: IMessageRowID(42), text: "test", expectedAccountID: "account-1")
+            try await client.send(chatID: IMessageRowID(42), text: "test", expectedAccountID: "account-1", expectedChatGUID: "iMessage;+;group", deadline: Date().addingTimeInterval(45), validateCurrent: { true })
         }
         let writes = await transport.writes
         #expect(writes.filter { String(decoding: $0, as: UTF8.self).contains("\"method\":\"personastack.send\"") }.count == 1)
@@ -351,10 +355,10 @@ private actor IMessageFakeTransport: IMessageRPCTransport {
     let transport = IMessageFakeTransport(mode: .holdSend)
     let client = IMessageRPCClient(transport: transport)
     _ = try await client.start()
-    let send = Task { try await client.send(chatID: IMessageRowID(42), text: "test", expectedAccountID: "account-1") }
+    let send = Task { try await client.send(chatID: IMessageRowID(42), text: "test", expectedAccountID: "account-1", expectedChatGUID: "iMessage;+;group", deadline: Date().addingTimeInterval(45), validateCurrent: { true }) }
     await transport.waitForSend()
     await #expect(throws: IMessageRPCError.busy) {
-        try await client.send(chatID: IMessageRowID(42), text: "second", expectedAccountID: "account-1")
+        try await client.send(chatID: IMessageRowID(42), text: "second", expectedAccountID: "account-1", expectedChatGUID: "iMessage;+;group", deadline: Date().addingTimeInterval(45), validateCurrent: { true })
     }
     send.cancel()
     await #expect(throws: IMessageRPCError.outcomeUnknown) { try await send.value }
@@ -477,7 +481,7 @@ private actor IMessageFakeTransport: IMessageRPCTransport {
     let transport = IMessageFakeTransport(mode: .lateReceipt)
     let client = IMessageRPCClient(transport: transport)
     _ = try await client.start()
-    let receipt = try await client.send(chatID: IMessageRowID(42), text: "test", expectedAccountID: "account-1")
+    let receipt = try await client.send(chatID: IMessageRowID(42), text: "test", expectedAccountID: "account-1", expectedChatGUID: "iMessage;+;group", deadline: Date().addingTimeInterval(45), validateCurrent: { true })
     #expect(receipt.messageGUID == "outgoing-1")
     let writes = await transport.writes
     #expect(writes.filter { String(decoding: $0, as: UTF8.self).contains("\"method\":\"personastack.send\"") }.count == 1)
@@ -491,7 +495,7 @@ private actor IMessageFakeTransport: IMessageRPCTransport {
     _ = try await client.start()
     for invalid in ["", "   ", "account\nother", "account\t", String(repeating: "é", count: 129)] {
         await #expect(throws: IMessageRPCError.invalidArguments) {
-            try await client.send(chatID: IMessageRowID(42), text: "test", expectedAccountID: invalid)
+            try await client.send(chatID: IMessageRowID(42), text: "test", expectedAccountID: invalid, expectedChatGUID: "iMessage;+;group", deadline: Date().addingTimeInterval(45), validateCurrent: { true })
         }
     }
     #expect(await transport.writes.count == 1)
@@ -503,7 +507,7 @@ private actor IMessageFakeTransport: IMessageRPCTransport {
     let client = IMessageRPCClient(transport: transport)
     _ = try await client.start()
     let sending = Task {
-        try await client.send(chatID: IMessageRowID(42), text: "test", expectedAccountID: "account-1")
+        try await client.send(chatID: IMessageRowID(42), text: "test", expectedAccountID: "account-1", expectedChatGUID: "iMessage;+;group", deadline: Date().addingTimeInterval(45), validateCurrent: { true })
     }
     await transport.waitForCheckpoint()
     sending.cancel()
@@ -525,4 +529,40 @@ private actor IMessageFakeTransport: IMessageRPCTransport {
     let once = IMessageRPCDispatchGate()
     #expect(once.claim(before: Date().addingTimeInterval(5)) == nil)
     #expect(once.claim(before: Date().addingTimeInterval(5)) == .invalidResponse)
+}
+
+
+@Test(arguments: ["guid", "scope", "deadline", "cancel"])
+func iMessageRPCClientRechecksExactGuidScopeAndOriginalDeadlineBeforePrivateSend(fault: String) async throws {
+    let transport = IMessageFakeTransport()
+    let client = IMessageRPCClient(transport: transport)
+    _ = try await client.start()
+    let gate = ConfiguredRuntimeGate()
+    let task = Task {
+        try await client.send(chatID: IMessageRowID(42), text: "hello", expectedAccountID: "account-1",
+            expectedChatGUID: fault == "guid" ? "iMessage;+;foreign" : "iMessage;+;group",
+            deadline: fault == "deadline" ? .distantPast : Date().addingTimeInterval(45), validateCurrent: {
+                if fault == "cancel" { await gate.pause() }
+                return fault != "scope"
+            })
+    }
+    if fault == "cancel" { await gate.wait(); task.cancel(); await gate.release() }
+    await #expect(throws: (any Error).self) { try await task.value }
+    let writes = await transport.writes
+    #expect(!writes.contains { String(decoding: $0, as: UTF8.self).contains("personastack.send") })
+    await client.stop()
+}
+
+@Test func iMessageRPCClientNeverTrustsProviderRetrySafeAfterInvokingPrivateSend() async throws {
+    let transport = IMessageFakeTransport(mode: .rejectedSend)
+    let client = IMessageRPCClient(transport: transport)
+    _ = try await client.start()
+    await #expect(throws: IMessageRPCError.outcomeUnknown) {
+        try await client.send(chatID: IMessageRowID(42), text: "hello", expectedAccountID: "account-1", expectedChatGUID: "iMessage;+;group",
+            deadline: Date().addingTimeInterval(45), validateCurrent: { true })
+    }
+    let writes = await transport.writes
+    #expect(writes.filter { String(decoding: $0, as: UTF8.self).contains("personastack.send") }.count == 1)
+    #expect(!writes.contains { String(decoding: $0, as: UTF8.self).contains("personastack.receive_page") })
+    await client.stop()
 }

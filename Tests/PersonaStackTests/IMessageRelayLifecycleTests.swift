@@ -255,8 +255,8 @@ func iMessageRelayLifecyclePauseAndRecoveryPreserveIMessageWithoutCua() async th
     await fixture.runtime.pause()
     #expect(fixture.runtime.paused && fixture.runtime.gatewayConnected)
     #expect(fixture.runtime.hasIMessageSetupIntentForTesting)
-    fixture.runtime.signalLifecycleLossForTesting()
-    await fixture.runtime.waitForLockCleanupForTesting()
+    // Network recovery after Desktop Control cleanup must preserve iMessage.
+    // A real OS lifecycle loss instead withdraws setup and retires the socket.
     fixture.runtime.requestConnectionRecoveryForTesting()
     await fixture.runtime.waitForSessionLockChangeForTesting()
     #expect(fixture.runtime.hasIMessageSetupIntentForTesting)
@@ -477,19 +477,29 @@ func iMessageRelayLifecycleDesktopRemovalClosesItsLeaseAndKeepsIMessageSocket() 
     await fixture.runtime.shutdownForQuit()
 }
 
-@Test @MainActor func iMessageSleepAndWakeNeverRestoresOldLocalConsent() async throws {
+@Test(arguments: [false, true]) @MainActor func iMessageSleepAndWakeNeverRestoresOldLocalConsent(alreadyLocked: Bool) async throws {
     let workspace = NotificationCenter()
     let monitor = DesktopControlSessionLock(workspaceCenter: workspace, activationCenter: NotificationCenter(),
         observeNetwork: false, snapshotReader: { .unlocked })
-    let fixture = try IMessageLifecycleFixture(iMessage: true, sessionMonitor: monitor)
+    let fixture = try IMessageLifecycleFixture(iMessage: true, connected: true, sessionMonitor: monitor)
     let session = try await fixture.runtime.iMessageSetupSession()
     let scope = IMessageGatewaySetupScope(setupReferenceSHA256: String(repeating: "A", count: 43), generation: 1,
         workspaceID: "workspace", userID: "human", expiresAt: ISO8601DateFormatter().string(from: Date().addingTimeInterval(300)), enabled: true)
     let intent = IMessageRuntimeSetupIntent(localGeneration: UUID(), scope: scope)
     try await session.runtime.activateLocalSetup(intent)
     try await session.runtime.setMetadataConsent(true, for: intent)
+    if alreadyLocked {
+        monitor.receive(.locked)
+        await fixture.runtime.waitForSessionLockChangeForTesting()
+        #expect(fixture.runtime.gatewayConnected)
+        try await session.runtime.setMetadataConsent(true, for: intent)
+    }
     workspace.post(name: NSWorkspace.willSleepNotification, object: nil)
     await fixture.runtime.waitForSessionLockChangeForTesting()
+    #expect(!fixture.runtime.gatewayConnected)
+    let attempts = fixture.socketAttempts
+    #expect(await fixture.runtime.reconnectRelayForTesting())
+    #expect(fixture.socketAttempts == attempts)
     workspace.post(name: NSWorkspace.didWakeNotification, object: nil)
     await fixture.runtime.waitForSessionLockChangeForTesting()
     await #expect(throws: IMessageSetupProviderError.accountChanged) { try await session.runtime.setMetadataConsent(true, for: intent) }

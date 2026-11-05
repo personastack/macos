@@ -93,7 +93,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private var credentialAuthorizationInProgress = false
     private var executor = DesktopControlCommandExecutor()
     private var lifecycleGeneration = UUID()
-    private var lockGeneration = UUID()
+    private var sessionAvailabilityGeneration = UUID()
     // Connection intent never grants provider or workspace authorization.
     private var desktopControlSetupGeneration: UUID?
     private struct IMessageSetupRelayIntent: Equatable {
@@ -107,6 +107,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private var iMessageSessionGeneration = UUID()
     private var iMessageCleanupTask: Task<Void, Never>?
     private var iMessageProviderFactory: () -> IMessageSetupProvider = { IMessageSetupProvider() }
+    private var iMessageAuthorizationClient = IMessageConfiguredAuthorizationClient()
     private var relayConfigurationState: DesktopControlConfigurationState?
     private var relayAuthorityReadSucceeded = false
     private var relayStateReadID = UUID()
@@ -152,18 +153,13 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         Self.clearObsoleteCredentialErrors(in: preferences)
         sessionLock.onChange = { [weak self] _ in
             guard let self else { return }
-            self.lockGeneration = UUID()
-            let generation = self.lockGeneration
-            self.sessionLockChangeTask = Task { await self.sessionLockChanged(generation) }
+            self.scheduleSessionAvailabilityCheck()
         }
-        sessionLock.onRecovery = { [weak self] in self?.requestConnectionRecovery() }
-        sessionLock.onLifecycleLoss = { [weak self] in
+        sessionLock.onRecovery = { [weak self] in
             guard let self else { return }
-            self.capabilitiesVerified = false
-            self.readiness = self.sessionLock.readiness
-            self.executorCleanupInProgress = true
-            self.lockCleanupTask = Task { await self.cleanupExecutor() }
+            self.scheduleSessionAvailabilityCheck(requestRecovery: true)
         }
+        sessionLock.onLifecycleLoss = { [weak self] in self?.latchSessionAvailabilityLoss() }
     }
 
     var hasActiveInstallation: Bool { activeInstallation != nil }
@@ -507,29 +503,44 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     /// Construction creates no provider process or permission request.
     func iMessageSetupSession() async throws -> IMessageNativeSession {
+        let availability = sessionAvailabilityGeneration
         let configuration = try configurationProvider()
         guard !disconnecting, !environmentSwitchPending else { throw CancellationError() }
         guard let installation = try await readStoredInstallation() else { throw DesktopControlEnrollmentError.installationMissing }
         try Task.checkCancellation()
-        guard configuration == (try configurationProvider()), !disconnecting, !environmentSwitchPending else { throw CancellationError() }
+        guard availability == sessionAvailabilityGeneration, configuration == (try configurationProvider()),
+              !disconnecting, !environmentSwitchPending else { throw CancellationError() }
         return try await iMessageSession(for: installation, configuration: configuration)
     }
 
     private func iMessageSession(for installation: DesktopControlInstallation,
                                 configuration: DesktopEnvironmentConfiguration) async throws -> IMessageNativeSession {
         try installation.requireEnvironment(configuration.appPageURL, configuration: configuration)
+        let availability = sessionAvailabilityGeneration
+        await sessionLockChangeTask?.value
+        try Task.checkCancellation()
+        guard availability == sessionAvailabilityGeneration, sessionLock.isAwakeAndActive else { throw CancellationError() }
         let expectedCleanup = iMessageSessionGeneration
         await iMessageCleanupTask?.value
         try Task.checkCancellation()
-        guard expectedCleanup == iMessageSessionGeneration else { throw CancellationError() }
+        guard expectedCleanup == iMessageSessionGeneration, availability == sessionAvailabilityGeneration,
+              sessionLock.isAwakeAndActive else { throw CancellationError() }
         if let session = iMessageSession, session.installation == installation, session.configuration == configuration { return session }
         let expected = await retireIMessageSession()
         try Task.checkCancellation()
         guard !disconnecting, !environmentSwitchPending, configuration == (try configurationProvider()) else { throw CancellationError() }
         let provider = iMessageProviderFactory()
         let runtime = IMessageRuntime(installationID: installation.installationID, provider: provider,
-            referenceDigest: IMessageSetupProvider.setupReferenceDigest)
-        guard expected == iMessageSessionGeneration else { throw CancellationError() }
+            referenceDigest: IMessageSetupProvider.setupReferenceDigest, textDigest: IMessageSetupProvider.messageTextDigest,
+            authorizeConfigured: { [weak self, provider] command, connectionID, deadline in
+                guard let self else { throw IMessageConfiguredAuthorizationError.unavailable }
+                return try await self.authorizeConfiguredIMessage(command, connectionID: connectionID, provider: provider,
+                    installation: installation, configuration: configuration, deadline: deadline)
+            })
+        await runtime.setConfiguredPolicy(enabled: configuredIMessageEnabled(configuration))
+        await runtime.setExecutionAvailable(sessionLock.isAwakeAndActive)
+        guard expected == iMessageSessionGeneration, availability == sessionAvailabilityGeneration,
+              sessionLock.isAwakeAndActive else { await runtime.drain(); throw CancellationError() }
         let session = IMessageNativeSession(installation: installation, configuration: configuration, runtime: runtime, provider: provider)
         iMessageSession = session
         return session
@@ -538,6 +549,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     /// A failed or canceled replacement can keep using the same shared socket.
     /// The actor remains bound, but no setup consent or snapshot survives.
     func suspendIMessageForReplacement() async {
+        await sessionLockChangeTask?.value
         iMessageSetupIntent = nil
         iMessageSessionGeneration = UUID()
         let id = iMessageSessionGeneration
@@ -556,6 +568,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func retireIMessageSession() async -> UUID {
+        await sessionLockChangeTask?.value
         iMessageSessionGeneration = UUID()
         let previous = iMessageCleanupTask, session = iMessageSession
         iMessageSession = nil
@@ -570,10 +583,42 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         return id
     }
 
+    private func configuredIMessageEnabled(_ configuration: DesktopEnvironmentConfiguration) -> Bool {
+        preferences.bool(forKey: IMessagePreferenceKeys.relayEnabled(configuration))
+            && !preferences.bool(forKey: IMessagePreferenceKeys.relayPaused(configuration))
+    }
+    private func authorizeConfiguredIMessage(_ command: IMessageGatewayCommand, connectionID: UUID, provider: IMessageSetupProvider,
+                                            installation: DesktopControlInstallation, configuration: DesktopEnvironmentConfiguration,
+                                            deadline: Date) async throws -> IMessageGatewaySnapshot {
+        let digest: String?
+        if case .configured(.sendMessage(let input)) = command.input { digest = IMessageSetupProvider.messageTextDigest(input.text) }
+        else { digest = nil }
+        return try await iMessageAuthorizationClient.authorize(command, installation: installation, configuration: configuration,
+            deadline: deadline, humanTextSHA256: digest, validateCurrent: { [weak self, provider] in
+                guard let self else { throw CancellationError() }
+                try await self.requireConfiguredIMessageContext(connectionID: connectionID, provider: provider,
+                    installation: installation, configuration: configuration)
+            })
+    }
+    private func requireConfiguredIMessageContext(connectionID: UUID, provider: IMessageSetupProvider,
+                                                 installation: DesktopControlInstallation, configuration: DesktopEnvironmentConfiguration) async throws {
+        try Task.checkCancellation()
+        guard !disconnecting, !environmentSwitchPending, sessionLock.isAwakeAndActive, configuredIMessageEnabled(configuration),
+              (try configurationProvider()) == configuration, iMessageSession?.provider === provider,
+              iMessageSession?.installation == installation, let connection = pendingGateway ?? gateway else { throw CancellationError() }
+        guard await connection.hasIMessageBinding(connectionID), !Task.isCancelled,
+              (pendingGateway === connection || gateway === connection), iMessageSession?.provider === provider,
+              sessionLock.isAwakeAndActive, configuredIMessageEnabled(configuration) else { throw CancellationError() }
+    }
+    private func reconcileIMessageExecutionAvailability() async {
+        await iMessageSession?.runtime.setExecutionAvailable(sessionLock.isAwakeAndActive)
+    }
+
     func refreshIMessageRelayPreference() async {
         guard let configuration = try? configurationProvider(), !disconnecting, !environmentSwitchPending else { return }
         let enabled = preferences.bool(forKey: IMessagePreferenceKeys.relayEnabled(configuration))
         let paused = preferences.bool(forKey: IMessagePreferenceKeys.relayPaused(configuration))
+        await iMessageSession?.runtime.setConfiguredPolicy(enabled: enabled && !paused)
         if !enabled || paused {
             iMessageSetupIntent = nil
             await iMessageSession?.runtime.suspendAndDrain()
@@ -590,6 +635,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     func finishIMessageSetupRelay(for intent: IMessageRuntimeSetupIntent, generation: UUID) async {
         guard let expiry = try? IMessageGatewayWire.utcDate(intent.scope.expiresAt) else { return }
+        if let configuration = try? configurationProvider() {
+            await iMessageSession?.runtime.setConfiguredPolicy(enabled: configuredIMessageEnabled(configuration))
+        }
         try? await finishIMessageSetupIfIdle(generation: generation, setupReferenceSHA256: intent.scope.setupReferenceSHA256,
             journeyGeneration: intent.scope.generation, expiresAt: expiry)
     }
@@ -931,7 +979,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     func connect(installation: DesktopControlInstallation, expectedGeneration: UUID? = nil) async {
-        guard !disconnecting, !environmentSwitchPending else { return }
+        guard !disconnecting, !environmentSwitchPending, sessionLock.isAwakeAndActive else { return }
         let generation = lifecycleGeneration
         guard expectedGeneration == nil || expectedGeneration == generation else { return }
         let sameInstallation = activeInstallation == installation
@@ -1006,6 +1054,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func reconnectIfNeeded(_ installation: DesktopControlInstallation, loopID: UUID) async -> Bool {
+        await sessionLockChangeTask?.value
+        guard sessionLock.isAwakeAndActive else { return true }
         let connected = await gateway?.isConnected() ?? false
         guard !Task.isCancelled, reconnectLoopID == loopID, !disconnecting else { return false }
         let generation = lifecycleGeneration
@@ -1039,8 +1089,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private func establishConnection(_ installation: DesktopControlInstallation, generation: UUID) async throws {
+        await sessionLockChangeTask?.value
         try requireCurrentLifecycle(generation)
-        guard !disconnecting, !environmentSwitchPending, !executorCleanupInProgress else { throw CancellationError() }
+        guard !disconnecting, !environmentSwitchPending, !executorCleanupInProgress, sessionLock.isAwakeAndActive else { throw CancellationError() }
 #if DEBUG
         if let reconnectAttemptForTesting { try await reconnectAttemptForTesting(); return }
 #endif
@@ -1560,17 +1611,41 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         executorCleanupInProgress = false
     }
 
-    private func sessionLockChanged(_ generation: UUID) async {
-        // Lock alone is diagnostic. CUA reports whether an operation is available.
-        if !sessionLock.isAwakeAndActive {
-            iMessageSetupIntent = nil
-            await iMessageSession?.runtime.suspendAndDrain()
-            guard lockGeneration == generation else { return }
-            readiness = sessionLock.readiness
-            await cleanupExecutor()
-            guard lockGeneration == generation else { return }
-            await gateway?.setReadiness(readiness)
+    private func scheduleSessionAvailabilityCheck(requestRecovery: Bool = false) {
+        let previous = sessionLockChangeTask
+        let generation = sessionAvailabilityGeneration
+        sessionLockChangeTask = Task {
+            await previous?.value
+            guard generation == sessionAvailabilityGeneration, !disconnecting, !environmentSwitchPending else { return }
+            await reconcileIMessageExecutionAvailability()
+            guard generation == sessionAvailabilityGeneration, sessionLock.isAwakeAndActive,
+                  !disconnecting, !environmentSwitchPending else { return }
+            if requestRecovery { requestConnectionRecovery() }
         }
+    }
+
+    /// Capture the loss synchronously. Recovery cannot erase this event or reuse
+    /// a physical connection while its captured actor/provider is still stopping.
+    private func latchSessionAvailabilityLoss() {
+        sessionAvailabilityGeneration = UUID()
+        let previous = sessionLockChangeTask
+        let pending = pendingGateway, current = gateway, session = iMessageSession
+        pendingGateway = nil; gateway = nil; gatewayConnectionID = nil; gatewayConnected = false
+        gatewayAttemptID = UUID()
+        iMessageSetupIntent = nil
+        capabilitiesVerified = false
+        readiness = sessionLock.readiness
+        executorCleanupInProgress = true
+        let task = Task {
+            await previous?.value
+            await session?.runtime.setExecutionAvailable(false)
+            await session?.runtime.suspendAndDrain()
+            await pending?.stopAndDrainIMessage()
+            await current?.stopAndDrainIMessage()
+            await cleanupExecutor()
+        }
+        sessionLockChangeTask = task
+        lockCleanupTask = task
     }
 
     private func heartbeatReadiness() async -> String? {
@@ -1734,6 +1809,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                                credentials: any DesktopControlCredentialStoring,
                                iMessageProviderFactory: (() -> IMessageSetupProvider)? = nil,
                                gatewaySocketFactory: (() -> any DesktopControlSocket)? = nil,
+                               iMessageAuthorizationClient: IMessageConfiguredAuthorizationClient? = nil,
                                executor: DesktopControlCommandExecutor? = nil,
                                proxy: CuaMCPProxy? = nil,
                                proxyFactory: ((CuaDriverInstallation, URL, Int32) -> CuaMCPProxy)? = nil,
@@ -1756,6 +1832,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             configurationProvider: configurationProvider, revokeInstallation: revokeInstallation, sessionLock: monitor)
         if let iMessageProviderFactory { runtime.iMessageProviderFactory = iMessageProviderFactory }
         runtime.gatewaySocketFactoryForTesting = gatewaySocketFactory
+        if let iMessageAuthorizationClient { runtime.iMessageAuthorizationClient = iMessageAuthorizationClient }
         if let executor { runtime.executor = executor }
         runtime.proxy = proxy
         runtime.proxyFactoryForTesting = proxyFactory

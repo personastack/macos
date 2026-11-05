@@ -261,6 +261,146 @@ actor IMessageSetupProvider: IMessageSetupProviding {
         return .init(conversations: metadata, liveAccount: evidence)
     }
 
+    static func messageTextDigest(_ text: String) -> String {
+        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    func executeConfigured(_ input: IMessageGatewayConfiguredInput, scope: IMessageGatewayConfigScope, deadline: Date,
+                           validateCurrent: @escaping @Sendable () async throws -> Bool) async throws -> IMessageGatewayConfiguredResult {
+        let expected = generation
+        do {
+            try IMessageConfiguredGatewayValidation.validate(input, in: scope)
+            return try await bounded(deadline: deadline, generation: expected) {
+                try await self.performConfigured(input, scope: scope, generation: expected, deadline: deadline, validation: validateCurrent)
+            }
+        } catch { throw await finishFailure(error, expectedGeneration: expected) }
+    }
+
+    private func performConfigured(_ input: IMessageGatewayConfiguredInput, scope: IMessageGatewayConfigScope, generation expected: UInt64,
+                                   deadline: Date, validation: @escaping @Sendable () async throws -> Bool) async throws -> IMessageGatewayConfiguredResult {
+        let status = try await ready(deadline: deadline, validation: validation, expectedGeneration: expected)
+        guard status.database.ready else { throw IMessageSetupProviderError.messagesUnavailable }
+        if case .status = input {
+            try await observeConfiguredAccount(scope, bindings: [], generation: expected, deadline: deadline, validation: validation)
+            return .status(.init(state: .connected, protocolVersion: status.protocolVersion, adapterRevision: status.adapterRevision))
+        }
+        let bindings = try configuredBindings(input, scope: scope)
+        let metadata = try await client.chatMetadata(chatIDs: bindings.map(\.nativeChatID)).chats
+        try await requireContext(expected, deadline: deadline, validation: validation)
+        guard metadata.map(\.id) == bindings.map(\.nativeChatID) else { throw IMessageSetupProviderError.dependencyInvalid }
+        for (row, binding) in zip(metadata, bindings) {
+            guard !row.available || (row.guid == binding.nativeChatGUID && row.service == "iMessage") else { throw IMessageSetupProviderError.accountChanged }
+        }
+        let available = zip(metadata, bindings).filter { $0.0.available }.map { $0.1 }
+        try await observeConfiguredAccount(scope, bindings: available, generation: expected, deadline: deadline, validation: validation)
+        return try await configuredResult(input, scope: scope, bindings: bindings, metadata: metadata,
+            generation: expected, deadline: deadline, validation: validation)
+    }
+
+    private func configuredBindings(_ input: IMessageGatewayConfiguredInput, scope: IMessageGatewayConfigScope) throws -> [IMessageGatewayConversationBinding] {
+        let ids: [String]
+        switch input {
+        case .status: ids = []
+        case .conversations: ids = scope.conversationIDs
+        case .conversation(let value): ids = [value.conversationID]
+        case .recentMessages(let value): ids = [value.conversationID]
+        case .sendMessage(let value): ids = [value.conversationID]
+        case .receivePage(let value): ids = [value.conversationID]
+        case .sourceCheckpoint(let value): ids = value.conversationIDs
+        }
+        return try ids.map { id in
+            guard let binding = scope.conversationBindings.first(where: { $0.conversationID == id }) else { throw IMessageSetupProviderError.accountChanged }
+            return binding
+        }
+    }
+
+    private func observeConfiguredAccount(_ scope: IMessageGatewayConfigScope, bindings: [IMessageGatewayConversationBinding], generation expected: UInt64,
+                                          deadline: Date, validation: @escaping @Sendable () async throws -> Bool) async throws {
+        try await requireContext(expected, deadline: deadline, validation: validation)
+        let account: IMessageSetupAccount
+        if bindings.isEmpty {
+            let value = try await accounts.observeCurrentAccount()
+            try await requireContext(expected, deadline: deadline, validation: validation)
+            account = .init(accountID: value.accountID, sourceGeneration: value.sourceGeneration)
+            rememberDisplay(value.accountLabel, accountID: value.accountID, sourceGeneration: value.sourceGeneration)
+        } else {
+            let guids = bindings.map(\.nativeChatGUID)
+            let value = try await accounts.observe(chatGUIDs: guids, expectedAccountID: scope.accountID, requestAutomation: false)
+            try await requireContext(expected, deadline: deadline, validation: validation)
+            guard value.chatGUIDs == guids else { throw IMessageSetupProviderError.accountChanged }
+            account = .init(accountID: value.accountID, sourceGeneration: value.sourceGeneration)
+            rememberDisplay(value.accountLabel, accountID: value.accountID, sourceGeneration: value.sourceGeneration)
+        }
+        guard account.accountID == scope.accountID, account.sourceGeneration == scope.sourceGeneration else { throw IMessageSetupProviderError.accountChanged }
+        try await accounts.validateProviderConnection()
+        try await requireContext(expected, deadline: deadline, validation: validation)
+    }
+
+    private func configuredResult(_ input: IMessageGatewayConfiguredInput, scope: IMessageGatewayConfigScope,
+                                  bindings: [IMessageGatewayConversationBinding], metadata: [IMessageConversation], generation expected: UInt64,
+                                  deadline: Date, validation: @escaping @Sendable () async throws -> Bool) async throws -> IMessageGatewayConfiguredResult {
+        switch input {
+        case .status: throw IMessageSetupProviderError.dependencyInvalid
+        case .conversations:
+            let rows = try zip(metadata, bindings).map { try IMessageConfiguredProjection.conversation($0.0, binding: $0.1) }
+            return .conversations(.init(conversations: rows))
+        case .conversation:
+            guard let row = metadata.first, let binding = bindings.first else { throw IMessageSetupProviderError.dependencyInvalid }
+            return .conversation(.init(conversation: try IMessageConfiguredProjection.conversation(row, binding: binding)))
+        case .sourceCheckpoint(let request):
+            let anchors = try (request.anchors ?? []).map { anchor -> IMessageSourceAnchor in
+                guard let binding = bindings.first(where: { $0.conversationID == anchor.conversationID }) else { throw IMessageSetupProviderError.accountChanged }
+                return .init(chatID: binding.nativeChatID, rowID: anchor.rowID, guid: anchor.guid)
+            }
+            let checkpoint = try await client.sourceCheckpoint(chatIDs: bindings.map(\.nativeChatID), anchors: anchors)
+            try await requireContext(expected, deadline: deadline, validation: validation)
+            let available = zip(metadata, bindings).filter { $0.0.available }.map { $0.1 }
+            try await observeConfiguredAccount(scope, bindings: available, generation: expected, deadline: deadline, validation: validation)
+            return .sourceCheckpoint(try IMessageConfiguredProjection.checkpoint(checkpoint, scope: scope, input: request,
+                liveAccount: .init(accountID: scope.accountID, sourceGeneration: scope.sourceGeneration), deadline: Self.utc(deadline)))
+        default:
+            guard let binding = bindings.first, metadata.first?.available == true else { throw IMessageSetupProviderError.messagesUnavailable }
+            return try await configuredContent(input, scope: scope, binding: binding, generation: expected, deadline: deadline, validation: validation)
+        }
+    }
+
+    private func configuredContent(_ input: IMessageGatewayConfiguredInput, scope: IMessageGatewayConfigScope, binding: IMessageGatewayConversationBinding,
+                                   generation expected: UInt64, deadline: Date,
+                                   validation: @escaping @Sendable () async throws -> Bool) async throws -> IMessageGatewayConfiguredResult {
+        switch input {
+        case .recentMessages(let request):
+            let limit = request.limit ?? 50
+            let source = try await client.recentMessages(chatID: binding.nativeChatID, limit: limit)
+            try await requireContext(expected, deadline: deadline, validation: validation)
+            try await observeConfiguredAccount(scope, bindings: [binding], generation: expected, deadline: deadline, validation: validation)
+            return .recentMessages(try IMessageConfiguredProjection.recentMessages(source, binding: binding, limit: limit))
+        case .receivePage(let request):
+            let checkpoint = try await client.sourceCheckpoint(chatIDs: [binding.nativeChatID])
+            try await requireContext(expected, deadline: deadline, validation: validation)
+            guard let row = checkpoint.chats.first, row.available, row.guid == binding.nativeChatGUID,
+                  row.service == "iMessage", checkpoint.sourceHighWater >= request.after else { throw IMessageSetupProviderError.accountChanged }
+            let through = min(request.through ?? checkpoint.sourceHighWater, checkpoint.sourceHighWater)
+            let source = try await client.receivePage(chatID: binding.nativeChatID, since: request.after, through: through, limit: request.limit)
+            try await requireContext(expected, deadline: deadline, validation: validation)
+            try await observeConfiguredAccount(scope, bindings: [binding], generation: expected, deadline: deadline, validation: validation)
+            return .receivePage(try IMessageConfiguredProjection.receivePage(source, binding: binding, scope: scope, input: request,
+                sourceHighWater: checkpoint.sourceHighWater, deadline: Self.utc(deadline)))
+        case .sendMessage(let request):
+            let receipt = try await client.send(chatID: binding.nativeChatID, text: request.text, expectedAccountID: scope.accountID,
+                expectedChatGUID: binding.nativeChatGUID, deadline: deadline, validateCurrent: {
+                    try await self.requireContext(expected, deadline: deadline, validation: validation)
+                    try await self.accounts.validateProviderConnection()
+                    try await self.requireContext(expected, deadline: deadline, validation: validation)
+                    return true
+                })
+            try await requireContext(expected, deadline: deadline, validation: validation)
+            try await observeConfiguredAccount(scope, bindings: [binding], generation: expected, deadline: deadline, validation: validation)
+            return .sendMessage(try IMessageConfiguredProjection.sendReceipt(receipt, binding: binding, input: request, confirmedAt: Self.utc(now())))
+        default: throw IMessageSetupProviderError.dependencyInvalid
+        }
+    }
+    private static func utc(_ value: Date) -> String { ISO8601DateFormatter().string(from: value) }
+
     func stop() async {
         if let cleanup { await cleanup.value; return }
         generation &+= 1
@@ -283,6 +423,7 @@ actor IMessageSetupProvider: IMessageSetupProviding {
 
     private static func requiresFreshConnection(_ error: Error) -> Bool {
         if error is CancellationError { return true }
+        if (error as? IMessageAccountError) == .sourceChanged || (error as? IMessageSetupProviderError) == .accountChanged { return true }
         switch error as? IMessageRPCError {
         case .notStarted, .alreadyStarted, .invalidResponse, .frameTooLarge, .dependencyInvalid,
              .processExited, .deadlineExceeded, .cancelled, .outcomeUnknown:

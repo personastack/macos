@@ -109,6 +109,7 @@ struct IMessageHostedMetadataRequest: Encodable, Sendable, CustomStringConvertib
         case .verifyConversations(let selection):
             guard (1...32).contains(selection.conversationIDs.count), Set(selection.conversationIDs).count == selection.conversationIDs.count,
                   selection.conversationIDs.allSatisfy(hostedOpaqueID) else { throw IMessageHostedSetupError.invalidRequest }
+        case .configured: throw IMessageHostedSetupError.invalidRequest
         }
         self.locator = locator; self.enrollmentTicket = enrollmentTicket; self.input = input
     }
