@@ -6,6 +6,7 @@ import PersonaStackCore
 private let hostedSetupReference = String(repeating: "A", count: 43)
 private let hostedSetupExpiry = "2030-01-02T03:04:05.123456789Z"
 private let hostedScopeJSON = #"{"natural_user_id":"human","workspace_id":"workspace","app_origin":"https://my.personastack.ai"}"#
+private let hostedBootstrapJSON = #"{"authenticated":true,"natural_user":{"id":"human","role":"user"},"effective_user":{"id":"human","role":"user","display_name":"Human","email":"","avatar_url":"","time_zone":""},"impersonation_active":false,"session_expires_at":"2030-01-02T03:04:05Z","workspaces":[{"id":"workspace","display_name":"Team workspace","status":"active","organization_id":"org","organization_name":"Team","personal":false,"workspace_admin":false}],"active_workspace_id":"workspace","no_accessible_workspace":false,"csrf_token":"private-csrf"}"#
 
 private func hostedJourneyJSON(_ generation: Int64 = 1, verified: Bool = false) -> String {
     "{\"setup_reference\":\"\(hostedSetupReference)\",\"generation\":\(generation),\"expires_at\":\"\(hostedSetupExpiry)\",\"mac_verified\":\(verified)}"
@@ -419,4 +420,130 @@ func iMessageHostedSetupClientPinsPageAndSelectedProjectionContracts(reason: Str
     await held.release()
     await #expect(throws: CancellationError.self) { try await pending.value }
     #expect(await held.requests.count == 1)
+}
+
+@Test func iMessageHostedSetupClientReadsTrustedDisplayContextWithoutChangingScopeAuthority() async throws {
+    let transport = IMessageHostedTransportFixture([.scope, .init("GET", "/user/mobile/bootstrap", hostedBootstrapJSON)])
+    let context = try await IMessageHostedSetupClient(transport: transport).displayContext(configuration: .production,
+        cookies: "fixture", expectedScope: hostedScopeFixture(), validateScope: {})
+    #expect(context.workspaceName == "Team workspace" && context.workspaceID == "workspace" && context.naturalUserID == "human")
+    #expect(await transport.requests.count == 2)
+    await transport.requireExhausted()
+}
+
+@Test(arguments: ["natural", "effective", "workspace", "impersonation", "unknown", "null", "duplicate"])
+func iMessageHostedSetupClientRejectsMismatchedOrAmbiguousDisplayContext(reason: String) async throws {
+    var body = hostedBootstrapJSON
+    switch reason {
+    case "natural": body = body.replacingOccurrences(of: #""natural_user":{"id":"human""#, with: #""natural_user":{"id":"foreign""#)
+    case "effective": body = body.replacingOccurrences(of: #""effective_user":{"id":"human""#, with: #""effective_user":{"id":"foreign""#)
+    case "workspace": body = body.replacingOccurrences(of: #""active_workspace_id":"workspace""#, with: #""active_workspace_id":"foreign""#)
+    case "impersonation": body = body.replacingOccurrences(of: #""impersonation_active":false"#, with: #""impersonation_active":true"#)
+    case "unknown": body = String(body.dropLast()) + #","setup_receipt":"private"}"#
+    case "null": body = body.replacingOccurrences(of: #""display_name":"Team workspace""#, with: #""display_name":null"#)
+    default: body = String(body.dropLast()) + #","active_workspace_id":"workspace"}"#
+    }
+    let transport = IMessageHostedTransportFixture([.scope, .init("GET", "/user/mobile/bootstrap", body)])
+    await #expect(throws: (any Error).self) {
+        try await IMessageHostedSetupClient(transport: transport).displayContext(configuration: .production,
+            cookies: "fixture", expectedScope: hostedScopeFixture(), validateScope: {})
+    }
+    await transport.requireExhausted()
+}
+
+private func hostedApprovalFixture() throws -> (IMessageSetupFinalConsent, IMessageSetupApprovalEvidence, DesktopControlInstallation, IMessageHostedJourney, Date) {
+    let journey = try JSONDecoder().decode(IMessageHostedJourney.self, from: Data(hostedJourneyJSON().utf8))
+    let now = try IMessageGatewayWire.utcDate(journey.expiresAt).addingTimeInterval(-3600)
+    let intent = IMessageRuntimeSetupIntent(localGeneration: UUID(), scope: .init(
+        setupReferenceSHA256: IMessageSetupProvider.setupReferenceDigest(hostedSetupReference), generation: 1,
+        workspaceID: "workspace", userID: "human", expiresAt: journey.expiresAt, enabled: true))
+    let metadataJSON = Data(#"{"id":"1","guid":"native-guid","name":"Selected conversation","service":"iMessage","is_group":false,"available":true,"participants":["participant"]}"#.utf8)
+    try IMessageJSONDocument.validate(data: metadataJSON, maximumBytes: 4096)
+    let metadata = try JSONDecoder().decode(IMessageConversation.self, from: metadataJSON)
+    let row = IMessageGatewaySetupConversation(conversationID: "local-option", metadata: metadata)
+    let account = IMessageSetupAccount(accountID: "native-account", sourceGeneration: "native-source")
+    let consent = try IMessageSetupFinalConsent(intent: intent, installationID: "mac", environmentIdentity: DesktopEnvironmentConfiguration.production.preferenceIdentity,
+        conversations: [row], account: account, readEnabled: true, sendEnabled: true, selectionAndCapabilitiesConfirmed: true,
+        confirmedAt: now, deadline: now.addingTimeInterval(10))
+    let evidence = try IMessageSetupApprovalEvidence(verification: .init(conversations: [row], liveAccount: .init(accountID: account.accountID,
+        sourceGeneration: account.sourceGeneration, chatGUIDs: ["native-guid"])), checkpoint: .init(sourceHighWater: IMessageRowID(1),
+        observedAt: "2030-01-02T02:04:05Z", chats: [.init(chatID: IMessageRowID(1), guid: "native-guid", tailRowID: IMessageRowID(1), tailGUID: "tail")]),
+        readEnabled: true, sendEnabled: true)
+    let installation = try DesktopControlInstallation(installationID: "mac", machineCredential: hostedSetupReference,
+        gatewayWebsocketURL: DesktopEnvironmentConfiguration.production.gatewayWebsocketURL, configuration: .production)
+    return (consent, evidence, installation, journey, now)
+}
+
+@Test func iMessageHostedSetupClientPrivatelyApprovesThenCreatesOnlyCanonicalConfigID() async throws {
+    let (consent, evidence, installation, journey, now) = try hostedApprovalFixture()
+    let transport = IMessageHostedTransportFixture([
+        .init("POST", "/user/imessage/approve", "{\"setup_receipt\":\"\(hostedSetupReference)\",\"expires_at\":\"\(hostedSetupExpiry)\"}", status: 201),
+        .scope, .init("POST", "/user/imessage/configs", #"{"integration_config_id":"canonical-config"}"#, status: 201),
+    ])
+    let client = IMessageHostedSetupClient(transport: transport)
+    let ticket = try JSONDecoder().decode(IMessageHostedEnrollmentTicket.self, from: Data("{\"enrollment_ticket\":\"\(hostedSetupReference)\",\"expires_at\":\"\(hostedSetupExpiry)\"}".utf8))
+    let receipt = try await client.approve(consent: consent, evidence: evidence, installation: installation, journey: journey, ticket: ticket,
+        mode: .enroll, macName: "Fixture Mac", accountLabel: "Messages account", configuration: .production, now: now, validateCurrent: { _ in })
+    #expect(!String(reflecting: receipt).contains(hostedSetupReference))
+    let id = try await client.createConfiguration(receipt: receipt, consent: consent, configuration: .production, cookies: "fixture",
+        csrf: "csrf", expectedScope: hostedScopeFixture(), now: now, validateCurrent: { _ in })
+    #expect(id == "canonical-config")
+    let requests = await transport.requests
+    #expect(requests[0].value(forHTTPHeaderField: "Authorization") == "Bearer " + installation.machineCredential)
+    for header in ["Cookie", "Origin", "Referer", "X-CSRF-Token"] { #expect(requests[0].value(forHTTPHeaderField: header) == nil) }
+    let approvalBody = try #require(requests[0].httpBody)
+    let approval = try #require(JSONSerialization.jsonObject(with: approvalBody) as? [String: Any])
+    #expect(Set(approval.keys) == ["enrollment_ticket", "operation", "setup_reference", "generation", "installation_id", "mac_name", "account_label", "verification", "checkpoint", "read_enabled", "send_enabled"])
+    #expect(approval["setup_reference"] as? String == hostedSetupReference)
+    let createBody = try #require(requests[2].httpBody)
+    let create = try #require(JSONSerialization.jsonObject(with: createBody) as? [String: Any])
+    #expect(Set(create.keys) == ["setup_receipt", "name", "conversation_ids", "read_enabled", "send_enabled"])
+    #expect(create["conversation_ids"] as? [String] == ["local-option"])
+    #expect(requests[2].value(forHTTPHeaderField: "Authorization") == nil)
+    await transport.requireExhausted()
+}
+
+@Test(arguments: [1, 2]) @MainActor
+func iMessageHostedSetupClientCancelsApprovalAfterEitherFinalConsentFence(heldCall: Int) async throws {
+    let (consent, evidence, installation, journey, now) = try hostedApprovalFixture()
+    let ticket = try JSONDecoder().decode(IMessageHostedEnrollmentTicket.self, from: Data("{\"enrollment_ticket\":\"\(hostedSetupReference)\",\"expires_at\":\"\(hostedSetupExpiry)\"}".utf8))
+    let transport = IMessageHostedTransportFixture([.init("POST", "/user/imessage/approve", "{\"setup_receipt\":\"\(hostedSetupReference)\",\"expires_at\":\"\(hostedSetupExpiry)\"}", status: 201)])
+    let fence = IMessageHostedHeldScopeFence(heldCall: heldCall)
+    let task = Task {
+        try await IMessageHostedSetupClient(transport: transport).approve(consent: consent, evidence: evidence,
+            installation: installation, journey: journey, ticket: ticket, mode: .enroll, macName: "Mac", accountLabel: "Messages",
+            configuration: .production, now: now, validateCurrent: { _ in await fence.validate() })
+    }
+    await fence.waitUntilHeld(); task.cancel(); fence.release()
+    await #expect(throws: CancellationError.self) { try await task.value }
+    #expect(await transport.requests.count == (heldCall == 1 ? 0 : 1))
+}
+
+@Test(arguments: ["standard_padded", "standard_unpadded", "url_padded", "url_unpadded"])
+func iMessageHostedSetupClientCanonicalizesLegacyMachineProofBeforeApproval(format: String) async throws {
+    let (consent, evidence, _, journey, now) = try hostedApprovalFixture()
+    let bytes = Data(repeating: 251, count: 32)
+    let standard = bytes.base64EncodedString()
+    let canonical = standard.replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+    let proof: String
+    switch format {
+    case "standard_padded": proof = standard
+    case "standard_unpadded": proof = String(standard.dropLast())
+    case "url_padded": proof = canonical + "="
+    default: proof = canonical
+    }
+    let installation = try DesktopControlInstallation(installationID: "mac", machineCredential: proof,
+        gatewayWebsocketURL: DesktopEnvironmentConfiguration.production.gatewayWebsocketURL, configuration: .production)
+    let ticket = try JSONDecoder().decode(IMessageHostedEnrollmentTicket.self,
+        from: Data("{\"enrollment_ticket\":\"\(hostedSetupReference)\",\"expires_at\":\"\(hostedSetupExpiry)\"}".utf8))
+    let transport = IMessageHostedTransportFixture([.init("POST", "/user/imessage/approve",
+        "{\"setup_receipt\":\"\(hostedSetupReference)\",\"expires_at\":\"\(hostedSetupExpiry)\"}", status: 201)])
+    _ = try await IMessageHostedSetupClient(transport: transport).approve(consent: consent, evidence: evidence, installation: installation,
+        journey: journey, ticket: ticket, mode: .attach(installationID: "mac"), macName: "Mac", accountLabel: "Messages",
+        configuration: .production, now: now, validateCurrent: { _ in })
+    let request = try #require(await transport.requests.first)
+    #expect(standard.contains("+") && standard.contains("/"))
+    #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer " + canonical)
+    #expect(canonical.utf8.count == 43 && !canonical.contains("="))
+    await transport.requireExhausted()
 }

@@ -97,6 +97,8 @@ private struct IMessageRelayCredentialFixture: DesktopControlCredentialStoring {
     let transport = IMessageRelayTransportFixture(#"{"has_active_config":false,"has_config":false,"has_active_imessage_config":true,"has_imessage_config":true}"#)
     let installation = try iMessageRelayInstallation()
     let preferences = try #require(UserDefaults(suiteName: "IMessageRelayOwnership-\(UUID().uuidString)"))
+    // API registration retains the socket only after explicit native Connect.
+    preferences.set(true, forKey: IMessagePreferenceKeys.relayEnabled(.production))
     let runtime = DesktopControlRuntime.makeForTesting(
         installer: IMessageRelayNeverInstall(), credentials: IMessageRelayCredentialFixture(installation: installation),
         installation: installation, connected: true, readiness: "paused", paused: true,

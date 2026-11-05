@@ -46,6 +46,33 @@ struct DesktopCrashRecoverySupervisorTests {
         return (try #require(UserDefaults(suiteName: suite)), suite)
     }
 
+    @Test(arguments: [false, true])
+    func iMessageOnlyCrashRecoveryUsesActiveIntentAndRejectsPausedIntent(paused: Bool) throws {
+        let (preferences, suite) = try makePreferences()
+        defer { preferences.removePersistentDomain(forName: suite) }
+        let runner = FakeCrashRecoveryProcessRunner()
+        runner.processIDs = [9001]
+        var scheduled: [(TimeInterval, @MainActor () -> Void)] = []
+        let supervisor = DesktopCrashRecoverySupervisor(preferences: preferences, processRunner: runner,
+            bundleURL: URL(fileURLWithPath: "/Applications/PersonaStack.app"),
+            bundleIdentifier: "ai.personastack.desktop", loginSessionID: { "login-imessage" },
+            shouldRestartForRelay: {
+                DesktopRelayStartupPolicy.shouldStart(desktopControlEnabled: false, desktopControlPaused: false,
+                    imessageEnabled: true, imessagePaused: paused)
+            }, schedule: { scheduled.append(($0, $1)) })
+        supervisor.start()
+        scheduled.removeAll()
+        runner.processIDs = []
+        supervisor.receiveApplicationTermination(bundleIdentifier: "ai.personastack.desktop", processID: 9001)
+        #expect(scheduled.map(\.0) == (paused ? [] : [5]))
+        if !paused {
+            // Logout/explicit Quit supersedes a queued crash callback.
+            DesktopCrashRecoveryPolicy.suppressUntilNextLogin(preferences: preferences)
+            scheduled.removeFirst().1()
+            #expect(runner.launchedArguments.isEmpty)
+        }
+    }
+
     @Test func directAccessoryRelaunchAfterQuitIsAdoptedAndItsCrashRestartsOnce() throws {
         let (preferences, suite) = try makePreferences()
         defer { preferences.removePersistentDomain(forName: suite) }

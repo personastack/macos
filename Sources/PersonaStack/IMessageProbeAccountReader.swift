@@ -26,11 +26,25 @@ struct IMessageLiveAccountObservation: Equatable, Sendable {
     let accountID: String
     let sourceGeneration: String
     let chatGUIDs: [String]
+    let accountLabel: String?
+    init(accountID: String, sourceGeneration: String, chatGUIDs: [String], accountLabel: String? = nil) {
+        self.accountID = accountID; self.sourceGeneration = sourceGeneration; self.chatGUIDs = chatGUIDs; self.accountLabel = accountLabel
+    }
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.accountID == rhs.accountID && lhs.sourceGeneration == rhs.sourceGeneration && lhs.chatGUIDs == rhs.chatGUIDs
+    }
 }
 
 struct IMessageCurrentAccountObservation: Equatable, Sendable {
     let accountID: String
     let sourceGeneration: String
+    let accountLabel: String?
+    init(accountID: String, sourceGeneration: String, accountLabel: String? = nil) {
+        self.accountID = accountID; self.sourceGeneration = sourceGeneration; self.accountLabel = accountLabel
+    }
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.accountID == rhs.accountID && lhs.sourceGeneration == rhs.sourceGeneration
+    }
 }
 
 struct IMessageSourceFileIdentity: Codable, Equatable, Sendable {
@@ -69,6 +83,7 @@ actor IMessageAccountReader {
             if (count of argv) < 1 or (count of argv) > 32 then return "unavailable"
             try
                 set commonAccountID to missing value
+                set commonAccountLabel to ""
                 tell application "/System/Applications/Messages.app"
                     repeat with requestedGUID in argv
                         set exactGUID to requestedGUID as text
@@ -81,11 +96,13 @@ actor IMessageAccountReader {
                         set observedAccountID to id of selectedAccount as text
                         if commonAccountID is missing value then
                             set commonAccountID to observedAccountID
+                            set commonAccountLabel to description of selectedAccount as text
                         else if commonAccountID is not observedAccountID then
                             return "unavailable"
                         end if
                     end repeat
-                    return commonAccountID
+                    if (count of commonAccountLabel) > 256 then set commonAccountLabel to ""
+                    return commonAccountID & tab & commonAccountLabel
                 end tell
             on error
                 return "unavailable"
@@ -98,19 +115,22 @@ actor IMessageAccountReader {
             if (count of argv) is not 0 then return "unavailable"
             try
                 set observedAccountIDs to {}
+                set observedAccountLabel to ""
                 tell application "/System/Applications/Messages.app"
                     repeat with candidateAccount in accounts
                         if (service type of candidateAccount) is iMessage then
                             if (enabled of candidateAccount) is true then
                                 if (connection status of candidateAccount) is connected then
                                     set end of observedAccountIDs to id of candidateAccount as text
+                                    set observedAccountLabel to description of candidateAccount as text
                                 end if
                             end if
                         end if
                     end repeat
                 end tell
                 if (count of observedAccountIDs) is not 1 then return "unavailable"
-                return item 1 of observedAccountIDs
+                if (count of observedAccountLabel) > 256 then set observedAccountLabel to ""
+                return (item 1 of observedAccountIDs) & tab & observedAccountLabel
             on error
                 return "unavailable"
             end try
@@ -120,10 +140,18 @@ actor IMessageAccountReader {
     /// Inventory needs a live account before any conversation has been selected.
     /// This passive read cannot request Automation or launch Messages.
     func observeCurrentAccount() async throws -> IMessageCurrentAccountObservation {
+        try await observeCurrentAccount(requestAutomation: false)
+    }
+
+    func requestCurrentAccountPermission() async throws -> IMessageCurrentAccountObservation {
+        try await observeCurrentAccount(requestAutomation: true)
+    }
+
+    private func observeCurrentAccount(requestAutomation: Bool) async throws -> IMessageCurrentAccountObservation {
         let observation = try await observeAccount(script: Self.currentAccountScript, arguments: [],
-            expectedAccountID: nil, requestAutomation: false)
+            expectedAccountID: nil, requestAutomation: requestAutomation)
         return IMessageCurrentAccountObservation(accountID: observation.accountID,
-            sourceGeneration: observation.sourceGeneration)
+            sourceGeneration: observation.sourceGeneration, accountLabel: observation.accountLabel)
     }
 
     /// Stop the old descriptor before binding path evidence for a fresh provider.
@@ -184,14 +212,15 @@ actor IMessageAccountReader {
         let result = try await withTaskCancellationHandler { try await command.value } onCancel: { command.cancel() }
         try Task.checkCancellation()
         try requireBinding(expectedBinding, source: sourceBefore)
-        let accountID = try Self.readAccountID(result)
+        let display = try Self.readAccount(result)
+        let accountID = display.id
         guard expectedAccountID.map({ $0 == accountID }) ?? true,
               connectionAccountID.map({ $0 == accountID }) ?? true else { throw IMessageAccountError.sourceChanged }
         let sourceGeneration = try environment.sourceGeneration(identity: sourceBefore, accountID: accountID)
         try Task.checkCancellation()
         try requireBinding(expectedBinding, source: sourceBefore)
         connectionAccountID = accountID
-        return IMessageLiveAccountObservation(accountID: accountID, sourceGeneration: sourceGeneration, chatGUIDs: arguments)
+        return IMessageLiveAccountObservation(accountID: accountID, sourceGeneration: sourceGeneration, chatGUIDs: arguments, accountLabel: display.label)
     }
 
     private func verifiedConnectionSource() throws -> IMessageSourceFileIdentity {
@@ -220,15 +249,21 @@ actor IMessageAccountReader {
         }
     }
 
-    private static func readAccountID(_ result: CuaProcessResult) throws -> String {
+    private static func readAccount(_ result: CuaProcessResult) throws -> (id: String, label: String?) {
         guard result.status == 0, result.stdout.count <= maximumOutputBytes, result.stderr.count <= maximumOutputBytes,
               var accountID = String(data: result.stdout, encoding: .utf8) else {
             throw IMessageAccountError.selectedAccountUnavailable
         }
         if accountID.hasSuffix("\n") { accountID.removeLast() }
         if accountID.hasSuffix("\r") { accountID.removeLast() }
-        guard validIdentifier(accountID), accountID != "unavailable" else { throw IMessageAccountError.selectedAccountUnavailable }
-        return accountID
+        let parts = accountID.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
+        guard (1...2).contains(parts.count), validIdentifier(String(parts[0])), parts[0] != "unavailable" else {
+            throw IMessageAccountError.selectedAccountUnavailable
+        }
+        // Display quality cannot change account identity or source continuity.
+        let rawLabel = parts.count == 2 ? String(parts[1]) : nil
+        let label = rawLabel.map { validIdentifier($0) ? $0 : "Messages" }
+        return (String(parts[0]), label)
     }
 }
 

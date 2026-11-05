@@ -337,3 +337,30 @@ func iMessageCurrentAccountObservationRejectsNoMixedOrAmbiguousAccount(value: St
     #expect(environment.generationRequests.isEmpty)
     #expect(environment.permissionRequests.map(\.1) == [false])
 }
+
+
+@Test func iMessageAccountReaderKeepsDescriptionAsNativeDisplayAndPromptsOnlyOnExplicitAction() async throws {
+    let environment = AccountEnvironmentFixture()
+    let process = AccountProcessFixture(stdout: Data("public-account\tPersonal Messages\n".utf8))
+    let reader = try await boundAccountReader(environment: environment, process: process)
+    let passive = try await reader.observeCurrentAccount()
+    #expect(passive.accountID == "public-account")
+    #expect(passive.accountLabel == "Personal Messages")
+    let explicit = try await reader.requestCurrentAccountPermission()
+    #expect(explicit.accountID == passive.accountID)
+    #expect(explicit.sourceGeneration == passive.sourceGeneration)
+    #expect(explicit.accountLabel == passive.accountLabel)
+    #expect(explicit == IMessageCurrentAccountObservation(accountID: passive.accountID, sourceGeneration: passive.sourceGeneration, accountLabel: "Renamed display"))
+    #expect(environment.permissionRequests.map(\.1) == [false, true])
+    #expect(process.calls.count == 2)
+    #expect(process.calls.allSatisfy { $0.0.path == "/usr/bin/osascript" && $0.1.count == 2 && $0.1[1].contains("description of candidateAccount") })
+}
+
+@Test(arguments: ["public-account\t\n", "public-account\twrong\tlabel\n", "public-account\tline\nlabel\n", "public-account\t" + String(repeating: "x", count: 257) + "\n"])
+func iMessageAccountReaderInvalidDisplayLabelCannotChangeAccountProof(raw: String) async throws {
+    let reader = try await boundAccountReader(environment: AccountEnvironmentFixture(), process: AccountProcessFixture(stdout: Data(raw.utf8)))
+    let observed = try await reader.observeCurrentAccount()
+    #expect(observed.accountID == "public-account")
+    #expect(observed.sourceGeneration == "source-1:public-account")
+    #expect(observed.accountLabel == "Messages")
+}

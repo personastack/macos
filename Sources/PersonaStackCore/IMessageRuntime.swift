@@ -44,7 +44,23 @@ public protocol IMessageSetupProviding: Sendable {
                        deadline: Date) async throws -> IMessageSetupProviderPage
     func verify(conversations: [IMessageConversation], account: IMessageSetupAccount,
                 deadline: Date) async throws -> IMessageSetupProviderVerification
+    func restore(selections: [IMessageSetupDraft.Selection], account: IMessageSetupAccount,
+                 deadline: Date) async throws -> IMessageSetupProviderVerification
     func stop() async
+}
+
+public struct IMessageRuntimeRetainedSelection: Sendable {
+    public let intent: IMessageRuntimeSetupIntent
+    public let conversations: [IMessageGatewaySetupConversation]
+    public let account: IMessageSetupAccount
+    public let expiresAt: Date
+}
+
+public extension IMessageSetupProviding {
+    func restore(selections: [IMessageSetupDraft.Selection], account: IMessageSetupAccount,
+                 deadline: Date) async throws -> IMessageSetupProviderVerification {
+        throw IMessageSetupProviderError.dependencyInvalid
+    }
 }
 
 /// A trusted native coordinator owns this exact receipt. It is not API authority.
@@ -69,6 +85,7 @@ public actor IMessageRuntime {
     private var connectionID: UUID?
     private var intent: IMessageRuntimeSetupIntent?
     private var metadataConsent = false
+    private var retired = false
     private var snapshot: IMessageGatewaySnapshot?
     private var highestRevision: Int64 = 0
     private var restrictiveCutoff: Int64 = 0
@@ -76,6 +93,7 @@ public actor IMessageRuntime {
     private var active: (job: Job, task: Task<Void, Never>, timer: Task<Void, Never>)?
     private var inventory = IMessageRuntimeInventory()
     private var cleanup: Task<Void, Never>?
+    private var restoration: (id: UUID, task: Task<IMessageRuntimeRetainedSelection, Error>)?
 
     private struct Job: Sendable {
         let id: UUID
@@ -97,22 +115,23 @@ public actor IMessageRuntime {
 
     /// Network replacement fences transport work without creating a semantic revocation.
     public func bind(connectionID: UUID) {
-        guard self.connectionID != connectionID else { return }
+        guard !retired, self.connectionID != connectionID else { return }
         cancelWork(code: .scopeDenied)
         self.connectionID = connectionID
         snapshot = nil
-        inventory = IMessageRuntimeInventory()
+        inventory.connectionReplaced()
     }
 
     public func unbind(connectionID: UUID) {
         guard self.connectionID == connectionID else { return }
         self.connectionID = nil
         snapshot = nil
-        inventory = IMessageRuntimeInventory()
+        inventory.connectionReplaced()
         cancelWork(code: .scopeDenied)
     }
 
     public func activateLocalSetup(_ receipt: IMessageRuntimeSetupIntent) throws {
+        guard !retired else { throw IMessageSetupProviderError.accountChanged }
         try IMessageGatewayWire.validate(IMessageGatewaySnapshot(installationID: installationID, revision: 1, setupScope: receipt.scope))
         let expiry = try IMessageGatewayWire.utcDate(receipt.scope.expiresAt)
         guard receipt.scope.enabled, expiry > now(), expiry.timeIntervalSince(now()) <= 86400 else {
@@ -154,6 +173,96 @@ public actor IMessageRuntime {
         return inventory.selected.map(\.conversationID)
     }
 
+    /// Native-only. Page and gateway DTOs never expose retained account evidence.
+    public func retainedSelection(for receipt: IMessageRuntimeSetupIntent) throws -> IMessageRuntimeRetainedSelection {
+        guard !retired, intent == receipt, metadataConsent, try intentIsLive(receipt) else {
+            throw IMessageSetupProviderError.accountChanged
+        }
+        let value = try inventory.retained(now: now())
+        return .init(intent: receipt, conversations: value.rows, account: value.account,
+                     expiresAt: min(value.expiresAt, try IMessageGatewayWire.utcDate(receipt.scope.expiresAt)))
+    }
+
+    public func restoreSelection(_ selections: [IMessageSetupDraft.Selection], account: IMessageSetupAccount,
+                                 originalExpiresAt: Date, for receipt: IMessageRuntimeSetupIntent) async throws -> IMessageRuntimeRetainedSelection {
+        guard restoration == nil else { throw IMessageSetupProviderError.busy }
+        let id = UUID()
+        let task = Task {
+            do { return try await self.performRestoration(selections, account: account, originalExpiresAt: originalExpiresAt, for: receipt) }
+            catch {
+                if self.intent == receipt,
+                   (error as? IMessageSetupProviderError) == .accountChanged || (error as? IMessageRuntimeInventoryError)?.code == .accountChanged {
+                    self.restrictCurrentAuthority(); self.metadataConsent = false
+                }
+                if Task.isCancelled { await self.provider.stop() }
+                throw error
+            }
+        }
+        restoration = (id, task)
+        defer { if restoration?.id == id { restoration = nil } }
+        return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+    }
+
+    private func performRestoration(_ selections: [IMessageSetupDraft.Selection], account: IMessageSetupAccount,
+                                    originalExpiresAt: Date, for receipt: IMessageRuntimeSetupIntent) async throws -> IMessageRuntimeRetainedSelection {
+        guard !retired, intent == receipt, metadataConsent, try intentIsLive(receipt), active == nil,
+              !selections.isEmpty, selections.count <= 32,
+              Set(selections.map(\.nativeChatRowID)).count == selections.count,
+              Set(selections.map(\.expectedGUID)).count == selections.count else {
+            throw IMessageSetupProviderError.accountChanged
+        }
+        let expiry = min(originalExpiresAt, try IMessageGatewayWire.utcDate(receipt.scope.expiresAt),
+                         now().addingTimeInterval(Self.inventoryLifetime))
+        guard expiry > now() else { throw IMessageSetupProviderError.accountChanged }
+        await cleanup?.value
+        try Task.checkCancellation()
+        guard !retired, intent == receipt, metadataConsent else { throw IMessageSetupProviderError.accountChanged }
+        let response = try await provider.restore(selections: selections, account: account,
+            deadline: min(expiry, now().addingTimeInterval(Self.commandLifetime)))
+        try Task.checkCancellation()
+        guard !retired, intent == receipt, metadataConsent, expiry > now(), active == nil else {
+            throw IMessageSetupProviderError.accountChanged
+        }
+        try inventory.restore(response, selections: selections, account: account, expiresAt: expiry, makeID: makeID)
+        return try retainedSelection(for: receipt)
+    }
+
+    public func unbindAndDrain(connectionID: UUID) async {
+        guard self.connectionID == connectionID else { return }
+        unbind(connectionID: connectionID)
+        await joinCleanup()
+    }
+
+    public func withdrawLocalSetupAndDrain(_ receipt: IMessageRuntimeSetupIntent) async {
+        guard intent == receipt else { return }
+        withdrawLocalSetup(receipt)
+        await joinCleanup()
+    }
+
+    public func suspendAndDrain() async {
+        intent = nil; metadataConsent = false; snapshot = nil
+        inventory = IMessageRuntimeInventory()
+        cancelWork(code: .scopeDenied)
+        await joinCleanup()
+    }
+
+    /// Permanently retires this installation session. A fresh session is denied.
+    public func drain() async {
+        retired = true
+        connectionID = nil; intent = nil; metadataConsent = false; snapshot = nil
+        inventory = IMessageRuntimeInventory()
+        cancelWork(code: .scopeDenied)
+        await joinCleanup()
+    }
+
+    private func joinCleanup() async {
+        let work = active?.task, local = restoration?.task, pending = cleanup
+        await pending?.value
+        await work?.value
+        _ = await local?.result
+        await cleanup?.value
+    }
+
     /// The ordered socket reader awaits this short operation. It starts no provider work.
     public func install(_ value: IMessageGatewaySnapshot, connectionID: UUID) -> IMessageGatewayPayload {
         do {
@@ -191,6 +300,7 @@ public actor IMessageRuntime {
             try IMessageGatewayWire.validate(command: command, against: snapshot,
                 setupReferenceSHA256: referenceDigest(command.caller.setupSession.setupReference))
             guard command.operation == .prerequisites || metadataConsent else { return safeFailure(.scopeDenied) }
+            guard restoration == nil else { return safeFailure(.busy) }
             guard active?.job.command.requestID != command.requestID,
                   !waiting.contains(where: { $0.command.requestID == command.requestID }) else { return safeFailure(.busy) }
             guard active == nil || waiting.count < Self.maximumWaitingCommands else { return safeFailure(.busy) }
@@ -234,6 +344,7 @@ public actor IMessageRuntime {
         waiting.removeAll()
         for job in rejected { Task { await job.reply(self.failure(code)) } }
         active?.task.cancel()
+        restoration?.task.cancel()
         scheduleCleanup()
     }
 

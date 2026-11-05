@@ -7,10 +7,21 @@ protocol IMessageSetupAccountReading: Sendable {
     func clearProviderBinding() async
     func validateProviderConnection() async throws
     func observeCurrentAccount() async throws -> IMessageCurrentAccountObservation
+    func requestCurrentAccountPermission() async throws -> IMessageCurrentAccountObservation
     func observe(chatGUIDs: [String], expectedAccountID: String?, requestAutomation: Bool) async throws -> IMessageLiveAccountObservation
 }
 
+extension IMessageSetupAccountReading {
+    func requestCurrentAccountPermission() async throws -> IMessageCurrentAccountObservation {
+        throw IMessageAccountError.automationRequired
+    }
+}
+
 extension IMessageAccountReader: IMessageSetupAccountReading {}
+
+enum IMessageSetupPermissionState: Equatable, Sendable {
+    case ready, messagesNotRunning, fullDiskAccessRequired, automationRequired, sourceChanged, unavailable
+}
 
 /// The app alone owns Apple account observation and the bundled provider child.
 actor IMessageSetupProvider: IMessageSetupProviding {
@@ -21,6 +32,7 @@ actor IMessageSetupProvider: IMessageSetupProviding {
     private var generation: UInt64 = 0
     private var cleanup: Task<Void, Never>?
     private var approvalID: UUID?
+    private var accountDisplay: (account: IMessageSetupAccount, label: String)?
 
     init(client: IMessageRPCClient = IMessageRPCClient(transport: IMessageSubprocessTransport(bundle: .main)),
          accounts: any IMessageSetupAccountReading = IMessageAccountReader(),
@@ -51,6 +63,7 @@ actor IMessageSetupProvider: IMessageSetupProviding {
             let expected = generation
             let account = try await accounts.observeCurrentAccount()
             try requireCurrent(expected, deadline: deadline)
+            rememberDisplay(account.accountLabel, accountID: account.accountID, sourceGeneration: account.sourceGeneration)
             let page = try await client.conversations(after: after, upper: upper, query: query, limit: limit)
             try requireCurrent(expected, deadline: deadline)
             try await accounts.validateProviderConnection()
@@ -67,6 +80,107 @@ actor IMessageSetupProvider: IMessageSetupProviding {
         } catch { throw await finishFailure(error, expectedGeneration: expected) }
     }
 
+    /// Passive native setup check. It never asks for Automation permission.
+    func setupPermissionState(deadline: Date) async throws -> IMessageSetupPermissionState {
+        let expected = generation
+        let deadline = min(deadline, now().addingTimeInterval(IMessageRuntime.commandLifetime))
+        do {
+            let result: IMessageSetupPermissionState = try await bounded(deadline: deadline, generation: expected) {
+                let status = try await self.ready(deadline: deadline, expectedGeneration: expected)
+                guard status.database.ready else {
+                    await self.stop()
+                    return .unavailable
+                }
+                let observed = try await self.accounts.observeCurrentAccount()
+                try await self.requireCurrent(expected, deadline: deadline)
+                try await self.accounts.validateProviderConnection()
+                try await self.requireCurrent(expected, deadline: deadline)
+                await self.rememberDisplay(observed.accountLabel, accountID: observed.accountID, sourceGeneration: observed.sourceGeneration)
+                return .ready
+            }
+            try Task.checkCancellation()
+            return result
+        } catch {
+            if Task.isCancelled || error is CancellationError { throw CancellationError() }
+            let state = Self.permissionState(for: error)
+            if generation == expected, Self.requiresFreshConnection(error) || (error as? IMessageAccountError) != nil { await stop() }
+            try Task.checkCancellation()
+            return state
+        }
+    }
+
+    private static func permissionState(for error: Error) -> IMessageSetupPermissionState {
+        switch error as? IMessageAccountError {
+        case .messagesNotRunning: .messagesNotRunning
+        case .sourceUnavailable: .fullDiskAccessRequired
+        case .automationRequired: .automationRequired
+        case .sourceChanged: .sourceChanged
+        default: .unavailable
+        }
+    }
+
+    /// Explicit native Allow Messages Access only. Passive consumers never call this.
+    func requestMessagesAccess(deadline: Date) async throws {
+        let expected = generation
+        do {
+            _ = try await ready(deadline: deadline, expectedGeneration: expected)
+            let observed = try await accounts.requestCurrentAccountPermission()
+            try requireCurrent(expected, deadline: deadline)
+            rememberDisplay(observed.accountLabel, accountID: observed.accountID, sourceGeneration: observed.sourceGeneration)
+        } catch { throw await finishFailure(error, expectedGeneration: expected) }
+    }
+
+    /// Native display only. A label is never sender-address or account proof.
+    func displayAccount(for account: IMessageSetupAccount) async throws -> String {
+        let expected = generation
+        try await accounts.validateProviderConnection()
+        try requireCurrent(expected, deadline: now().addingTimeInterval(1))
+        guard let accountDisplay, accountDisplay.account == account else { throw IMessageSetupProviderError.accountChanged }
+        return accountDisplay.label
+    }
+
+    func restore(selections: [IMessageSetupDraft.Selection], account: IMessageSetupAccount,
+                 deadline: Date) async throws -> IMessageSetupProviderVerification {
+        let expected = generation
+        do {
+            guard (1...32).contains(selections.count), Set(selections.map(\.nativeChatRowID)).count == selections.count,
+                  Set(selections.map(\.expectedGUID)).count == selections.count else { throw IMessageSetupProviderError.accountChanged }
+            let ids = try selections.map { try IMessageRowID(decimal: $0.nativeChatRowID) }
+            return try await bounded(deadline: deadline, generation: expected) {
+                try await self.refreshSelection(chatIDs: ids, expectedGUIDs: selections.map(\.expectedGUID), account: account,
+                    deadline: deadline, requireAvailable: true, expectedGeneration: expected)
+            }
+        } catch { throw await finishFailure(error, expectedGeneration: expected) }
+    }
+
+    private func bounded<Value: Sendable>(deadline: Date, generation expected: UInt64,
+                                         operation: @escaping @Sendable () async throws -> Value) async throws -> Value {
+        try check(deadline)
+        let delay = deadline.timeIntervalSince(now())
+        return try await withThrowingTaskGroup(of: Value.self) { tasks in
+            tasks.addTask { try await operation() }
+            tasks.addTask {
+                try await Task.sleep(for: .seconds(delay))
+                throw IMessageSetupProviderError.providerTimeout
+            }
+            do {
+                guard let result = try await tasks.next() else { throw IMessageSetupProviderError.dependencyInvalid }
+                tasks.cancelAll()
+                return result
+            } catch {
+                tasks.cancelAll()
+                if self.generation == expected { await self.stop() }
+                throw error
+            }
+        }
+    }
+
+    private func rememberDisplay(_ label: String?, accountID: String, sourceGeneration: String) {
+        guard let label, !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, label.utf8.count <= 256,
+              !label.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) else { return }
+        accountDisplay = (.init(accountID: accountID, sourceGeneration: sourceGeneration), label)
+    }
+
     /// Direct native final approval only. It is absent from the gateway and page
     /// bridges and cannot be authorized by metadata consent or machine presence.
     func approvalEvidence(for consent: IMessageSetupFinalConsent, deadline: Date,
@@ -79,24 +193,8 @@ actor IMessageSetupProvider: IMessageSetupProviding {
         let validation: @Sendable () async throws -> Bool = { try await validateCurrent(consent) }
         do {
             try check(originalDeadline)
-            let delay = originalDeadline.timeIntervalSince(now())
-            let result = try await withThrowingTaskGroup(of: IMessageSetupApprovalEvidence.self) { tasks in
-                tasks.addTask {
-                    try await self.collectApproval(consent, generation: expected, deadline: originalDeadline, validation: validation)
-                }
-                tasks.addTask {
-                    try await Task.sleep(for: .seconds(delay))
-                    throw IMessageSetupProviderError.providerTimeout
-                }
-                do {
-                    guard let result = try await tasks.next() else { throw IMessageSetupApprovalError.invalidEvidence }
-                    tasks.cancelAll()
-                    return result
-                } catch {
-                    tasks.cancelAll()
-                    if self.generation == expected { await self.stop() }
-                    throw error
-                }
+            let result = try await bounded(deadline: originalDeadline, generation: expected) {
+                try await self.collectApproval(consent, generation: expected, deadline: originalDeadline, validation: validation)
             }
             try await requireContext(expected, deadline: originalDeadline, validation: validation)
             return result
@@ -131,15 +229,21 @@ actor IMessageSetupProvider: IMessageSetupProviding {
                                   requireAvailable: Bool = false,
                                   validation: (@Sendable () async throws -> Bool)? = nil,
                                   expectedGeneration: UInt64? = nil) async throws -> IMessageSetupProviderVerification {
+        try await refreshSelection(chatIDs: conversations.map(\.id), expectedGUIDs: conversations.map(\.guid), account: account,
+            deadline: deadline, requireAvailable: requireAvailable, validation: validation, expectedGeneration: expectedGeneration)
+    }
+
+    private func refreshSelection(chatIDs: [IMessageRowID], expectedGUIDs: [String], account: IMessageSetupAccount, deadline: Date,
+                                  requireAvailable: Bool, validation: (@Sendable () async throws -> Bool)? = nil,
+                                  expectedGeneration: UInt64? = nil) async throws -> IMessageSetupProviderVerification {
         _ = try await ready(deadline: deadline, validation: validation, expectedGeneration: expectedGeneration)
         let expected = expectedGeneration ?? generation
         try await requireContext(expected, deadline: deadline, validation: validation)
-        let metadata = try await client.chatMetadata(chatIDs: conversations.map(\.id)).chats
+        let metadata = try await client.chatMetadata(chatIDs: chatIDs).chats
         try await requireContext(expected, deadline: deadline, validation: validation)
-        guard metadata.count == conversations.count else { throw IMessageSetupProviderError.dependencyInvalid }
-        for (requested, current) in zip(conversations, metadata) {
-            guard requested.id == current.id else { throw IMessageSetupProviderError.dependencyInvalid }
-            guard !current.available || current.guid == requested.guid else { throw IMessageSetupProviderError.accountChanged }
+        guard metadata.map(\.id) == chatIDs, expectedGUIDs.count == metadata.count else { throw IMessageSetupProviderError.dependencyInvalid }
+        for (guid, current) in zip(expectedGUIDs, metadata) {
+            guard !current.available || current.guid == guid else { throw IMessageSetupProviderError.accountChanged }
         }
         if requireAvailable && !metadata.allSatisfy(\.available) { throw IMessageSetupApprovalError.selectionUnavailable }
         let available = metadata.filter(\.available).map(\.guid)
@@ -149,6 +253,7 @@ actor IMessageSetupProvider: IMessageSetupProviding {
             try await requireContext(expected, deadline: deadline, validation: validation)
             guard observed.accountID == account.accountID, observed.sourceGeneration == account.sourceGeneration,
                   observed.chatGUIDs == available else { throw IMessageSetupProviderError.accountChanged }
+            rememberDisplay(observed.accountLabel, accountID: observed.accountID, sourceGeneration: observed.sourceGeneration)
             evidence = .init(accountID: observed.accountID, sourceGeneration: observed.sourceGeneration, chatGUIDs: available)
         }
         try await accounts.validateProviderConnection()
@@ -160,6 +265,7 @@ actor IMessageSetupProvider: IMessageSetupProviding {
         if let cleanup { await cleanup.value; return }
         generation &+= 1
         started = false
+        accountDisplay = nil
         let accounts = accounts, client = client
         let task = Task {
             await accounts.clearProviderBinding()

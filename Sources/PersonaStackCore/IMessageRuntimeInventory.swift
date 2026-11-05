@@ -134,6 +134,38 @@ internal struct IMessageRuntimeInventory {
         return (rows, account)
     }
 
+    mutating func connectionReplaced() {
+        snapshot = nil
+        pages.removeAll()
+    }
+
+    func retained(now: Date) throws -> (rows: [IMessageGatewaySetupConversation], account: IMessageSetupAccount, expiresAt: Date) {
+        let value = try verification(selected.map(\.conversationID), now: now)
+        guard let expiry = selected.map(\.expiresAt).min() else { throw IMessageRuntimeInventoryError.invalidSelection }
+        return (value.rows, value.account, expiry)
+    }
+
+    mutating func restore(_ response: IMessageSetupProviderVerification, selections: [IMessageSetupDraft.Selection],
+                          account: IMessageSetupAccount, expiresAt: Date, makeID: () -> String) throws {
+        guard validAccount(account), response.conversations.count == selections.count,
+              let proof = response.liveAccount, proof.accountID == account.accountID,
+              proof.sourceGeneration == account.sourceGeneration,
+              proof.chatGUIDs == selections.map(\.expectedGUID) else { throw IMessageRuntimeInventoryError.accountChanged }
+        for (choice, current) in zip(selections, response.conversations) {
+            guard current.id.rawValue == choice.nativeChatRowID, current.guid == choice.expectedGUID,
+                  current.available, current.service == "iMessage" else { throw IMessageRuntimeInventoryError.accountChanged }
+        }
+        let oldIDs = Set((selected + pages.flatMap(\.rows)).map(\.conversationID))
+        let rows = response.conversations.map { Option(conversationID: makeID(), metadata: $0, expiresAt: expiresAt) }
+        guard Set(rows.map(\.conversationID)).count == rows.count,
+              rows.allSatisfy({ !oldIDs.contains($0.conversationID) }) else { throw IMessageRuntimeInventoryError.providerInvalid }
+        let wire = IMessageGatewayVerificationResult(conversations: rows.map(\.wire), liveAccount: proof)
+        try IMessageGatewayWire.validate(.verification(wire))
+        self = IMessageRuntimeInventory()
+        self.account = account
+        selected = rows
+    }
+
     private func validate(_ page: IMessageConversationPage, request: Request, limit: Int) throws {
         guard page.chats.count <= limit, page.nextChatRowID >= request.after, page.nextChatRowID <= page.upperChatRowID,
               request.upper.map({ $0 == page.upperChatRowID }) ?? true,

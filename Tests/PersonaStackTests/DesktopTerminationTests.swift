@@ -1,10 +1,83 @@
 import AppKit
 import Testing
+import PersonaStackCore
 @testable import PersonaStack
 
 @MainActor
 private final class MiniaturizedMainWindowState {
     var isMiniaturized = true
+}
+
+@Test @MainActor func iMessageExternalHandoffIsFiniteAndWaitsForItsNativeOwner() throws {
+    let delegate = PersonaStackTerminationDelegate(shutdown: { true }, terminate: { _ in }, timeout: .seconds(1))
+    let first = String(repeating: "A", count: 43)
+    let latest = Data(repeating: 2, count: 32).base64EncodedString().replacingOccurrences(of: "=", with: "")
+    let firstURL = try #require(URL(string: IMessageSetupHandoff.deepLinkPrefix + first))
+    let latestURL = try #require(URL(string: IMessageSetupHandoff.deepLinkPrefix + latest))
+    delegate.application(NSApplication.shared, open: [firstURL])
+    delegate.application(NSApplication.shared, open: [latestURL])
+    var received: [String] = []
+    delegate.openIMessageSetup = { received.append($0.setupReference) }
+    #expect(received == [latest])
+    delegate.application(NSApplication.shared, open: [firstURL, latestURL])
+    delegate.application(NSApplication.shared, open: [URL(string: "https://example.test")!])
+    delegate.application(NSApplication.shared, open: [URL(string: IMessageSetupHandoff.deepLinkPrefix + first + "&extra=1")!])
+    #expect(received == [latest])
+    delegate.application(NSApplication.shared, open: [firstURL])
+    #expect(received == [latest, first])
+}
+
+@Test @MainActor func iMessageQuitTimeoutNeverBypassesPendingCoordinatorProviderJoin() async {
+    var join: CheckedContinuation<Bool, Never>?
+    var pending = true
+    var exits = 0
+    var notices = 0
+    var handoffs = 0
+    let delegate = PersonaStackTerminationDelegate(shutdown: {
+        let result = await withCheckedContinuation { join = $0 }
+        pending = false
+        return result
+    }, terminate: { _ in exits += 1 }, timeout: .milliseconds(10), hasActiveSessions: { pending },
+        showCleanupFailure: { notices += 1 })
+    delegate.openIMessageSetup = { _ in handoffs += 1 }
+    #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateCancel)
+    delegate.application(NSApplication.shared, open: [URL(string: IMessageSetupHandoff.deepLinkPrefix + String(repeating: "A", count: 43))!])
+    #expect(handoffs == 0)
+    while notices == 0 { await Task.yield() }
+    #expect(exits == 0 && pending)
+    join?.resume(returning: true)
+    while exits == 0 { await Task.yield() }
+    #expect(exits == 1 && !pending)
+    #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateNow)
+}
+
+@Test @MainActor func iMessagePermissionRestartHintIsNavigationOnlyBoundedAndEnvironmentScoped() throws {
+    let suite = "IMessageRestartTests.\(UUID().uuidString)"
+    let preferences = try #require(UserDefaults(suiteName: suite))
+    defer { preferences.removePersistentDomain(forName: suite) }
+    var clock = Date(timeIntervalSince1970: 1_700_000_000)
+    let owner = DesktopApplicationRestart(defaults: preferences, now: { clock })
+    var waiter: Process?
+    var quits = 0
+    let draft = Data("existing-private-draft-fixture".utf8)
+    preferences.set(draft, forKey: "fixture.draft")
+    try owner.request(applicationURL: URL(fileURLWithPath: "/Applications/PersonaStack.app"), processID: 123,
+        iMessageConfiguration: .production, installUpdate: { false }, start: { waiter = $0 }, terminate: { quits += 1 })
+    #expect(quits == 1)
+    #expect(waiter?.arguments?.last == DesktopApplicationRestart.iMessageForegroundArgument)
+    #expect(!owner.consumeResumeHint())
+    #expect(!owner.consumeIMessageSetupResume(configuration: .lan))
+    #expect(owner.consumeIMessageSetupResume(configuration: .production))
+    #expect(!owner.consumeIMessageSetupResume(configuration: .production))
+    #expect(preferences.data(forKey: "fixture.draft") == draft)
+    let page = DesktopApplicationRestart.initialIMessagePageURL(DesktopEnvironmentConfiguration.production.appURL, resume: true)
+    #expect(page.absoluteString == "https://my.personastack.ai/user/imessage?resume_setup=1")
+    let otherQuery = URL(string: "https://my.personastack.ai/other?arbitrary=1#private")!
+    #expect(DesktopApplicationRestart.initialIMessagePageURL(otherQuery, resume: true) == page)
+    try owner.request(applicationURL: URL(fileURLWithPath: "/Applications/PersonaStack.app"), processID: 123,
+        iMessageConfiguration: .production, installUpdate: { true }, start: { _ in Issue.record("Updater owns restart") }, terminate: {})
+    clock.addTimeInterval(1801)
+    #expect(!owner.consumeIMessageSetupResume(configuration: .production))
 }
 
 @Test @MainActor func appSwitcherActivationRestoresMiniaturizedMainWindow() {

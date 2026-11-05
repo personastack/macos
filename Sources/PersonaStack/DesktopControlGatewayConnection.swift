@@ -39,6 +39,7 @@ actor DesktopControlGatewayConnection {
     private let iMessageRuntime: IMessageRuntime?
     private var iMessageConnectionID = UUID()
     private var iMessageEnabled = false
+    private var iMessageCleanup: Task<Void, Never>?
     private var iMessageRequestIDs: Set<String> = []
     private let session: URLSession
     private let socketOverride: (any DesktopControlSocket)?
@@ -111,7 +112,10 @@ actor DesktopControlGatewayConnection {
             diagnosticsSupported = ready.diagnosticsSupported == true
             iMessageEnabled = iMessageRuntime != nil && IMessageGatewayWire.supports(protocolVersion: ready.imessageProtocolVersion)
             iMessageConnectionID = UUID()
-            if iMessageEnabled { await iMessageRuntime?.bind(connectionID: iMessageConnectionID) }
+            let bindingID = iMessageConnectionID
+            await iMessageCleanup?.value
+            guard !Task.isCancelled, socket === task else { throw DesktopControlGatewayConnectionError.socketUnavailable }
+            if iMessageEnabled { await iMessageRuntime?.bind(connectionID: bindingID) }
             guard !Task.isCancelled, socket === task else { throw DesktopControlGatewayConnectionError.socketUnavailable }
             connected = true
             lastGatewayHeartbeat = now()
@@ -192,7 +196,27 @@ actor DesktopControlGatewayConnection {
         iMessageConnectionID = UUID()
         iMessageEnabled = false
         iMessageRequestIDs.removeAll()
-        if let iMessageRuntime { Task { await iMessageRuntime.unbind(connectionID: retiredIMessageConnection) } }
+        if let iMessageRuntime {
+            let previous = iMessageCleanup
+            iMessageCleanup = Task {
+                await previous?.value
+                await iMessageRuntime.unbindAndDrain(connectionID: retiredIMessageConnection)
+            }
+        }
+    }
+
+    func usesIMessageRuntime(_ runtime: IMessageRuntime) -> Bool {
+        iMessageRuntime === runtime
+    }
+
+    func drainIMessage() async {
+        retireIMessageConnection()
+        await iMessageCleanup?.value
+    }
+
+    func stopAndDrainIMessage() async {
+        stop()
+        await iMessageCleanup?.value
     }
 
     func stop() {
@@ -457,7 +481,7 @@ actor DesktopControlGatewayConnection {
 
     private func disconnected(error: DesktopControlGatewayConnectionError? = nil) async {
         guard connected else { return }
-        stop()
+        await stopAndDrainIMessage()
         await onDisconnect(error)
     }
 

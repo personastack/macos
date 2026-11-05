@@ -1,15 +1,21 @@
 import AppKit
 import Foundation
+import PersonaStackCore
 
 @MainActor
 final class DesktopApplicationRestart {
     static let shared = DesktopApplicationRestart(defaults: .standard)
     // Navigation only. Never resumes a native scope, ticket, or permission grant.
     static let resumesPermissionSetup = shared.consumeResumeHint(arguments: CommandLine.arguments)
+    static let resumesIMessageSetup: Bool = {
+        guard let configuration = try? LaunchConfiguration.selectedEnvironment() else { return false }
+        return shared.consumeIMessageSetupResume(configuration: configuration)
+    }()
     private static let resumeHintKey = "desktop.permissionSetup.resumeUntil"
     private let defaults: UserDefaults?
     private let now: () -> Date
     private var pendingWaiter: Process?
+    private var pendingIMessageHintKey: String?
     private let isRunning: (Process) -> Bool
     private let stop: (Process) -> Void
 
@@ -24,6 +30,8 @@ final class DesktopApplicationRestart {
 
     func cancelPendingRestart() {
         defaults?.removeObject(forKey: Self.resumeHintKey)
+        if let pendingIMessageHintKey { defaults?.removeObject(forKey: pendingIMessageHintKey) }
+        pendingIMessageHintKey = nil
         _ = defaults?.synchronize()
         stopPendingWaiter()
     }
@@ -34,6 +42,33 @@ final class DesktopApplicationRestart {
         if isRunning(waiter) { stop(waiter) }
     }
     static let foregroundArgument = "--personastack-permission-relaunch"
+    static let iMessageForegroundArgument = "--personastack-imessage-permission-relaunch"
+
+    private static func imessageHintKey(_ configuration: DesktopEnvironmentConfiguration) -> String {
+        DesktopEnvironmentConfigurationStore.scopedPreferenceKey("imessage.permissionSetup.resumeUntil",
+            appOrigin: configuration.preferenceIdentity)
+    }
+
+    func consumeIMessageSetupResume(configuration: DesktopEnvironmentConfiguration) -> Bool {
+        let key = Self.imessageHintKey(configuration)
+        let expiry = defaults?.double(forKey: key) ?? 0
+        defaults?.removeObject(forKey: key)
+        _ = defaults?.synchronize()
+        let remaining = expiry - now().timeIntervalSince1970
+        return remaining > 0 && remaining <= 30 * 60
+    }
+
+    static func initialIMessagePageURL(_ appURL: URL, resume: Bool) -> URL {
+        guard resume, var components = URLComponents(url: appURL, resolvingAgainstBaseURL: false) else { return appURL }
+        components.path = "/user/imessage"
+        components.queryItems = [URLQueryItem(name: "resume_setup", value: "1")]
+        components.fragment = nil
+        return components.url ?? appURL
+    }
+
+    static func requestIMessageSetupResume(configuration: DesktopEnvironmentConfiguration) throws {
+        try shared.request(iMessageConfiguration: configuration)
+    }
 
     func consumeResumeHint(arguments: [String] = []) -> Bool {
         let expiry = defaults?.double(forKey: Self.resumeHintKey) ?? 0
@@ -64,13 +99,17 @@ final class DesktopApplicationRestart {
 
     func request(applicationURL: URL = Bundle.main.bundleURL,
                  processID: Int32 = ProcessInfo.processInfo.processIdentifier,
+                 iMessageConfiguration: DesktopEnvironmentConfiguration? = nil,
                  installUpdate: () throws -> Bool = { try DesktopUpdater.shared.restartForPermissionRepairIfNeeded() },
                  start: (Process) throws -> Void = { try $0.run() },
                  terminate: () -> Void = { NSApp.terminate(nil) }) throws {
         guard applicationURL.isFileURL, applicationURL.pathExtension == "app", processID > 0 else {
             throw CocoaError(.fileReadUnsupportedScheme)
         }
-        defaults?.set(now().addingTimeInterval(30 * 60).timeIntervalSince1970, forKey: Self.resumeHintKey)
+        let hint = iMessageConfiguration.map(Self.imessageHintKey) ?? Self.resumeHintKey
+        if let previous = pendingIMessageHintKey, previous != hint { defaults?.removeObject(forKey: previous) }
+        pendingIMessageHintKey = iMessageConfiguration == nil ? nil : hint
+        defaults?.set(now().addingTimeInterval(30 * 60).timeIntervalSince1970, forKey: hint)
         _ = defaults?.synchronize()
         do {
             if try installUpdate() { stopPendingWaiter(); return }
@@ -91,7 +130,8 @@ final class DesktopApplicationRestart {
             remaining=$((remaining - 1))
         done
         exec /usr/bin/open -a "$2" --args "$3"
-        """, "personastack-restart", String(processID), applicationURL.path, Self.foregroundArgument]
+        """, "personastack-restart", String(processID), applicationURL.path,
+            iMessageConfiguration == nil ? Self.foregroundArgument : Self.iMessageForegroundArgument]
         waiter.standardInput = FileHandle.nullDevice
         waiter.standardOutput = FileHandle.nullDevice
         waiter.standardError = FileHandle.nullDevice

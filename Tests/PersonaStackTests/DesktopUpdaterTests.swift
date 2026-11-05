@@ -516,6 +516,54 @@ private func isolatedUpdatePreferences() -> UserDefaults {
     UserDefaults(suiteName: "DesktopUpdaterTests-\(UUID().uuidString)")!
 }
 
+@Test(arguments: ["success", "cancel", "permission-restart-failure"]) @MainActor
+func iMessageUpdaterJoinsSetupAndProviderBeforeReplacementAndFencesCanceledAttempt(outcome: String) async throws {
+    let preferences = isolatedUpdatePreferences()
+    var continuation: CheckedContinuation<Void, Never>?
+    var events: [String] = []
+    var installations = 0
+    let updater = DesktopUpdater(updaterFactory: { _, _ in FakeDesktopUpdateClient(preferences: preferences) },
+        preferences: preferences, presentReadyReminder: { _ in }, clearAvailableNotification: { _ in },
+        clearUpdateNotifications: { _ in }, confirmRestart: { true },
+        agentBridgeNeedsHandoff: { false }, prepareAgentBridgeUpdate: {
+            events.append("existing-agents")
+            if outcome == "permission-restart-failure" { throw AgentBridgeFailure.busy }
+        },
+        cancelAgentBridgeUpdate: {}, imessageNeedsHandoff: { true }, prepareIMessageUpdate: {
+            events.append("imessage-start")
+            await withCheckedContinuation { continuation = $0 }
+            events.append("imessage-joined")
+        })
+    #expect(updater.retainAutomaticInstallHandler(version: "0.9.0", handler: { installations += 1; events.append("replace") }))
+    if outcome == "permission-restart-failure" {
+        #expect(try updater.restartForPermissionRepairIfNeeded())
+        #expect(try updater.restartForPermissionRepairIfNeeded())
+    } else {
+        updater.restartToInstall()
+        updater.restartToInstall()
+    }
+    while continuation == nil { await Task.yield() }
+    #expect(installations == 0 && events == ["imessage-start"])
+    if outcome == "cancel" { updater.cancelBackgroundUpdate() }
+    continuation?.resume()
+    if outcome == "cancel" {
+        await updater.resumeBackgroundAgentsAfterCanceledUpdate()
+        #expect(installations == 0)
+        #expect(events == ["imessage-start", "imessage-joined"])
+        #expect(!preferences.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey))
+    } else if outcome == "permission-restart-failure" {
+        while !updater.waitsForBackgroundAgents { await Task.yield() }
+        #expect(installations == 0)
+        #expect(events == ["imessage-start", "imessage-joined", "existing-agents"])
+        #expect(!preferences.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey))
+    } else {
+        while installations == 0 { await Task.yield() }
+        #expect(installations == 1)
+        #expect(events == ["imessage-start", "imessage-joined", "existing-agents", "replace"])
+        #expect(preferences.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey))
+    }
+}
+
 @Test @MainActor func permissionRestartUsesReadyUpdateHandlerAndFailsClosedWithoutOne() throws {
     let preferences = isolatedUpdatePreferences()
     let updater = DesktopUpdater(updaterFactory: { _, _ in FakeDesktopUpdateClient(preferences: preferences) },

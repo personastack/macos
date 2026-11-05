@@ -71,4 +71,26 @@ struct DesktopCrashRecoveryPolicyTests {
         DesktopCrashRecoveryPolicy.recordTerminationIntent(isUpdateRelaunch: false, preferences: preferences)
         #expect(!DesktopCrashRecoveryPolicy.shouldLaunchAtLogin(preferences: preferences))
     }
+
+    @Test func iMessageAndDesktopControlCrashIntentHonorsBothPausesAndExplicitQuit() throws {
+        let (preferences, suite) = try preferences()
+        defer { preferences.removePersistentDomain(forName: suite) }
+        for dcEnabled in [false, true] {
+            for dcPaused in [false, true] {
+                for imEnabled in [false, true] {
+                    for imPaused in [false, true] {
+                        let active = (dcEnabled && !dcPaused) || (imEnabled && !imPaused)
+                        #expect(DesktopRelayStartupPolicy.shouldStart(desktopControlEnabled: dcEnabled, desktopControlPaused: dcPaused,
+                            imessageEnabled: imEnabled, imessagePaused: imPaused) == active)
+                        for quit in [false, true] {
+                            preferences.set(quit, forKey: DesktopCrashRecoveryPolicy.quitSuppressedKey)
+                            #expect(DesktopCrashRecoveryPolicy.shouldRestartAfterUnexpectedExit(relayEnabled: dcEnabled,
+                                relayPaused: dcPaused, imessageEnabled: imEnabled, imessagePaused: imPaused,
+                                preferences: preferences) == (active && !quit))
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

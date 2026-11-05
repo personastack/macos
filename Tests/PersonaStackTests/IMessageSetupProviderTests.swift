@@ -7,24 +7,36 @@ private actor SetupProviderAccountFixture: IMessageSetupAccountReading {
     private(set) var prepares = 0
     private(set) var clears = 0
     private(set) var currentReads = 0
+    private(set) var explicitPermissionReads = 0
     private(set) var selectedReads: [([String], String?, Bool)] = []
     private let selectedGate: SetupApprovalGate?
     private let selectedAccount: String
     private let selectedSource: String
-    init(selectedAccount: String = "live-account", selectedSource: String = "native-source", selectedGate: SetupApprovalGate? = nil) {
+    private let permissionError: IMessageAccountError?
+    init(selectedAccount: String = "live-account", selectedSource: String = "native-source", selectedGate: SetupApprovalGate? = nil, permissionError: IMessageAccountError? = nil) {
         self.selectedAccount = selectedAccount; self.selectedSource = selectedSource; self.selectedGate = selectedGate
+        self.permissionError = permissionError
     }
-    func prepareProviderConnection(_ client: IMessageRPCClient) async throws { prepares += 1; await client.stop() }
+    func prepareProviderConnection(_ client: IMessageRPCClient) async throws {
+        prepares += 1
+        if permissionError == .sourceUnavailable { throw IMessageAccountError.sourceUnavailable }
+        await client.stop()
+    }
     func clearProviderBinding() async { clears += 1; await selectedGate?.release() }
     func validateProviderConnection() throws {}
     func observeCurrentAccount() throws -> IMessageCurrentAccountObservation {
         currentReads += 1
-        return .init(accountID: "live-account", sourceGeneration: "native-source")
+        if let permissionError { throw permissionError }
+        return .init(accountID: "live-account", sourceGeneration: "native-source", accountLabel: "Personal Messages")
+    }
+    func requestCurrentAccountPermission() -> IMessageCurrentAccountObservation {
+        explicitPermissionReads += 1
+        return .init(accountID: "live-account", sourceGeneration: "native-source", accountLabel: "Personal Messages")
     }
     func observe(chatGUIDs: [String], expectedAccountID: String?, requestAutomation: Bool) async throws -> IMessageLiveAccountObservation {
         selectedReads.append((chatGUIDs, expectedAccountID, requestAutomation))
         await selectedGate?.pause()
-        return .init(accountID: selectedAccount, sourceGeneration: selectedSource, chatGUIDs: chatGUIDs)
+        return .init(accountID: selectedAccount, sourceGeneration: selectedSource, chatGUIDs: chatGUIDs, accountLabel: "Personal Messages")
     }
 }
 
@@ -73,9 +85,11 @@ private actor SetupProviderTransportFixture: IMessageRPCTransport {
     private(set) var terminations = 0
     let changedGUID: Bool
     let adapterRevision: Int
+    let databaseReady: Bool
     init(changedGUID: Bool = false, adapterRevision: Int = 2, metadataFault: SetupProviderMetadataFault? = nil,
          availableIDs: Set<String> = ["42"], metadataGate: SetupApprovalGate? = nil,
-         checkpointGate: SetupApprovalGate? = nil, checkpointFault: SetupApprovalCheckpointFault? = nil) {
+         checkpointGate: SetupApprovalGate? = nil, checkpointFault: SetupApprovalCheckpointFault? = nil, databaseReady: Bool = true) {
+        self.databaseReady = databaseReady
         self.changedGUID = changedGUID; self.adapterRevision = adapterRevision; self.metadataFault = metadataFault
         self.availableIDs = availableIDs; self.metadataGate = metadataGate; self.checkpointGate = checkpointGate; self.checkpointFault = checkpointFault
     }
@@ -99,7 +113,7 @@ private actor SetupProviderTransportFixture: IMessageRPCTransport {
         switch method {
         case "personastack.initialize", "personastack.status":
             result = ["protocol_version": 1, "personastack_adapter_revision": adapterRevision,
-                "database": ["ready": true], "methods": IMessageRPCMethod.allCases.map(\.rawValue)]
+                "database": ["ready": databaseReady], "methods": IMessageRPCMethod.allCases.map(\.rawValue)]
         case "personastack.chats.page":
             result = ["chats": [metadata("42")], "next_chat_rowid": "42", "upper_chat_rowid": "42", "has_more": false, "stop_reason": "caught_up"]
         case "personastack.chatMetadata":
@@ -433,4 +447,63 @@ private func iMessageFinalApprovalRejectsNoncorrelatedCheckpoint(fault: SetupApp
     await #expect(throws: CancellationError.self) { try await work.value }
     #expect(await transport.terminations == 1)
     #expect(await accounts.clears == 1)
+}
+
+
+@Test func iMessageSetupProviderRestoresExactDraftSelectorsAndDisplaysOnlyMatchingNativeAccount() async throws {
+    let accounts = SetupProviderAccountFixture()
+    let transport = SetupProviderTransportFixture()
+    let provider = IMessageSetupProvider(client: IMessageRPCClient(transport: transport), accounts: accounts)
+    let account = IMessageSetupAccount(accountID: "live-account", sourceGeneration: "native-source")
+    let result = try await provider.restore(selections: [IMessageSetupDraft.Selection(nativeChatRowID: "42", expectedGUID: "chosen-guid")],
+        account: account, deadline: Date().addingTimeInterval(10))
+    #expect(result.conversations.map { $0.id.rawValue } == ["42"])
+    #expect(try await provider.displayAccount(for: account) == "Personal Messages")
+    await #expect(throws: IMessageSetupProviderError.accountChanged) {
+        try await provider.displayAccount(for: .init(accountID: "other-account", sourceGeneration: "native-source"))
+    }
+    #expect(await accounts.explicitPermissionReads == 0)
+    #expect(await transport.methods == ["personastack.initialize", "personastack.chatMetadata"])
+    await provider.stop()
+    await #expect(throws: IMessageSetupProviderError.accountChanged) { try await provider.displayAccount(for: account) }
+}
+
+@Test func iMessageSetupProviderPermissionRequestIsAnExplicitNativeOperation() async throws {
+    let accounts = SetupProviderAccountFixture()
+    let provider = IMessageSetupProvider(client: IMessageRPCClient(transport: SetupProviderTransportFixture()), accounts: accounts)
+    try await provider.requestMessagesAccess(deadline: Date().addingTimeInterval(10))
+    #expect(await accounts.explicitPermissionReads == 1)
+    #expect(await accounts.currentReads == 0)
+    #expect(await accounts.selectedReads.isEmpty)
+    await provider.stop()
+}
+
+
+@Test(arguments: [IMessageAccountError.messagesNotRunning, .sourceUnavailable, .automationRequired, .sourceChanged, .selectedAccountUnavailable, .sourceRecordUnavailable])
+func iMessageSetupPermissionStatePreservesFiniteNativeReasonWithoutPrompting(reason: IMessageAccountError) async throws {
+    let accounts = SetupProviderAccountFixture(permissionError: reason)
+    let transport = SetupProviderTransportFixture()
+    let provider = IMessageSetupProvider(client: IMessageRPCClient(transport: transport), accounts: accounts)
+    let expected: IMessageSetupPermissionState
+    switch reason {
+    case .messagesNotRunning: expected = .messagesNotRunning
+    case .sourceUnavailable: expected = .fullDiskAccessRequired
+    case .automationRequired: expected = .automationRequired
+    case .sourceChanged: expected = .sourceChanged
+    default: expected = .unavailable
+    }
+    #expect(try await provider.setupPermissionState(deadline: Date().addingTimeInterval(10)) == expected)
+    #expect(await accounts.explicitPermissionReads == 0)
+    #expect(await accounts.selectedReads.isEmpty)
+    #expect(await transport.methods == (reason == .sourceUnavailable ? [] : ["personastack.initialize"]))
+    await provider.stop()
+}
+
+@Test(arguments: [false, true]) func iMessageSetupPermissionStateRequiresBothDatabaseAndPassiveLiveAccount(databaseReady: Bool) async throws {
+    let accounts = SetupProviderAccountFixture()
+    let provider = IMessageSetupProvider(client: IMessageRPCClient(transport: SetupProviderTransportFixture(databaseReady: databaseReady)), accounts: accounts)
+    #expect(try await provider.setupPermissionState(deadline: Date().addingTimeInterval(10)) == (databaseReady ? .ready : .unavailable))
+    #expect(await accounts.currentReads == (databaseReady ? 1 : 0))
+    #expect(await accounts.explicitPermissionReads == 0)
+    await provider.stop()
 }

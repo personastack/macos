@@ -139,7 +139,7 @@ struct IMessageMachineSetupClient: Sendable {
         } catch { throw IMessageMachineSetupError.invalidResponse }
     }
 
-    private static func canonicalProof(_ value: String) throws -> String {
+    static func canonicalProof(_ value: String) throws -> String {
         guard value.utf8.count <= 44 else { throw IMessageMachineSetupError.invalidRequest }
         var encoded = value.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
         encoded += String(repeating: "=", count: (4 - encoded.count % 4) % 4)

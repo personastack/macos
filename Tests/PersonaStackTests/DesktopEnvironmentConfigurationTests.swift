@@ -3,6 +3,32 @@ import Testing
 @testable import PersonaStackCore
 
 struct DesktopEnvironmentConfigurationTests {
+    @Test func iMessageIntentDefaultsOffAndIsIndependentAcrossProfilesAndFamilies() throws {
+        let suite = "IMessageIntentTests.\(UUID().uuidString)"
+        let preferences = try #require(UserDefaults(suiteName: suite))
+        defer { preferences.removePersistentDomain(forName: suite) }
+        let changedGateway = try DesktopEnvironmentConfiguration(appURL: DesktopEnvironmentConfiguration.production.appOrigin,
+            gatewayURL: "https://another-gateway.example", mcpURL: DesktopEnvironmentConfiguration.production.mcpURL.absoluteString)
+        let changedMCP = try DesktopEnvironmentConfiguration(appURL: DesktopEnvironmentConfiguration.production.appOrigin,
+            gatewayURL: DesktopEnvironmentConfiguration.production.gatewayURL.absoluteString, mcpURL: "https://another-mcp.example")
+        for configuration in [DesktopEnvironmentConfiguration.production, .lan, changedGateway, changedMCP] {
+            #expect(!preferences.bool(forKey: IMessagePreferenceKeys.relayEnabled(configuration)))
+            #expect(!preferences.bool(forKey: IMessagePreferenceKeys.relayPaused(configuration)))
+        }
+        preferences.set(true, forKey: DesktopControlPreferenceKeys.relayEnabled(.production))
+        #expect(!preferences.bool(forKey: IMessagePreferenceKeys.relayEnabled(.production)))
+        preferences.set(true, forKey: IMessagePreferenceKeys.relayEnabled(.production))
+        preferences.set(true, forKey: IMessagePreferenceKeys.relayPaused(.production))
+        #expect(preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(.production)))
+        #expect(!preferences.bool(forKey: DesktopControlPreferenceKeys.relayPaused(.production)))
+        for configuration in [DesktopEnvironmentConfiguration.lan, changedGateway, changedMCP] {
+            #expect(!preferences.bool(forKey: IMessagePreferenceKeys.relayEnabled(configuration)))
+            #expect(!preferences.bool(forKey: IMessagePreferenceKeys.relayPaused(configuration)))
+        }
+        _ = DesktopEnvironmentConfigurationStore(preferences: preferences)
+        #expect(preferences.bool(forKey: IMessagePreferenceKeys.relayEnabled(.production)))
+        #expect(preferences.bool(forKey: IMessagePreferenceKeys.relayPaused(.production)))
+    }
     @Test
     func normalizesSchemesHostsDefaultPortsAndTrailingSlashes() throws {
         let configuration = try DesktopEnvironmentConfiguration(

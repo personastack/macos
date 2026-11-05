@@ -237,7 +237,10 @@ final class DesktopCrashRecoverySupervisor {
         let preferences = UserDefaults.standard
         _ = preferences.synchronize()
         guard let configuration = try? LaunchConfiguration.selectedEnvironment() else { return false }
-        return preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(configuration))
-            && !preferences.bool(forKey: DesktopControlPreferenceKeys.relayPaused(configuration))
+        return DesktopRelayStartupPolicy.shouldStart(
+            desktopControlEnabled: preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(configuration)),
+            desktopControlPaused: preferences.bool(forKey: DesktopControlPreferenceKeys.relayPaused(configuration)),
+            imessageEnabled: preferences.bool(forKey: IMessagePreferenceKeys.relayEnabled(configuration)),
+            imessagePaused: preferences.bool(forKey: IMessagePreferenceKeys.relayPaused(configuration)))
     }
 }

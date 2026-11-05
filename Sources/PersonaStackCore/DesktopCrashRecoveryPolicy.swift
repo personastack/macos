@@ -45,8 +45,11 @@ public enum DesktopCrashRecoveryPolicy {
 
     public static func shouldRestartAfterUnexpectedExit(relayEnabled: Bool,
                                                         relayPaused: Bool,
+                                                        imessageEnabled: Bool = false,
+                                                        imessagePaused: Bool = false,
                                                         preferences: UserDefaults = .standard) -> Bool {
         _ = preferences.synchronize()
-        return relayEnabled && !relayPaused && !preferences.bool(forKey: quitSuppressedKey)
+        return DesktopRelayStartupPolicy.shouldStart(desktopControlEnabled: relayEnabled, desktopControlPaused: relayPaused,
+            imessageEnabled: imessageEnabled, imessagePaused: imessagePaused) && !preferences.bool(forKey: quitSuppressedKey)
     }
 }

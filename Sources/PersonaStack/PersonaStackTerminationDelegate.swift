@@ -4,6 +4,15 @@ import PersonaStackCore
 @MainActor
 final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     var reopenMainWindow: (@MainActor () -> Void)?
+    var openIMessageSetup: (@MainActor (IMessageSetupHandoff) -> Void)? {
+        didSet {
+            if phase == .idle, let handoff = pendingIMessageHandoff, let openIMessageSetup {
+                pendingIMessageHandoff = nil
+                openIMessageSetup(handoff)
+            }
+        }
+    }
+    private var pendingIMessageHandoff: IMessageSetupHandoff?
     private var shouldRestoreMainWindow = false
     private var pendingMainPage: URL?
     private let shutdown: @MainActor () async -> Bool
@@ -22,10 +31,13 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
 
     override init() {
         shutdown = {
-            await Self.cleanupControlForQuit(DesktopControlRuntime.shared)
+            await IMessageSetupManager.shared.shutdown()
+            return await Self.cleanupControlForQuit(DesktopControlRuntime.shared)
         }
         terminate = { $0.terminate(nil) }
-        hasActiveSessions = { Self.controlCleanupPendingForQuit(DesktopControlRuntime.shared) }
+        hasActiveSessions = {
+            IMessageSetupManager.shared.hasPendingShutdown || Self.controlCleanupPendingForQuit(DesktopControlRuntime.shared)
+        }
         showCleanupFailure = {}
         cancelPermissionRestart = { DesktopApplicationRestart.shared.cancelPendingRestart() }
         timeout = .seconds(10)
@@ -70,8 +82,12 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
                                           forKey: AgentBridgeService.errorKey)
             }
         }
+        let resumeIMessage = DesktopApplicationRestart.resumesIMessageSetup
         guard UserDefaults.standard.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
-                || DesktopApplicationRestart.resumesPermissionSetup else { return }
+                || DesktopApplicationRestart.resumesPermissionSetup || resumeIMessage else { return }
+        if resumeIMessage, let configuration = try? LaunchConfiguration.selectedEnvironment() {
+            pendingMainPage = DesktopApplicationRestart.initialIMessagePageURL(configuration.appURL, resume: true)
+        }
         UserDefaults.standard.removeObject(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
         _ = UserDefaults.standard.synchronize()
         shouldRestoreMainWindow = true
@@ -133,6 +149,13 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         reopenMainWindow()
     }
 
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard phase == .idle, urls.count == 1, let url = urls.first,
+              let handoff = try? IMessageSetupHandoff.parseDeepLink(url) else { return }
+        if let openIMessageSetup { openIMessageSetup(handoff) }
+        else { pendingIMessageHandoff = handoff }
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         guard let reopenMainWindow else { return true }
         reopenMainWindow()
@@ -156,6 +179,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         guard phase == .idle else { return .terminateCancel }
         guard DesktopUpdater.shared.allowsTermination() else { return .terminateCancel }
         DesktopUpdater.shared.applicationWillTerminate()
+        pendingIMessageHandoff = nil
         phase = .cleaning
         Task { @MainActor in
             let cleaned = await shutdown()

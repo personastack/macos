@@ -252,3 +252,22 @@ public enum DesktopControlPreferenceKeys {
         DesktopEnvironmentConfigurationStore.scopedPreferenceKey("desktopControlRelayError", appOrigin: configuration.preferenceIdentity)
     }
 }
+
+/// Independent native intent. Only an explicit successful Messages Connect or
+/// Resume sets these values. They never restore setup consent or runtime grants.
+public enum IMessagePreferenceKeys {
+    public static func relayEnabled(_ configuration: DesktopEnvironmentConfiguration) -> String {
+        DesktopEnvironmentConfigurationStore.scopedPreferenceKey("imessageRelayEnabled", appOrigin: configuration.preferenceIdentity)
+    }
+
+    public static func relayPaused(_ configuration: DesktopEnvironmentConfiguration) -> String {
+        DesktopEnvironmentConfigurationStore.scopedPreferenceKey("imessageRelayPaused", appOrigin: configuration.preferenceIdentity)
+    }
+}
+
+public enum DesktopRelayStartupPolicy {
+    public static func shouldStart(desktopControlEnabled: Bool, desktopControlPaused: Bool,
+                                   imessageEnabled: Bool, imessagePaused: Bool) -> Bool {
+        (desktopControlEnabled && !desktopControlPaused) || (imessageEnabled && !imessagePaused)
+    }
+}

@@ -73,6 +73,8 @@ final class DesktopUpdater: NSObject, ObservableObject {
     private let agentBridgeNeedsHandoff: @MainActor () -> Bool
     private let prepareAgentBridgeUpdate: @MainActor () async throws -> Void
     private let cancelAgentBridgeUpdate: @MainActor () async throws -> Void
+    private let imessageNeedsHandoff: @MainActor () -> Bool
+    private let prepareIMessageUpdate: @MainActor () async -> Void
     private var updater: (any DesktopUpdateClient)?
     private var userDriver: SPUStandardUserDriver?
     private var didStart = false
@@ -107,6 +109,10 @@ final class DesktopUpdater: NSObject, ObservableObject {
          agentBridgeNeedsHandoff: @escaping @MainActor () -> Bool = { AgentBridgeUpdateHandoff.shared.needsHandoff },
          prepareAgentBridgeUpdate: @escaping @MainActor () async throws -> Void = DesktopUpdater.prepareAgentBridgeReplacement,
          cancelAgentBridgeUpdate: @escaping @MainActor () async throws -> Void = { try await AgentBridgeUpdateHandoff.shared.cancelReplacement() },
+         imessageNeedsHandoff: @escaping @MainActor () -> Bool = {
+             IMessageSetupManager.shared.hasPendingShutdown || DesktopControlRuntime.shared.hasPendingIMessageCleanup
+         },
+         prepareIMessageUpdate: @escaping @MainActor () async -> Void = { await IMessageSetupLifetime.prepareForReplacement() },
          cancelPermissionRestart: @escaping @MainActor () -> Void = {}) {
         self.updaterFactory = updaterFactory
         self.preferences = preferences
@@ -121,6 +127,8 @@ final class DesktopUpdater: NSObject, ObservableObject {
         self.agentBridgeNeedsHandoff = agentBridgeNeedsHandoff
         self.prepareAgentBridgeUpdate = prepareAgentBridgeUpdate
         self.cancelAgentBridgeUpdate = cancelAgentBridgeUpdate
+        self.imessageNeedsHandoff = imessageNeedsHandoff
+        self.prepareIMessageUpdate = prepareIMessageUpdate
         super.init()
     }
 
@@ -271,7 +279,7 @@ final class DesktopUpdater: NSObject, ObservableObject {
         guard !isImmediateInstallRequested, cancellationTask == nil else { return }
         isImmediateInstallRequested = true
         let generation = replacementGeneration
-        if !agentBridgeNeedsHandoff() { finishImmediateInstallation(immediateInstallHandler); return }
+        if !agentBridgeNeedsHandoff(), !imessageNeedsHandoff() { finishImmediateInstallation(immediateInstallHandler); return }
         Task { @MainActor in
             let prepared = await prepareBackgroundAgentsForUpdate()
             guard replacementGeneration == generation else { return }
@@ -322,6 +330,10 @@ final class DesktopUpdater: NSObject, ObservableObject {
 
     private func performBackgroundPreparation(generation: UUID) async -> Bool {
         do {
+            if imessageNeedsHandoff() {
+                await prepareIMessageUpdate()
+                guard !Task.isCancelled, replacementGeneration == generation else { return false }
+            }
             try await prepareAgentBridgeUpdate()
             guard replacementGeneration == generation else { return false }
             isAgentBridgeReplacementPrepared = true

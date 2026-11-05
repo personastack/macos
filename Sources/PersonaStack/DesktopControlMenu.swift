@@ -96,6 +96,7 @@ struct DesktopControlMenu: View {
                 Image(nsImage: DesktopControlIcon.image).renderingMode(.original)
             }
         }
+        IMessageMenu()
         Divider()
         Menu("Settings") {
             DesktopConcernNotificationsMenuItem()
@@ -270,9 +271,9 @@ struct DesktopControlMenu: View {
     @MainActor
     private func confirmDisconnect() {
         let alert = NSAlert()
-        alert.messageText = "Disconnect this Mac from PersonaStack?"
-        alert.informativeText = "This revokes the desktop connection for every workspace. CUA remains installed and running. Other CUA clients are not disconnected."
-        alert.addButton(withTitle: "Disconnect Desktop Control")
+        alert.messageText = DesktopMachineDisconnectConfirmation.title
+        alert.informativeText = DesktopMachineDisconnectConfirmation.detail
+        alert.addButton(withTitle: DesktopMachineDisconnectConfirmation.action)
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         Task { await disconnectRelay() }
@@ -306,6 +307,12 @@ struct DesktopControlMenu: View {
         }
     }
 
+}
+
+enum DesktopMachineDisconnectConfirmation {
+    static let title = "Disconnect this Mac from PersonaStack?"
+    static let detail = "Desktop Control and iMessage will stop for every workspace. CUA stays installed and running."
+    static let action = "Disconnect This Mac"
 }
 
 /// Presentation of the existing relay action, shared by its single menu button.

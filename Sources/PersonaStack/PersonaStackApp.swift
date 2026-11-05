@@ -41,17 +41,21 @@ struct PersonaStackApp: App {
     }()
     init() {
         let foregroundUpdateRelaunch = UserDefaults.standard.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
-            || DesktopApplicationRestart.resumesPermissionSetup
-        guard let configuration = try? LaunchConfiguration.selectedEnvironment(),
-              UserDefaults.standard.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(configuration)) else { return }
+            || DesktopApplicationRestart.resumesPermissionSetup || DesktopApplicationRestart.resumesIMessageSetup
+        guard let configuration = try? LaunchConfiguration.selectedEnvironment() else { return }
+        let dcEnabled = UserDefaults.standard.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(configuration))
+        let dcPaused = UserDefaults.standard.bool(forKey: DesktopControlPreferenceKeys.relayPaused(configuration))
+        let imEnabled = UserDefaults.standard.bool(forKey: IMessagePreferenceKeys.relayEnabled(configuration))
+        let imPaused = UserDefaults.standard.bool(forKey: IMessagePreferenceKeys.relayPaused(configuration))
+        guard DesktopRelayStartupPolicy.shouldStart(desktopControlEnabled: dcEnabled, desktopControlPaused: dcPaused,
+            imessageEnabled: imEnabled, imessagePaused: imPaused) else { return }
         if DesktopUpdatePolicy.shouldUseAccessoryActivation(relayEnabled: true,
                                                             foregroundUpdateRelaunch: foregroundUpdateRelaunch) {
             NSApplication.shared.setActivationPolicy(.accessory)
         }
-        let paused = UserDefaults.standard.bool(forKey: DesktopControlPreferenceKeys.relayPaused(configuration))
         Task { @MainActor in
             _ = MainWebViewHost.shared
-            await DesktopControlRuntime.shared.startAtLaunch(configuration: configuration, paused: paused)
+            await DesktopControlRuntime.shared.startAtLaunch(configuration: configuration, paused: dcPaused)
         }
     }
 
@@ -70,6 +74,9 @@ struct PersonaStackApp: App {
             }
             .overlay(alignment: .bottomTrailing) {
                 DesktopDownloadToast().padding(18)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                IMessageSetupManager.shared.recheckAfterActivation(MainWebViewHost.shared.webView)
             }
         }
         .defaultSize(width: 1440, height: 960)
@@ -212,6 +219,7 @@ final class MainWebViewHost {
                 MainActor.assumeIsolated {
                     guard let self else { return }
                     self.resetOnNextOpen = true
+                    IMessageSetupManager.shared.documentInvalidated(self.webView)
                     self.closedWindow = window
                     self.mainWindow = nil
                     if let container = self.webView.superview { self.park(from: container) }
@@ -256,6 +264,7 @@ final class MainWebViewHost {
         configuration.userContentController.addScriptMessageHandler(LocalClusterSetupManager.shared, contentWorld: .page, name: "personastackLocalCluster")
         configuration.userContentController.addScriptMessageHandler(DesktopSkillsManager.shared, contentWorld: .page, name: "personastackSkills")
         configuration.userContentController.addScriptMessageHandler(DesktopControlSetupManager.shared, contentWorld: .page, name: "personastackDesktopControl")
+        configuration.userContentController.addScriptMessageHandler(IMessageSetupManager.shared, contentWorld: .page, name: IMessageSetupManager.bridgeName)
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.allowsBackForwardNavigationGestures = true
@@ -269,6 +278,7 @@ final class MainWebViewHost {
         LocalClusterSetupManager.shared.register(webView, appURL: appURL)
         DesktopSkillsManager.shared.register(webView, appURL: appURL)
         DesktopControlSetupManager.shared.register(webView, appURL: appURL)
+        IMessageSetupManager.shared.register(webView, appURL: appURL)
 
         let backgroundWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1, height: 1),
                                         styleMask: .borderless, backing: .buffered, defer: false)
@@ -339,11 +349,12 @@ final class MainWebViewHost {
         LocalClusterSetupManager.shared.unregister(webView)
         DesktopSkillsManager.shared.unregister(webView)
         DesktopControlSetupManager.shared.unregister(webView)
+        IMessageSetupManager.shared.unregister(webView)
         coordinator.retire()
         webView.stopLoading()
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
-        for name in ["personastackConcern", "personastackChat", "personastackStack", "personastackLocalSession", "personastackAgentBridge", "personastackLocalCluster", "personastackSkills", "personastackDesktopControl"] {
+        for name in ["personastackConcern", "personastackChat", "personastackStack", "personastackLocalSession", "personastackAgentBridge", "personastackLocalCluster", "personastackSkills", "personastackDesktopControl", IMessageSetupManager.bridgeName] {
             webView.configuration.userContentController.removeScriptMessageHandler(forName: name)
         }
         webView.removeFromSuperview()
@@ -390,6 +401,9 @@ struct PersonaStackWebView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> MainWebViewContainer {
         let action = openWindow
+        let delegate = applicationDelegate
+        IMessageSetupManager.shared.navigateMainWindow = { [weak delegate] destination in delegate?.openMainPage(destination) }
+        applicationDelegate.openIMessageSetup = { IMessageSetupManager.shared.receive($0) }
         applicationDelegate.installMainWindowReopener {
             MainWebViewHost.showMainWindow { action(id: "personastack-main") }
         }
@@ -481,6 +495,11 @@ struct PersonaStackWebView: NSViewRepresentable {
             onDocumentLoaded?()
         }
 
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+            guard webView === self.webView else { return }
+            IMessageSetupManager.shared.documentCommitted(webView)
+        }
+
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
             guard webView === self.webView, let navigation else { return }
             loadRecovery.navigationFailed(navigation, error: error)
@@ -495,6 +514,7 @@ struct PersonaStackWebView: NSViewRepresentable {
             mediaPermission.cancel(owner: documentGeneration)
             documentGeneration = UUID()
             if let webView { DesktopSkillsManager.shared.invalidate(webView) }
+            if let webView { IMessageSetupManager.shared.documentInvalidated(webView) }
             cancelPermissionVerification()
         }
 
@@ -594,6 +614,7 @@ struct PersonaStackWebView: NSViewRepresentable {
                 LocalSessionManager.shared.invalidateSession()
                 AgentBridgeSetupManager.shared.invalidateSession()
                 LocalClusterSetupManager.shared.invalidateSession()
+                IMessageSetupManager.shared.invalidateSession()
             }
 
             return .allow

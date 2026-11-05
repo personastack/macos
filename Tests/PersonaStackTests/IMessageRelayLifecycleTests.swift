@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 import PersonaStackCore
@@ -69,12 +70,13 @@ private actor IMessageLifecycleCuaService: DesktopControlCuaServicing {
 }
 
 private final class IMessageLifecycleCredentials: DesktopControlCredentialStoring, @unchecked Sendable {
-    let installation: DesktopControlInstallation
+    private var installation: DesktopControlInstallation
     private let lock = NSLock()
     private var reads = 0
     var readCount: Int { lock.withLock { reads } }
     init(installation: DesktopControlInstallation) { self.installation = installation }
     func load() throws -> DesktopControlInstallation? { lock.withLock { reads += 1; return installation } }
+    func replace(_ installation: DesktopControlInstallation) { lock.withLock { self.installation = installation } }
     func save(_ installation: DesktopControlInstallation) throws { Issue.record("Relay lifecycle must not replace credentials") }
     func delete() throws { Issue.record("Relay lifecycle must not delete credentials") }
 }
@@ -86,6 +88,7 @@ private final class IMessageLifecycleFixture {
     let service = IMessageLifecycleCuaService()
     let credentials: IMessageLifecycleCredentials
     let runtime: DesktopControlRuntime
+    let preferences: UserDefaults
     var socketAttempts = 0
     var now = Date(timeIntervalSince1970: 1_800_000_000)
     let connectionID = UUID()
@@ -93,14 +96,17 @@ private final class IMessageLifecycleFixture {
     var expiry: Date { now.addingTimeInterval(3600) }
 
     init(desktop: Bool = false, iMessage: Bool = false, connected: Bool = false,
-         executor: DesktopControlCommandExecutor? = nil) throws {
+         executor: DesktopControlCommandExecutor? = nil, sessionMonitor: DesktopControlSessionLock? = nil,
+         revokeInstallation: (@Sendable (DesktopControlInstallation, DesktopEnvironmentConfiguration) async throws -> Void)? = nil) throws {
         authority = IMessageLifecycleAuthority(desktop: desktop, iMessage: iMessage)
         let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: Data(#"{"installation_id":"lifecycle-mac","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://cluster-agent.personastack.ai/v1/desktop-control/ws","environment_origin":"https://my.personastack.ai"}"#.utf8))
         credentials = IMessageLifecycleCredentials(installation: installation)
-        let preferences = try #require(UserDefaults(suiteName: "IMessageRelayLifecycle-\(UUID().uuidString)"))
+        preferences = try #require(UserDefaults(suiteName: "IMessageRelayLifecycle-\(UUID().uuidString)"))
+        preferences.set(iMessage, forKey: IMessagePreferenceKeys.relayEnabled(.production))
         runtime = DesktopControlRuntime.makeForTesting(installer: installer, cuaService: service,
             credentials: credentials, executor: executor, connectionID: connectionID, installation: installation, connected: connected,
-            sessionLockState: .unlocked, relayStateReader: authority, scheduleReconnect: false, preferences: preferences)
+            sessionLockState: .unlocked, sessionMonitor: sessionMonitor, relayStateReader: authority, scheduleReconnect: false, preferences: preferences,
+            revokeInstallation: revokeInstallation)
         runtime.setRelayClockForTesting { [weak self] in self?.now ?? .distantFuture }
         runtime.setRelayConnectionAttemptForTesting { [weak self] in self?.socketAttempts += 1 }
     }
@@ -333,6 +339,8 @@ func iMessageRelayLifecycleFailedRefreshCannotRestartCuaFromCachedDesktopFlags()
 @Test @MainActor
 func iMessageRelayLifecycleOlderAuthorityReadCannotRestoreRemovedDesktopIntent() async throws {
     let fixture = try IMessageLifecycleFixture(desktop: true, connected: true)
+    // Messages was explicitly enabled locally before the API registration changes.
+    fixture.preferences.set(true, forKey: IMessagePreferenceKeys.relayEnabled(.production))
     await fixture.authority.suspendNextRead()
     let oldRead = Task { try await fixture.runtime.reconcileRelayForTesting() }
     await fixture.authority.waitForRead()
@@ -398,4 +406,177 @@ func iMessageRelayLifecycleDesktopRemovalClosesItsLeaseAndKeepsIMessageSocket() 
     #expect(!fixture.runtime.executorCleanupFailedForTesting)
     await fixture.assertNoCua()
     await fixture.runtime.shutdownForQuit()
+}
+
+
+@Test @MainActor func iMessageNativeSessionFactoryReusesOneDeniedTupleAndNeverStartsCua() async throws {
+    let fixture = try IMessageLifecycleFixture()
+    let first = try await fixture.runtime.iMessageSetupSession()
+    let second = try await fixture.runtime.iMessageSetupSession()
+    #expect(first.runtime === second.runtime)
+    #expect(first.provider === second.provider)
+    #expect(first.installation == second.installation)
+    #expect(first.configuration == .production)
+    #expect(fixture.runtime.hasPendingIMessageCleanup)
+    let scope = IMessageGatewaySetupScope(setupReferenceSHA256: String(repeating: "A", count: 43), generation: 1,
+        workspaceID: "workspace", userID: "human", expiresAt: ISO8601DateFormatter().string(from: Date().addingTimeInterval(300)), enabled: true)
+    #expect(await first.runtime.install(.init(installationID: first.installation.installationID, revision: 1, setupScope: scope), connectionID: UUID()) != .snapshotAck(.init(revision: 1)))
+    await fixture.assertNoCua()
+    await fixture.runtime.drainIMessage()
+    #expect(!fixture.runtime.hasPendingIMessageCleanup)
+    await #expect(throws: IMessageSetupProviderError.accountChanged) {
+        try await first.runtime.activateLocalSetup(.init(localGeneration: UUID(), scope: scope))
+    }
+}
+
+@Test @MainActor func iMessageNativeSessionReplacementRetiresOldInstallationAndPreservesDcPause() async throws {
+    let fixture = try IMessageLifecycleFixture()
+    let old = try await fixture.runtime.iMessageSetupSession()
+    let replacement = try DesktopControlInstallation(installationID: "replacement-mac", machineCredential: String(repeating: "A", count: 43),
+        gatewayWebsocketURL: DesktopEnvironmentConfiguration.production.gatewayWebsocketURL, configuration: .production)
+    fixture.credentials.replace(replacement)
+    let current = try await fixture.runtime.iMessageSetupSession()
+    #expect(old.runtime !== current.runtime)
+    #expect(current.installation == replacement)
+    #expect(!fixture.runtime.paused)
+    let scope = IMessageGatewaySetupScope(setupReferenceSHA256: String(repeating: "A", count: 43), generation: 1,
+        workspaceID: "workspace", userID: "human", expiresAt: ISO8601DateFormatter().string(from: Date().addingTimeInterval(300)), enabled: true)
+    await #expect(throws: IMessageSetupProviderError.accountChanged) { try await old.runtime.activateLocalSetup(.init(localGeneration: UUID(), scope: scope)) }
+    await fixture.assertNoCua()
+    await fixture.runtime.drainIMessage()
+}
+
+@Test @MainActor func iMessageNativeSessionEnvironmentSwitchJoinsAndDiscardsOnlyOwnedTuple() async throws {
+    let fixture = try IMessageLifecycleFixture()
+    let session = try await fixture.runtime.iMessageSetupSession()
+    try await fixture.runtime.prepareForEnvironmentSwitch()
+    #expect(!fixture.runtime.hasPendingIMessageCleanup)
+    #expect(fixture.credentials.readCount > 0)
+    #expect(session.configuration == .production)
+    await #expect(throws: CancellationError.self) { try await fixture.runtime.iMessageSetupSession() }
+    await fixture.assertNoCua()
+}
+
+
+@Test @MainActor func iMessageOnlyLaunchAndPauseRecoveryNeverStartsCuaOrClearsTheEnablePreference() async throws {
+    let fixture = try IMessageLifecycleFixture(iMessage: true)
+    await fixture.runtime.startAtLaunch(configuration: .production, paused: false)
+    #expect(fixture.socketAttempts == 1)
+    fixture.preferences.set(true, forKey: IMessagePreferenceKeys.relayPaused(.production))
+    await fixture.runtime.refreshIMessageRelayPreference()
+    let attempts = fixture.socketAttempts
+    fixture.runtime.requestConnectionRecoveryForTesting()
+    #expect(!(await fixture.runtime.reconnectRelayForTesting()))
+    #expect(fixture.socketAttempts == attempts)
+    #expect(fixture.preferences.bool(forKey: IMessagePreferenceKeys.relayEnabled(.production)))
+    #expect(fixture.preferences.bool(forKey: IMessagePreferenceKeys.relayPaused(.production)))
+    fixture.preferences.set(false, forKey: IMessagePreferenceKeys.relayPaused(.production))
+    await fixture.runtime.startAtLaunch(configuration: .production, paused: false)
+    #expect(fixture.socketAttempts == attempts + 1)
+    await fixture.assertNoCua()
+    await fixture.runtime.shutdownForQuit()
+}
+
+@Test @MainActor func iMessageSleepAndWakeNeverRestoresOldLocalConsent() async throws {
+    let workspace = NotificationCenter()
+    let monitor = DesktopControlSessionLock(workspaceCenter: workspace, activationCenter: NotificationCenter(),
+        observeNetwork: false, snapshotReader: { .unlocked })
+    let fixture = try IMessageLifecycleFixture(iMessage: true, sessionMonitor: monitor)
+    let session = try await fixture.runtime.iMessageSetupSession()
+    let scope = IMessageGatewaySetupScope(setupReferenceSHA256: String(repeating: "A", count: 43), generation: 1,
+        workspaceID: "workspace", userID: "human", expiresAt: ISO8601DateFormatter().string(from: Date().addingTimeInterval(300)), enabled: true)
+    let intent = IMessageRuntimeSetupIntent(localGeneration: UUID(), scope: scope)
+    try await session.runtime.activateLocalSetup(intent)
+    try await session.runtime.setMetadataConsent(true, for: intent)
+    workspace.post(name: NSWorkspace.willSleepNotification, object: nil)
+    await fixture.runtime.waitForSessionLockChangeForTesting()
+    workspace.post(name: NSWorkspace.didWakeNotification, object: nil)
+    await fixture.runtime.waitForSessionLockChangeForTesting()
+    await #expect(throws: IMessageSetupProviderError.accountChanged) { try await session.runtime.setMetadataConsent(true, for: intent) }
+    #expect(fixture.preferences.bool(forKey: IMessagePreferenceKeys.relayEnabled(.production)))
+    await fixture.assertNoCua()
+    await fixture.runtime.shutdownForQuit()
+}
+
+
+private enum IMessageMachineRevokeFailure: Error { case unavailable }
+private actor IMessageMachineRevokeFixture {
+    private(set) var installations: [DesktopControlInstallation] = []
+    private(set) var configurations: [DesktopEnvironmentConfiguration] = []
+    private var first: CheckedContinuation<Void, Never>?
+    private var entered: CheckedContinuation<Void, Never>?
+    func perform(_ installation: DesktopControlInstallation, configuration: DesktopEnvironmentConfiguration) async throws {
+        installations.append(installation); configurations.append(configuration)
+        if installations.count == 1 {
+            await withCheckedContinuation { first = $0; entered?.resume(); entered = nil }
+            throw IMessageMachineRevokeFailure.unavailable
+        }
+        #expect(installations.count == 2)
+    }
+    func waitUntilEntered() async { if first == nil { await withCheckedContinuation { entered = $0 } } }
+    func failFirst() { first?.resume(); first = nil }
+}
+
+@Test @MainActor func iMessageMachineDisconnectFencesBothFamiliesBeforeAwaitAndPreservesProofForExplicitRetry() async throws {
+    let revoke = IMessageMachineRevokeFixture()
+    let fixture = try IMessageLifecycleFixture(desktop: true, iMessage: true,
+        revokeInstallation: { installation, configuration in try await revoke.perform(installation, configuration: configuration) })
+    let prefs = fixture.preferences
+    prefs.set(true, forKey: DesktopControlPreferenceKeys.relayEnabled(.production))
+    prefs.set(false, forKey: DesktopControlPreferenceKeys.relayPaused(.production))
+    let unrelated = [DesktopControlPreferenceKeys.relayEnabled(.lan), DesktopControlPreferenceKeys.relayPaused(.lan),
+                     IMessagePreferenceKeys.relayEnabled(.lan), IMessagePreferenceKeys.relayPaused(.lan)]
+    for key in unrelated { prefs.set(true, forKey: key) }
+    let loaded = try fixture.credentials.load()
+    let original = try #require(loaded)
+    let session = try await fixture.runtime.iMessageSetupSession()
+    let scope = IMessageGatewaySetupScope(setupReferenceSHA256: String(repeating: "A", count: 43), generation: 1,
+        workspaceID: "workspace", userID: "human", expiresAt: ISO8601DateFormatter().string(from: Date().addingTimeInterval(300)), enabled: true)
+    let intent = IMessageRuntimeSetupIntent(localGeneration: UUID(), scope: scope)
+    try await session.runtime.activateLocalSetup(intent)
+    try await session.runtime.setMetadataConsent(true, for: intent)
+    let generation = try fixture.runtime.beginDisconnect()
+    #expect(prefs.bool(forKey: DesktopControlPreferenceKeys.relayPaused(.production)))
+    #expect(prefs.bool(forKey: IMessagePreferenceKeys.relayPaused(.production)))
+    let operation = Task { try await fixture.runtime.disconnect(generation: generation) }
+    await revoke.waitUntilEntered()
+    await #expect(throws: IMessageSetupProviderError.accountChanged) { try await session.runtime.activateLocalSetup(intent) }
+    await revoke.failFirst()
+    await #expect(throws: IMessageMachineRevokeFailure.unavailable) { try await operation.value }
+    #expect(prefs.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(.production)))
+    #expect(prefs.bool(forKey: IMessagePreferenceKeys.relayEnabled(.production)))
+    #expect(!DesktopRelayStartupPolicy.shouldStart(desktopControlEnabled: true, desktopControlPaused: true,
+        imessageEnabled: true, imessagePaused: true))
+    let attempts = fixture.socketAttempts
+    fixture.runtime.requestConnectionRecoveryForTesting()
+    #expect(fixture.socketAttempts == attempts)
+    #expect(!fixture.runtime.hasIMessageSetupIntentForTesting)
+    #expect(try fixture.credentials.load() == original)
+    for key in unrelated { #expect(prefs.bool(forKey: key)) }
+    try await fixture.runtime.disconnect()
+    #expect(await revoke.installations == [original, original])
+    #expect(await revoke.configurations == [.production, .production])
+    #expect(try fixture.credentials.load() == original)
+    #expect(!prefs.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(.production)))
+    #expect(!prefs.bool(forKey: DesktopControlPreferenceKeys.relayPaused(.production)))
+    #expect(!prefs.bool(forKey: IMessagePreferenceKeys.relayEnabled(.production)))
+    #expect(!prefs.bool(forKey: IMessagePreferenceKeys.relayPaused(.production)))
+    for key in unrelated { #expect(prefs.bool(forKey: key)) }
+    await fixture.assertNoCua()
+}
+
+
+@Test @MainActor func iMessageMachineDisconnectRejectsForeignBoundEnvironmentBeforeChangingPreferences() throws {
+    let fixture = try IMessageLifecycleFixture()
+    let loaded = try fixture.credentials.load()
+    let original = try #require(loaded)
+    let runtime = DesktopControlRuntime.makeForTesting(installer: fixture.installer, cuaService: fixture.service,
+        credentials: fixture.credentials, installation: original, preferences: fixture.preferences, configurationProvider: { .lan })
+    let keys = [DesktopControlPreferenceKeys.relayPaused(.production), IMessagePreferenceKeys.relayPaused(.production),
+                DesktopControlPreferenceKeys.relayPaused(.lan), IMessagePreferenceKeys.relayPaused(.lan)]
+    for key in keys { fixture.preferences.set(false, forKey: key) }
+    #expect(throws: DesktopControlEnrollmentError.invalidRequest) { try runtime.beginDisconnect() }
+    for key in keys { #expect(!fixture.preferences.bool(forKey: key)) }
+    #expect(!runtime.isDisconnecting)
+    #expect(try fixture.credentials.load() == original)
 }

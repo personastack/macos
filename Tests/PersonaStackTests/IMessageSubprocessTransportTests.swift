@@ -32,7 +32,9 @@ func iMessageSubprocessTransportStopsItsOwnedDescendantsAfterTimeoutOrCancellati
     try Data((script + "\n").utf8).write(to: executable)
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
     let transport = IMessageSubprocessTransport(testExecutableURL: executable, testBundleURL: root)
-    let client = IMessageRPCClient(transport: transport, readTimeoutSeconds: cancel ? 5 : 0.2, sendTimeoutSeconds: 1)
+    // This budget also covers the initial shell launch/handshake under parallel
+    // test scheduling. The later nonresponding status must still time out.
+    let client = IMessageRPCClient(transport: transport, readTimeoutSeconds: cancel ? 5 : 1, sendTimeoutSeconds: 1)
     _ = try await client.start()
     do {
         let request = Task { try await client.status() }

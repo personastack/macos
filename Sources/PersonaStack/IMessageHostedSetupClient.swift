@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import PersonaStackCore
 
 /// Only finite failures cross this boundary. HTTP bodies and transport errors stay private.
@@ -234,11 +235,113 @@ struct IMessageHostedMetadataResponse: Decodable, Equatable, Sendable {
     private enum Keys: String, CodingKey, CaseIterable { case setupReference = "setup_reference", generation, operation, result, reasonCode = "reason_code" }
 }
 
-/// No application factory or WebView bridge installs this client yet.
+/// Native-only hosted operations. The coordinator owns document and consent fences.
 struct IMessageHostedSetupClient: Sendable {
     typealias ValidateScope = @MainActor @Sendable () async throws -> Void
+    typealias ValidateFinalConsent = @MainActor @Sendable (IMessageSetupFinalConsent) async throws -> Void
     private let transport: any AgentBridgeHostedTransport
     init(transport: any AgentBridgeHostedTransport = AgentBridgeURLTransport()) { self.transport = transport }
+
+    func displayContext(configuration: DesktopEnvironmentConfiguration, cookies: String,
+                        expectedScope: IMessageHostedNativeScope, validateScope: ValidateScope) async throws -> IMessageHostedDisplayContext {
+        let scope = try await currentScope(configuration, cookies: cookies, expected: expectedScope, validateScope: validateScope)
+        let data = try await perform(configuration: configuration, cookies: cookies, path: "/user/mobile/bootstrap",
+            method: "GET", status: 200, maximum: 65536, validateScope: validateScope)
+        let context: IMessageHostedDisplayContext = try decode(data, maximum: 65536)
+        guard context.naturalUserID == scope.naturalUserID, context.workspaceID == scope.workspaceID else {
+            throw IMessageHostedSetupError.scopeChanged
+        }
+        return context
+    }
+
+    func approve(consent: IMessageSetupFinalConsent, evidence: IMessageSetupApprovalEvidence,
+                 installation: DesktopControlInstallation, journey: IMessageHostedJourney, ticket: IMessageHostedEnrollmentTicket,
+                 mode: IMessageHostedEnrollmentMode, macName: String, accountLabel: String,
+                 configuration: DesktopEnvironmentConfiguration, now: Date = Date(),
+                 validateCurrent: ValidateFinalConsent) async throws -> IMessageHostedApprovalReceipt {
+        try validateApproval(consent, evidence: evidence, installation: installation, ticket: ticket,
+            macName: macName, accountLabel: accountLabel, configuration: configuration, now: now)
+        let digest = Data(SHA256.hash(data: Data(journey.setupReference.utf8))).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+        let journeyExpiry = try IMessageGatewayWire.utcDate(journey.expiresAt)
+        let ticketExpiry = try IMessageGatewayWire.utcDate(ticket.expiresAt)
+        guard consent.intent.scope.setupReferenceSHA256 == digest, consent.intent.scope.generation == journey.generation,
+              consent.intent.scope.expiresAt == journey.expiresAt, ticketExpiry <= journeyExpiry else {
+            throw IMessageHostedSetupError.scopeChanged
+        }
+        if case .attach(let installationID) = mode, installationID != installation.installationID { throw IMessageHostedSetupError.scopeChanged }
+        let request = HostedApprovalRequest(consent: consent, evidence: evidence, ticket: ticket.enrollmentTicket,
+            setupReference: journey.setupReference, operation: mode == .enroll ? "enroll" : "attach", macName: macName, accountLabel: accountLabel)
+        let data = try await approvalRequest(try JSONEncoder().encode(request), installation: installation,
+            configuration: configuration, consent: consent, now: now, validateCurrent: validateCurrent)
+        let response: HostedApprovalResponse = try decode(data, maximum: 4096)
+        let expiry = try IMessageGatewayWire.utcDate(response.expiresAt)
+        guard expiry > now, expiry <= journeyExpiry else { throw IMessageHostedSetupError.invalidResponse }
+        return .init(value: response.setupReceipt, expiresAt: response.expiresAt, consent: consent, macName: macName)
+    }
+
+    func createConfiguration(receipt: IMessageHostedApprovalReceipt, consent: IMessageSetupFinalConsent,
+                             configuration: DesktopEnvironmentConfiguration, cookies: String, csrf: String,
+                             expectedScope: IMessageHostedNativeScope, now: Date = Date(),
+                             validateCurrent: @escaping ValidateFinalConsent) async throws -> String {
+        guard receipt.consent == consent, consent.environmentIdentity == configuration.preferenceIdentity,
+              consent.intent.scope.userID == expectedScope.naturalUserID, consent.intent.scope.workspaceID == expectedScope.workspaceID,
+              consent.deadline > now, try IMessageGatewayWire.utcDate(receipt.expiresAt) > now else {
+            throw IMessageHostedSetupError.scopeChanged
+        }
+        let fence: ValidateScope = { try await validateCurrent(consent) }
+        let scope = try await currentScope(configuration, cookies: cookies, expected: expectedScope, validateScope: fence)
+        let body = try JSONEncoder().encode(HostedCreateRequest(setupReceipt: receipt.value, name: receipt.macName,
+            conversationIDs: consent.conversations.map(\.conversationID), readEnabled: consent.readEnabled, sendEnabled: consent.sendEnabled))
+        let data = try await perform(configuration: configuration, cookies: cookies, path: "/user/imessage/configs", method: "POST",
+            body: body, workspace: scope.workspaceID, csrf: csrf, status: 201, validateScope: fence)
+        let result: HostedCreatedResponse = try decode(data, maximum: 4096)
+        return result.integrationConfigID
+    }
+
+    private func validateApproval(_ consent: IMessageSetupFinalConsent, evidence: IMessageSetupApprovalEvidence,
+                                  installation: DesktopControlInstallation, ticket: IMessageHostedEnrollmentTicket,
+                                  macName: String, accountLabel: String, configuration: DesktopEnvironmentConfiguration, now: Date) throws {
+        try installation.requireEnvironment(configuration.appPageURL, configuration: configuration)
+        guard consent.installationID == installation.installationID, consent.environmentIdentity == configuration.preferenceIdentity,
+              consent.deadline > now, try IMessageGatewayWire.utcDate(ticket.expiresAt) > now,
+              hostedDisplayLabel(macName), hostedDisplayLabel(accountLabel),
+              evidence.readEnabled == consent.readEnabled, evidence.sendEnabled == consent.sendEnabled,
+              evidence.verification.conversations == consent.conversations,
+              evidence.verification.liveAccount == .init(accountID: consent.account.accountID,
+                sourceGeneration: consent.account.sourceGeneration, chatGUIDs: consent.conversations.map(\.metadata.guid)) else {
+            throw IMessageHostedSetupError.invalidRequest
+        }
+    }
+
+    private func approvalRequest(_ body: Data, installation: DesktopControlInstallation,
+                                 configuration: DesktopEnvironmentConfiguration, consent: IMessageSetupFinalConsent,
+                                 now: Date, validateCurrent: ValidateFinalConsent) async throws -> Data {
+        guard body.count <= IMessageGatewayWire.maximumResultBytes else {
+            throw IMessageHostedSetupError.invalidRequest
+        }
+        let bearer: String
+        do { bearer = try IMessageMachineSetupClient.canonicalProof(installation.machineCredential) }
+        catch { throw IMessageHostedSetupError.invalidRequest }
+        var parts = URLComponents(url: configuration.appURL, resolvingAgainstBaseURL: false)!
+        parts.path = "/user/imessage/approve"; parts.query = nil; parts.fragment = nil
+        var request = URLRequest(url: parts.url!, cachePolicy: .reloadIgnoringLocalCacheData,
+            timeoutInterval: min(10, consent.deadline.timeIntervalSince(now)))
+        request.httpMethod = "POST"; request.httpBody = body; request.httpShouldHandleCookies = false
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("macos-imessage-v1", forHTTPHeaderField: "X-PersonaStack-Native-Client")
+        request.setValue("Bearer " + bearer, forHTTPHeaderField: "Authorization")
+        try Task.checkCancellation(); try await validateCurrent(consent); try Task.checkCancellation()
+        let data: Data, status: Int
+        do { (data, status) = try await transport.request(request) }
+        catch is CancellationError { throw CancellationError() }
+        catch { throw IMessageHostedSetupError.serviceUnavailable }
+        try Task.checkCancellation(); try await validateCurrent(consent); try Task.checkCancellation()
+        guard data.count <= 4096 else { throw IMessageHostedSetupError.invalidResponse }
+        guard status == 201 else { throw Self.statusError(status) }
+        return data
+    }
 
     func nativeScope(configuration: DesktopEnvironmentConfiguration, cookies: String,
                      validateScope: ValidateScope) async throws -> IMessageHostedNativeScope {
@@ -397,6 +500,141 @@ struct IMessageHostedSetupClient: Sendable {
     }
 }
 
+/// Display only. The separate native-scope response remains authority.
+struct IMessageHostedDisplayContext: Decodable, Equatable, Sendable {
+    let naturalUserID: String
+    let workspaceID: String
+    let workspaceName: String
+
+    init(from decoder: Decoder) throws {
+        let c = try hostedContainer(decoder, Keys.self, optional: [.organization])
+        let natural = try c.decode(Identity.self, forKey: .naturalUser)
+        let effective = try c.decode(User.self, forKey: .effectiveUser)
+        let workspaces = try c.decode([Workspace].self, forKey: .workspaces)
+        let activeWorkspaceID = try c.decode(String.self, forKey: .activeWorkspaceID)
+        let authenticated = try c.decode(Bool.self, forKey: .authenticated)
+        let impersonation = try c.decode(Bool.self, forKey: .impersonationActive)
+        let noWorkspace = try c.decode(Bool.self, forKey: .noAccessibleWorkspace)
+        guard authenticated, !impersonation, !noWorkspace, natural.id == effective.id,
+              workspaces.count <= 256, Set(workspaces.map(\.id)).count == workspaces.count,
+              let selected = workspaces.first(where: { $0.id == activeWorkspaceID }) else { throw IMessageHostedSetupError.scopeChanged }
+        _ = try c.decode(String.self, forKey: .sessionExpiresAt)
+        _ = try c.decode(String.self, forKey: .csrfToken)
+        if c.contains(.organization) { _ = try c.decode(Organization.self, forKey: .organization) }
+        naturalUserID = natural.id; workspaceID = activeWorkspaceID; workspaceName = selected.displayName
+    }
+    private enum Keys: String, CodingKey, CaseIterable {
+        case authenticated, naturalUser = "natural_user", effectiveUser = "effective_user", organization
+        case impersonationActive = "impersonation_active", sessionExpiresAt = "session_expires_at"
+        case workspaces, activeWorkspaceID = "active_workspace_id", noAccessibleWorkspace = "no_accessible_workspace", csrfToken = "csrf_token"
+    }
+    private struct Identity: Decodable {
+        let id: String
+        init(from decoder: Decoder) throws {
+            let c = try hostedContainer(decoder, Keys.self)
+            id = try c.decode(String.self, forKey: .id)
+            guard hostedID(id) else { throw IMessageHostedSetupError.invalidResponse }
+            _ = try c.decode(String.self, forKey: .role)
+        }
+        enum Keys: String, CodingKey, CaseIterable { case id, role }
+    }
+    private struct User: Decodable {
+        let id: String
+        init(from decoder: Decoder) throws {
+            let c = try hostedContainer(decoder, Keys.self)
+            id = try c.decode(String.self, forKey: .id)
+            guard hostedID(id) else { throw IMessageHostedSetupError.invalidResponse }
+            for key in Keys.allCases where key != .id { _ = try c.decode(String.self, forKey: key) }
+        }
+        enum Keys: String, CodingKey, CaseIterable { case id, role, displayName = "display_name", email, avatarURL = "avatar_url", timeZone = "time_zone" }
+    }
+    private struct Workspace: Decodable {
+        let id: String
+        let displayName: String
+        init(from decoder: Decoder) throws {
+            let c = try hostedContainer(decoder, Keys.self)
+            id = try c.decode(String.self, forKey: .id); displayName = try c.decode(String.self, forKey: .displayName)
+            guard hostedID(id), !displayName.isEmpty, displayName.utf8.count <= 1024, !hostedHasControls(displayName) else {
+                throw IMessageHostedSetupError.invalidResponse
+            }
+            for key in [Keys.status, .organizationID, .organizationName] { _ = try c.decode(String.self, forKey: key) }
+            _ = try c.decode(Bool.self, forKey: .personal); _ = try c.decode(Bool.self, forKey: .workspaceAdmin)
+        }
+        enum Keys: String, CodingKey, CaseIterable {
+            case id, displayName = "display_name", status, organizationID = "organization_id", organizationName = "organization_name"
+            case personal, workspaceAdmin = "workspace_admin"
+        }
+    }
+    private struct Organization: Decodable {
+        init(from decoder: Decoder) throws {
+            let c = try hostedContainer(decoder, Keys.self)
+            guard hostedID(try c.decode(String.self, forKey: .id)) else { throw IMessageHostedSetupError.invalidResponse }
+            _ = try c.decode(String.self, forKey: .displayName)
+            _ = try c.decode(Bool.self, forKey: .canManageSettings)
+        }
+        enum Keys: String, CodingKey, CaseIterable { case id, displayName = "display_name", canManageSettings = "can_manage_settings" }
+    }
+}
+
+struct IMessageHostedApprovalReceipt: Sendable, CustomStringConvertible, CustomReflectable {
+    fileprivate let value: String
+    let expiresAt: String
+    fileprivate let consent: IMessageSetupFinalConsent
+    fileprivate let macName: String
+    var description: String { "IMessageHostedApprovalReceipt(<redacted>)" }
+    var customMirror: Mirror { Mirror(self, children: ["receipt": "<redacted>"]) }
+}
+
+private struct HostedApprovalRequest: Encodable {
+    let consent: IMessageSetupFinalConsent
+    let evidence: IMessageSetupApprovalEvidence
+    let ticket: String
+    let setupReference: String
+    let operation: String
+    let macName: String
+    let accountLabel: String
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: Keys.self)
+        try c.encode(ticket, forKey: .enrollmentTicket); try c.encode(operation, forKey: .operation)
+        try c.encode(setupReference, forKey: .setupReference)
+        try c.encode(macName, forKey: .macName); try c.encode(accountLabel, forKey: .accountLabel)
+        try c.encode(consent.intent.scope.generation, forKey: .generation); try c.encode(consent.installationID, forKey: .installationID)
+        try c.encode(evidence.verification, forKey: .verification); try c.encode(evidence.checkpoint, forKey: .checkpoint)
+        try c.encode(evidence.readEnabled, forKey: .readEnabled); try c.encode(evidence.sendEnabled, forKey: .sendEnabled)
+    }
+    enum Keys: String, CodingKey {
+        case enrollmentTicket = "enrollment_ticket", operation, setupReference = "setup_reference", generation, installationID = "installation_id"
+        case macName = "mac_name", accountLabel = "account_label", verification, checkpoint, readEnabled = "read_enabled", sendEnabled = "send_enabled"
+    }
+}
+private struct HostedApprovalResponse: Decodable {
+    let setupReceipt: String
+    let expiresAt: String
+    init(from decoder: Decoder) throws {
+        let c = try hostedContainer(decoder, Keys.self)
+        setupReceipt = try c.decode(String.self, forKey: .setupReceipt); expiresAt = try c.decode(String.self, forKey: .expiresAt)
+        guard hostedCanonical32(setupReceipt) else { throw IMessageHostedSetupError.invalidResponse }
+        _ = try IMessageGatewayWire.utcDate(expiresAt)
+    }
+    enum Keys: String, CodingKey, CaseIterable { case setupReceipt = "setup_receipt", expiresAt = "expires_at" }
+}
+private struct HostedCreateRequest: Encodable {
+    let setupReceipt: String
+    let name: String
+    let conversationIDs: [String]
+    let readEnabled: Bool
+    let sendEnabled: Bool
+    enum CodingKeys: String, CodingKey { case setupReceipt = "setup_receipt", name, conversationIDs = "conversation_ids", readEnabled = "read_enabled", sendEnabled = "send_enabled" }
+}
+private struct HostedCreatedResponse: Decodable {
+    let integrationConfigID: String
+    init(from decoder: Decoder) throws {
+        let c = try hostedContainer(decoder, Keys.self); integrationConfigID = try c.decode(String.self, forKey: .integrationConfigID)
+        guard hostedID(integrationConfigID) else { throw IMessageHostedSetupError.invalidResponse }
+    }
+    enum Keys: String, CodingKey, CaseIterable { case integrationConfigID = "integration_config_id" }
+}
+private func hostedDisplayLabel(_ value: String) -> Bool { !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && value.utf8.count <= 256 && !hostedHasControls(value) }
 private struct HostedAnyKey: CodingKey {
     let stringValue: String
     var intValue: Int? { nil }

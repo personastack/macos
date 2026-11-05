@@ -46,6 +46,13 @@ struct CuaSetupBlockedError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+struct IMessageNativeSession: Sendable {
+    let installation: DesktopControlInstallation
+    let configuration: DesktopEnvironmentConfiguration
+    let runtime: IMessageRuntime
+    let provider: IMessageSetupProvider
+}
+
 @MainActor
 final class DesktopControlRuntime: DesktopControlSetupRuntime {
     static let shared = DesktopControlRuntime(
@@ -58,6 +65,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private let relayStateReader: (any DesktopControlRelayStateReading)?
     private let preferences: UserDefaults
     private let configurationProvider: () throws -> DesktopEnvironmentConfiguration
+    private let revokeInstallation: @Sendable (DesktopControlInstallation, DesktopEnvironmentConfiguration) async throws -> Void
+    private var disconnectConfiguration: (generation: UUID, configuration: DesktopEnvironmentConfiguration)?
     private let sessionLock: DesktopControlSessionLock
     private let cuaService: any DesktopControlCuaServicing
     private var selectedCuaInstallation: CuaDriverInstallation?
@@ -67,6 +76,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 #if DEBUG
     private var proxyFactoryForTesting: ((CuaDriverInstallation, URL, Int32) -> CuaMCPProxy)?
     private var reconnectAttemptForTesting: (() async throws -> Void)?
+    private var gatewaySocketFactoryForTesting: (() -> any DesktopControlSocket)?
     private var scheduleReconnectForTesting = true
     private var beforeCuaPublicationForTesting: (() async -> Void)?
 #endif
@@ -93,6 +103,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let expiresAt: Date
     }
     private var iMessageSetupIntent: IMessageSetupRelayIntent?
+    private var iMessageSession: IMessageNativeSession?
+    private var iMessageSessionGeneration = UUID()
+    private var iMessageCleanupTask: Task<Void, Never>?
+    private var iMessageProviderFactory: () -> IMessageSetupProvider = { IMessageSetupProvider() }
     private var relayConfigurationState: DesktopControlConfigurationState?
     private var relayAuthorityReadSucceeded = false
     private var relayStateReadID = UUID()
@@ -123,6 +137,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                  relayStateReader: (any DesktopControlRelayStateReading)? = nil,
                  preferences: UserDefaults = .standard,
                  configurationProvider: @escaping () throws -> DesktopEnvironmentConfiguration = { try LaunchConfiguration.selectedEnvironment() },
+                 revokeInstallation: (@Sendable (DesktopControlInstallation, DesktopEnvironmentConfiguration) async throws -> Void)? = nil,
                  sessionLock: DesktopControlSessionLock = DesktopControlSessionLock()) {
         self.installer = installer
         self.cuaService = cuaService
@@ -130,6 +145,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         self.relayStateReader = relayStateReader
         self.preferences = preferences
         self.configurationProvider = configurationProvider
+        self.revokeInstallation = revokeInstallation ?? { installation, configuration in
+            try await DesktopControlEnrollmentClient(credentials: credentials).revokeRemote(installation: installation, appURL: configuration.appPageURL)
+        }
         self.sessionLock = sessionLock
         Self.clearObsoleteCredentialErrors(in: preferences)
         sessionLock.onChange = { [weak self] _ in
@@ -149,10 +167,11 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     var hasActiveInstallation: Bool { activeInstallation != nil }
+    var hasPendingIMessageCleanup: Bool { iMessageSession != nil || iMessageCleanupTask != nil }
     var hasPendingEnvironmentSwitch: Bool { environmentSwitchPending }
     var isDisconnecting: Bool { disconnecting }
     var hasPendingControlCleanupForQuit: Bool {
-        executorCleanupInProgress || executorCleanupFailed || !executor.permissionSetupAvailable
+        iMessageCleanupTask != nil || executorCleanupInProgress || executorCleanupFailed || !executor.permissionSetupAvailable
     }
     var permissionSetupAvailable: Bool {
         cuaSetupBlockReason == nil
@@ -384,7 +403,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         preferences.set("", forKey: DesktopControlPreferenceKeys.relayError(configuration))
         preferences.set("", forKey: "desktopControlRepairError")
         do {
-            if paused { try await startPaused(generation: generation) }
+            let desktopEnabled = preferences.bool(forKey: DesktopControlPreferenceKeys.relayEnabled(configuration))
+            let iMessageOnly = !desktopEnabled && preferences.bool(forKey: IMessagePreferenceKeys.relayEnabled(configuration))
+                && !preferences.bool(forKey: IMessagePreferenceKeys.relayPaused(configuration))
+            if paused || iMessageOnly { try await startPaused(generation: generation) }
             else { try await resume(generation: generation) }
         } catch is CancellationError {
             return
@@ -483,6 +505,95 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         try await startCua(startPaused: false, generation: generation)
     }
 
+    /// Construction creates no provider process or permission request.
+    func iMessageSetupSession() async throws -> IMessageNativeSession {
+        let configuration = try configurationProvider()
+        guard !disconnecting, !environmentSwitchPending else { throw CancellationError() }
+        guard let installation = try await readStoredInstallation() else { throw DesktopControlEnrollmentError.installationMissing }
+        try Task.checkCancellation()
+        guard configuration == (try configurationProvider()), !disconnecting, !environmentSwitchPending else { throw CancellationError() }
+        return try await iMessageSession(for: installation, configuration: configuration)
+    }
+
+    private func iMessageSession(for installation: DesktopControlInstallation,
+                                configuration: DesktopEnvironmentConfiguration) async throws -> IMessageNativeSession {
+        try installation.requireEnvironment(configuration.appPageURL, configuration: configuration)
+        let expectedCleanup = iMessageSessionGeneration
+        await iMessageCleanupTask?.value
+        try Task.checkCancellation()
+        guard expectedCleanup == iMessageSessionGeneration else { throw CancellationError() }
+        if let session = iMessageSession, session.installation == installation, session.configuration == configuration { return session }
+        let expected = await retireIMessageSession()
+        try Task.checkCancellation()
+        guard !disconnecting, !environmentSwitchPending, configuration == (try configurationProvider()) else { throw CancellationError() }
+        let provider = iMessageProviderFactory()
+        let runtime = IMessageRuntime(installationID: installation.installationID, provider: provider,
+            referenceDigest: IMessageSetupProvider.setupReferenceDigest)
+        guard expected == iMessageSessionGeneration else { throw CancellationError() }
+        let session = IMessageNativeSession(installation: installation, configuration: configuration, runtime: runtime, provider: provider)
+        iMessageSession = session
+        return session
+    }
+
+    /// A failed or canceled replacement can keep using the same shared socket.
+    /// The actor remains bound, but no setup consent or snapshot survives.
+    func suspendIMessageForReplacement() async {
+        iMessageSetupIntent = nil
+        iMessageSessionGeneration = UUID()
+        let id = iMessageSessionGeneration
+        let previous = iMessageCleanupTask, session = iMessageSession
+        let task = Task {
+            await previous?.value
+            await session?.runtime.suspendAndDrain()
+        }
+        iMessageCleanupTask = task
+        await task.value
+        if iMessageSessionGeneration == id { iMessageCleanupTask = nil }
+    }
+
+    func drainIMessage() async {
+        _ = await retireIMessageSession()
+    }
+
+    private func retireIMessageSession() async -> UUID {
+        iMessageSessionGeneration = UUID()
+        let previous = iMessageCleanupTask, session = iMessageSession
+        iMessageSession = nil
+        let id = iMessageSessionGeneration
+        let task = Task {
+            await previous?.value
+            await session?.runtime.drain()
+        }
+        iMessageCleanupTask = task
+        await task.value
+        if iMessageSessionGeneration == id { iMessageCleanupTask = nil }
+        return id
+    }
+
+    func refreshIMessageRelayPreference() async {
+        guard let configuration = try? configurationProvider(), !disconnecting, !environmentSwitchPending else { return }
+        let enabled = preferences.bool(forKey: IMessagePreferenceKeys.relayEnabled(configuration))
+        let paused = preferences.bool(forKey: IMessagePreferenceKeys.relayPaused(configuration))
+        if !enabled || paused {
+            iMessageSetupIntent = nil
+            await iMessageSession?.runtime.suspendAndDrain()
+        }
+        try? await reconcileRelayIntent(generation: lifecycleGeneration)
+    }
+
+    func resumeIMessageSetupRelay(for intent: IMessageRuntimeSetupIntent) async throws -> UUID {
+        let generation = lifecycleGeneration
+        try await resumeForIMessageSetup(generation: generation, setupReferenceSHA256: intent.scope.setupReferenceSHA256,
+            journeyGeneration: intent.scope.generation, expiresAt: IMessageGatewayWire.utcDate(intent.scope.expiresAt))
+        return generation
+    }
+
+    func finishIMessageSetupRelay(for intent: IMessageRuntimeSetupIntent, generation: UUID) async {
+        guard let expiry = try? IMessageGatewayWire.utcDate(intent.scope.expiresAt) else { return }
+        try? await finishIMessageSetupIfIdle(generation: generation, setupReferenceSHA256: intent.scope.setupReferenceSHA256,
+            journeyGeneration: intent.scope.generation, expiresAt: expiry)
+    }
+
     /// Only the authenticated native coordinator may supply the API journey receipt.
     /// This intent keeps setup metadata transport alive. It grants no provider access.
     func resumeForIMessageSetup(generation: UUID, setupReferenceSHA256: String,
@@ -554,7 +665,14 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     private var relayConnectionIntended: Bool {
-        temporaryRelayConnectionIntended || relayConfigurationState?.hasActiveRelayCapability == true
+        temporaryRelayConnectionIntended || relayConfigurationState.map(hasActiveRelayCapability) == true
+    }
+
+    private func hasActiveRelayCapability(_ state: DesktopControlConfigurationState) -> Bool {
+        guard let configuration = try? configurationProvider() else { return state.hasActiveConfig }
+        return DesktopRelayStartupPolicy.shouldStart(desktopControlEnabled: state.hasActiveConfig, desktopControlPaused: false,
+            imessageEnabled: state.hasActiveIMessageConfig && preferences.bool(forKey: IMessagePreferenceKeys.relayEnabled(configuration)),
+            imessagePaused: preferences.bool(forKey: IMessagePreferenceKeys.relayPaused(configuration)))
     }
 
     func beginRepair(expectedGeneration: UUID? = nil) throws -> UUID {
@@ -664,8 +782,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         gateway = nil
         gatewayConnectionID = nil
         gatewayConnected = false
-        await pending?.stop()
-        await current?.stop()
+        await pending?.stopAndDrainIMessage()
+        await current?.stopAndDrainIMessage()
+        await drainIMessage()
         await stopLocalControl(generation: generation)
         activeInstallation = nil
         // A refused Quit leaves the app available for an explicit cleanup retry.
@@ -694,11 +813,12 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         gateway = nil
         gatewayConnectionID = nil
         gatewayConnected = false
-        await pending?.stop()
-        await current?.stop()
+        await pending?.stopAndDrainIMessage()
+        await current?.stopAndDrainIMessage()
+        await drainIMessage()
         await stopLocalControl(generation: generation)
         guard generation == lifecycleGeneration else { throw CancellationError() }
-        await gateway?.stop()
+        await gateway?.stopAndDrainIMessage()
         gateway = nil
         gatewayConnectionID = nil
         activeInstallation = nil
@@ -729,8 +849,15 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
 
     func beginDisconnect() throws -> UUID {
         guard !disconnecting else { throw CancellationError() }
+        let configuration = try configurationProvider()
+        try activeInstallation?.requireEnvironment(configuration.appPageURL, configuration: configuration)
         disconnecting = true
         lifecycleGeneration = UUID()
+        disconnectConfiguration = (lifecycleGeneration, configuration)
+        // Machine revocation affects both families. Persist the local fence
+        // before suspension so a failed response cannot trigger crash recovery.
+        preferences.set(true, forKey: DesktopControlPreferenceKeys.relayPaused(configuration))
+        preferences.set(true, forKey: IMessagePreferenceKeys.relayPaused(configuration))
         desktopControlSetupGeneration = nil
         iMessageSetupIntent = nil
         relayConfigurationState = nil
@@ -741,8 +868,14 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     }
 
     func disconnect(generation: UUID) async throws {
+        guard disconnecting, generation == lifecycleGeneration,
+              let receipt = disconnectConfiguration, receipt.generation == generation else { throw CancellationError() }
+        let configuration = receipt.configuration
+        defer {
+            if generation == lifecycleGeneration { disconnecting = false; disconnectConfiguration = nil }
+        }
+        await drainIMessage()
         guard disconnecting, generation == lifecycleGeneration else { throw CancellationError() }
-        defer { if generation == lifecycleGeneration { disconnecting = false } }
         reconnectTask?.cancel()
         reconnectTask = nil
         gatewayAttemptID = UUID()
@@ -753,7 +886,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         let pendingConnection = pendingGateway
         pendingGateway = nil
         if pendingConnection != nil { gatewayConnectionID = nil }
-        await pendingConnection?.stop()
+        await pendingConnection?.stopAndDrainIMessage()
         guard disconnecting else { return }
         let installation: DesktopControlInstallation?
         let credentialLoadError: Error?
@@ -773,23 +906,15 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             await gateway?.setReadiness(readiness)
             throw DesktopControlLocalCleanupError()
         }
-        let enrollment = DesktopControlEnrollmentClient(credentials: credentials)
         if let installation {
-            do {
-                try await enrollment.revokeRemote(installation: installation, appURL: LaunchConfiguration.selectedURL())
-            } catch {
-                Task { @MainActor [weak self] in
-                    guard let self, generation == self.lifecycleGeneration else { return }
-                    self.beginReconnectLoop(for: installation)
-                }
-                throw error
-            }
+            try installation.requireEnvironment(configuration.appPageURL, configuration: configuration)
+            try await revokeInstallation(installation, configuration)
             guard disconnecting, generation == lifecycleGeneration else { throw CancellationError() }
         }
 
         reconnectTask?.cancel()
         reconnectTask = nil
-        await gateway?.stop()
+        await gateway?.stopAndDrainIMessage()
         gateway = nil
         gatewayConnectionID = nil
         gatewayConnected = false
@@ -797,6 +922,10 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         if let credentialLoadError { throw credentialLoadError }
         // Keep the installation identity after revocation. Deleting it would
         // let a later setup enroll a second identity while its config remains.
+        preferences.set(false, forKey: DesktopControlPreferenceKeys.relayEnabled(configuration))
+        preferences.set(false, forKey: DesktopControlPreferenceKeys.relayPaused(configuration))
+        preferences.set(false, forKey: IMessagePreferenceKeys.relayEnabled(configuration))
+        preferences.set(false, forKey: IMessagePreferenceKeys.relayPaused(configuration))
         environmentSwitchPending = false
         paused = false
     }
@@ -805,12 +934,19 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         guard !disconnecting, !environmentSwitchPending else { return }
         let generation = lifecycleGeneration
         guard expectedGeneration == nil || expectedGeneration == generation else { return }
+        let sameInstallation = activeInstallation == installation
         activeInstallation = installation
-        let alreadyConnected = await gateway?.isConnected() == true
+        let socketConnected = await gateway?.isConnected() == true
+        let alreadyConnected = sameInstallation && socketConnected
         guard generation == lifecycleGeneration, !disconnecting else { return }
         if alreadyConnected {
-            beginReconnectLoop(for: installation)
-            return
+            let expectedIMessageSession = iMessageSessionGeneration
+            let currentActor = try? await gatewayUsesCurrentIMessageSession(installation)
+            guard generation == lifecycleGeneration, !disconnecting else { return }
+            if currentActor == true, expectedIMessageSession == iMessageSessionGeneration {
+                beginReconnectLoop(for: installation)
+                return
+            }
         }
         do {
             try await establishConnection(installation, generation: generation)
@@ -820,6 +956,11 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         }
         guard generation == lifecycleGeneration, !disconnecting else { return }
         beginReconnectLoop(for: installation)
+    }
+
+    private func gatewayUsesCurrentIMessageSession(_ installation: DesktopControlInstallation) async throws -> Bool {
+        let session = try await iMessageSession(for: installation, configuration: configurationProvider())
+        return await gateway?.usesIMessageRuntime(session.runtime) == true
     }
 
     private func requestConnectionRecovery() {
@@ -909,20 +1050,27 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         if let pendingGateway {
             self.pendingGateway = nil
             gatewayConnectionID = nil
-            await pendingGateway.stop()
+            await pendingGateway.stopAndDrainIMessage()
             try requireCurrentConnectionAttempt(generation, attemptID: attemptID)
         }
         if let gateway {
             self.gateway = nil
             gatewayConnectionID = nil
             gatewayConnected = false
-            await gateway.stop()
+            await gateway.stopAndDrainIMessage()
             await cleanupExecutor()
             try requireCurrentConnectionAttempt(generation, attemptID: attemptID)
         }
+        let session = try await iMessageSession(for: installation, configuration: configurationProvider())
+        try requireCurrentConnectionAttempt(generation, attemptID: attemptID)
         let connectionID = UUID()
+        var socketOverride: (any DesktopControlSocket)? = nil
+#if DEBUG
+        socketOverride = gatewaySocketFactoryForTesting?()
+#endif
         let connection = DesktopControlGatewayConnection(
             installation: installation,
+            socket: socketOverride,
             onDisconnect: { [weak self] error in await self?.gatewayDisconnected(connectionID: connectionID, error: error) },
             diagnosticsProvider: { [weak self] in
                 guard let self else {
@@ -933,6 +1081,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             },
             readinessProvider: { [weak self] in await self?.heartbeatReadiness() },
             afterConfigRevocation: { [weak self] in await self?.reconcileRelayAfterConfigRevocation(connectionID: connectionID) },
+            iMessageRuntime: session.runtime,
             handler: { [weak self] frame, onChunk in
                 guard let self else { return Self.failure(for: frame, code: "desktop_executor_unavailable") }
                 return await self.handle(frame, connectionID: connectionID, onChunk: onChunk)
@@ -957,7 +1106,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             if pendingGateway === connection { pendingGateway = nil }
             if gatewayConnectionID == connectionID { gatewayConnectionID = nil }
             if generation == lifecycleGeneration, gatewayAttemptID == attemptID { gatewayConnected = false }
-            await connection.stop()
+            await connection.stopAndDrainIMessage()
             throw error
         }
     }
@@ -1031,7 +1180,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         try Task.checkCancellation()
         guard generation == lifecycleGeneration, !disconnecting, !environmentSwitchPending,
               try configurationProvider() == configuration else { throw CancellationError() }
-        if !state.hasActiveRelayCapability && !temporaryRelayConnectionIntended {
+        if !hasActiveRelayCapability(state) && !temporaryRelayConnectionIntended {
             try await stopIdleRelay(expectedLifecycle: generation)
         } else if !desktopControlConnectionIntended {
             await stopInactiveDesktopControl(generation: generation)
@@ -1042,7 +1191,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         do {
             let state = try await refreshRelayConfiguration(installation: installation, generation: generation)
             guard generation == lifecycleGeneration else { return false }
-            if !state.hasActiveRelayCapability && !temporaryRelayConnectionIntended {
+            if !hasActiveRelayCapability(state) && !temporaryRelayConnectionIntended {
                 try? await stopIdleRelay(expectedLifecycle: generation)
                 return true
             }
@@ -1193,7 +1342,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
         readiness = "paused"
         let pending = pendingGateway
         pendingGateway = nil
-        await pending?.stop()
+        await pending?.stopAndDrainIMessage()
         guard generation == lifecycleGeneration else { throw CancellationError() }
         await stopLocalControl(generation: generation)
         guard generation == lifecycleGeneration else { throw CancellationError() }
@@ -1204,7 +1353,7 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
             if let installation = activeInstallation, gateway != nil { beginReconnectLoop(for: installation) }
             throw DesktopControlLocalCleanupError()
         }
-        await gateway?.stop()
+        await gateway?.stopAndDrainIMessage()
         guard generation == lifecycleGeneration else { throw CancellationError() }
         gateway = nil
         gatewayConnectionID = nil
@@ -1414,6 +1563,9 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     private func sessionLockChanged(_ generation: UUID) async {
         // Lock alone is diagnostic. CUA reports whether an operation is available.
         if !sessionLock.isAwakeAndActive {
+            iMessageSetupIntent = nil
+            await iMessageSession?.runtime.suspendAndDrain()
+            guard lockGeneration == generation else { return }
             readiness = sessionLock.readiness
             await cleanupExecutor()
             guard lockGeneration == generation else { return }
@@ -1580,6 +1732,8 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
     static func makeForTesting(installer: any DesktopControlDriverInstalling,
                                cuaService: any DesktopControlCuaServicing = CuaStandaloneService(),
                                credentials: any DesktopControlCredentialStoring,
+                               iMessageProviderFactory: (() -> IMessageSetupProvider)? = nil,
+                               gatewaySocketFactory: (() -> any DesktopControlSocket)? = nil,
                                executor: DesktopControlCommandExecutor? = nil,
                                proxy: CuaMCPProxy? = nil,
                                proxyFactory: ((CuaDriverInstallation, URL, Int32) -> CuaMCPProxy)? = nil,
@@ -1594,11 +1748,14 @@ final class DesktopControlRuntime: DesktopControlSetupRuntime {
                                relayStateReader: (any DesktopControlRelayStateReading)? = nil,
                                scheduleReconnect: Bool = true,
                                preferences: UserDefaults = .standard,
-                               configurationProvider: @escaping () throws -> DesktopEnvironmentConfiguration = { .production }) -> DesktopControlRuntime {
+                               configurationProvider: @escaping () throws -> DesktopEnvironmentConfiguration = { .production },
+                               revokeInstallation: (@Sendable (DesktopControlInstallation, DesktopEnvironmentConfiguration) async throws -> Void)? = nil) -> DesktopControlRuntime {
         let monitor = sessionMonitor ?? DesktopControlSessionLock(observeSystem: false, snapshotReader: { .unknown })
         let runtime = DesktopControlRuntime(installer: installer, cuaService: cuaService, credentials: credentials,
             relayStateReader: relayStateReader, preferences: preferences,
-            configurationProvider: configurationProvider, sessionLock: monitor)
+            configurationProvider: configurationProvider, revokeInstallation: revokeInstallation, sessionLock: monitor)
+        if let iMessageProviderFactory { runtime.iMessageProviderFactory = iMessageProviderFactory }
+        runtime.gatewaySocketFactoryForTesting = gatewaySocketFactory
         if let executor { runtime.executor = executor }
         runtime.proxy = proxy
         runtime.proxyFactoryForTesting = proxyFactory

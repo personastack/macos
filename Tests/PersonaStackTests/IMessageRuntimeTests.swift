@@ -28,7 +28,7 @@ private actor IMessageRuntimeReplies {
 }
 
 private actor IMessageRuntimeProvider: IMessageSetupProviding {
-    enum Call: Equatable { case prerequisites, page(String, String?, String, Int), verify([String]) }
+    enum Call: Equatable { case prerequisites, page(String, String?, String, Int), verify([String]), restore([String]) }
     private(set) var calls: [Call] = []
     private(set) var stops = 0
     private var pages: [IMessageSetupProviderPage] = []
@@ -67,6 +67,19 @@ private actor IMessageRuntimeProvider: IMessageSetupProviding {
         guard let verified else { Issue.record("Unplanned provider verification"); throw IMessageSetupProviderError.dependencyInvalid }
         return verified
     }
+    func restore(selections: [IMessageSetupDraft.Selection], account: IMessageSetupAccount,
+                 deadline: Date) async throws -> IMessageSetupProviderVerification {
+        calls.append(.restore(selections.map(\.nativeChatRowID)))
+        if held {
+            try await withCheckedThrowingContinuation {
+                pending = $0; entered?.resume(); entered = nil
+            }
+        }
+        try Task.checkCancellation()
+        guard let verified else { throw IMessageSetupProviderError.dependencyInvalid }
+        return verified
+    }
+
     func stop() {
         stops += 1
         pending?.resume(throwing: CancellationError()); pending = nil
@@ -348,4 +361,76 @@ func iMessageRuntimeVerificationCannotSubstituteLiveAccountSourceOrSelectedIdent
     #expect(await fixture.enqueue(fixture.command("blocked"))?.code == .scopeDenied)
     #expect(await fixture.runtime.selectedConversationIDs(for: fixture.intent).isEmpty)
     await fixture.stop()
+}
+
+
+@Test func iMessageRuntimeRetainsOnlyNativeSelectionAcrossReconnectWithoutRenewingExpiry() async throws {
+    let fixture = IMessageRuntimeFixture()
+    try await fixture.activate()
+    await fixture.provider.supply(try runtimePage([runtimeMetadata(1), runtimeMetadata(2)], next: 2))
+    let page = try runtimePageResult(await fixture.dispatch(fixture.command("page", input: .setupConversations(.init()))))
+    try await fixture.runtime.setSelectedConversationIDs(Array(page.conversations.map(\.conversationID).reversed()), for: fixture.intent)
+    let before = try await fixture.runtime.retainedSelection(for: fixture.intent)
+    await fixture.runtime.unbindAndDrain(connectionID: fixture.connectionID)
+    let replacement = UUID()
+    await fixture.runtime.bind(connectionID: replacement)
+    let retained = try await fixture.runtime.retainedSelection(for: fixture.intent)
+    #expect(retained.conversations == before.conversations)
+    #expect(retained.expiresAt == before.expiresAt)
+    #expect(retained.account == before.account)
+    fixture.clock.advance(301)
+    await #expect(throws: (any Error).self) { try await fixture.runtime.retainedSelection(for: fixture.intent) }
+    await fixture.runtime.drain()
+}
+
+@Test func iMessageRuntimeDraftRestorationRequiresFreshConsentAndMintsNewOpaqueIDs() async throws {
+    let fixture = IMessageRuntimeFixture()
+    let choices = try [IMessageSetupDraft.Selection(nativeChatRowID: "2", expectedGUID: "guid-2"),
+                       IMessageSetupDraft.Selection(nativeChatRowID: "1", expectedGUID: "guid-1")]
+    let account = IMessageSetupAccount(accountID: "account", sourceGeneration: "source")
+    await #expect(throws: (any Error).self) {
+        try await fixture.runtime.restoreSelection(choices, account: account, originalExpiresAt: fixture.clock.now().addingTimeInterval(90), for: fixture.intent)
+    }
+    #expect(await fixture.provider.calls.isEmpty)
+    try await fixture.activate()
+    await fixture.provider.supplyVerification(.init(conversations: [try runtimeMetadata(2), try runtimeMetadata(1)],
+        liveAccount: .init(accountID: "account", sourceGeneration: "source", chatGUIDs: ["guid-2", "guid-1"])))
+    let expiry = fixture.clock.now().addingTimeInterval(90)
+    let restored = try await fixture.runtime.restoreSelection(choices, account: account, originalExpiresAt: expiry, for: fixture.intent)
+    #expect(restored.conversations.map { $0.metadata.id.rawValue } == ["2", "1"])
+    #expect(restored.conversations.map(\.conversationID) == ["option-1", "option-2"])
+    #expect(restored.expiresAt == expiry)
+    #expect(await fixture.provider.calls == [.restore(["2", "1"])])
+    await fixture.runtime.drain()
+}
+
+@Test(arguments: ["account", "source", "guid", "unavailable"])
+func iMessageRuntimeRestorationRejectsChangedEvidenceWithoutRetainingAuthority(fault: String) async throws {
+    let fixture = IMessageRuntimeFixture()
+    try await fixture.activate()
+    let choice = try IMessageSetupDraft.Selection(nativeChatRowID: "1", expectedGUID: "guid-1")
+    await fixture.provider.supplyVerification(.init(conversations: [try runtimeMetadata(fault == "guid" ? 2 : 1, available: fault != "unavailable")],
+        liveAccount: .init(accountID: fault == "account" ? "other" : "account", sourceGeneration: fault == "source" ? "other" : "source", chatGUIDs: ["guid-1"])))
+    await #expect(throws: (any Error).self) {
+        try await fixture.runtime.restoreSelection([choice], account: .init(accountID: "account", sourceGeneration: "source"),
+            originalExpiresAt: fixture.clock.now().addingTimeInterval(90), for: fixture.intent)
+    }
+    #expect(await fixture.runtime.selectedConversationIDs(for: fixture.intent).isEmpty)
+    await fixture.runtime.drain()
+}
+
+@Test func iMessageRuntimeDrainJoinsRestorationAndPermanentlyDeniesRetiredSession() async throws {
+    let fixture = IMessageRuntimeFixture()
+    try await fixture.activate()
+    await fixture.provider.hold()
+    let operation = Task {
+        try await fixture.runtime.restoreSelection([IMessageSetupDraft.Selection(nativeChatRowID: "1", expectedGUID: "guid-1")],
+            account: .init(accountID: "account", sourceGeneration: "source"), originalExpiresAt: fixture.clock.now().addingTimeInterval(90), for: fixture.intent)
+    }
+    await fixture.provider.waitUntilHeld()
+    operation.cancel()
+    await fixture.runtime.drain()
+    await #expect(throws: (any Error).self) { try await operation.value }
+    await #expect(throws: IMessageSetupProviderError.accountChanged) { try await fixture.runtime.activateLocalSetup(fixture.intent) }
+    #expect(await fixture.provider.stops > 0)
 }
