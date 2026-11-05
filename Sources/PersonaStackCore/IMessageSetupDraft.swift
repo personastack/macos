@@ -13,6 +13,33 @@ public enum IMessageSetupDraftError: Error, Equatable, Sendable {
 /// source and selected metadata before obtaining new local consent. Callback
 /// generations and all transient tokens belong to that coordinator, not here.
 public struct IMessageSetupDraft: Codable, Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+    public struct SavedIntention: Codable, Equatable, Sendable, CustomStringConvertible, CustomReflectable {
+        public let action: IMessageSavedPageCommand.Action
+        public let configID: String
+        public let expectedConfigVersion: Int64
+        public var description: String { "IMessageSetupDraft.SavedIntention(<redacted>)" }
+        public var customMirror: Mirror { Mirror(self, children: ["intention": "<redacted>"]) }
+        public init(action: IMessageSavedPageCommand.Action, configID: String, expectedConfigVersion: Int64) throws {
+            guard [.edit, .resume, .resumeFromNow, .repair].contains(action),
+                  IMessageSavedPageCommand.validToken(configID), expectedConfigVersion > 0 else { throw IMessageSetupDraftError.invalidRecord }
+            self.action = action; self.configID = configID; self.expectedConfigVersion = expectedConfigVersion
+        }
+        public init(from decoder: Decoder) throws {
+            let all = try decoder.container(keyedBy: DraftKey.self)
+            guard Set(all.allKeys.map(\.stringValue)) == Set(Keys.allCases.map(\.rawValue)) else { throw IMessageSetupDraftError.invalidRecord }
+            let c = try decoder.container(keyedBy: Keys.self)
+            let raw = try c.decode(String.self, forKey: .version)
+            guard let action = IMessageSavedPageCommand.Action(rawValue: try c.decode(String.self, forKey: .flow)),
+                  let version = Int64(raw), String(version) == raw else { throw IMessageSetupDraftError.invalidRecord }
+            try self.init(action: action, configID: c.decode(String.self, forKey: .configID), expectedConfigVersion: version)
+        }
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: Keys.self)
+            try c.encode(action.rawValue, forKey: .flow); try c.encode(configID, forKey: .configID)
+            try c.encode(String(expectedConfigVersion), forKey: .version)
+        }
+        private enum Keys: String, CodingKey, CaseIterable { case flow, configID = "config_id", version = "expected_config_version" }
+    }
     public struct Selection: Codable, Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
         public let nativeChatRowID: String
         public let expectedGUID: String
@@ -51,6 +78,7 @@ public struct IMessageSetupDraft: Codable, Equatable, Sendable, CustomStringConv
     public let expectedAccountID: String?
     public let sourceGeneration: String?
     public let selectedConversations: [Selection]
+    public let savedIntention: SavedIntention?
     private let originalExpiry: Date
 
     public var expiry: Date { originalExpiry }
@@ -60,7 +88,7 @@ public struct IMessageSetupDraft: Codable, Equatable, Sendable, CustomStringConv
 
     public init(setupReference: String, naturalUserID: String, workspaceID: String,
                 environmentIdentity: String, expiresAt: String, expectedAccountID: String? = nil,
-                sourceGeneration: String? = nil, selectedConversations: [Selection] = []) throws {
+                sourceGeneration: String? = nil, selectedConversations: [Selection] = [], savedIntention: SavedIntention? = nil) throws {
         let expiry: Date
         do {
             expiry = try IMessagePendingEnrollment.validateIdentity(setupReference: setupReference,
@@ -87,6 +115,7 @@ public struct IMessageSetupDraft: Codable, Equatable, Sendable, CustomStringConv
         self.expectedAccountID = expectedAccountID
         self.sourceGeneration = sourceGeneration
         self.selectedConversations = selectedConversations
+        self.savedIntention = savedIntention
         self.originalExpiry = expiry
     }
 
@@ -110,7 +139,7 @@ public struct IMessageSetupDraft: Codable, Equatable, Sendable, CustomStringConv
     public init(from decoder: Decoder) throws {
         let all = try decoder.container(keyedBy: DraftKey.self)
         let keys = Set(all.allKeys.map(\.stringValue))
-        let optionalKeys: Set<String> = [CodingKeys.expectedAccountID.rawValue, CodingKeys.sourceGeneration.rawValue]
+        let optionalKeys: Set<String> = [CodingKeys.expectedAccountID.rawValue, CodingKeys.sourceGeneration.rawValue, CodingKeys.savedIntention.rawValue]
         let allowed = Set(CodingKeys.allCases.map(\.rawValue))
         guard allowed.subtracting(optionalKeys).isSubset(of: keys), keys.isSubset(of: allowed) else {
             throw IMessageSetupDraftError.invalidRecord
@@ -134,7 +163,8 @@ public struct IMessageSetupDraft: Codable, Equatable, Sendable, CustomStringConv
             workspaceID: container.decode(String.self, forKey: .workspaceID),
             environmentIdentity: container.decode(String.self, forKey: .environmentIdentity),
             expiresAt: container.decode(String.self, forKey: .expiresAt), expectedAccountID: account, sourceGeneration: source,
-            selectedConversations: container.decode([Selection].self, forKey: .selectedConversations))
+            selectedConversations: container.decode([Selection].self, forKey: .selectedConversations),
+            savedIntention: container.contains(.savedIntention) ? container.decode(SavedIntention.self, forKey: .savedIntention) : nil)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -148,13 +178,14 @@ public struct IMessageSetupDraft: Codable, Equatable, Sendable, CustomStringConv
         try container.encodeIfPresent(expectedAccountID, forKey: .expectedAccountID)
         try container.encodeIfPresent(sourceGeneration, forKey: .sourceGeneration)
         try container.encode(selectedConversations, forKey: .selectedConversations)
+        try container.encodeIfPresent(savedIntention, forKey: .savedIntention)
     }
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
         case version, setupReference = "setup_reference", naturalUserID = "natural_user_id"
         case workspaceID = "workspace_id", environmentIdentity = "environment_identity", expiresAt = "expires_at"
         case expectedAccountID = "expected_account_id", sourceGeneration = "source_generation"
-        case selectedConversations = "selected_conversations"
+        case selectedConversations = "selected_conversations", savedIntention = "saved_intention"
     }
 
     private static func identifier(_ value: String) -> Bool {

@@ -25,7 +25,7 @@ private final class AgentBridgeUpdaterState {
             preferences: UserDefaults(suiteName: "AgentBridgeUpdaterTests." + UUID().uuidString)!,
             presentReadyReminder: { _ in }, clearAvailableNotification: { _ in }, clearUpdateNotifications: { _ in },
             agentBridgeNeedsHandoff: { true },
-            prepareAgentBridgeUpdate: { throw AgentBridgeFailure.localRuntimeActive }, cancelAgentBridgeUpdate: {})
+            prepareAgentBridgeUpdate: { throw AgentBridgeFailure.localRuntimeActive }, cancelAgentBridgeUpdate: {}, registrationService: isolatedLoginRegistrationService())
         updater.projectReady(version: "0.9.0", notifyWhenInactive: false)
         #expect(!(await updater.prepareBackgroundAgentsForUpdate()))
         #expect(updater.waitsForBackgroundAgents)
@@ -38,7 +38,7 @@ private final class AgentBridgeUpdaterState {
         let updater = DesktopUpdater(updaterFactory: { _, _ in AgentBridgeUpdaterClient() },
             preferences: UserDefaults(suiteName: "AgentBridgeUpdaterTests." + UUID().uuidString)!,
             presentReadyReminder: { _ in }, clearAvailableNotification: { _ in }, clearUpdateNotifications: { _ in },
-            agentBridgeNeedsHandoff: { true }, prepareAgentBridgeUpdate: { throw failure }, cancelAgentBridgeUpdate: {})
+            agentBridgeNeedsHandoff: { true }, prepareAgentBridgeUpdate: { throw failure }, cancelAgentBridgeUpdate: {}, registrationService: isolatedLoginRegistrationService())
         updater.projectReady(version: "0.9.0", notifyWhenInactive: false)
         #expect(!(await updater.prepareBackgroundAgentsForUpdate()))
         let guidance = updater.statusMessage
@@ -54,7 +54,7 @@ private final class AgentBridgeUpdaterState {
             presentReadyReminder: { _ in }, clearAvailableNotification: { _ in }, clearUpdateNotifications: { _ in },
             agentBridgeNeedsHandoff: { true }, prepareAgentBridgeUpdate: {}, cancelAgentBridgeUpdate: {
                 await withCheckedContinuation { release = $0 }
-            })
+            }, registrationService: isolatedLoginRegistrationService())
         updater.projectReady(version: "0.9.0", notifyWhenInactive: false)
         #expect(await updater.prepareBackgroundAgentsForUpdate())
         #expect(updater.allowsTermination())
@@ -74,7 +74,7 @@ private final class AgentBridgeUpdaterState {
         let client = AgentBridgeUpdaterClient()
         client.automaticallyDownloadsUpdates = false
         let updater = DesktopUpdater(updaterFactory: { _, _ in client }, preferences: preferences,
-            agentBridgeNeedsHandoff: { false }, prepareAgentBridgeUpdate: {}, cancelAgentBridgeUpdate: {})
+            agentBridgeNeedsHandoff: { false }, prepareAgentBridgeUpdate: {}, cancelAgentBridgeUpdate: {}, registrationService: isolatedLoginRegistrationService())
         updater.start(publicKey: Data(repeating: 1, count: 32).base64EncodedString(), feed: DesktopUpdatePolicy.feedURL)
         #expect(client.automaticallyDownloadsUpdates)
         #expect(updater.automaticallyDownloadsUpdates)
@@ -94,7 +94,7 @@ private final class AgentBridgeUpdaterState {
                 calls.append("prepare")
                 try await withCheckedThrowingContinuation { release = $0 }
                 calls.append("prepared")
-            }, cancelAgentBridgeUpdate: { calls.append("resume") })
+            }, cancelAgentBridgeUpdate: { calls.append("resume") }, registrationService: isolatedLoginRegistrationService())
         _ = updater.retainAutomaticInstallHandler(version: "0.9.0") { installs += 1 }
         updater.restartToInstall()
         for _ in 0..<100 where release == nil { await Task.yield() }
@@ -123,7 +123,7 @@ private final class AgentBridgeUpdaterState {
         let updater = DesktopUpdater(updaterFactory: { _, _ in client }, preferences: preferences,
                                      presentAvailableReminder: { _ in }, presentReadyReminder: { _ in },
                                      clearAvailableNotification: { _ in }, clearUpdateNotifications: { _ in },
-                                     agentBridgeNeedsHandoff: { state.needsHandoff }, prepareAgentBridgeUpdate: {}, cancelAgentBridgeUpdate: {})
+                                     agentBridgeNeedsHandoff: { state.needsHandoff }, prepareAgentBridgeUpdate: {}, cancelAgentBridgeUpdate: {}, registrationService: isolatedLoginRegistrationService())
         updater.start(publicKey: Data(repeating: 1, count: 32).base64EncodedString(), feed: DesktopUpdatePolicy.feedURL)
         #expect(updater.automaticallyDownloadsUpdates)
         #expect(!client.automaticallyDownloadsUpdates)
@@ -141,7 +141,7 @@ private final class AgentBridgeUpdaterState {
                                      clearAvailableNotification: { _ in }, clearUpdateNotifications: { _ in },
                                      agentBridgeNeedsHandoff: { state.needsHandoff },
                                      prepareAgentBridgeUpdate: { state.calls.append("quiesce") },
-                                     cancelAgentBridgeUpdate: { state.calls.append("resume") })
+                                     cancelAgentBridgeUpdate: { state.calls.append("resume") }, registrationService: isolatedLoginRegistrationService())
         updater.projectReady(version: "0.3.0", notifyWhenInactive: false)
         #expect(throws: AgentBridgeFailure.busy) { try updater.prepareToEnableBackgroundAgents() }
         #expect(!updater.allowsTermination())
@@ -156,7 +156,7 @@ private final class AgentBridgeUpdaterState {
                                      clearAvailableNotification: { _ in }, clearUpdateNotifications: { _ in },
                                      agentBridgeNeedsHandoff: { state.needsHandoff },
                                      prepareAgentBridgeUpdate: { state.calls.append("quiesce-idle-retire") },
-                                     cancelAgentBridgeUpdate: { state.calls.append("restore-resume") })
+                                     cancelAgentBridgeUpdate: { state.calls.append("restore-resume") }, registrationService: isolatedLoginRegistrationService())
         #expect(updater.allowsTermination())
         #expect(state.calls.isEmpty)
         updater.projectReady(version: "0.3.0", notifyWhenInactive: false)

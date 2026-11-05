@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import PersonaStackCore
 import Testing
 @testable import PersonaStack
@@ -38,7 +39,7 @@ private final class RestartConfirmationState {
     @Test @MainActor func validatesFeedAndPersistsSparklePreferenceThroughClient() {
         let preferences = isolatedUpdatePreferences()
         let client = FakeDesktopUpdateClient(preferences: preferences)
-        let updater = DesktopUpdater(updaterFactory: { _, _ in client }, preferences: preferences)
+        let updater = DesktopUpdater(updaterFactory: { _, _ in client }, preferences: preferences, registrationService: isolatedLoginRegistrationService())
         let publicKey = Data(repeating: 3, count: 32).base64EncodedString()
 
         updater.start(publicKey: publicKey, feed: DesktopUpdatePolicy.feedURL)
@@ -68,7 +69,7 @@ private final class RestartConfirmationState {
             preferences: preferences,
             clearAvailableNotification: { _ in },
             clearUpdateNotifications: { _ in }
-        )
+        , registrationService: isolatedLoginRegistrationService())
         let publicKey = Data(repeating: 3, count: 32).base64EncodedString()
 
         updater.start(
@@ -107,7 +108,7 @@ private final class RestartConfirmationState {
             clearUpdateNotifications: { _ in },
             confirmRestart: { restartConfirmations += 1; return true },
             presentApplicationsInstallInstruction: { presentedMessages.append($0) }
-        )
+        , registrationService: isolatedLoginRegistrationService())
         let publicKey = Data(repeating: 3, count: 32).base64EncodedString()
         updater.start(
             publicKey: publicKey,
@@ -133,7 +134,7 @@ private final class RestartConfirmationState {
             updaterFactory: { _, _ in client },
             preferences: preferences,
             presentAvailableReminder: { reminders.append($0) }
-        )
+        , registrationService: isolatedLoginRegistrationService())
         let publicKey = Data(repeating: 4, count: 32).base64EncodedString()
         updater.start(publicKey: publicKey, feed: DesktopUpdatePolicy.feedURL)
 
@@ -164,7 +165,7 @@ private final class RestartConfirmationState {
             updaterFactory: { _, _ in client },
             preferences: preferences,
             presentAvailableReminder: { reminders.append($0) }
-        )
+        , registrationService: isolatedLoginRegistrationService())
         let publicKey = Data(repeating: 4, count: 32).base64EncodedString()
         updater.start(publicKey: publicKey, feed: DesktopUpdatePolicy.feedURL)
 
@@ -194,7 +195,7 @@ private final class RestartConfirmationState {
                 updaterFactory: { _, _ in client },
                 preferences: preferences,
                 presentAvailableReminder: { reminders.append($0) }
-            )
+            , registrationService: isolatedLoginRegistrationService())
             let publicKey = Data(repeating: 4, count: 32).base64EncodedString()
             updater.start(publicKey: publicKey, feed: DesktopUpdatePolicy.feedURL)
             updater.projectFoundUpdate(version: version, isScheduled: true)
@@ -223,7 +224,7 @@ private final class RestartConfirmationState {
             updaterFactory: { _, _ in client },
             preferences: preferences,
             presentAvailableReminder: { reminders.append($0) }
-        )
+        , registrationService: isolatedLoginRegistrationService())
         let publicKey = Data(repeating: 4, count: 32).base64EncodedString()
         updater.start(publicKey: publicKey, feed: DesktopUpdatePolicy.feedURL)
 
@@ -247,7 +248,7 @@ private final class RestartConfirmationState {
             clearAvailableNotification: { _ in },
             clearUpdateNotifications: { clearedVersions.append($0) },
             confirmRestart: { true }
-        )
+        , registrationService: isolatedLoginRegistrationService())
         let publicKey = Data(repeating: 4, count: 32).base64EncodedString()
         updater.start(publicKey: publicKey, feed: DesktopUpdatePolicy.feedURL)
         #expect(updater.retainAutomaticInstallHandler(version: "0.2.7", handler: { installCount += 1 }))
@@ -275,7 +276,7 @@ private final class RestartConfirmationState {
             updaterFactory: { _, _ in FakeDesktopUpdateClient(preferences: preferences) },
             preferences: preferences,
             clearUpdateNotifications: { _ in }
-        )
+        , registrationService: isolatedLoginRegistrationService())
         let publicKey = Data(repeating: 4, count: 32).base64EncodedString()
         updater.start(publicKey: publicKey, feed: DesktopUpdatePolicy.feedURL)
         updater.projectFoundUpdate(version: "0.2.8", isScheduled: false)
@@ -294,7 +295,7 @@ private final class RestartConfirmationState {
         let updater = DesktopUpdater(
             updaterFactory: { _, _ in FakeDesktopUpdateClient(preferences: preferences) },
             preferences: preferences
-        )
+        , registrationService: isolatedLoginRegistrationService())
         updater.projectFoundUpdate(version: "0.2.2", isScheduled: false)
         updater.projectDownloadProgress("Downloading update… 43%")
 
@@ -310,7 +311,7 @@ private final class RestartConfirmationState {
     @Test @MainActor func rejectsAnUntrustedFeedBeforeStartingTheClient() {
         let preferences = isolatedUpdatePreferences()
         let client = FakeDesktopUpdateClient(preferences: preferences)
-        let updater = DesktopUpdater(updaterFactory: { _, _ in client }, preferences: preferences)
+        let updater = DesktopUpdater(updaterFactory: { _, _ in client }, preferences: preferences, registrationService: isolatedLoginRegistrationService())
         let publicKey = Data(repeating: 5, count: 32).base64EncodedString()
 
         updater.start(publicKey: publicKey, feed: "http://updates.example.test/appcast.xml")
@@ -381,7 +382,7 @@ private final class RestartConfirmationState {
             presentReadyReminder: { readyReminders.append($0) },
             clearAvailableNotification: { _ in },
             confirmRestart: { confirmation.allowed }
-        )
+        , registrationService: isolatedLoginRegistrationService())
         let publicKey = Data(repeating: 6, count: 32).base64EncodedString()
         updater.start(publicKey: publicKey, feed: DesktopUpdatePolicy.feedURL)
 
@@ -407,7 +408,7 @@ private final class RestartConfirmationState {
             preferences: preferences,
             presentReadyReminder: { _ in },
             clearAvailableNotification: { _ in }
-        )
+        , registrationService: isolatedLoginRegistrationService())
         let publicKey = Data(repeating: 9, count: 32).base64EncodedString()
         updater.start(publicKey: publicKey, feed: DesktopUpdatePolicy.feedURL)
         #expect(updater.retainAutomaticInstallHandler(version: "0.3.1", handler: {}))
@@ -428,7 +429,7 @@ private final class RestartConfirmationState {
             clearAvailableNotification: { _ in },
             clearUpdateNotifications: { clearedVersions.append($0) },
             confirmRestart: { true }
-        )
+        , registrationService: isolatedLoginRegistrationService())
         let publicKey = Data(repeating: 7, count: 32).base64EncodedString()
         updater.start(publicKey: publicKey, feed: DesktopUpdatePolicy.feedURL)
         #expect(updater.retainAutomaticInstallHandler(version: "0.4.0", handler: {}))
@@ -460,7 +461,7 @@ private final class RestartConfirmationState {
             presentReadyReminder: { _ in },
             clearAvailableNotification: { _ in },
             confirmRestart: { true }
-        )
+        , registrationService: isolatedLoginRegistrationService())
         let publicKey = Data(repeating: 8, count: 32).base64EncodedString()
         updater.start(publicKey: publicKey, feed: DesktopUpdatePolicy.feedURL)
         #expect(updater.retainAutomaticInstallHandler(version: "0.5.0", handler: { installCount += 1 }))
@@ -483,7 +484,7 @@ private final class RestartConfirmationState {
             preferences: preferences,
             clearUpdateNotifications: { clearedVersions.append($0) },
             runningVersion: { "0.5.0" }
-        )
+        , registrationService: isolatedLoginRegistrationService())
 
         updater.start(publicKey: nil, feed: nil)
 
@@ -501,7 +502,7 @@ private final class RestartConfirmationState {
             preferences: preferences,
             clearUpdateNotifications: { _ in },
             runningVersion: { "0.6.0" }
-        )
+        , registrationService: isolatedLoginRegistrationService())
 
         updater.start(publicKey: nil, feed: nil)
 
@@ -533,7 +534,7 @@ func iMessageUpdaterJoinsSetupAndProviderBeforeReplacementAndFencesCanceledAttem
             events.append("imessage-start")
             await withCheckedContinuation { continuation = $0 }
             events.append("imessage-joined")
-        })
+        }, registrationService: isolatedLoginRegistrationService())
     #expect(updater.retainAutomaticInstallHandler(version: "0.9.0", handler: { installations += 1; events.append("replace") }))
     if outcome == "permission-restart-failure" {
         #expect(try updater.restartForPermissionRepairIfNeeded())
@@ -543,6 +544,7 @@ func iMessageUpdaterJoinsSetupAndProviderBeforeReplacementAndFencesCanceledAttem
         updater.restartToInstall()
     }
     while continuation == nil { await Task.yield() }
+    #expect(!updater.admitsNativeIMessageOperations)
     #expect(installations == 0 && events == ["imessage-start"])
     if outcome == "cancel" { updater.cancelBackgroundUpdate() }
     continuation?.resume()
@@ -551,6 +553,7 @@ func iMessageUpdaterJoinsSetupAndProviderBeforeReplacementAndFencesCanceledAttem
         #expect(installations == 0)
         #expect(events == ["imessage-start", "imessage-joined"])
         #expect(!preferences.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey))
+        #expect(updater.admitsNativeIMessageOperations)
     } else if outcome == "permission-restart-failure" {
         while !updater.waitsForBackgroundAgents { await Task.yield() }
         #expect(installations == 0)
@@ -567,7 +570,7 @@ func iMessageUpdaterJoinsSetupAndProviderBeforeReplacementAndFencesCanceledAttem
 @Test @MainActor func permissionRestartUsesReadyUpdateHandlerAndFailsClosedWithoutOne() throws {
     let preferences = isolatedUpdatePreferences()
     let updater = DesktopUpdater(updaterFactory: { _, _ in FakeDesktopUpdateClient(preferences: preferences) },
-                                 preferences: preferences, presentReadyReminder: { _ in }, clearAvailableNotification: { _ in })
+                                 preferences: preferences, presentReadyReminder: { _ in }, clearAvailableNotification: { _ in }, registrationService: isolatedLoginRegistrationService())
     #expect(try !updater.restartForPermissionRepairIfNeeded())
     updater.projectReady(version: "0.5.0", notifyWhenInactive: true)
     #expect(throws: CocoaError.self) { try updater.restartForPermissionRepairIfNeeded() }
@@ -587,7 +590,7 @@ func iMessageUpdaterJoinsSetupAndProviderBeforeReplacementAndFencesCanceledAttem
     var cancellations = 0
     let updater = DesktopUpdater(updaterFactory: { _, _ in FakeDesktopUpdateClient(preferences: preferences) },
         preferences: preferences, presentReadyReminder: { _ in }, clearAvailableNotification: { _ in },
-        clearUpdateNotifications: { _ in }, cancelPermissionRestart: { cancellations += 1; owner.cancelPendingRestart() })
+        clearUpdateNotifications: { _ in }, cancelPermissionRestart: { cancellations += 1; owner.cancelPendingRestart() }, registrationService: isolatedLoginRegistrationService())
     #expect(updater.retainAutomaticInstallHandler(version: "0.6.0", handler: {}))
     try owner.request(applicationURL: URL(fileURLWithPath: "/Applications/PersonaStack.app"),
         installUpdate: { try updater.restartForPermissionRepairIfNeeded() }, start: { _ in Issue.record("Sparkle owns relaunch") })
@@ -598,4 +601,162 @@ func iMessageUpdaterJoinsSetupAndProviderBeforeReplacementAndFencesCanceledAttem
     }
     #expect(cancellations == (outcome == "benign" ? 0 : 1))
     #expect(owner.consumeResumeHint() == (outcome == "benign"))
+}
+
+@Test(arguments: [false, true], ["success", "failure", "cancelled-follower", "unchanged"]) @MainActor
+func iMessageUpdateAndPermissionRestartJoinKnownLoginRegistrationBeforeReplacement(permissionRestart: Bool, outcome: String) async throws {
+    let fixture = try HeldLoginRegistrationFixture(outcome: outcome)
+    fixture.start()
+    let held = outcome != "unchanged"
+    let entered = await fixture.waitForStartup(held: held)
+    #expect(entered)
+    guard entered else { await fixture.finish(); return }
+    defer { fixture.release() }
+    var followerEntered = false
+    let follower = outcome == "cancelled-follower" ? fixture.follower { followerEntered = true } : nil
+    if follower != nil {
+        let enteredJoin = await loginLifecycleObserved { followerEntered }
+        #expect(enteredJoin)
+    }
+    follower?.cancel()
+    let preferences = isolatedUpdatePreferences()
+    var installations = 0
+    let updater = DesktopUpdater(updaterFactory: { _, _ in FakeDesktopUpdateClient(preferences: preferences) },
+        preferences: preferences, presentReadyReminder: { _ in }, clearAvailableNotification: { _ in },
+        clearUpdateNotifications: { _ in }, confirmRestart: { true }, agentBridgeNeedsHandoff: { false },
+        prepareAgentBridgeUpdate: {}, cancelAgentBridgeUpdate: {}, imessageNeedsHandoff: { false },
+        prepareIMessageUpdate: { Issue.record("Registration is independent of configured Messages") }, registrationService: fixture.service)
+    #expect(updater.retainAutomaticInstallHandler(version: "0.99.0", handler: { installations += 1 }))
+    if permissionRestart { _ = try updater.restartForPermissionRepairIfNeeded() }
+    else { updater.restartToInstall() }
+    if held {
+        let reachedAdmission = await loginLifecycleObserved { !fixture.service.isAcceptingRegistrations || installations > 0 }
+        #expect(reachedAdmission)
+        #expect(installations == 0)
+        #expect(fixture.service.hasPendingRegistration)
+        #expect(!fixture.service.isAcceptingRegistrations)
+        #expect(fixture.state.calls == ["unregister"])
+    }
+    fixture.release()
+    _ = try? await fixture.startup?.value
+    let installed = await loginLifecycleObserved { installations == 1 }
+    #expect(installed)
+    #expect(!fixture.service.hasPendingRegistration)
+    #expect(fixture.state.calls == (held ? ["unregister", "register"] : []))
+    if let follower {
+        var cancelled = false
+        do { _ = try await follower.value } catch is CancellationError { cancelled = true } catch {}
+        #expect(cancelled)
+    }
+    await fixture.finish()
+}
+
+@Test @MainActor func iMessageCanceledUpdateCannotReopenAConcurrentTerminalLoginDrain() async throws {
+    let fixture = try HeldLoginRegistrationFixture(outcome: "success")
+    fixture.start()
+    let entered = await fixture.waitForStartup(held: true)
+    #expect(entered)
+    guard entered else { await fixture.finish(); return }
+    defer { fixture.release() }
+    let preferences = isolatedUpdatePreferences()
+    var replacements = 0, exits = 0
+    let updater = DesktopUpdater(updaterFactory: { _, _ in FakeDesktopUpdateClient(preferences: preferences) },
+        preferences: preferences, presentReadyReminder: { _ in }, clearAvailableNotification: { _ in },
+        clearUpdateNotifications: { _ in }, confirmRestart: { true }, agentBridgeNeedsHandoff: { false },
+        prepareAgentBridgeUpdate: {}, cancelAgentBridgeUpdate: {}, imessageNeedsHandoff: { false },
+        prepareIMessageUpdate: {}, registrationService: fixture.service)
+    #expect(updater.retainAutomaticInstallHandler(version: "0.99.0", handler: { replacements += 1 }))
+    updater.restartToInstall()
+    let closed = await loginLifecycleObserved { !fixture.service.isAcceptingRegistrations }
+    #expect(closed && replacements == 0)
+    let delegate = PersonaStackTerminationDelegate(shutdown: { true }, terminate: { _ in exits += 1 },
+        timeout: .seconds(1), registrationService: fixture.service)
+    #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateCancel)
+    updater.cancelBackgroundUpdate()
+    let canceled = Task { await updater.resumeBackgroundAgentsAfterCanceledUpdate() }
+    fixture.release()
+    _ = try? await fixture.startup?.value
+    await canceled.value
+    let quitFinished = await loginLifecycleObserved { exits == 1 }
+    #expect(quitFinished && replacements == 0)
+    #expect(!fixture.service.isAcceptingRegistrations)
+    #expect(!updater.admitsNativeIMessageOperations && !delegate.admitsNativeIMessageOperations)
+    let denied = fixture.follower()
+    var rejected = false
+    do { _ = try await denied.value } catch { rejected = true }
+    #expect(rejected)
+    #expect(fixture.state.calls == ["unregister", "register"])
+    await fixture.finish()
+}
+
+@Test @MainActor func iMessageFailedQuitDoesNotReleaseAnEarlierUpdateRegistrationClosure() async throws {
+    let fixture = try HeldLoginRegistrationFixture(outcome: "success")
+    fixture.start()
+    let entered = await fixture.waitForStartup(held: true)
+    #expect(entered)
+    guard entered else { await fixture.finish(); return }
+    defer { fixture.release() }
+    let preferences = isolatedUpdatePreferences()
+    var helperDrain: CheckedContinuation<Void, Never>?
+    var replacements = 0, failures = 0
+    let updater = DesktopUpdater(updaterFactory: { _, _ in FakeDesktopUpdateClient(preferences: preferences) },
+        preferences: preferences, presentReadyReminder: { _ in }, clearAvailableNotification: { _ in },
+        clearUpdateNotifications: { _ in }, confirmRestart: { true }, agentBridgeNeedsHandoff: { false },
+        prepareAgentBridgeUpdate: { await withCheckedContinuation { helperDrain = $0 } },
+        cancelAgentBridgeUpdate: {}, imessageNeedsHandoff: { false }, prepareIMessageUpdate: {}, registrationService: fixture.service)
+    #expect(updater.retainAutomaticInstallHandler(version: "0.99.0", handler: { replacements += 1 }))
+    updater.restartToInstall()
+    let delegate = PersonaStackTerminationDelegate(shutdown: { false }, terminate: { _ in Issue.record("Cleanup failed") },
+        timeout: .seconds(1), showCleanupFailure: { failures += 1 }, registrationService: fixture.service)
+    #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateCancel)
+    fixture.release()
+    _ = try? await fixture.startup?.value
+    let helperEntered = await loginLifecycleObserved { helperDrain != nil }
+    let quitFailed = await loginLifecycleObserved { failures == 1 }
+    #expect(helperEntered && quitFailed)
+    #expect(!fixture.service.isAcceptingRegistrations)
+    #expect(!delegate.admitsNativeIMessageOperations)
+    updater.cancelBackgroundUpdate()
+    let canceled = Task { await updater.resumeBackgroundAgentsAfterCanceledUpdate() }
+    helperDrain?.resume(); helperDrain = nil
+    await canceled.value
+    #expect(replacements == 0)
+    #expect(fixture.service.isAcceptingRegistrations && delegate.admitsNativeIMessageOperations)
+    await fixture.finish()
+}
+
+@Test(arguments: [false, true]) @MainActor
+func iMessageUpdateFencesRuntimeBeforeJoiningHeldLoginRegistration(cancel: Bool) async throws {
+    let fixture = try HeldLoginRegistrationFixture(outcome: "success")
+    fixture.start()
+    let entered = await fixture.waitForStartup(held: true)
+    #expect(entered)
+    guard entered else { await fixture.finish(); return }
+    defer { fixture.release() }
+    let preferences = isolatedUpdatePreferences()
+    var events: [String] = [], replacements = 0
+    let updater = DesktopUpdater(updaterFactory: { _, _ in FakeDesktopUpdateClient(preferences: preferences) },
+        preferences: preferences, presentReadyReminder: { _ in }, clearAvailableNotification: { _ in },
+        clearUpdateNotifications: { _ in }, confirmRestart: { true }, agentBridgeNeedsHandoff: { false },
+        prepareAgentBridgeUpdate: { events.append("bridge") }, cancelAgentBridgeUpdate: { events.append("resume") },
+        imessageNeedsHandoff: { true }, prepareIMessageUpdate: { events.append("imessage") }, registrationService: fixture.service)
+    #expect(updater.retainAutomaticInstallHandler(version: "0.99.0", handler: { replacements += 1 }))
+    updater.restartToInstall()
+    let fenced = await loginLifecycleObserved { !events.isEmpty }
+    #expect(fenced && events == ["imessage"])
+    #expect(fixture.service.hasPendingRegistration && !fixture.service.isAcceptingRegistrations)
+    #expect(fixture.state.calls == ["unregister"] && replacements == 0)
+    if cancel { updater.cancelBackgroundUpdate() }
+    let canceled = cancel ? Task { await updater.resumeBackgroundAgentsAfterCanceledUpdate() } : nil
+    fixture.release()
+    _ = try? await fixture.startup?.value
+    if let canceled {
+        await canceled.value
+        #expect(replacements == 0 && events == ["imessage", "resume"])
+        #expect(fixture.service.isAcceptingRegistrations)
+    } else {
+        let installed = await loginLifecycleObserved { replacements == 1 }
+        #expect(installed && events == ["imessage", "bridge"])
+    }
+    await fixture.finish()
 }

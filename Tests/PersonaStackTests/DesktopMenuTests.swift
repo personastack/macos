@@ -1,3 +1,6 @@
+import Foundation
+import PersonaStackCore
+import ServiceManagement
 import Testing
 @testable import PersonaStack
 
@@ -65,5 +68,37 @@ import Testing
             activelyControlling: true, cleanupPending: true))
         #expect(action.title == "Stopping PersonaStack Control…")
         #expect(!action.isEnabled)
+    }
+}
+
+@Test(arguments: ["enabled", "approval", "terminal", "signature"]) @MainActor
+func launchAtLoginMenuUsesSharedCurrentExecutableOwnerAndPreservesSettingsFeedback(outcome: String) async throws {
+    let name = "LaunchAtLoginMenu.\(UUID().uuidString)"
+    let preferences = try #require(UserDefaults(suiteName: name))
+    defer { preferences.removePersistentDomain(forName: name) }
+    preferences.set("old", forKey: DesktopLoginItemRegistration.registeredExecutableKey)
+    var status = SMAppService.Status.notRegistered
+    var registrations = 0, settings = 0
+    let service = DesktopLoginItemRegistration.Service(status: { status },
+        unregister: { Issue.record("Already absent") }, legacyStatus: { .notRegistered },
+        unregisterLegacy: { Issue.record("No legacy entry") }, register: {
+            registrations += 1
+            status = outcome == "approval" ? .requiresApproval : .enabled
+        })
+    if outcome == "terminal" { service.stopAdmission(terminal: true) }
+    let error = await DesktopControlMenu.requestLaunchAtLogin(register: {
+        try await DesktopLoginItemRegistration.registerCurrentExecutable(preferences: preferences,
+            bundleURL: URL(fileURLWithPath: "/Applications/PersonaStack.app"), volumeIsReadOnly: false,
+            signatureValid: { _ in outcome != "signature" }, identity: { _ in "current" }, service: service)
+    }, openSettings: { settings += 1 })
+    if outcome == "terminal" || outcome == "signature" {
+        #expect(registrations == 0 && settings == 0)
+        #expect(preferences.string(forKey: DesktopLoginItemRegistration.registeredExecutableKey) == "old")
+        #expect(outcome == "terminal" ? error.isEmpty : error == DesktopLoginItemRegistration.invalidSignatureMessage)
+    } else {
+        #expect(registrations == 1)
+        #expect(settings == (outcome == "approval" ? 1 : 0))
+        #expect(error == (outcome == "approval" ? DesktopLoginItemRegistration.approvalMessage : ""))
+        #expect(preferences.string(forKey: DesktopLoginItemRegistration.registeredExecutableKey) == "current")
     }
 }

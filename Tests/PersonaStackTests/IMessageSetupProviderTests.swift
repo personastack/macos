@@ -12,10 +12,13 @@ private actor SetupProviderAccountFixture: IMessageSetupAccountReading {
     private let selectedGate: SetupApprovalGate?
     private let selectedAccount: String
     private let selectedSource: String
+    private let currentAccount: String
+    private let currentSource: String
     private let permissionError: IMessageAccountError?
-    init(selectedAccount: String = "live-account", selectedSource: String = "native-source", selectedGate: SetupApprovalGate? = nil, permissionError: IMessageAccountError? = nil) {
+    init(selectedAccount: String = "live-account", selectedSource: String = "native-source", selectedGate: SetupApprovalGate? = nil, permissionError: IMessageAccountError? = nil, currentAccount: String = "live-account", currentSource: String = "native-source") {
         self.selectedAccount = selectedAccount; self.selectedSource = selectedSource; self.selectedGate = selectedGate
         self.permissionError = permissionError
+        self.currentAccount = currentAccount; self.currentSource = currentSource
     }
     func prepareProviderConnection(_ client: IMessageRPCClient) async throws {
         prepares += 1
@@ -27,7 +30,7 @@ private actor SetupProviderAccountFixture: IMessageSetupAccountReading {
     func observeCurrentAccount() throws -> IMessageCurrentAccountObservation {
         currentReads += 1
         if let permissionError { throw permissionError }
-        return .init(accountID: "live-account", sourceGeneration: "native-source", accountLabel: "Personal Messages")
+        return .init(accountID: currentAccount, sourceGeneration: currentSource, accountLabel: "Personal Messages")
     }
     func requestCurrentAccountPermission() -> IMessageCurrentAccountObservation {
         explicitPermissionReads += 1
@@ -504,6 +507,44 @@ func iMessageSetupPermissionStatePreservesFiniteNativeReasonWithoutPrompting(rea
     let provider = IMessageSetupProvider(client: IMessageRPCClient(transport: SetupProviderTransportFixture(databaseReady: databaseReady)), accounts: accounts)
     #expect(try await provider.setupPermissionState(deadline: Date().addingTimeInterval(10)) == (databaseReady ? .ready : .unavailable))
     #expect(await accounts.currentReads == (databaseReady ? 1 : 0))
+    #expect(await accounts.explicitPermissionReads == 0)
+    await provider.stop()
+}
+
+@Test(arguments: [false, true])
+func iMessageDraftRestoreProvesLiveAccountForHealthyAndMissingSelectedRows(allMissing: Bool) async throws {
+    let accounts = SetupProviderAccountFixture()
+    let transport = SetupProviderTransportFixture(availableIDs: allMissing ? [] : ["42"])
+    let provider = IMessageSetupProvider(client: .init(transport: transport), accounts: accounts)
+    let choices = try [IMessageSetupDraft.Selection(nativeChatRowID: "42", expectedGUID: "chosen-guid"),
+        IMessageSetupDraft.Selection(nativeChatRowID: "43", expectedGUID: "chosen-guid-43")]
+    let result = try await provider.restore(selections: choices, account: .init(accountID: "live-account", sourceGeneration: "native-source"),
+        deadline: Date().addingTimeInterval(10))
+    #expect(result.conversations.map(\.id.rawValue) == ["42", "43"])
+    #expect(result.conversations.map(\.available) == [!allMissing, false])
+    let missing = try #require(result.conversations.last)
+    #expect(missing.guid.isEmpty && missing.service.isEmpty && missing.name.isEmpty && missing.participants.isEmpty)
+    #expect(result.liveAccount?.accountID == "live-account" && result.liveAccount?.sourceGeneration == "native-source")
+    #expect(result.liveAccount?.chatGUIDs == (allMissing ? [] : ["chosen-guid"]))
+    #expect(await accounts.currentReads == (allMissing ? 1 : 0))
+    let reads = await accounts.selectedReads
+    #expect(reads.count == (allMissing ? 0 : 1))
+    if let read = reads.first { #expect(read.0 == ["chosen-guid"] && read.1 == "live-account" && !read.2) }
+    #expect(await accounts.explicitPermissionReads == 0)
+    await provider.stop()
+}
+
+@Test(arguments: ["account", "source", "permission", "guid"])
+func iMessageDraftRestoreNeverInfersMissingAccountOrAcceptsChangedAvailableGUID(fault: String) async throws {
+    let accounts = SetupProviderAccountFixture(permissionError: fault == "permission" ? .automationRequired : nil,
+        currentAccount: fault == "account" ? "foreign" : "live-account", currentSource: fault == "source" ? "foreign" : "native-source")
+    let transport = SetupProviderTransportFixture(changedGUID: fault == "guid", availableIDs: fault == "guid" ? ["42"] : [])
+    let provider = IMessageSetupProvider(client: .init(transport: transport), accounts: accounts)
+    await #expect(throws: (any Error).self) {
+        _ = try await provider.restore(selections: [.init(nativeChatRowID: "42", expectedGUID: "chosen-guid")],
+            account: .init(accountID: "live-account", sourceGeneration: "native-source"), deadline: Date().addingTimeInterval(10))
+    }
+    #expect(await accounts.selectedReads.isEmpty)
     #expect(await accounts.explicitPermissionReads == 0)
     await provider.stop()
 }

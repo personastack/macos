@@ -102,7 +102,7 @@ struct DesktopControlMenu: View {
             DesktopConcernNotificationsMenuItem()
             DesktopServerSettingsMenuItem()
             Button("Launch at Login") {
-                registerLoginItem()
+                Task { await registerLoginItem() }
             }
             .disabled(DesktopLoginItemRegistration.loginStatus() == .enabled)
             Divider()
@@ -253,18 +253,25 @@ struct DesktopControlMenu: View {
     }
 
     @MainActor
-    private func registerLoginItem() {
+    private func registerLoginItem() async {
         loginItemError = ""
+        loginItemError = await Self.requestLaunchAtLogin()
+    }
+
+    @MainActor
+    static func requestLaunchAtLogin(
+        register: @MainActor () async throws -> SMAppService.Status = { try await DesktopLoginItemRegistration.registerCurrentExecutable() },
+        openSettings: @MainActor () -> Void = { SMAppService.openSystemSettingsLoginItems() }
+    ) async -> String {
         do {
-            let status = try DesktopLoginItemRegistration.registerAndMigrateLegacy()
-            if status != .enabled {
-                loginItemError = status == .requiresApproval
-                    ? DesktopLoginItemRegistration.approvalMessage
-                    : DesktopLoginItemRegistration.unconfirmedMessage
-                SMAppService.openSystemSettingsLoginItems()
-            }
+            let status = try await register()
+            guard status != .enabled else { return "" }
+            openSettings()
+            return status == .requiresApproval ? DesktopLoginItemRegistration.approvalMessage : DesktopLoginItemRegistration.unconfirmedMessage
+        } catch is CancellationError {
+            return ""
         } catch {
-            loginItemError = error.localizedDescription
+            return error.localizedDescription
         }
     }
 

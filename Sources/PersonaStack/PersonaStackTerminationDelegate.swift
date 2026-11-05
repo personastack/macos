@@ -13,8 +13,17 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         }
     }
     private var pendingIMessageHandoff: IMessageSetupHandoff?
+    var openIMessageSaved: (@MainActor (IMessageSavedHandoff) -> Void)? {
+        didSet {
+            if phase == .idle, let handoff = pendingIMessageSavedHandoff, let openIMessageSaved {
+                pendingIMessageSavedHandoff = nil; openIMessageSaved(handoff)
+            }
+        }
+    }
+    private var pendingIMessageSavedHandoff: IMessageSavedHandoff?
     private var shouldRestoreMainWindow = false
     private var pendingMainPage: URL?
+    private let registrationService: DesktopLoginItemRegistration.Service
     private let shutdown: @MainActor () async -> Bool
     private let terminate: @MainActor (NSApplication) -> Void
     private let hasActiveSessions: @MainActor () -> Bool
@@ -27,9 +36,11 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     private let navigateMainWindow: @MainActor (URL) -> Void
     private enum Phase { case idle, cleaning, admitted }
     private var phase = Phase.idle
+    var admitsNativeIMessageOperations: Bool { phase == .idle && registrationService.isAcceptingRegistrations }
     private var timeoutTask: Task<Void, Never>?
 
     override init() {
+        registrationService = .current
         shutdown = {
             await IMessageSetupManager.shared.shutdown()
             return await Self.cleanupControlForQuit(DesktopControlRuntime.shared)
@@ -66,7 +77,6 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        DesktopLoginItemRegistration.enableOnFirstLaunch()
         DesktopNotificationCoordinator.shared.install()
         DesktopNotificationCoordinator.shared.installConcernNavigation { [weak self] in self?.openMainPage($0) }
         ChatWindowManager.shared.navigateMainWindow = { [weak self] in self?.openMainPage($0) }
@@ -130,7 +140,9 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
          navigateMainWindow: @escaping @MainActor (URL) -> Void = { MainWebViewHost.shared.navigate(to: $0) },
          hasMiniaturizedMainWindow: @escaping @MainActor () -> Bool = {
              MainWebViewHost.shared.mainWindow?.isMiniaturized == true
-         }) {
+         },
+         registrationService: DesktopLoginItemRegistration.Service = .current) {
+        self.registrationService = registrationService
         self.shutdown = shutdown
         self.terminate = terminate
         self.timeout = timeout
@@ -150,10 +162,14 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        guard phase == .idle, urls.count == 1, let url = urls.first,
-              let handoff = try? IMessageSetupHandoff.parseDeepLink(url) else { return }
-        if let openIMessageSetup { openIMessageSetup(handoff) }
-        else { pendingIMessageHandoff = handoff }
+        guard phase == .idle, urls.count == 1, let url = urls.first else { return }
+        if let handoff = try? IMessageSetupHandoff.parseDeepLink(url) {
+            pendingIMessageSavedHandoff = nil
+            if let openIMessageSetup { openIMessageSetup(handoff) } else { pendingIMessageHandoff = handoff }
+        } else if let handoff = try? IMessageSavedHandoff.parseDeepLink(url) {
+            pendingIMessageHandoff = nil
+            if let openIMessageSaved { openIMessageSaved(handoff) } else { pendingIMessageSavedHandoff = handoff }
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -180,15 +196,19 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         guard DesktopUpdater.shared.allowsTermination() else { return .terminateCancel }
         DesktopUpdater.shared.applicationWillTerminate()
         pendingIMessageHandoff = nil
+        pendingIMessageSavedHandoff = nil
         phase = .cleaning
+        registrationService.stopAdmission(terminal: true)
         Task { @MainActor in
             let cleaned = await shutdown()
+            await registrationService.stopAdmissionAndDrain()
             guard phase == .cleaning else { return }
             if cleaned { finish(sender) }
             else {
                 timeoutTask?.cancel()
                 timeoutTask = nil
                 phase = .idle
+                registrationService.cancelTerminalAdmission()
                 cancelPermissionRestart()
                 showCleanupFailure()
             }
@@ -196,7 +216,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
         timeoutTask = Task { @MainActor in
             do { try await Task.sleep(for: timeout) } catch { return }
             guard phase == .cleaning else { return }
-            if hasActiveSessions() { showCleanupFailure() }
+            if registrationService.hasPendingRegistration || hasActiveSessions() { showCleanupFailure() }
             else { finish(sender) }
         }
         // AppKit's terminateLater loop starves main-actor Tasks. Cancel this
@@ -205,7 +225,7 @@ final class PersonaStackTerminationDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func finish(_ sender: NSApplication) {
-        guard phase == .cleaning else { return }
+        guard phase == .cleaning, !registrationService.hasPendingRegistration else { return }
         phase = .admitted
         timeoutTask?.cancel()
         timeoutTask = nil

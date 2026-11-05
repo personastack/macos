@@ -36,6 +36,7 @@ func iMessageSubprocessTransportStopsItsOwnedDescendantsAfterTimeoutOrCancellati
     // test scheduling. The later nonresponding status must still time out.
     let client = IMessageRPCClient(transport: transport, readTimeoutSeconds: cancel ? 5 : 1, sendTimeoutSeconds: 1)
     _ = try await client.start()
+    #expect(await transport.resources()?.ownedChildren == 1)
     do {
         let request = Task { try await client.status() }
         if cancel {
@@ -47,6 +48,7 @@ func iMessageSubprocessTransportStopsItsOwnedDescendantsAfterTimeoutOrCancellati
         }
         let expected: IMessageRPCError = cancel ? .cancelled : .deadlineExceeded
         await #expect(throws: expected) { try await request.value }
+        #expect(await transport.resources()?.ownedChildren == 0)
         let text = try String(contentsOf: identities, encoding: .utf8)
         let ids = text.split(separator: "\n").compactMap { Int32($0) }
         #expect(ids.count == 2)

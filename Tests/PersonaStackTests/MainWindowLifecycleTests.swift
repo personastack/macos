@@ -158,7 +158,7 @@ struct MainWindowLifecycleTests {
                     #expect(fixture.host.mainWindow === fixture.window)
                     #expect(fixture.window.isVisible)
                     fixture.host.navigate(to: $0)
-                })
+                }, registrationService: isolatedLoginRegistrationService())
             delegate.installMainWindowReopener {
                 fixture.host.show { Issue.record("The main window should be retained") }
             }

@@ -244,3 +244,24 @@ private func gatewayResultFrame(_ result: IMessageGatewaySetupResult) -> Desktop
     let hybrid = DesktopControlFrame(type: "imessage", requestID: "request", operation: "desktop_control_status", imessage: failure.imessage)
     #expect(throws: IMessageGatewayWireError.invalidFrame) { try DesktopControlFrameCodec.encode(hybrid) }
 }
+
+@Test func iMessageStrictHTTPDocumentBudgetIsIndependentFromUnchangedWebSocketFrameLimit() throws {
+    let documentBudget = IMessageJSONDocument.maximumDocumentBytes
+    #expect(documentBudget == (8 << 20) + 16384)
+    try IMessageJSONDocument.validate(data: Data(#"{"ok":true}"#.utf8), maximumBytes: documentBudget)
+    #expect(throws: IMessageGatewayWireError.frameTooLarge) {
+        try IMessageGatewayJSONInspection(Data("{}".utf8), maximumBytes: documentBudget)
+    }
+    #expect(throws: IMessageGatewayWireError.frameTooLarge) {
+        try DesktopControlFrameCodec.decode(Data(repeating: 0x20, count: DesktopControlFrameCodec.maximumFrameBytes + 1))
+    }
+    #expect(throws: IMessageGatewayWireError.frameTooLarge) {
+        try IMessageJSONDocument.validate(data: Data("{}".utf8), maximumBytes: documentBudget + 1)
+    }
+    #expect(throws: IMessageGatewayWireError.frameTooLarge) {
+        try IMessageJSONDocument.validate(data: Data(repeating: 0x20, count: documentBudget + 1), maximumBytes: documentBudget)
+    }
+    for invalid in [#"{"ok":true,"ok":false}"#, #"{"ok":null}"#, #"{"revision":1.5}"#, "{} {}"] {
+        #expect(throws: (any Error).self) { try IMessageJSONDocument.validate(data: Data(invalid.utf8), maximumBytes: documentBudget) }
+    }
+}

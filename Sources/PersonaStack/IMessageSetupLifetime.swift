@@ -15,49 +15,44 @@ enum IMessageSetupLifetimeError: Error, Equatable, LocalizedError {
 
 @MainActor enum IMessageSetupLifetime {
     static var backgroundReady: Bool {
-        let bundle = Bundle.main.bundleURL
-        let roots = [URL(fileURLWithPath: "/Applications", isDirectory: true),
-            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true)]
-        let readOnly = (try? bundle.resourceValues(forKeys: [.volumeIsReadOnlyKey]).volumeIsReadOnly) ?? true
-        return isApplicationsInstall(bundle, roots: roots)
-            && !DesktopUpdatePolicy.requiresApplicationsInstall(bundleURL: bundle, volumeIsReadOnly: readOnly)
-            && DesktopLoginItemRegistration.hasValidBundleSignature(bundleURL: bundle)
-            && DesktopLoginItemRegistration.loginStatus() == .enabled
+        DesktopLoginItemRegistration.installationStatus() == .ready
+            && DesktopLoginItemRegistration.isCurrentExecutableRegistered()
     }
 
     /// Explicit setup only. This prepares the existing app login registration
     /// and never changes either family's enabled or paused preference.
     static func prepareBackgroundConnection(configuration: DesktopEnvironmentConfiguration,
         bundleURL: URL = Bundle.main.bundleURL, volumeIsReadOnly: Bool? = nil,
-        applicationDirectories: [URL] = [URL(fileURLWithPath: "/Applications", isDirectory: true),
-            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true)],
+        applicationDirectories: [URL] = DesktopLoginItemRegistration.applicationDirectories,
         signatureValid: @MainActor (URL) -> Bool = { DesktopLoginItemRegistration.hasValidBundleSignature(bundleURL: $0) },
         prepareUpdater: @MainActor () throws -> Void = { try DesktopUpdater.shared.prepareToEnableBackgroundAgents() },
-        registerLogin: @MainActor () throws -> Bool = { try DesktopLoginItemRegistration.registerAndMigrateLegacy() == .enabled }
+        preferences: UserDefaults = .standard,
+        executableIdentity: @MainActor (URL) -> String? = { DesktopLoginItemRegistration.executableIdentity(bundleURL: $0) },
+        loginService: DesktopLoginItemRegistration.Service = .current
     ) async throws {
         try Task.checkCancellation()
+        guard loginService.isAcceptingRegistrations else { throw CancellationError() }
         let canonical = try DesktopEnvironmentConfiguration(appURL: configuration.appOrigin,
             gatewayURL: configuration.gatewayURL.absoluteString, mcpURL: configuration.mcpURL.absoluteString)
         guard canonical == configuration else { throw DesktopEnvironmentConfigurationError.invalidStoredConfiguration }
-        let readOnly = volumeIsReadOnly ?? ((try? bundleURL.resourceValues(forKeys: [.volumeIsReadOnlyKey]).volumeIsReadOnly) ?? true)
-        guard isApplicationsInstall(bundleURL, roots: applicationDirectories),
-              !DesktopUpdatePolicy.requiresApplicationsInstall(bundleURL: bundleURL, volumeIsReadOnly: readOnly) else {
-            throw IMessageSetupLifetimeError.applicationsRequired
+        switch DesktopLoginItemRegistration.installationStatus(bundleURL: bundleURL,
+            volumeIsReadOnly: volumeIsReadOnly, applicationDirectories: applicationDirectories, signatureValid: signatureValid) {
+        case .ready: break
+        case .applicationsRequired: throw IMessageSetupLifetimeError.applicationsRequired
+        case .signatureRequired: throw IMessageSetupLifetimeError.signatureRequired
         }
-        guard signatureValid(bundleURL) else { throw IMessageSetupLifetimeError.signatureRequired }
         try Task.checkCancellation()
         try prepareUpdater()
-        guard try registerLogin() else { throw IMessageSetupLifetimeError.backgroundApprovalRequired }
+        try Task.checkCancellation()
+        guard try await DesktopLoginItemRegistration.registerCurrentExecutable(preferences: preferences,
+            bundleURL: bundleURL, volumeIsReadOnly: volumeIsReadOnly, applicationDirectories: applicationDirectories,
+            signatureValid: signatureValid, identity: executableIdentity, service: loginService) == .enabled else {
+            throw IMessageSetupLifetimeError.backgroundApprovalRequired
+        }
     }
 
     static func isApplicationsInstall(_ bundleURL: URL, roots: [URL]) -> Bool {
-        guard bundleURL.isFileURL, bundleURL.pathExtension == "app" else { return false }
-        let bundle = bundleURL.resolvingSymlinksInPath().standardizedFileURL.pathComponents
-        return roots.contains { root in
-            guard root.isFileURL else { return false }
-            let components = root.resolvingSymlinksInPath().standardizedFileURL.pathComponents
-            return bundle.count > components.count && bundle.starts(with: components)
-        }
+        DesktopLoginItemRegistration.isApplicationsInstall(bundleURL, roots: roots)
     }
 
     /// A canceled replacement can later accept a fresh explicit setup. Keep the

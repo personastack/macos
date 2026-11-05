@@ -22,6 +22,9 @@ private actor IMessageLifecycleAuthority: DesktopControlRelayStateReading {
         state = .init(hasActiveConfig: desktop, hasConfig: desktop,
                       hasActiveIMessageConfig: iMessage, hasIMessageConfig: iMessage)
     }
+    func pauseIMessageKeepingRegistration() {
+        state = .init(hasActiveConfig: true, hasConfig: true, hasActiveIMessageConfig: false, hasIMessageConfig: true)
+    }
     func fail() { unavailable = true }
     func suspendNextRead() { suspendRead = true }
     func waitForRead() async {
@@ -589,4 +592,24 @@ private actor IMessageMachineRevokeFixture {
     for key in keys { #expect(!fixture.preferences.bool(forKey: key)) }
     #expect(!runtime.isDisconnecting)
     #expect(try fixture.credentials.load() == original)
+}
+
+@Test @MainActor func iMessageRelayLifecycleCanonicalIMessageRemovalPreservesDesktopSocketProofAndOtherEnvironmentIntent() async throws {
+    let fixture = try IMessageLifecycleFixture(desktop: true, iMessage: true, connected: true)
+    let other = DesktopEnvironmentConfigurationStore.scopedPreferenceKey("imessageRelayEnabled", appOrigin: "https://other.example")
+    fixture.preferences.set(true, forKey: other)
+    fixture.preferences.set(true, forKey: IMessagePreferenceKeys.relayPaused(.production))
+    await fixture.authority.pauseIMessageKeepingRegistration()
+    try await fixture.runtime.reconcileRelayForTesting()
+    #expect(fixture.preferences.bool(forKey: IMessagePreferenceKeys.relayEnabled(.production)))
+    #expect(fixture.preferences.bool(forKey: IMessagePreferenceKeys.relayPaused(.production)))
+    await fixture.authority.replace(desktop: true, iMessage: false)
+    try await fixture.runtime.reconcileRelayForTesting()
+    #expect(!fixture.preferences.bool(forKey: IMessagePreferenceKeys.relayEnabled(.production)))
+    #expect(!fixture.preferences.bool(forKey: IMessagePreferenceKeys.relayPaused(.production)))
+    #expect(fixture.preferences.bool(forKey: other))
+    #expect(fixture.runtime.gatewayConnected && fixture.runtime.hasActiveInstallation)
+    #expect(fixture.runtime.hasDesktopControlIntentForTesting)
+    #expect(try fixture.credentials.load()?.installationID == "lifecycle-mac")
+    await fixture.runtime.shutdownForQuit()
 }

@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 import Testing
 import PersonaStackCore
 @testable import PersonaStack
@@ -9,7 +10,7 @@ private final class MiniaturizedMainWindowState {
 }
 
 @Test @MainActor func iMessageExternalHandoffIsFiniteAndWaitsForItsNativeOwner() throws {
-    let delegate = PersonaStackTerminationDelegate(shutdown: { true }, terminate: { _ in }, timeout: .seconds(1))
+    let delegate = PersonaStackTerminationDelegate(shutdown: { true }, terminate: { _ in }, timeout: .seconds(1), registrationService: isolatedLoginRegistrationService())
     let first = String(repeating: "A", count: 43)
     let latest = Data(repeating: 2, count: 32).base64EncodedString().replacingOccurrences(of: "=", with: "")
     let firstURL = try #require(URL(string: IMessageSetupHandoff.deepLinkPrefix + first))
@@ -38,9 +39,11 @@ private final class MiniaturizedMainWindowState {
         pending = false
         return result
     }, terminate: { _ in exits += 1 }, timeout: .milliseconds(10), hasActiveSessions: { pending },
-        showCleanupFailure: { notices += 1 })
+        showCleanupFailure: { notices += 1 }, registrationService: isolatedLoginRegistrationService())
     delegate.openIMessageSetup = { _ in handoffs += 1 }
+    #expect(delegate.admitsNativeIMessageOperations)
     #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateCancel)
+    #expect(!delegate.admitsNativeIMessageOperations)
     delegate.application(NSApplication.shared, open: [URL(string: IMessageSetupHandoff.deepLinkPrefix + String(repeating: "A", count: 43))!])
     #expect(handoffs == 0)
     while notices == 0 { await Task.yield() }
@@ -85,7 +88,7 @@ private final class MiniaturizedMainWindowState {
     var reopenCalls = 0
     let app = NSApplication.shared
     let delegate = PersonaStackTerminationDelegate(shutdown: { true }, terminate: { _ in }, timeout: .seconds(1),
-        moveToMenuBar: { _ in }, hasMiniaturizedMainWindow: { state.isMiniaturized })
+        moveToMenuBar: { _ in }, hasMiniaturizedMainWindow: { state.isMiniaturized }, registrationService: isolatedLoginRegistrationService())
     delegate.installMainWindowReopener { reopenCalls += 1 }
 
     delegate.applicationDidBecomeActive(Notification(name: NSApplication.didBecomeActiveNotification, object: app))
@@ -121,7 +124,7 @@ private final class MiniaturizedMainWindowState {
            backgrounds += 1
            windowsVisible = false
            dockVisible = false
-       })
+       }, registrationService: isolatedLoginRegistrationService())
     delegate.installMainWindowReopener {
         windowsVisible = true
         dockVisible = true
@@ -150,7 +153,7 @@ private final class MiniaturizedMainWindowState {
         shutdown: { await withCheckedContinuation { continuation = $0 } },
         terminate: { _ in Issue.record("Exited after failed cleanup") }, timeout: .seconds(1),
         hasActiveSessions: { true }, showCleanupFailure: { failures += 1 },
-        moveToMenuBar: { _ in backgrounds += 1 })
+        moveToMenuBar: { _ in backgrounds += 1 }, registrationService: isolatedLoginRegistrationService())
     #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateCancel)
     delegate.closeToMenuBar(NSApplication.shared)
     #expect(backgrounds == 0)
@@ -169,7 +172,7 @@ private final class MiniaturizedMainWindowState {
     var continuation: CheckedContinuation<Bool, Never>?
     let delegate = PersonaStackTerminationDelegate(
         shutdown: { cleanupCalls += 1; return await withCheckedContinuation { continuation = $0 } },
-        terminate: { _ in requests += 1 }, timeout: .seconds(1), recordQuitIntent: { intents += 1 })
+        terminate: { _ in requests += 1 }, timeout: .seconds(1), recordQuitIntent: { intents += 1 }, registrationService: isolatedLoginRegistrationService())
     let app = NSApplication.shared
     #expect(delegate.applicationShouldTerminate(app) == .terminateCancel)
     #expect(delegate.applicationShouldTerminate(app) == .terminateCancel)
@@ -189,7 +192,7 @@ private final class MiniaturizedMainWindowState {
     var intents = 0
     let delegate = PersonaStackTerminationDelegate(shutdown: { cleanupCalls += 1; return cleanupCalls > 1 },
         terminate: { _ in requests += 1 }, timeout: .seconds(1), hasActiveSessions: { true },
-        showCleanupFailure: { failures += 1 }, recordQuitIntent: { intents += 1 })
+        showCleanupFailure: { failures += 1 }, recordQuitIntent: { intents += 1 }, registrationService: isolatedLoginRegistrationService())
     #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateCancel)
     while failures == 0 { await Task.yield() }
     #expect(requests == 0 && intents == 0)
@@ -206,7 +209,7 @@ private final class MiniaturizedMainWindowState {
         let delegate = PersonaStackTerminationDelegate(
             shutdown: { await withCheckedContinuation { continuation = $0 } },
             terminate: { _ in requests += 1 }, timeout: .milliseconds(10), hasActiveSessions: { active },
-            showCleanupFailure: { failures += 1 })
+            showCleanupFailure: { failures += 1 }, registrationService: isolatedLoginRegistrationService())
         #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateCancel)
         while continuation == nil { await Task.yield() }
         while requests + failures == 0 { try? await Task.sleep(for: .milliseconds(5)) }
@@ -232,7 +235,7 @@ func quitAfterFailedPermissionRestartDoesNotInheritItsWaiter(retryRestart: Bool)
         exits += 1
         if running { relaunches += 1; running = false }
     }, timeout: .seconds(1), showCleanupFailure: { failures += 1 },
-       cancelPermissionRestart: { restart.cancelPendingRestart() })
+       cancelPermissionRestart: { restart.cancelPendingRestart() }, registrationService: isolatedLoginRegistrationService())
     func requestRestart() throws {
         try restart.request(applicationURL: URL(fileURLWithPath: "/Applications/PersonaStack.app"),
             processID: 123, installUpdate: { false }, start: { _ in starts += 1; running = true },
@@ -266,4 +269,161 @@ func quitAfterFailedPermissionRestartDoesNotInheritItsWaiter(retryRestart: Bool)
     #expect(stops == 1 && !running)
     restart.cancelPendingRestart()
     #expect(stops == 1)
+}
+
+@Test @MainActor func iMessageSavedManagementHandoffWaitsForNativeOwnerAndNeverBecomesSetupOrExecution() throws {
+    let delegate = PersonaStackTerminationDelegate(shutdown: { true }, terminate: { _ in }, timeout: .seconds(1), registrationService: isolatedLoginRegistrationService())
+    let url = URL(string: "personastack://manage-imessage?config_id=saved")!
+    delegate.application(NSApplication.shared, open: [url])
+    var ids: [String] = []
+    var setups = 0
+    delegate.openIMessageSetup = { _ in setups += 1 }
+    delegate.openIMessageSaved = { ids.append($0.configID) }
+    #expect(ids == ["saved"] && setups == 0)
+    delegate.application(NSApplication.shared, open: [URL(string: "personastack://manage-imessage?config_id=saved&action=send")!])
+    #expect(ids == ["saved"])
+}
+
+/// Each lifecycle regression owns its Service, defaults, OS-status fake and
+/// held unregister. No test changes Service.current or calls SMAppService.
+@MainActor final class HeldLoginRegistrationFixture {
+    @MainActor final class State {
+        var status = SMAppService.Status.enabled
+        var calls: [String] = []
+        var removal: CheckedContinuation<Void, Never>?
+        var failRegistration = false
+    }
+    let state = State()
+    let preferences: UserDefaults
+    let suite: String
+    let service: DesktopLoginItemRegistration.Service
+    var startup: Task<SMAppService.Status, any Error>?
+    init(outcome: String) throws {
+        suite = "HeldLoginRegistration.\(UUID().uuidString)"
+        guard let preferences = UserDefaults(suiteName: suite) else { throw CocoaError(.fileReadUnknown) }
+        self.preferences = preferences
+        state.failRegistration = outcome == "failure"
+        preferences.set(outcome == "unchanged" ? "current" : "old", forKey: DesktopLoginItemRegistration.registeredExecutableKey)
+        let captured = state
+        service = .init(status: { captured.status }, unregister: {
+            captured.calls.append("unregister")
+            await withCheckedContinuation { captured.removal = $0 }
+            captured.status = .notRegistered
+        }, legacyStatus: { .notRegistered }, unregisterLegacy: { Issue.record("No legacy registration") }, register: {
+            captured.calls.append("register")
+            if captured.failRegistration { throw CocoaError(.executableNotLoadable) }
+            captured.status = .enabled
+        })
+    }
+    func start() {
+        startup = follower()
+    }
+    func follower(onEnter: @escaping @MainActor () -> Void = {}) -> Task<SMAppService.Status, any Error> {
+        Task {
+            onEnter()
+            return try await DesktopLoginItemRegistration.registerCurrentExecutable(preferences: preferences,
+            bundleURL: URL(fileURLWithPath: "/Applications/PersonaStack.app"), volumeIsReadOnly: false,
+                signatureValid: { _ in true }, identity: { _ in "current" }, service: service)
+        }
+    }
+    func waitForStartup(held: Bool) async -> Bool {
+        if !held { _ = try? await startup?.value; return true }
+        return await loginLifecycleObserved { self.state.removal != nil }
+    }
+    func release() { state.removal?.resume(); state.removal = nil }
+    func finish() async {
+        release()
+        _ = try? await startup?.value
+        preferences.removePersistentDomain(forName: suite)
+    }
+}
+
+@MainActor func loginLifecycleObserved(_ condition: @MainActor () -> Bool) async -> Bool {
+    let end = ContinuousClock.now.advanced(by: .seconds(1))
+    while !condition(), ContinuousClock.now < end { try? await Task.sleep(for: .milliseconds(2)) }
+    return condition()
+}
+
+@Test(arguments: ["success", "failure", "cancelled-follower", "unchanged"]) @MainActor
+func iMessageQuitJoinsKnownLoginRegistrationBeforeTimeoutOrRepeatedTermination(outcome: String) async throws {
+    let fixture = try HeldLoginRegistrationFixture(outcome: outcome)
+    fixture.start()
+    let held = outcome != "unchanged"
+    let entered = await fixture.waitForStartup(held: held)
+    #expect(entered)
+    guard entered else { await fixture.finish(); return }
+    defer { fixture.release() }
+    var followerEntered = false
+    let follower = outcome == "cancelled-follower" ? fixture.follower { followerEntered = true } : nil
+    if follower != nil {
+        let enteredJoin = await loginLifecycleObserved { followerEntered }
+        #expect(enteredJoin)
+    }
+    follower?.cancel()
+    var exits = 0, cleanups = 0, notices = 0
+    let delegate = PersonaStackTerminationDelegate(shutdown: { cleanups += 1; return true },
+        terminate: { _ in exits += 1 }, timeout: .milliseconds(20), hasActiveSessions: { false },
+        showCleanupFailure: { notices += 1 }, registrationService: fixture.service)
+    let app = NSApplication.shared
+    #expect(delegate.applicationShouldTerminate(app) == .terminateCancel)
+    #expect(delegate.applicationShouldTerminate(app) == .terminateCancel)
+    if held {
+        let timeoutObserved = await loginLifecycleObserved { notices > 0 || exits > 0 }
+        #expect(timeoutObserved)
+        #expect(exits == 0)
+        // Existing shutdown must fence setup/runtime immediately, even while
+        // the independent registration drain still prevents termination.
+        #expect(cleanups == 1)
+        #expect(fixture.service.hasPendingRegistration)
+        #expect(!fixture.service.isAcceptingRegistrations)
+        #expect(fixture.state.calls == ["unregister"])
+    }
+    fixture.release()
+    _ = try? await fixture.startup?.value
+    let finished = await loginLifecycleObserved { exits == 1 }
+    #expect(finished && cleanups == 1)
+    #expect(delegate.applicationShouldTerminate(app) == .terminateNow)
+    #expect(!fixture.service.hasPendingRegistration)
+    #expect(fixture.state.calls == (held ? ["unregister", "register"] : []))
+    if let follower {
+        var cancelled = false
+        do { _ = try await follower.value } catch is CancellationError { cancelled = true } catch {}
+        #expect(cancelled)
+    }
+    if outcome == "failure" { #expect(fixture.preferences.string(forKey: DesktopLoginItemRegistration.registeredExecutableKey) == nil) }
+    await fixture.finish()
+}
+
+@MainActor func isolatedLoginRegistrationService() -> DesktopLoginItemRegistration.Service {
+    .init(status: { .notRegistered }, unregister: { Issue.record("No registration operation expected") },
+        legacyStatus: { .notRegistered }, unregisterLegacy: { Issue.record("No legacy registration expected") },
+        register: { Issue.record("No registration operation expected") })
+}
+
+@Test @MainActor func iMessageFailedOrderlyQuitReleasesOnlyItsSettledTerminalRegistrationClosure() async throws {
+    let fixture = try HeldLoginRegistrationFixture(outcome: "success")
+    fixture.start()
+    let entered = await fixture.waitForStartup(held: true)
+    #expect(entered)
+    guard entered else { await fixture.finish(); return }
+    defer { fixture.release() }
+    var cleanupCalls = 0, exits = 0, notices = 0
+    let delegate = PersonaStackTerminationDelegate(shutdown: { cleanupCalls += 1; return cleanupCalls > 1 },
+        terminate: { _ in exits += 1 }, timeout: .seconds(1), showCleanupFailure: { notices += 1 },
+        registrationService: fixture.service)
+    #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateCancel)
+    fixture.release()
+    _ = try? await fixture.startup?.value
+    let failed = await loginLifecycleObserved { notices == 1 }
+    #expect(failed && exits == 0)
+    #expect(fixture.service.isAcceptingRegistrations && delegate.admitsNativeIMessageOperations)
+    let retry = fixture.follower()
+    _ = try await retry.value
+    #expect(fixture.state.calls == ["unregister", "register"])
+    #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateCancel)
+    let finished = await loginLifecycleObserved { exits == 1 }
+    #expect(finished && cleanupCalls == 2)
+    fixture.service.resumeAdmission()
+    #expect(!fixture.service.isAcceptingRegistrations)
+    await fixture.finish()
 }

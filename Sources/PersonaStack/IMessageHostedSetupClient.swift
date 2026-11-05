@@ -345,9 +345,9 @@ struct IMessageHostedSetupClient: Sendable {
     }
 
     func nativeScope(configuration: DesktopEnvironmentConfiguration, cookies: String,
-                     validateScope: ValidateScope) async throws -> IMessageHostedNativeScope {
+                     deadline: Date? = nil, validateScope: ValidateScope) async throws -> IMessageHostedNativeScope {
         let data = try await perform(configuration: configuration, cookies: cookies, path: "/user/imessage/native-scope",
-            method: "GET", status: 200, validateScope: validateScope)
+            method: "GET", status: 200, deadline: deadline, validateScope: validateScope)
         let scope: IMessageHostedNativeScope = try decode(data, maximum: 4096)
         guard scope.appOrigin == configuration.appOrigin else { throw IMessageHostedSetupError.scopeChanged }
         return scope
@@ -425,23 +425,25 @@ struct IMessageHostedSetupClient: Sendable {
         return response
     }
 
-    private func currentScope(_ configuration: DesktopEnvironmentConfiguration, cookies: String, expected: IMessageHostedNativeScope,
-                              validateScope: ValidateScope) async throws -> IMessageHostedNativeScope {
-        let current = try await nativeScope(configuration: configuration, cookies: cookies, validateScope: validateScope)
+    func currentScope(_ configuration: DesktopEnvironmentConfiguration, cookies: String, expected: IMessageHostedNativeScope,
+                              deadline: Date? = nil, validateScope: ValidateScope) async throws -> IMessageHostedNativeScope {
+        let current = try await nativeScope(configuration: configuration, cookies: cookies, deadline: deadline, validateScope: validateScope)
         guard current == expected else { throw IMessageHostedSetupError.scopeChanged }
         return current
     }
 
     private func perform(configuration: DesktopEnvironmentConfiguration, cookies: String, path: String, method: String,
                          query: [URLQueryItem]? = nil, body: Data? = nil, workspace: String? = nil, csrf: String? = nil,
-                         status: Int, maximum: Int = 4096, validateScope: ValidateScope) async throws -> Data {
+                         status: Int, maximum: Int = 4096, deadline: Date? = nil, validateScope: ValidateScope) async throws -> Data {
         try validateRequest(configuration: configuration, cookies: cookies, path: path, method: method,
             body: body, workspace: workspace, csrf: csrf)
         try Task.checkCancellation(); try await validateScope()
         try Task.checkCancellation()
+        if let deadline, deadline <= Date() { throw IMessageHostedSetupError.serviceUnavailable }
         var parts = URLComponents(url: configuration.appURL, resolvingAgainstBaseURL: false)!
         parts.path = path; parts.queryItems = query
-        var request = URLRequest(url: parts.url!, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+        var request = URLRequest(url: parts.url!, cachePolicy: .reloadIgnoringLocalCacheData,
+            timeoutInterval: min(15, deadline?.timeIntervalSinceNow ?? 15))
         request.httpMethod = method; request.httpBody = body; request.httpShouldHandleCookies = false
         request.setValue(cookies, forHTTPHeaderField: "Cookie"); request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("macos-imessage-v1", forHTTPHeaderField: "X-PersonaStack-Native-Client")
@@ -455,6 +457,7 @@ struct IMessageHostedSetupClient: Sendable {
         catch { throw IMessageHostedSetupError.serviceUnavailable }
         try Task.checkCancellation(); try await validateScope()
         try Task.checkCancellation()
+        if let deadline, deadline <= Date() { throw IMessageHostedSetupError.serviceUnavailable }
         guard data.count <= maximum else { throw IMessageHostedSetupError.invalidResponse }
         guard code == status else { throw Self.statusError(code) }
         return data
@@ -578,10 +581,10 @@ struct IMessageHostedDisplayContext: Decodable, Equatable, Sendable {
 }
 
 struct IMessageHostedApprovalReceipt: Sendable, CustomStringConvertible, CustomReflectable {
-    fileprivate let value: String
+    let value: String
     let expiresAt: String
-    fileprivate let consent: IMessageSetupFinalConsent
-    fileprivate let macName: String
+    let consent: IMessageSetupFinalConsent
+    let macName: String
     var description: String { "IMessageHostedApprovalReceipt(<redacted>)" }
     var customMirror: Mirror { Mirror(self, children: ["receipt": "<redacted>"]) }
 }
@@ -643,7 +646,7 @@ private struct HostedAnyKey: CodingKey {
     init?(intValue: Int) { return nil }
 }
 
-private func hostedContainer<K: CodingKey & CaseIterable & Hashable>(_ decoder: Decoder, _ keys: K.Type,
+func hostedContainer<K: CodingKey & CaseIterable & Hashable>(_ decoder: Decoder, _ keys: K.Type,
                                                                   optional: Set<K> = []) throws -> KeyedDecodingContainer<K> {
     let all = try decoder.container(keyedBy: HostedAnyKey.self)
     let seen = Set(all.allKeys.map(\.stringValue)), allowed = Set(K.allCases.map(\.stringValue))
@@ -653,8 +656,8 @@ private func hostedContainer<K: CodingKey & CaseIterable & Hashable>(_ decoder: 
     for key in all.allKeys { guard try !all.decodeNil(forKey: key) else { throw IMessageHostedSetupError.invalidResponse } }
     return try decoder.container(keyedBy: keys)
 }
-private func hostedHasControls(_ value: String) -> Bool { value.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) }
-private func hostedID(_ value: String) -> Bool {
+func hostedHasControls(_ value: String) -> Bool { value.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) }
+func hostedID(_ value: String) -> Bool {
     !value.isEmpty && value.unicodeScalars.count <= 256 && value.trimmingCharacters(in: .whitespacesAndNewlines) == value && !hostedHasControls(value)
 }
 private func hostedOpaqueID(_ value: String) -> Bool { value.utf8.count <= 256 && hostedID(value) }

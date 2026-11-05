@@ -473,3 +473,71 @@ func iMessageRuntimeRestorationRejectsChangedEvidenceWithoutRetainingAuthority(f
     #expect(await fixture.provider.calls == [.prerequisites])
     await fixture.stop()
 }
+
+@Test(arguments: [false, true])
+func iMessageSavedRestorationUsesExactCurrentVersionOnlyAfterLocalMetadataConsent(paused: Bool) async throws {
+    let fixture = IMessageRuntimeFixture()
+    try await fixture.activate(consent: false)
+    let base = try configuredFixtureScope(paused: paused)
+    let grant = IMessageGatewaySnapshot(installationID: "mac", revision: 2, configs: [base], setupScope: fixture.intent.scope)
+    #expect(await fixture.runtime.install(grant, connectionID: fixture.connectionID) == .snapshotAck(.init(revision: 2)))
+    await #expect(throws: IMessageSetupProviderError.accountChanged) {
+        try await fixture.runtime.restorationIntentions(for: fixture.intent, configID: "config", expectedConfigVersion: 2)
+    }
+    try await fixture.runtime.setMetadataConsent(true, for: fixture.intent)
+    let intentions = try await fixture.runtime.restorationIntentions(for: fixture.intent, configID: "config", expectedConfigVersion: 2)
+    #expect(intentions.selections.map(\.nativeChatRowID) == ["9007199254740993"])
+    #expect(intentions.selections.map(\.expectedGUID) == ["iMessage;+;selected"])
+    #expect(intentions.account.accountID == "public-account" && intentions.account.sourceGeneration == "source")
+    await #expect(throws: IMessageSetupProviderError.accountChanged) {
+        try await fixture.runtime.restorationIntentions(for: fixture.intent, configID: "config", expectedConfigVersion: 1)
+    }
+    await #expect(throws: IMessageSetupProviderError.accountChanged) {
+        try await fixture.runtime.restorationIntentions(for: fixture.intent, configID: "foreign", expectedConfigVersion: 2)
+    }
+    #expect(await fixture.provider.calls.isEmpty)
+    await fixture.runtime.suspendAndDrain()
+    await #expect(throws: IMessageSetupProviderError.accountChanged) {
+        try await fixture.runtime.restorationIntentions(for: fixture.intent, configID: "config", expectedConfigVersion: 2)
+    }
+    await fixture.runtime.drain()
+}
+
+@Test(arguments: [false, true])
+func iMessageRestoredMissingChoicesStayUnavailableUntilExplicitDeselection(allMissing: Bool) async throws {
+    let fixture = IMessageRuntimeFixture()
+    try await fixture.activate()
+    let choices = try [IMessageSetupDraft.Selection(nativeChatRowID: "1", expectedGUID: "guid-1"),
+        IMessageSetupDraft.Selection(nativeChatRowID: "2", expectedGUID: "guid-2")]
+    let rows = [try runtimeMetadata(1, available: !allMissing), try runtimeMetadata(2, available: false)]
+    await fixture.provider.supplyVerification(.init(conversations: rows,
+        liveAccount: .init(accountID: "account", sourceGeneration: "source", chatGUIDs: allMissing ? [] : ["guid-1"])))
+    let restored = try await fixture.runtime.restoreSelection(choices, account: .init(accountID: "account", sourceGeneration: "source"),
+        originalExpiresAt: fixture.clock.now().addingTimeInterval(90), for: fixture.intent)
+    #expect(restored.conversations.map(\.conversationID) == ["option-1", "option-2"])
+    #expect(restored.expectedSelections == choices)
+    #expect(restored.conversations[1].metadata.guid.isEmpty && !restored.conversations[1].metadata.available)
+    let result = await fixture.dispatch(fixture.command("unavailable-selection", input: .verifyConversations(.init(conversationIDs: ["option-1", "option-2"]))))
+    guard case .failure(let failure) = result else { Issue.record("Unavailable choice reached final verification"); return }
+    #expect(failure.code == .invalidArguments)
+    #expect(await fixture.provider.calls == [.restore(["1", "2"])])
+    if allMissing {
+        try await fixture.runtime.setSelectedConversationIDs(["option-2"], for: fixture.intent)
+        #expect(await fixture.runtime.selectedConversationIDs(for: fixture.intent) == ["option-2"])
+        let stillUnavailable = await fixture.dispatch(fixture.command("remaining-unavailable", input: .verifyConversations(.init(conversationIDs: ["option-2"]))))
+        guard case .failure(let denied) = stillUnavailable else { Issue.record("Unavailable restored choice became authority"); return }
+        #expect(denied.code == .invalidArguments)
+        #expect(await fixture.provider.calls == [.restore(["1", "2"])])
+        try await fixture.runtime.setSelectedConversationIDs([], for: fixture.intent)
+    }
+    if !allMissing {
+        try await fixture.runtime.setSelectedConversationIDs(["option-1"], for: fixture.intent)
+        await fixture.provider.supplyVerification(.init(conversations: [try runtimeMetadata(1)],
+            liveAccount: .init(accountID: "account", sourceGeneration: "source", chatGUIDs: ["guid-1"])))
+        let valid = await fixture.dispatch(fixture.command("healthy-selection", input: .verifyConversations(.init(conversationIDs: ["option-1"]))))
+        guard case .result(.verification(let verified)) = valid else { Issue.record("Healthy retained choice could not be verified after deselection"); return }
+        #expect(verified.conversations.map(\.conversationID) == ["option-1"])
+        #expect(await fixture.provider.calls == [.restore(["1", "2"]), .verify(["1"])])
+    }
+    await fixture.runtime.drain()
+}

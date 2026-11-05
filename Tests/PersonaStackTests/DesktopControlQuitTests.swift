@@ -34,8 +34,9 @@ private struct QuitCredentials: DesktopControlCredentialStoring {
     let preferences = try #require(UserDefaults(suiteName: "DesktopControlQuitTests." + UUID().uuidString))
     let executor = DesktopControlCommandExecutor()
     executor.failNextCleanupForTesting()
+    let registrationService = isolatedLoginRegistrationService()
     let runtime = DesktopControlRuntime.makeForTesting(installer: QuitInstaller(), credentials: QuitCredentials(),
-        executor: executor, preferences: preferences)
+        executor: executor, preferences: preferences, registrationService: registrationService)
     var exits = 0
     var failures = 0
     var intents = 0
@@ -46,7 +47,7 @@ private struct QuitCredentials: DesktopControlCredentialStoring {
         return result
     }, terminate: { _ in exits += 1 }, timeout: .seconds(1),
         hasActiveSessions: { PersonaStackTerminationDelegate.controlCleanupPendingForQuit(runtime) },
-        showCleanupFailure: { failures += 1 }, recordQuitIntent: { intents += 1 })
+        showCleanupFailure: { failures += 1 }, recordQuitIntent: { intents += 1 }, registrationService: registrationService)
     #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateCancel)
     while !cleaned { await Task.yield() }
     #expect(runtime.executorCleanupFailedForTesting)
@@ -69,8 +70,9 @@ private struct QuitCredentials: DesktopControlCredentialStoring {
     let executor = DesktopControlCommandExecutor()
     let barrier = QuitCleanupBarrier()
     executor.pauseCleanupBeforeResourceCloseForTesting { await barrier.wait() }
+    let registrationService = isolatedLoginRegistrationService()
     let runtime = DesktopControlRuntime.makeForTesting(installer: QuitInstaller(), credentials: QuitCredentials(),
-        executor: executor, preferences: preferences)
+        executor: executor, preferences: preferences, registrationService: registrationService)
     var exits = 0
     var failures = 0
     var cleaned = false
@@ -80,7 +82,7 @@ private struct QuitCredentials: DesktopControlCredentialStoring {
         return result
     }, terminate: { _ in exits += 1 }, timeout: .milliseconds(10),
         hasActiveSessions: { PersonaStackTerminationDelegate.controlCleanupPendingForQuit(runtime) },
-        showCleanupFailure: { failures += 1 })
+        showCleanupFailure: { failures += 1 }, registrationService: registrationService)
     #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateCancel)
     while barrier.continuation == nil { await Task.yield() }
     #expect(PersonaStackTerminationDelegate.controlCleanupPendingForQuit(runtime))

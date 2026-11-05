@@ -73,6 +73,7 @@ private actor ConfiguredRuntimeProvider: IMessageSetupProviding {
     let gate: ConfiguredRuntimeGate?
     let sendFails: Bool
     private(set) var calls: [String] = []
+    private(set) var deadlines: [Date] = []
     private(set) var stops = 0
     init(gate: ConfiguredRuntimeGate? = nil, sendFails: Bool = false) { self.gate = gate; self.sendFails = sendFails }
     func prerequisites(deadline: Date) throws -> IMessageGatewayPrerequisitesResult { Issue.record("Configured job used setup"); throw IMessageSetupProviderError.dependencyInvalid }
@@ -81,6 +82,7 @@ private actor ConfiguredRuntimeProvider: IMessageSetupProviding {
     func executeConfigured(_ input: IMessageGatewayConfiguredInput, scope: IMessageGatewayConfigScope, deadline: Date,
                            validateCurrent: @escaping @Sendable () async throws -> Bool) async throws -> IMessageGatewayConfiguredResult {
         calls.append(input.operationRawValue)
+        deadlines.append(deadline)
         if calls.count == 1 { await gate?.pause() }
         try Task.checkCancellation()
         guard try await validateCurrent() else { throw IMessageSetupProviderError.accountChanged }
@@ -375,5 +377,65 @@ func iMessageConfiguredRuntimeRejectsUnconfirmedChangedOrExpiredHumanPreview(fau
     #expect(await fixture.enqueue(command)?.code == .scopeDenied)
     #expect(await fixture.authority.commands.isEmpty)
     #expect(await fixture.provider.calls.isEmpty)
+    await fixture.runtime.drain()
+}
+
+@Test(arguments: ["earlier", "equal", "later", "expired"])
+func iMessageHumanReceiptDeadlineCanTightenButNeverExtendIssuedCommand(bound: String) async throws {
+    let fixture = try ConfiguredRuntimeFixture()
+    await fixture.activate()
+    let command = fixture.command("native-deadline", human: true)
+    let issued = try IMessageGatewayWire.utcDate(command.deadlineAt)
+    let receipt = bound == "earlier" ? issued.addingTimeInterval(-1)
+        : (bound == "later" ? issued.addingTimeInterval(1) : (bound == "expired" ? fixture.clock.now() : issued))
+    if bound == "later" || bound == "expired" {
+        await #expect(throws: IMessageSetupProviderError.accountChanged) {
+            try await fixture.runtime.registerHumanAction(command, localGeneration: UUID(), confirmed: true, deadline: receipt)
+        }
+        #expect(await fixture.enqueue(command)?.code == .scopeDenied)
+    } else {
+        try await fixture.runtime.registerHumanAction(command, localGeneration: UUID(), confirmed: true, deadline: receipt)
+        #expect(await fixture.enqueue(command) == nil)
+        guard case .result(.configured(.status)) = await fixture.replies.get(command.requestID) else { Issue.record("Valid tightened receipt failed"); return }
+        #expect(await fixture.provider.deadlines == [receipt])
+    }
+    await fixture.runtime.drain()
+}
+
+@Test func iMessageQueuedHumanExpiryNeverReachesFinalAuthorizationOrProvider() async throws {
+    let gate = ConfiguredRuntimeGate()
+    let fixture = try ConfiguredRuntimeFixture(providerGate: gate)
+    await fixture.activate()
+    #expect(await fixture.enqueue(fixture.command("first")) == nil)
+    await gate.wait()
+    let send = fixture.command("queued-human", input: .sendMessage(.init(integrationID: "config", conversationID: "chat", clientRequestID: "one-key", text: "hello")), human: true)
+    try await fixture.runtime.registerHumanAction(send, localGeneration: UUID(), confirmed: true, deadline: fixture.clock.now().addingTimeInterval(1))
+    #expect(await fixture.enqueue(send) == nil)
+    fixture.clock.advance(2)
+    await fixture.runtime.reconcileDeadlines()
+    guard case .failure(let failure) = await fixture.replies.get(send.requestID) else { Issue.record("Expired native intent dispatched"); return }
+    #expect(failure.retrySafe && failure.clientRequestID == "one-key")
+    #expect(await fixture.authority.commands == ["first"])
+    #expect(await fixture.provider.calls == ["imessage_status"])
+    await gate.release()
+    _ = await fixture.replies.get("first")
+    await fixture.runtime.drain()
+}
+
+@Test func iMessageActiveHumanProviderBudgetUsesOriginalStricterNativeExpiry() async throws {
+    let gate = ConfiguredRuntimeGate()
+    let fixture = try ConfiguredRuntimeFixture(providerGate: gate)
+    await fixture.activate()
+    let send = fixture.command("active-human", input: .sendMessage(.init(integrationID: "config", conversationID: "chat", clientRequestID: "one-key", text: "hello")), human: true)
+    let expiry = fixture.clock.now().addingTimeInterval(2)
+    try await fixture.runtime.registerHumanAction(send, localGeneration: UUID(), confirmed: true, deadline: expiry)
+    #expect(await fixture.enqueue(send) == nil)
+    await gate.wait()
+    #expect(await fixture.provider.deadlines == [expiry])
+    fixture.clock.advance(3)
+    await fixture.runtime.reconcileDeadlines()
+    guard case .failure(let failure) = await fixture.replies.get(send.requestID) else { Issue.record("Expired active provider returned success"); return }
+    #expect(!failure.retrySafe && failure.code == .outcomeUnknown)
+    #expect(await fixture.provider.calls == ["imessage_send_message"])
     await fixture.runtime.drain()
 }

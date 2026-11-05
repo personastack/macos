@@ -161,3 +161,36 @@ func iMessageSetupDraftBoundsPrivateIdentityWithoutControls(value: String) {
         #expect(text.contains("<redacted>"))
     }
 }
+
+@Test(arguments: [IMessageSavedPageCommand.Action.edit, .resume, .resumeFromNow, .repair])
+func iMessageSavedDraftIntentionSurvivesRestartWithoutPersistingAuthority(action: IMessageSavedPageCommand.Action) throws {
+    let intent = try IMessageSetupDraft.SavedIntention(action: action, configID: "private-config", expectedConfigVersion: Int64.max)
+    let draft = try IMessageSetupDraft(setupReference: draftReference, naturalUserID: "human", workspaceID: "workspace",
+        environmentIdentity: "app|gateway|mcp", expiresAt: draftExpiry, savedIntention: intent)
+    let data = try JSONEncoder().encode(draft)
+    let restored = try JSONDecoder().decode(IMessageSetupDraft.self, from: data)
+    #expect(restored == draft && restored.savedIntention?.expectedConfigVersion == Int64.max)
+    #expect(!String(describing: restored.savedIntention!).contains("private-config"))
+    let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let saved = try #require(object["saved_intention"] as? [String: Any])
+    #expect(Set(saved.keys) == ["flow", "config_id", "expected_config_version"])
+    #expect(saved["expected_config_version"] as? String == "9223372036854775807")
+    let old = try draftFixture()
+    #expect(try JSONDecoder().decode(IMessageSetupDraft.self, from: JSONEncoder().encode(old)).savedIntention == nil)
+}
+
+@Test(arguments: ["zero", "float", "overflow", "number", "unknown", "null", "send_flow"])
+func iMessageSavedDraftIntentionRejectsMalformedOrExecutionAuthority(fault: String) throws {
+    var raw: [String: Any] = ["flow": "edit_connection", "config_id": "config", "expected_config_version": "1"]
+    switch fault {
+    case "zero": raw["expected_config_version"] = "0"
+    case "float": raw["expected_config_version"] = "1.0"
+    case "overflow": raw["expected_config_version"] = "9223372036854775808"
+    case "number": raw["expected_config_version"] = 1
+    case "unknown": raw["native_approval_receipt"] = "forged"
+    case "null": raw["config_id"] = NSNull()
+    default: raw["flow"] = "send_test"
+    }
+    let data = try JSONSerialization.data(withJSONObject: raw)
+    #expect(throws: (any Error).self) { try JSONDecoder().decode(IMessageSetupDraft.SavedIntention.self, from: data) }
+}

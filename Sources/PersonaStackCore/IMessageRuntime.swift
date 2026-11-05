@@ -56,6 +56,13 @@ public struct IMessageRuntimeRetainedSelection: Sendable {
     public let conversations: [IMessageGatewaySetupConversation]
     public let account: IMessageSetupAccount
     public let expiresAt: Date
+    public let expectedSelections: [IMessageSetupDraft.Selection]
+}
+
+public struct IMessageRuntimeRestorationIntentions: Sendable {
+    public let selections: [IMessageSetupDraft.Selection]
+    public let account: IMessageSetupAccount
+    public let conversationIDs: [String]
 }
 
 public extension IMessageSetupProviding {
@@ -86,6 +93,9 @@ public enum IMessageConfiguredAuthorizationError: Error, Equatable, Sendable {
 }
 
 public actor IMessageRuntime {
+    public func diagnostics() -> IMessageRuntimeDiagnostics {
+        .init(waitingCommands: waiting.count, activeCommand: active != nil, cleanupPending: cleanupID != nil, restorationPending: restoration != nil)
+    }
     public static let maximumWaitingCommands = 8
     public static let commandLifetime: TimeInterval = 10
     public static let inventoryLifetime: TimeInterval = 300
@@ -99,6 +109,7 @@ public actor IMessageRuntime {
     private let referenceDigest: @Sendable (String) -> String
     private let textDigest: @Sendable (String) -> String
     private let authorizeConfigured: ConfiguredAuthorization
+    private let applicationAdmission: @Sendable () async -> Bool
     private var configuredEnabled = false
     private var executionAvailable = true
     private var interactiveReads = 0
@@ -116,6 +127,7 @@ public actor IMessageRuntime {
     private var active: (job: Job, task: Task<Void, Never>, timer: Task<Void, Never>, replying: Bool)?
     private var inventory = IMessageRuntimeInventory()
     private var cleanup: Task<Void, Never>?
+    private var cleanupID: UUID?
     private var restoration: (id: UUID, task: Task<IMessageRuntimeRetainedSelection, Error>)?
 
     private struct Job: Sendable {
@@ -137,10 +149,12 @@ public actor IMessageRuntime {
                 referenceDigest: @escaping @Sendable (String) -> String,
                 textDigest: @escaping @Sendable (String) -> String = { _ in "" },
                 authorizeConfigured: @escaping ConfiguredAuthorization = { _, _, _ in throw IMessageConfiguredAuthorizationError.denied(.scopeDenied) },
+                applicationAdmission: @escaping @Sendable () async -> Bool = { true },
                 now: @escaping @Sendable () -> Date = Date.init,
                 makeID: @escaping @Sendable () -> String = { UUID().uuidString }) {
         self.installationID = installationID; self.provider = provider
         self.referenceDigest = referenceDigest; self.textDigest = textDigest; self.authorizeConfigured = authorizeConfigured
+        self.applicationAdmission = applicationAdmission
         self.now = now; self.makeID = makeID
     }
 
@@ -153,11 +167,12 @@ public actor IMessageRuntime {
         if !available { humanIntents.removeAll(); cancelWork(code: .scopeDenied) }
     }
     /// Trusted native confirmation only. No page handler may call this from raw JS scope.
-    public func registerHumanAction(_ command: IMessageGatewayCommand, localGeneration: UUID, confirmed: Bool, deadline: Date) throws {
+    public func registerHumanAction(_ command: IMessageGatewayCommand, localGeneration: UUID, confirmed: Bool, deadline: Date) async throws {
+        guard await applicationAdmission() else { throw IMessageSetupProviderError.accountChanged }
         try IMessageGatewayWire.validate(command)
         guard confirmed, command.caller.kind == .humanAction, configuredEnabled, executionAvailable, !retired,
               command.target.installationID == installationID, deadline > now(),
-              try IMessageGatewayWire.utcDate(command.deadlineAt) <= deadline else { throw IMessageSetupProviderError.accountChanged }
+              deadline <= (try IMessageGatewayWire.utcDate(command.deadlineAt)) else { throw IMessageSetupProviderError.accountChanged }
         if let human = command.caller.humanAction, case .configured(.sendMessage(let input)) = command.input {
             guard human.textSHA256 == textDigest(input.text) else { throw IMessageSetupProviderError.accountChanged }
         }
@@ -166,7 +181,9 @@ public actor IMessageRuntime {
         humanIntents[command.authorizationID] = (command, localGeneration, deadline)
     }
     public func withdrawHumanActions(localGeneration: UUID) {
+        let previous = humanIntents.count
         humanIntents = humanIntents.filter { $0.value.generation != localGeneration }
+        guard humanIntents.count != previous else { return }
         cancelInvalidJobs()
     }
 
@@ -191,8 +208,8 @@ public actor IMessageRuntime {
         cancelWork(code: .scopeDenied)
     }
 
-    public func activateLocalSetup(_ receipt: IMessageRuntimeSetupIntent) throws {
-        guard !retired else { throw IMessageSetupProviderError.accountChanged }
+    public func activateLocalSetup(_ receipt: IMessageRuntimeSetupIntent) async throws {
+        guard await applicationAdmission(), !retired else { throw IMessageSetupProviderError.accountChanged }
         try IMessageGatewayWire.validate(IMessageGatewaySnapshot(installationID: installationID, revision: 1, setupScope: receipt.scope))
         let expiry = try IMessageGatewayWire.utcDate(receipt.scope.expiresAt)
         guard receipt.scope.enabled, expiry > now(), expiry.timeIntervalSince(now()) <= 86400 else {
@@ -210,8 +227,8 @@ public actor IMessageRuntime {
         inventory = IMessageRuntimeInventory()
     }
 
-    public func setMetadataConsent(_ granted: Bool, for receipt: IMessageRuntimeSetupIntent) throws {
-        guard intent == receipt, try intentIsLive(receipt) else { throw IMessageSetupProviderError.accountChanged }
+    public func setMetadataConsent(_ granted: Bool, for receipt: IMessageRuntimeSetupIntent) async throws {
+        guard await applicationAdmission(), intent == receipt, try intentIsLive(receipt) else { throw IMessageSetupProviderError.accountChanged }
         metadataConsent = granted
         if !granted { restrictCurrentAuthority(); inventory = IMessageRuntimeInventory() }
     }
@@ -242,7 +259,22 @@ public actor IMessageRuntime {
         }
         let value = try inventory.retained(now: now())
         return .init(intent: receipt, conversations: value.rows, account: value.account,
-                     expiresAt: min(value.expiresAt, try IMessageGatewayWire.utcDate(receipt.scope.expiresAt)))
+                     expiresAt: min(value.expiresAt, try IMessageGatewayWire.utcDate(receipt.scope.expiresAt)), expectedSelections: value.expectedSelections)
+    }
+
+    /// Native edit intentions only. This neither installs an execution grant nor
+    /// restores consent, option tokens, expiry or cached metadata.
+    public func restorationIntentions(for receipt: IMessageRuntimeSetupIntent, configID: String,
+                                      expectedConfigVersion: Int64) throws -> IMessageRuntimeRestorationIntentions {
+        guard !retired, intent == receipt, metadataConsent, try intentIsLive(receipt),
+              let snapshot, sameAuthority(receipt.scope, snapshot.setupScope),
+              snapshot.configs.count == 1, let config = snapshot.configs.first,
+              config.configID == configID, config.configVersion == expectedConfigVersion,
+              config.workspaceID == receipt.scope.workspaceID else { throw IMessageSetupProviderError.accountChanged }
+        let selections = try config.conversationBindings.map {
+            try IMessageSetupDraft.Selection(nativeChatRowID: $0.nativeChatID.rawValue, expectedGUID: $0.nativeChatGUID)
+        }
+        return .init(selections: selections, account: .init(accountID: config.accountID, sourceGeneration: config.sourceGeneration), conversationIDs: config.conversationIDs)
     }
 
     public func restoreSelection(_ selections: [IMessageSetupDraft.Selection], account: IMessageSetupAccount,
@@ -333,10 +365,10 @@ public actor IMessageRuntime {
     }
 
     /// The ordered socket reader awaits this short operation. It starts no provider work.
-    public func install(_ value: IMessageGatewaySnapshot, connectionID: UUID) -> IMessageGatewayPayload {
+    public func install(_ value: IMessageGatewaySnapshot, connectionID: UUID) async -> IMessageGatewayPayload {
         do {
             try IMessageGatewayWire.validate(value)
-            guard !retired, self.connectionID == connectionID, value.installationID == installationID else { return failure(.scopeDenied) }
+            guard await applicationAdmission(), !retired, self.connectionID == connectionID, value.installationID == installationID else { return failure(.scopeDenied) }
             guard value.configs.count <= 1 else { return failure(.scopeDenied) }
             let incoming = value.configs.first
             if value.revision < highestSetupRevision, let setup = value.setupScope, let previous = snapshot?.setupScope,
@@ -366,10 +398,10 @@ public actor IMessageRuntime {
         } catch { return failure(.scopeDenied) }
     }
 
-    public func admit(_ command: IMessageGatewayCommand, connectionID: UUID, reply: @escaping Reply) -> IMessageGatewayFailure? {
+    public func admit(_ command: IMessageGatewayCommand, connectionID: UUID, reply: @escaping Reply) async -> IMessageGatewayFailure? {
         do {
             try IMessageGatewayWire.validate(command)
-            guard !retired, executionAvailable, self.connectionID == connectionID, let snapshot,
+            guard await applicationAdmission(), !retired, executionAvailable, self.connectionID == connectionID, let snapshot,
                   snapshot.revision == command.target.snapshotRevision else { return safeFailure(.scopeDenied, command: command) }
             let authority = try admissionAuthority(command, snapshot: snapshot)
             if command.operation == .sendMessage, let attempt = command.sendAttemptID,
@@ -382,6 +414,9 @@ public actor IMessageRuntime {
             let budget = command.operation == .sendMessage ? Self.sendLifetime : Self.commandLifetime
             var deadline = min(try IMessageGatewayWire.utcDate(command.deadlineAt), now().addingTimeInterval(budget))
             if case .setup(_, let scope) = authority { deadline = min(deadline, try IMessageGatewayWire.utcDate(scope.expiresAt)) }
+            if command.caller.kind == .humanAction, let receipt = humanIntents[command.authorizationID] {
+                deadline = min(deadline, receipt.deadline)
+            }
             guard deadline > now() else { return safeFailure(.providerTimeout, command: command) }
             let job = Job(id: UUID(), connectionID: connectionID, authority: authority, command: command,
                           admittedSnapshot: snapshot, deadline: deadline, reply: reply)
@@ -437,7 +472,10 @@ public actor IMessageRuntime {
                 && job.command.target.snapshotRevision > scope.revokedThrough && humanPermitted(job.command)
         }
     }
-    private func isCurrent(_ job: Job) -> Bool { !Task.isCancelled && active?.job.id == job.id && permitted(job) }
+    private func isCurrent(_ job: Job) async -> Bool {
+        guard await applicationAdmission() else { return false }
+        return !Task.isCancelled && active?.job.id == job.id && permitted(job)
+    }
     private func cancelInvalidJobs() {
         let rejected = waiting.filter { !permitted($0) }
         waiting.removeAll { !permitted($0) }
@@ -473,7 +511,13 @@ public actor IMessageRuntime {
     private func scheduleCleanup() {
         let previous = cleanup
         let provider = provider
-        cleanup = Task { await previous?.value; await provider.stop() }
+        let id = UUID()
+        cleanupID = id
+        cleanup = Task {
+            await previous?.value
+            await provider.stop()
+            if cleanupID == id { cleanupID = nil }
+        }
     }
 
     private func start(_ job: Job) {
@@ -509,19 +553,19 @@ public actor IMessageRuntime {
         do {
             await cleanup?.value
             try Task.checkCancellation()
-            guard permitted(job) else { throw RuntimeDenied.scope }
+            guard await isCurrent(job) else { throw RuntimeDenied.scope }
             if case .configured(let scope) = job.authority {
                 let authorized = try await authorizeConfigured(job.command, job.connectionID, job.deadline)
                 try Task.checkCancellation()
-                guard permitted(job), authorized.configs.first(where: { $0.configID == scope.configID }) == scope else { throw RuntimeDenied.scope }
+                guard await isCurrent(job), authorized.configs.first(where: { $0.configID == scope.configID }) == scope else { throw RuntimeDenied.scope }
                 try IMessageGatewayWire.validate(command: job.command, against: authorized, humanTextSHA256: humanDigest(job.command))
             }
             try Task.checkCancellation()
-            guard permitted(job) else { throw RuntimeDenied.scope }
+            guard await isCurrent(job) else { throw RuntimeDenied.scope }
             if job.command.operation == .sendMessage { mutationPhase = .possibleDispatch }
             let value = try await execute(job)
             try Task.checkCancellation()
-            guard permitted(job) else { throw RuntimeDenied.scope }
+            guard await isCurrent(job) else { throw RuntimeDenied.scope }
             let frame = DesktopControlFrame(type: "imessage", requestID: job.command.requestID, imessage: .result(value))
             try IMessageGatewayWire.validateResult(frame, for: job.command, snapshot: job.admittedSnapshot,
                 setupReferenceSHA256: referenceDigest(job.command.caller.setupSession?.setupReference ?? ""), humanTextSHA256: humanDigest(job.command))
@@ -541,8 +585,9 @@ public actor IMessageRuntime {
     }
     private func jobFailure(_ error: Error, job: Job, possibleDispatch: Bool) -> IMessageGatewayPayload {
         let wireCode: IMessageGatewayFailureCode? = (error as? IMessageGatewayWireError) == .resultTooLarge ? .payloadTooLarge : nil
+        let admissionCode: IMessageGatewayFailureCode? = error is RuntimeDenied ? .scopeDenied : nil
         let typedCode = (error as? IMessageSetupProviderError)?.code ?? (error as? IMessageRuntimeInventoryError)?.code
-            ?? (error as? IMessageConfiguredAuthorizationError)?.code ?? wireCode
+            ?? (error as? IMessageConfiguredAuthorizationError)?.code ?? wireCode ?? admissionCode
         if typedCode == .accountChanged {
             if case .setup = job.authority { restrictCurrentAuthority(); metadataConsent = false }
             else if case .configured(let scope) = job.authority, configuredScope == scope { configuredScope = nil; cancelInvalidJobs() }
@@ -579,14 +624,15 @@ public actor IMessageRuntime {
             let response = try await provider.conversations(after: request.after, upper: request.upper,
                 query: input.query, limit: input.limit, deadline: job.deadline)
             try Task.checkCancellation()
-            guard permitted(job) else { throw RuntimeDenied.scope }
+            guard await isCurrent(job) else { throw RuntimeDenied.scope }
             return .conversationsPage(try inventory.accept(response, input: input, request: request, now: now(), makeID: makeID))
         case .verifyConversations(let input):
             let selection = try inventory.verification(input.conversationIDs, now: now())
+            guard selection.rows.allSatisfy({ $0.metadata.available }) else { throw IMessageRuntimeInventoryError.invalidSelection }
             let response = try await provider.verify(conversations: selection.rows.map(\.metadata),
                 account: selection.account, deadline: job.deadline)
             try Task.checkCancellation()
-            guard permitted(job) else { throw RuntimeDenied.scope }
+            guard await isCurrent(job) else { throw RuntimeDenied.scope }
             try validateVerification(response, selected: selection.rows, account: selection.account)
             let rows = zip(selection.rows, response.conversations).map {
                 IMessageGatewaySetupConversation(conversationID: $0.0.conversationID, metadata: $0.1)

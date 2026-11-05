@@ -373,4 +373,27 @@ func terminalProbeRPCFailureRequiresANewExplicitCheckAndPreservesCheckpoint(meth
     #expect(await transport.methods.isEmpty)
     #expect(await transport.terminateCount == 0)
 }
+@Test func explicitProbeChecksCannotBypassRestartLatchByRecreatingBackendOrClient() async throws {
+    let budget = IMessageProviderRestartBudget()
+    for _ in 0..<4 {
+        let transport = ScriptedProbeTransport()
+        let client = IMessageRPCClient(transport: transport, restartBudget: budget)
+        let backend = CoreProbeBackend(client: client, target: backendTarget) { _ in liveAccount() }
+        _ = try await backend.readiness(requestAutomation: false)
+        await transport.failNext("personastack.status")
+        await #expect(throws: IMessageRPCError.processExited) { try await backend.readiness(requestAutomation: false) }
+        #expect(await transport.launchCount == 1)
+        #expect(await transport.isClosed())
+        #expect(!(await transport.methods.contains("personastack.send")))
+    }
+    let transport = ScriptedProbeTransport()
+    let client = IMessageRPCClient(transport: transport, restartBudget: budget)
+    let backend = CoreProbeBackend(client: client, target: backendTarget) { _ in liveAccount() }
+    for _ in 0..<2 {
+        await #expect(throws: IMessageRPCError.restartLimitReached) { try await backend.readiness(requestAutomation: false) }
+    }
+    #expect(await transport.launchCount == 0)
+    #expect(await transport.methods.isEmpty)
+    #expect(budget.snapshot().exhausted)
+}
 #endif

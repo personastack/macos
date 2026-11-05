@@ -210,12 +210,13 @@ public actor CoreProbeBackend: ProbeBackend {
         guard let failure = error as? IMessageRPCError else { return }
         switch failure {
         case .alreadyStarted, .busy, .invalidArguments, .providerRejected: return
-        case .notStarted, .invalidResponse, .frameTooLarge, .dependencyInvalid,
+        case .notStarted, .invalidResponse, .frameTooLarge, .dependencyInvalid, .restartLimitReached,
              .processExited, .deadlineExceeded, .cancelled, .outcomeUnknown: break
         }
         // No retry occurs here. A later explicit prerequisite check may start
         // one fresh provider only after this cleanup has joined. Retain the
         // live GUID and checkpoint so restart cannot erase continuity fences.
+        // stop never resets the client's shared app-lifetime restart budget.
         clientStarted = false
         await client.stop()
     }

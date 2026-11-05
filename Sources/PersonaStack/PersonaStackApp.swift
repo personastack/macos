@@ -40,6 +40,8 @@ struct PersonaStackApp: App {
         return image
     }()
     init() {
+        let registrationService = DesktopLoginItemRegistration.Service.current
+        let loginRegistration = Task { @MainActor in await DesktopLoginItemRegistration.reconcileAtLaunch(service: registrationService) }
         let foregroundUpdateRelaunch = UserDefaults.standard.bool(forKey: DesktopUpdater.foregroundUpdateRelaunchKey)
             || DesktopApplicationRestart.resumesPermissionSetup || DesktopApplicationRestart.resumesIMessageSetup
         guard let configuration = try? LaunchConfiguration.selectedEnvironment() else { return }
@@ -53,7 +55,11 @@ struct PersonaStackApp: App {
                                                             foregroundUpdateRelaunch: foregroundUpdateRelaunch) {
             NSApplication.shared.setActivationPolicy(.accessory)
         }
+        let applicationDelegate = terminationDelegate
         Task { @MainActor in
+            await loginRegistration.value
+            guard registrationService.isAcceptingRegistrations, applicationDelegate.admitsNativeIMessageOperations,
+                  DesktopUpdater.shared.admitsNativeIMessageOperations else { return }
             _ = MainWebViewHost.shared
             await DesktopControlRuntime.shared.startAtLaunch(configuration: configuration, paused: dcPaused)
         }
@@ -89,7 +95,7 @@ struct PersonaStackApp: App {
                     terminationDelegate.closeToMenuBar(NSApp)
                 }
                 .keyboardShortcut("q", modifiers: [.command])
-                .help("Hide PersonaStack windows and keep Desktop Control running. Quit PersonaStack from its menu bar icon to stop the app.")
+                .help("Hide PersonaStack windows and keep background connections running. Quit PersonaStack from its menu bar icon to stop the app.")
             }
             CommandGroup(after: .toolbar) {
                 Button("Toggle Full Screen") {
@@ -404,6 +410,9 @@ struct PersonaStackWebView: NSViewRepresentable {
         let delegate = applicationDelegate
         IMessageSetupManager.shared.navigateMainWindow = { [weak delegate] destination in delegate?.openMainPage(destination) }
         applicationDelegate.openIMessageSetup = { IMessageSetupManager.shared.receive($0) }
+        applicationDelegate.openIMessageSaved = { IMessageSetupManager.shared.receive($0) }
+        IMessageSetupManager.shared.lifetimeAdmitsOperations = { [weak delegate] in delegate?.admitsNativeIMessageOperations == true }
+        DesktopControlRuntime.shared.onIMessageConnectionRecovery = { IMessageSetupManager.shared.recoverPendingPause() }
         applicationDelegate.installMainWindowReopener {
             MainWebViewHost.showMainWindow { action(id: "personastack-main") }
         }

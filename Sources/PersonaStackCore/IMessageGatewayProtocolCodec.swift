@@ -26,6 +26,7 @@ private struct IMessageGatewayAnyKey: CodingKey {
 /// Strict finite HTTP documents reuse the gateway's bounded lexer. Typed
 /// decoders still own each document's required and optional field contracts.
 public enum IMessageJSONDocument {
+    public static let maximumDocumentBytes = (8 << 20) + 16384
     public static func validate(data: Data, maximumBytes: Int) throws {
         var inspection = try IMessageGatewayJSONInspection(data, maximumBytes: maximumBytes, strictDocument: true)
         _ = try inspection.inspect()
@@ -48,7 +49,8 @@ internal struct IMessageGatewayJSONInspection {
     private var invalidNegotiation = false
 
     init(_ data: Data, maximumBytes: Int = DesktopControlFrameCodec.maximumFrameBytes, strictDocument: Bool = false) throws {
-        guard maximumBytes > 0, maximumBytes <= DesktopControlFrameCodec.maximumFrameBytes,
+        let permitted = strictDocument ? IMessageJSONDocument.maximumDocumentBytes : DesktopControlFrameCodec.maximumFrameBytes
+        guard maximumBytes > 0, maximumBytes <= permitted,
               data.count <= maximumBytes else { throw IMessageGatewayWireError.frameTooLarge }
         guard String(data: data, encoding: .utf8) != nil else { throw IMessageGatewayWireError.invalidFrame }
         bytes = Array(data)

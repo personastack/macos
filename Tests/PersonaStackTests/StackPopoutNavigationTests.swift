@@ -70,7 +70,7 @@ struct StackPopoutNavigationTests {
         var destinations: [URL] = []
         var reopens = 0
         let delegate = PersonaStackTerminationDelegate(shutdown: { true }, terminate: { _ in }, timeout: .seconds(1),
-            navigateMainWindow: { destinations.append($0) })
+            navigateMainWindow: { destinations.append($0) }, registrationService: isolatedLoginRegistrationService())
         delegate.installMainWindowReopener { reopens += 1 }
         let manager = StackWindowManager(loadPages: false, defaults: preferences.defaults, presentWindows: false)
         manager.navigateMainWindow = { delegate.openMainPage($0) }

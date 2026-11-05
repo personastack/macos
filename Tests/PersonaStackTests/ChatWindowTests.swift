@@ -173,7 +173,7 @@ struct ChatWindowTests {
         var destinations: [URL] = []
         var reopens = 0
         let delegate = PersonaStackTerminationDelegate(shutdown: { true }, terminate: { _ in }, timeout: .seconds(1),
-            navigateMainWindow: { destinations.append($0) })
+            navigateMainWindow: { destinations.append($0) }, registrationService: isolatedLoginRegistrationService())
         delegate.installMainWindowReopener {
             #expect(destinations.count == reopens)
             reopens += 1
@@ -206,7 +206,7 @@ struct ChatWindowTests {
         var destinations: [URL] = []
         var reopens = 0
         let delegate = PersonaStackTerminationDelegate(shutdown: { true }, terminate: { _ in }, timeout: .seconds(1),
-            navigateMainWindow: { destinations.append($0) })
+            navigateMainWindow: { destinations.append($0) }, registrationService: isolatedLoginRegistrationService())
         let destination = try #require(URL(string: "https://example.invalid/user/personas/p-1"))
         delegate.openMainPage(destination)
         #expect(destinations.isEmpty && reopens == 0)

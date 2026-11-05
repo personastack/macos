@@ -216,6 +216,7 @@ private actor IMessageSessionProviderTransport: IMessageRPCTransport {
     private var closed = false
     private var receiver: CheckedContinuation<Data, any Error>?
     private(set) var launches = 0
+    private(set) var methods: [String] = []
     func launch() { launches += 1; closed = false }
     func terminate() { closed = true; bytes.removeAll(); receiver?.resume(returning: Data()); receiver = nil }
     func read(maximumBytes: Int) async throws -> Data {
@@ -229,6 +230,7 @@ private actor IMessageSessionProviderTransport: IMessageRPCTransport {
         let request = try #require(decoded as? [String: Any])
         let method = try #require(request["method"] as? String)
         let id = try #require(request["id"] as? String)
+        methods.append(method)
         let result: [String: Any]
         switch method {
         case "personastack.initialize", "personastack.status":
@@ -262,9 +264,9 @@ private actor IMessageSessionProviderTransport: IMessageRPCTransport {
     }
 }
 
-private func sessionReplacementIntent(_ generation: Int64) -> IMessageRuntimeSetupIntent {
+private func sessionReplacementIntent(_ generation: Int64, expiresAt: String? = nil) -> IMessageRuntimeSetupIntent {
     .init(localGeneration: UUID(), scope: .init(setupReferenceSHA256: IMessageSetupProvider.setupReferenceDigest(String(repeating: "A", count: 43)),
-        generation: generation, workspaceID: "w", userID: "u", expiresAt: ISO8601DateFormatter().string(from: Date().addingTimeInterval(300)), enabled: true))
+        generation: generation, workspaceID: "w", userID: "u", expiresAt: expiresAt ?? ISO8601DateFormatter().string(from: Date().addingTimeInterval(300)), enabled: true))
 }
 
 private func sessionReplacementSnapshot(_ intent: IMessageRuntimeSetupIntent, revision: Int64, id: String, socket: IMessageRuntimeSocket, bounded: Bool = false) async throws -> DesktopControlFrame {
@@ -315,7 +317,10 @@ func iMessageSessionReplacementAllowsFreshSetupOnTheCurrentGatewayActor(permanen
     await #expect(throws: IMessageSetupProviderError.accountChanged) { try await original.runtime.setMetadataConsent(true, for: oldIntent) }
     let current = try await runtime.iMessageSetupSession()
     #expect((current.runtime === original.runtime) == !permanent)
-    let newIntent = sessionReplacementIntent(2)
+    // This is a new authorization generation of the same setup journey. Its
+    // original expiry must not slide when this test crosses a wall-clock second.
+    let newIntent = sessionReplacementIntent(2, expiresAt: oldIntent.scope.expiresAt)
+    #expect(newIntent.scope.expiresAt == oldIntent.scope.expiresAt)
     try await current.runtime.activateLocalSetup(newIntent)
     try await current.runtime.setMetadataConsent(true, for: newIntent)
     _ = try await runtime.resumeIMessageSetupRelay(for: newIntent)
@@ -495,7 +500,7 @@ func iMessageLifecycleLossCannotBeErasedByImmediateRecovery(loss: String) async 
     #expect(current.runtime === fixture.session.runtime)
     await #expect(throws: IMessageSetupProviderError.accountChanged) { try await current.runtime.setMetadataConsent(true, for: fixture.intent) }
     for provider in fixture.state.providers { #expect(await provider.launches == 0) }
-    let newIntent = sessionReplacementIntent(2)
+    let newIntent = sessionReplacementIntent(2, expiresAt: fixture.intent.scope.expiresAt)
     try await current.runtime.activateLocalSetup(newIntent)
     try await current.runtime.setMetadataConsent(true, for: newIntent)
     _ = try await fixture.runtime.resumeIMessageSetupRelay(for: newIntent)
@@ -522,7 +527,8 @@ private actor IMessageReplyFailureProvider: IMessageSetupProviding {
     private(set) var operations: [String] = []
     private var nextStopGate: ConfiguredRuntimeGate?
     func holdNextStop(_ gate: ConfiguredRuntimeGate) { nextStopGate = gate }
-    init(failSend: Bool) { self.failSend = failSend }
+    let statusFailure: Bool
+    init(failSend: Bool, statusFailure: Bool = false) { self.failSend = failSend; self.statusFailure = statusFailure }
     func prerequisites(deadline: Date) -> IMessageGatewayPrerequisitesResult {
         operations.append("prerequisites")
         return .init(databaseReady: true)
@@ -538,7 +544,9 @@ private actor IMessageReplyFailureProvider: IMessageSetupProviding {
         #expect(try await validateCurrent())
         operations.append(input.operationRawValue)
         switch input {
-        case .status: return .status(.init(state: .connected))
+        case .status:
+            if statusFailure { throw IMessageSetupProviderError.permissionRequired }
+            return .status(.init(state: .connected))
         case .sendMessage(let request):
             if failSend { throw IMessageSetupProviderError.busy }
             return .sendMessage(.init(conversationID: request.conversationID, clientRequestID: request.clientRequestID,
@@ -701,4 +709,326 @@ func iMessageReplyTransportFailureDrainsAndAllowsFreshBindingWithoutReplay(mode:
     await drain.value
     #expect(await provider.operations == ["imessage_send_message"])
     await runtime.drain()
+}
+
+@Test(arguments: ["replacement", "loss"]) @MainActor
+func iMessageHumanContextCapturesOneActualPhysicalBindingAndCannotSurviveRetirement(reason: String) async throws {
+    let state = IMessageSessionFactoryState()
+    let installation = try gatewayRuntimeInstallation()
+    let preferences = try #require(UserDefaults(suiteName: "IMessageHumanContext-\(UUID().uuidString)"))
+    preferences.set(true, forKey: IMessagePreferenceKeys.relayEnabled(.production))
+    let runtime = DesktopControlRuntime.makeForTesting(installer: IMessageSessionInstaller(), credentials: IMessageSessionCredentials(installation: installation),
+        iMessageProviderFactory: { state.provider() }, gatewaySocketFactory: { state.socket() }, paused: true,
+        sessionLockState: .unlocked, scheduleReconnect: false, preferences: preferences)
+    let session = try await runtime.iMessageSetupSession()
+    let intent = sessionReplacementIntent(1)
+    try await session.runtime.activateLocalSetup(intent)
+    try await session.runtime.setMetadataConsent(true, for: intent)
+    _ = try await runtime.resumeIMessageSetupRelay(for: intent)
+    let context = try await runtime.captureIMessageHumanContext()
+    try runtime.validateIMessageHumanContext(context)
+    if reason == "replacement" { await runtime.suspendIMessageForReplacement() }
+    else { runtime.signalLifecycleLossForTesting() }
+    #expect(throws: IMessageHumanContextError.changed) { try runtime.validateIMessageHumanContext(context) }
+    await runtime.shutdownForQuit()
+    #expect(state.providers.count == 1)
+}
+
+
+private actor IMessageMenuStatusObservations {
+    private(set) var values: [IMessageMenuState] = []
+    func put(_ value: IMessageMenuState) { values.append(value) }
+}
+
+@Test(arguments: [false, true])
+func iMessageConfiguredGatewayReportsBoundCurrentProviderStatusWithoutASetupPage(permissionFailure: Bool) async throws {
+    let provider = IMessageReplyFailureProvider(failSend: false, statusFailure: permissionFailure)
+    let observed = IMessageMenuStatusObservations()
+    let scope = try configuredFixtureScope()
+    let snapshot = IMessageGatewaySnapshot(installationID: "gateway-mac", revision: 3, configs: [scope])
+    let runtime = IMessageRuntime(installationID: "gateway-mac", provider: provider, referenceDigest: IMessageSetupProvider.setupReferenceDigest,
+        authorizeConfigured: { _, _, _ in snapshot })
+    await runtime.setConfiguredPolicy(enabled: true)
+    let socket = IMessageRuntimeSocket()
+    try socket.push(.init(type: "ready", imessageProtocolVersion: 2))
+    let connection = DesktopControlGatewayConnection(installation: try gatewayRuntimeInstallation(), socket: socket, iMessageRuntime: runtime,
+        onIMessageStatus: { await observed.put($0) }) { _, _ in Issue.record("Configured status must not use CUA"); return .init(type: "failure") }
+    try await connection.connect()
+    try socket.push(.init(type: "imessage", requestID: "status-snapshot", imessage: .snapshot(snapshot)))
+    _ = try await boundedReplyFailureResponse(socket, requestID: "status-snapshot")
+    let command = IMessageGatewayCommand(requestID: "provider-status", authorizationID: "current-status-grant",
+        deadlineAt: ISO8601DateFormatter().string(from: Date().addingTimeInterval(10)),
+        target: .init(installationID: "gateway-mac", workspaceID: "workspace", snapshotRevision: 3, configID: "config", configVersion: 2,
+            accountGeneration: "account", sourceGeneration: "source"),
+        caller: .init(personaMCP: .init(principalID: "principal", personaID: "persona", bindingVersion: 1)), input: .configured(.status(.init(integrationID: "config"))))
+    try socket.push(.init(type: "imessage", requestID: command.requestID, imessage: .command(command)))
+    _ = try await boundedReplyFailureResponse(socket, requestID: command.requestID)
+    #expect(await waitForReplyFailureEvent { await observed.values.count == 1 })
+    #expect(await observed.values == [permissionFailure ? .needsAttention : .connected])
+    #expect(await provider.operations == ["imessage_status"])
+    await connection.stopAndDrainIMessage()
+}
+
+private actor IMessageReplacementBarrier {
+    private(set) var entered = false
+    private var released = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    func pause() async {
+        entered = true
+        if released { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func release() { released = true; continuation?.resume(); continuation = nil }
+}
+
+private actor IMessageReplacementAuthorization: AgentBridgeHostedTransport {
+    let scope: IMessageGatewayConfigScope
+    private(set) var requests: [String] = []
+    private(set) var holding = false
+    private var hold = false
+    private var pending: CheckedContinuation<(Data, Int), any Error>?
+    private var heldResponse: Data?
+    init(scope: IMessageGatewayConfigScope) { self.scope = scope }
+    func holdNext() { hold = true }
+    func request(_ request: URLRequest) async throws -> (Data, Int) {
+        #expect(request.url?.path == "/v1/desktop-control/imessage/commands/authorize")
+        #expect(request.httpMethod == "POST" && !request.httpShouldHandleCookies)
+        let body = try #require(request.httpBody)
+        let command = try JSONDecoder().decode(IMessageGatewayNativeCommandRequest.self, from: body).command
+        requests.append(command.requestID)
+        let snapshot = IMessageGatewaySnapshot(installationID: "gateway-mac", revision: command.target.snapshotRevision, configs: [scope])
+        let data = try JSONEncoder().encode(IMessageGatewayNativeAuthorizationResponse(authorized: true, snapshot: snapshot))
+        if hold {
+            hold = false; holding = true; heldResponse = data
+            // Intentionally return the late HTTP response despite cancellation.
+            // The real authorization client must enforce its post-await fence.
+            return try await withCheckedThrowingContinuation { pending = $0 }
+        }
+        return (data, 200)
+    }
+    func release() {
+        if let pending, let heldResponse { pending.resume(returning: (heldResponse, 200)) }
+        pending = nil; heldResponse = nil; holding = false
+    }
+}
+
+private struct IMessageReplacementRelayState: DesktopControlRelayStateReading {
+    func configurationState(installation: DesktopControlInstallation, appURL: URL) -> DesktopControlConfigurationState {
+        #expect(installation.installationID == "gateway-mac")
+        return .init(hasActiveConfig: false, hasConfig: false, hasActiveIMessageConfig: true, hasIMessageConfig: true)
+    }
+}
+
+@MainActor private final class IMessageReplacementUpdateClient: DesktopUpdateClient {
+    var canCheckForUpdates = true
+    var automaticallyChecksForUpdates = false
+    var automaticallyDownloadsUpdates = false
+    func start() {}
+    func checkForUpdates() { Issue.record("No Sparkle network check") }
+}
+
+@MainActor private final class IMessageReplacementProgress {
+    var drainStarted = false
+    var drainFinished = false
+    var installations = 0
+}
+
+@MainActor private final class IMessageActualReplacementFixture {
+    let installation: DesktopControlInstallation
+    let state = IMessageSessionFactoryState()
+    let registration: HeldLoginRegistrationFixture
+    let bridge = IMessageReplacementBarrier()
+    let progress = IMessageReplacementProgress()
+    let authorization: IMessageReplacementAuthorization
+    let scope: IMessageGatewayConfigScope
+    let preferences: UserDefaults
+    let suite: String
+    let runtime: DesktopControlRuntime
+    let updater: DesktopUpdater
+    init(credentials: (any DesktopControlCredentialStoring)? = nil) throws {
+        let installation = try gatewayRuntimeInstallation(); self.installation = installation
+        registration = try HeldLoginRegistrationFixture(outcome: "success")
+        scope = .init(configID: "config", workspaceID: "w", configVersion: 2, accountGeneration: "epoch", sourceGeneration: "source",
+            accountID: "account", conversationIDs: ["chat"], conversationBindings: [.init(conversationID: "chat", nativeChatID: try IMessageRowID(1), nativeChatGUID: "selected-guid")], readEnabled: true, sendEnabled: true)
+        let authorization = IMessageReplacementAuthorization(scope: scope); self.authorization = authorization
+        let suite = "ActualReplacement.\(UUID().uuidString)"; self.suite = suite
+        guard let preferences = UserDefaults(suiteName: suite) else { throw CocoaError(.fileReadUnknown) }
+        self.preferences = preferences
+        preferences.set(true, forKey: IMessagePreferenceKeys.relayEnabled(.production))
+        let state = state
+        let runtime = DesktopControlRuntime.makeForTesting(installer: IMessageSessionInstaller(),
+            credentials: credentials ?? IMessageSessionCredentials(installation: installation), iMessageProviderFactory: { state.provider() },
+            gatewaySocketFactory: { state.socket() }, iMessageAuthorizationClient: .init(transport: authorization), paused: true,
+            sessionLockState: .locked, relayStateReader: IMessageReplacementRelayState(), scheduleReconnect: false, preferences: preferences,
+            registrationService: registration.service)
+        self.runtime = runtime
+        let progress = progress, bridge = bridge
+        updater = DesktopUpdater(updaterFactory: { _, _ in IMessageReplacementUpdateClient() }, preferences: preferences,
+            presentReadyReminder: { _ in }, clearAvailableNotification: { _ in }, clearUpdateNotifications: { _ in }, confirmRestart: { true },
+            agentBridgeNeedsHandoff: { true }, prepareAgentBridgeUpdate: { await bridge.pause() }, cancelAgentBridgeUpdate: {},
+            imessageNeedsHandoff: { true }, prepareIMessageUpdate: {
+                progress.drainStarted = true
+                await runtime.suspendIMessageForReplacement()
+                progress.drainFinished = true
+            }, registrationService: registration.service)
+    }
+    func connect() async throws {
+        _ = try await runtime.iMessageSetupSession()
+        await runtime.connect(installation: installation)
+        #expect(runtime.gatewayConnected)
+    }
+    func command(_ id: String, revision: Int64) -> IMessageGatewayCommand {
+        .init(requestID: id, authorizationID: "grant-" + id, deadlineAt: ISO8601DateFormatter().string(from: Date().addingTimeInterval(10)),
+            target: .init(installationID: "gateway-mac", workspaceID: "w", snapshotRevision: revision, configID: "config", configVersion: 2,
+                accountGeneration: "epoch", sourceGeneration: "source"),
+            caller: .init(personaMCP: .init(principalID: "principal", personaID: "persona", bindingVersion: 1)), input: .configured(.status(.init(integrationID: "config"))))
+    }
+    func install(_ revision: Int64, id: String) async throws -> DesktopControlFrame {
+        let socket = try #require(state.sockets.last)
+        try socket.push(.init(type: "imessage", requestID: id, imessage: .snapshot(.init(installationID: "gateway-mac", revision: revision, configs: [scope]))))
+        return try await boundedReplyFailureResponse(socket, requestID: id)
+    }
+    func status(_ id: String, revision: Int64) async throws -> DesktopControlFrame {
+        let socket = try #require(state.sockets.last)
+        try socket.push(.init(type: "imessage", requestID: id, imessage: .command(command(id, revision: revision))))
+        return try await boundedReplyFailureResponse(socket, requestID: id)
+    }
+    func beginReplacement() {
+        #expect(updater.retainAutomaticInstallHandler(version: "0.99.0", handler: { self.progress.installations += 1 }))
+        updater.restartToInstall()
+    }
+    func cancelReplacement() async {
+        updater.cancelBackgroundUpdate()
+        let task = Task { await self.updater.resumeBackgroundAgentsAfterCanceledUpdate() }
+        registration.release()
+        await bridge.release()
+        await task.value
+    }
+    func cleanup() async {
+        await authorization.release()
+        await cancelReplacement()
+        await runtime.shutdownForQuit()
+        await registration.finish()
+        preferences.removePersistentDomain(forName: suite)
+    }
+}
+
+@Test(arguments: ["bridge", "registration"], ["cancel", "terminal", "failed-quit"]) @MainActor
+func iMessageActualReplacementRejectsFreshGatewayWorkUntilJoinedCancellation(heldAt: String, completion: String) async throws {
+    let f = try IMessageActualReplacementFixture()
+    do {
+    try await f.connect()
+    _ = try await f.install(1, id: "baseline-snapshot")
+    guard case .result(.configured(.status))? = try await f.status("baseline", revision: 1).imessage else {
+        Issue.record("Fixture must prove actual configured provider operation before replacement"); await f.cleanup(); return
+    }
+    if heldAt == "registration" {
+        f.registration.start()
+        let registered = await f.registration.waitForStartup(held: true)
+        #expect(registered)
+    }
+    f.beginReplacement()
+    let drained = await loginLifecycleObserved { f.progress.drainFinished }
+    #expect(drained)
+    if heldAt == "bridge" { #expect(await waitForReplyFailureEvent { await f.bridge.entered }) }
+    let requestsBefore = await f.authorization.requests.count
+    let providerCallsBefore = await f.state.providers.first?.methods.count
+    _ = try await f.install(2, id: "closed-snapshot")
+    let rejected = try await f.status("during-replacement", revision: 2)
+    if case .failure? = rejected.imessage {} else { Issue.record("Fresh configured command executed during app replacement") }
+    #expect(await f.authorization.requests.count == requestsBefore)
+    #expect(await f.state.providers.first?.methods.count == providerCallsBefore)
+    var exits = 0, quitFailures = 0
+    let quit = PersonaStackTerminationDelegate(shutdown: { completion != "failed-quit" }, terminate: { _ in exits += 1 }, timeout: .seconds(1),
+        showCleanupFailure: { quitFailures += 1 }, registrationService: f.registration.service)
+    if completion != "cancel" { #expect(quit.applicationShouldTerminate(NSApplication.shared) == .terminateCancel) }
+    await f.cancelReplacement()
+    if completion == "terminal" {
+        #expect(await loginLifecycleObserved { exits == 1 })
+        await #expect(throws: (any Error).self) { _ = try await f.runtime.iMessageSetupSession() }
+    } else {
+        if completion == "failed-quit" { #expect(await loginLifecycleObserved { quitFailures == 1 }) }
+        #expect(f.registration.service.isAcceptingRegistrations)
+        await f.runtime.connect(installation: f.installation)
+        _ = try await f.install(3, id: "resumed-snapshot")
+        let before = await f.authorization.requests.count
+        let resumed = try await f.status("explicit-fresh", revision: 3)
+        if case .result(.configured(.status))? = resumed.imessage {} else { Issue.record("Fresh current authorization did not recover after joined cancellation") }
+        #expect(await f.authorization.requests.count == before + 1)
+    }
+    #expect(f.progress.installations == 0)
+    } catch {
+        await f.cleanup()
+        throw error
+    }
+    await f.cleanup()
+}
+
+@Test @MainActor func iMessageActualReplacementRejectsAConfiguredAuthorizationReturningAfterClosure() async throws {
+    let f = try IMessageActualReplacementFixture()
+    do {
+    try await f.connect()
+    _ = try await f.install(1, id: "held-auth-snapshot")
+    await f.authorization.holdNext()
+    let socket = try #require(f.state.sockets.first)
+    try socket.push(.init(type: "imessage", requestID: "before-close", imessage: .command(f.command("before-close", revision: 1))))
+    #expect(await waitForReplyFailureEvent { await f.authorization.holding })
+    f.beginReplacement()
+    #expect(await loginLifecycleObserved { f.progress.drainStarted })
+    await f.authorization.release()
+    _ = try await boundedReplyFailureResponse(socket, requestID: "before-close")
+    #expect(await waitForReplyFailureEvent { await f.bridge.entered })
+    #expect(await f.authorization.requests == ["before-close"])
+    for provider in f.state.providers { #expect(await provider.launches == 0) }
+    } catch {
+        await f.cleanup()
+        throw error
+    }
+    await f.cleanup()
+}
+
+private final class IMessageReplacementCredentials: DesktopControlCredentialStoring, @unchecked Sendable {
+    let installation: DesktopControlInstallation
+    private let lock = NSLock()
+    private let gate = DispatchSemaphore(value: 0)
+    private var held = false
+    private var released = false
+    var entered: Bool { lock.withLock { held } }
+    init(installation: DesktopControlInstallation) { self.installation = installation }
+    func load() throws -> DesktopControlInstallation? {
+        let wait = lock.withLock { held = true; return !released }
+        if wait, gate.wait(timeout: .now() + 3) != .success { throw CancellationError() }
+        return installation
+    }
+    func release() { lock.withLock { released = true }; gate.signal() }
+    func save(_ installation: DesktopControlInstallation) throws { Issue.record("No credential mutation") }
+    func delete() throws { Issue.record("No credential deletion") }
+}
+
+@Test @MainActor func iMessageActualReplacementPreventsStartupCredentialAndFactoryPublicationAcrossClosure() async throws {
+    let credentials = IMessageReplacementCredentials(installation: try gatewayRuntimeInstallation())
+    let f = try IMessageActualReplacementFixture(credentials: credentials)
+    let startup = Task { await f.runtime.startAtLaunch(configuration: .production, paused: true) }
+    do {
+    let entered = await loginLifecycleObserved { credentials.entered }
+    #expect(entered)
+    f.beginReplacement()
+    #expect(await waitForReplyFailureEvent { await f.bridge.entered })
+    credentials.release()
+    await startup.value
+    #expect(f.state.providers.isEmpty && f.state.sockets.isEmpty && !f.runtime.gatewayConnected)
+    await f.cancelReplacement()
+    await f.runtime.startAtLaunch(configuration: .production, paused: true)
+    #expect(f.state.providers.count == 1 && f.state.sockets.count == 1 && f.runtime.gatewayConnected)
+    _ = try await f.install(4, id: "fresh-startup-snapshot")
+    let fresh = try await f.status("fresh-startup-command", revision: 4)
+    if case .result(.configured(.status))? = fresh.imessage {} else { Issue.record("Fresh startup must obtain current authorization") }
+    #expect(await f.authorization.requests == ["fresh-startup-command"])
+    } catch {
+        credentials.release()
+        await startup.value
+        await f.cleanup()
+        throw error
+    }
+    await f.cleanup()
 }

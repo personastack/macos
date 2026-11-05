@@ -188,12 +188,28 @@ struct DesktopControlDiagnosticReport: Sendable {
     var cuaCheckFailure: String? = nil
     var serviceRecoveryAttempts = 0
     var serviceRecoveryInProgress = false
+    var iMessageRuntime: IMessageRuntimeDiagnostics? = nil
+    var iMessageProvider: IMessageRPCDiagnostics? = nil
+    var iMessageRestarts: IMessageProviderRestartBudget.Snapshot? = nil
 
     var text: String {
         let last = lastConnection.map { $0.ISO8601Format() } ?? "Not observed"
         let resources = resources.map {
             "Processes: \($0.activeProcesses)\nFile handles: \($0.openFileHandles)\nBuffered bytes: \($0.bufferedOutputBytes)\nOutput gaps: \($0.outputGapsTotal)"
         } ?? "Resource counts: unavailable"
+        let messages = iMessageRestarts.map { restarts in
+            var lines = ["iMessage diagnostics", "Provider restarts (5 minutes): \(restarts.recentRestarts)", "Provider Retry required: \(restarts.exhausted)"]
+            if let state = iMessageRuntime {
+                lines += ["Waiting commands: \(state.waitingCommands)", "Active command: \(state.activeCommand)",
+                    "Runtime cleanup pending: \(state.cleanupPending)", "Selection restoration pending: \(state.restorationPending)"]
+            }
+            if let provider = iMessageProvider {
+                lines += ["RPC buffered bytes: \(provider.bufferedBytes)", "RPC request pending: \(provider.requestPending)",
+                    "Provider started: \(provider.started)", "Provider ready: \(provider.ready)", "Provider cleanup pending: \(provider.cleanupPending)"]
+                if let resources = provider.resources { lines += ["Owned provider processes: \(resources.ownedChildren)", "Owned pipe handles: \(resources.ownedPipeHandles)"] }
+            }
+            return "\n\n" + lines.joined(separator: "\n")
+        } ?? ""
         return """
         PersonaStack diagnostics
         App version: \(Self.versionLabel(appVersion))
@@ -212,7 +228,7 @@ struct DesktopControlDiagnosticReport: Sendable {
         Reconnect pending: \(reconnectPending)
         Cleanup pending: \(cleanupPending)
         \(resources)
-        """
+        """ + messages
     }
 
     private static func versionLabel(_ value: String) -> String {

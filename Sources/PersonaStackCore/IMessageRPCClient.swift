@@ -6,6 +6,11 @@ public protocol IMessageRPCTransport: Sendable {
     func read(maximumBytes: Int) async throws -> Data
     func write(_ data: Data) async throws
     func terminate() async
+    func resources() async -> IMessageProviderResources?
+}
+
+public extension IMessageRPCTransport {
+    func resources() async -> IMessageProviderResources? { nil }
 }
 
 public actor IMessageRPCClient {
@@ -17,6 +22,8 @@ public actor IMessageRPCClient {
     public static let maximumChatMetadataResultBytes = 1024 * 1024
     private static let chatMetadataEnvelopeBytes = 256
     private let transport: any IMessageRPCTransport
+    private let restartBudget: IMessageProviderRestartBudget
+    private let now: @Sendable () -> Date
     private var generation: UInt64 = 0
     private var sequence: UInt64 = 0
     private var started = false
@@ -29,6 +36,7 @@ public actor IMessageRPCClient {
     private var mutationDeadline: Date?
     private var receiptDeadline: Date?
     private let readTimeoutSeconds: TimeInterval
+    private let initializationTimeoutSeconds: TimeInterval
     private let sendTimeoutSeconds: TimeInterval
     private var buffer = Data()
     private var reader: Task<Void, Never>?
@@ -45,15 +53,23 @@ public actor IMessageRPCClient {
         var dispatched = false
     }
 
-    public init(transport: any IMessageRPCTransport) {
+    public init(transport: any IMessageRPCTransport, restartBudget: IMessageProviderRestartBudget = .init()) {
         self.transport = transport
+        self.restartBudget = restartBudget
+        self.now = Date.init
         self.readTimeoutSeconds = 10
+        self.initializationTimeoutSeconds = 10
         self.sendTimeoutSeconds = 45
     }
 
-    internal init(transport: any IMessageRPCTransport, readTimeoutSeconds: TimeInterval, sendTimeoutSeconds: TimeInterval) {
+    internal init(transport: any IMessageRPCTransport, readTimeoutSeconds: TimeInterval, sendTimeoutSeconds: TimeInterval,
+                  restartBudget: IMessageProviderRestartBudget = .init(), now: @escaping @Sendable () -> Date = Date.init,
+                  initializationTimeoutSeconds: TimeInterval? = nil) {
         self.transport = transport
+        self.restartBudget = restartBudget
+        self.now = now
         self.readTimeoutSeconds = readTimeoutSeconds
+        self.initializationTimeoutSeconds = initializationTimeoutSeconds ?? readTimeoutSeconds
         self.sendTimeoutSeconds = sendTimeoutSeconds
     }
 
@@ -75,6 +91,7 @@ public actor IMessageRPCClient {
     public func start() async throws -> IMessageRPCStatus {
         guard !started, !stopping, !transportNeedsCleanup else { throw IMessageRPCError.alreadyStarted }
         try Task.checkCancellation()
+        try restartBudget.beforeLaunch()
         generation &+= 1
         let current = generation
         started = true
@@ -83,7 +100,10 @@ public actor IMessageRPCClient {
         launchTask = launch
         do { try await launch.value }
         catch {
-            if generation == current { await stop() }
+            if generation == current {
+                if !Task.isCancelled { restartBudget.recordUnexpectedFailure() }
+                await stop()
+            }
             throw IMessageRPCError.processExited
         }
         guard generation == current, started else { throw IMessageRPCError.cancelled }
@@ -102,12 +122,15 @@ public actor IMessageRPCClient {
         }
         do {
             let status: IMessageRPCStatus = try await call(.initialize, params: IMessageEmptyParams(),
-                timeoutSeconds: readTimeoutSeconds, keys: ["protocol_version", "personastack_adapter_revision", "database", "methods"])
+                timeoutSeconds: initializationTimeoutSeconds, keys: ["protocol_version", "personastack_adapter_revision", "database", "methods"])
             try validate(status)
             ready = true
             return status
         } catch {
-            if generation == current { await stop() }
+            if generation == current {
+                if !Task.isCancelled, Self.isUnexpectedFailure(error, dispatched: true) { restartBudget.recordUnexpectedFailure() }
+                await stop()
+            }
             throw error
         }
     }
@@ -139,10 +162,43 @@ public actor IMessageRPCClient {
         await joinCleanup(cleanup, generation: generation)
     }
 
+    public func retryAfterExplicitUserAction() async throws {
+        await stop()
+        try Task.checkCancellation()
+        guard !transportNeedsCleanup, !started, !stopping else { throw IMessageRPCError.busy }
+        restartBudget.resetAfterExplicitRetry()
+    }
+
+    public func restartSnapshot() -> IMessageProviderRestartBudget.Snapshot { restartBudget.snapshot() }
+
+    /// Read-only. Does not launch a provider or refresh readiness.
+    public func diagnostics() async -> IMessageRPCDiagnostics {
+        let resources = await transport.resources()
+        return .init(bufferedBytes: buffer.count, requestPending: pending != nil, started: started, ready: ready,
+            cleanupPending: transportNeedsCleanup || cleanupTask != nil, resources: resources, restarts: restartBudget.snapshot())
+    }
+
+    /// Typed response semantics retire the same owned generation as framing
+    /// failures. Generation fencing makes repeated caller cleanup count once.
+    private func providerResult<Result: Sendable>(generation expected: UInt64,
+        _ validate: (isolated IMessageRPCClient) throws -> Result) async throws -> Result {
+        do {
+            guard expected == generation, started, !Task.isCancelled else { throw IMessageRPCError.cancelled }
+            return try validate(self)
+        } catch {
+            let failure = error is CancellationError ? IMessageRPCError.cancelled : ((error as? IMessageRPCError) ?? .invalidResponse)
+            if Self.isUnexpectedFailure(failure, dispatched: false) { await failed(failure, generation: expected) }
+            throw failure
+        }
+    }
+
     public func status() async throws -> IMessageRPCStatus {
+        let expected = generation
         let result: IMessageRPCStatus = try await call(.status, params: IMessageEmptyParams(), timeoutSeconds: readTimeoutSeconds, keys: ["protocol_version", "personastack_adapter_revision", "database", "methods"])
-        try validate(result)
-        return result
+        return try await providerResult(generation: expected) { client in
+            try client.validate(result)
+            return result
+        }
     }
 
     public func conversations(after: IMessageRowID, upper: IMessageRowID? = nil,
@@ -150,15 +206,18 @@ public actor IMessageRPCClient {
         guard query.count <= 128, (1...50).contains(limit), upper.map({ $0 >= after }) ?? true else {
             throw IMessageRPCError.invalidArguments
         }
+        let expected = generation
         let result: IMessageConversationPage = try await call(.chatsPage,
             params: ChatPageParams(after: after, upper: upper, query: query, limit: limit), timeoutSeconds: readTimeoutSeconds,
             keys: ["chats", "next_chat_rowid", "upper_chat_rowid", "has_more", "stop_reason"])
-        guard result.chats.count <= limit, result.nextChatRowID >= after,
-              result.nextChatRowID <= result.upperChatRowID,
-              upper.map({ $0 == result.upperChatRowID }) ?? true,
-              !result.hasMore || result.nextChatRowID > after else { throw IMessageRPCError.invalidResponse }
-        for chat in result.chats { try validate(chat) }
-        return result
+        return try await providerResult(generation: expected) { client in
+            guard result.chats.count <= limit, result.nextChatRowID >= after,
+                  result.nextChatRowID <= result.upperChatRowID,
+                  upper.map({ $0 == result.upperChatRowID }) ?? true,
+                  !result.hasMore || result.nextChatRowID > after else { throw IMessageRPCError.invalidResponse }
+            for chat in result.chats { try client.validate(chat) }
+            return result
+        }
     }
 
     public func sourceCheckpoint(chatIDs: [IMessageRowID], anchors: [IMessageSourceAnchor] = []) async throws -> IMessageSourceCheckpoint {
@@ -169,43 +228,49 @@ public actor IMessageRPCClient {
               anchors.allSatisfy({ selected.contains($0.chatID) && bounded($0.guid, maximum: 256, nonempty: true) }) else {
             throw IMessageRPCError.invalidArguments
         }
+        let expected = generation
         let result: IMessageSourceCheckpoint = try await call(.sourceCheckpoint,
             params: CheckpointParams(chatIDs: chatIDs, anchors: anchors), timeoutSeconds: readTimeoutSeconds,
             keys: ["adapter_revision", "source_high_water", "chats", "observed_at"])
-        guard result.adapterRevision == Self.adapterRevision,
-              Set(result.chats.map(\.chatID)) == selected, result.chats.count == chatIDs.count,
-              validDate(result.observedAt) else { throw IMessageRPCError.invalidResponse }
-        for chat in result.chats {
-            guard chat.tailRowID <= result.sourceHighWater,
-                  bounded(chat.guid, maximum: 256), bounded(chat.tailGUID, maximum: 256),
-                  chat.accountID.map({ bounded($0, maximum: 256) }) ?? true,
-                  chat.accountLogin.map({ bounded($0, maximum: 256) }) ?? true,
-                  !chat.available || chat.service == "iMessage" else { throw IMessageRPCError.invalidResponse }
+        return try await providerResult(generation: expected) { client in
+            guard result.adapterRevision == Self.adapterRevision,
+                  Set(result.chats.map(\.chatID)) == selected, result.chats.count == chatIDs.count,
+                  client.validDate(result.observedAt) else { throw IMessageRPCError.invalidResponse }
+            for chat in result.chats {
+                guard chat.tailRowID <= result.sourceHighWater,
+                      client.bounded(chat.guid, maximum: 256), client.bounded(chat.tailGUID, maximum: 256),
+                      chat.accountID.map({ client.bounded($0, maximum: 256) }) ?? true,
+                      chat.accountLogin.map({ client.bounded($0, maximum: 256) }) ?? true,
+                      !chat.available || chat.service == "iMessage" else { throw IMessageRPCError.invalidResponse }
+            }
+            return result
         }
-        return result
     }
 
     public func chatMetadata(chatIDs: [IMessageRowID]) async throws -> IMessageChatMetadata {
         guard (1...32).contains(chatIDs.count), Set(chatIDs).count == chatIDs.count,
               chatIDs.allSatisfy({ $0.value > 0 }) else { throw IMessageRPCError.invalidArguments }
+        let expected = generation
         let result: IMessageChatMetadata = try await call(.chatMetadata, params: ChatMetadataParams(chatIDs: chatIDs),
             timeoutSeconds: min(readTimeoutSeconds, Self.chatMetadataTimeoutSeconds), keys: ["chats"],
             maximumResponseBytes: Self.maximumChatMetadataResultBytes + Self.chatMetadataEnvelopeBytes)
-        guard result.chats.map(\.id) == chatIDs else { throw IMessageRPCError.invalidResponse }
-        for chat in result.chats {
-            if chat.available {
-                try validate(chat)
-                let fields = [chat.guid, chat.name] + chat.participants + [chat.accountID, chat.accountLogin].compactMap { $0 }
-                guard fields.allSatisfy({ $0.utf8.count <= 256 }) else { throw IMessageRPCError.invalidResponse }
-            }
-            else {
-                guard chat.guid.isEmpty, chat.name.isEmpty, chat.service.isEmpty, !chat.isGroup,
-                      chat.participants.isEmpty, chat.accountID == nil, chat.accountLogin == nil else {
-                    throw IMessageRPCError.invalidResponse
+        return try await providerResult(generation: expected) { client in
+            guard result.chats.map(\.id) == chatIDs else { throw IMessageRPCError.invalidResponse }
+            for chat in result.chats {
+                if chat.available {
+                    try client.validate(chat)
+                    let fields = [chat.guid, chat.name] + chat.participants + [chat.accountID, chat.accountLogin].compactMap { $0 }
+                    guard fields.allSatisfy({ $0.utf8.count <= 256 }) else { throw IMessageRPCError.invalidResponse }
+                }
+                else {
+                    guard chat.guid.isEmpty, chat.name.isEmpty, chat.service.isEmpty, !chat.isGroup,
+                          chat.participants.isEmpty, chat.accountID == nil, chat.accountLogin == nil else {
+                        throw IMessageRPCError.invalidResponse
+                    }
                 }
             }
+            return result
         }
-        return result
     }
 
     public func receivePage(chatID: IMessageRowID, since: IMessageRowID, through: IMessageRowID? = nil,
@@ -213,29 +278,35 @@ public actor IMessageRPCClient {
         guard chatID.value > 0, (1...100).contains(limit), through.map({ $0 >= since }) ?? true else {
             throw IMessageRPCError.invalidArguments
         }
+        let expected = generation
         let result: IMessageReceivePage = try await call(.receivePage,
             params: ReceiveParams(chatID: chatID, since: since, through: through, limit: limit), timeoutSeconds: readTimeoutSeconds,
             keys: ["messages", "next_rowid", "has_more", "stop_reason"])
-        guard result.messages.count <= limit, result.nextRowID >= since,
-              through.map({ result.nextRowID <= $0 }) ?? true,
-              !result.hasMore || result.nextRowID > since else { throw IMessageRPCError.invalidResponse }
-        var previous = since
-        for message in result.messages {
-            try validate(message, chatID: chatID)
-            guard message.rowID > previous, message.rowID <= result.nextRowID else { throw IMessageRPCError.invalidResponse }
-            previous = message.rowID
+        return try await providerResult(generation: expected) { client in
+            guard result.messages.count <= limit, result.nextRowID >= since,
+                  through.map({ result.nextRowID <= $0 }) ?? true,
+                  !result.hasMore || result.nextRowID > since else { throw IMessageRPCError.invalidResponse }
+            var previous = since
+            for message in result.messages {
+                try client.validate(message, chatID: chatID)
+                guard message.rowID > previous, message.rowID <= result.nextRowID else { throw IMessageRPCError.invalidResponse }
+                previous = message.rowID
+            }
+            return result
         }
-        return result
     }
 
     public func recentMessages(chatID: IMessageRowID, limit: Int = 50) async throws -> IMessageRecentMessages {
         guard chatID.value > 0, (1...100).contains(limit) else { throw IMessageRPCError.invalidArguments }
+        let expected = generation
         let result: IMessageRecentMessages = try await call(.recentMessages,
             params: RecentParams(chatID: chatID, limit: limit), timeoutSeconds: readTimeoutSeconds,
             keys: ["messages", "truncated", "stop_reason"])
-        guard result.messages.count <= limit else { throw IMessageRPCError.invalidResponse }
-        for message in result.messages { try validate(message, chatID: chatID) }
-        return result
+        return try await providerResult(generation: expected) { client in
+            guard result.messages.count <= limit else { throw IMessageRPCError.invalidResponse }
+            for message in result.messages { try client.validate(message, chatID: chatID) }
+            return result
+        }
     }
 
     /// Executes one send and verifies a new exact row in the selected chat.
@@ -246,7 +317,7 @@ public actor IMessageRPCClient {
               text.utf8.count <= 16 * 1024, validAccountID(expectedAccountID), bounded(expectedChatGUID, maximum: 256, nonempty: true) else { throw IMessageRPCError.invalidArguments }
         guard !mutationInFlight else { throw IMessageRPCError.busy }
         mutationInFlight = true
-        mutationDeadline = min(deadline, Date().addingTimeInterval(sendTimeoutSeconds))
+        mutationDeadline = min(deadline, now().addingTimeInterval(sendTimeoutSeconds))
         let expectedGeneration = generation
         defer { mutationInFlight = false; mutationDeadline = nil; receiptDeadline = nil }
         let checkpoint = try await sourceCheckpoint(chatIDs: [chatID])
@@ -255,13 +326,15 @@ public actor IMessageRPCClient {
         guard try await validateCurrent() else { throw IMessageRPCError.cancelled }
         try Task.checkCancellation()
         guard expectedGeneration == generation, started, ready else { throw IMessageRPCError.cancelled }
-        guard deadline > Date() else { throw IMessageRPCError.deadlineExceeded }
+        guard deadline > now() else { throw IMessageRPCError.deadlineExceeded }
         let result: SendResult = try await call(.send, params: SendParams(chatID: chatID, chatGUID: chat.guid, text: text, expectedAccountID: expectedAccountID),
             timeoutSeconds: sendTimeoutSeconds, keys: ["submitted", "transport", "service", "chat_guid"])
         do {
-            guard result.submitted, result.transport == "applescript", result.service == "iMessage",
-                  result.chatGUID == chat.guid else { throw IMessageRPCError.outcomeUnknown }
-            receiptDeadline = Date().addingTimeInterval(min(8, mutationDeadline?.timeIntervalSinceNow ?? 0))
+            guard result.submitted, result.transport == "applescript", result.service == "iMessage", result.chatGUID == chat.guid else {
+                await failed(.invalidResponse, generation: expectedGeneration)
+                throw IMessageRPCError.outcomeUnknown
+            }
+            receiptDeadline = now().addingTimeInterval(min(8, mutationDeadline?.timeIntervalSince(now()) ?? 0))
             return try await confirmSend(chatID: chatID, chatGUID: chat.guid, text: text,
                                          after: checkpoint.sourceHighWater)
         } catch { throw IMessageRPCError.outcomeUnknown }
@@ -272,12 +345,12 @@ public actor IMessageRPCClient {
         let submittedBytes = Data(text.utf8)
         while true {
             let observed = try await receivePage(chatID: chatID, since: boundary)
+            guard let receiptDeadline, receiptDeadline > now() else { throw IMessageRPCError.outcomeUnknown }
             let matches = observed.messages.filter { $0.isFromMe && Data($0.text.utf8) == submittedBytes && !$0.textTruncated }
             guard !observed.hasMore, observed.stopReason == .caughtUp, matches.count <= 1 else { throw IMessageRPCError.outcomeUnknown }
             if let match = matches.first {
                 return IMessageSendReceipt(messageGUID: match.guid, rowID: match.rowID.value, chatGUID: chatGUID)
             }
-            guard let receiptDeadline, receiptDeadline > Date() else { throw IMessageRPCError.outcomeUnknown }
             try await Task.sleep(for: .milliseconds(100))
         }
     }
@@ -289,10 +362,11 @@ public actor IMessageRPCClient {
         guard started, ready || method == .initialize else { throw IMessageRPCError.notStarted }
         guard pending == nil else { throw IMessageRPCError.busy }
         try Task.checkCancellation()
-        let effectiveTimeout = min(timeoutSeconds, mutationDeadline?.timeIntervalSinceNow ?? timeoutSeconds,
-                                   receiptDeadline?.timeIntervalSinceNow ?? timeoutSeconds)
+        let effectiveTimeout = min(timeoutSeconds, mutationDeadline?.timeIntervalSince(now()) ?? timeoutSeconds,
+                                   receiptDeadline?.timeIntervalSince(now()) ?? timeoutSeconds)
         guard effectiveTimeout > 0 else { throw IMessageRPCError.deadlineExceeded }
-        let dispatchDeadline = Date().addingTimeInterval(effectiveTimeout)
+        let dispatchDeadline = now().addingTimeInterval(effectiveTimeout)
+        let callGeneration = generation
         sequence &+= 1
         let id = "\(generation):\(sequence)"
         var request = try JSONEncoder().encode(IMessageRPCRequest(id: id, method: method, params: params))
@@ -305,8 +379,9 @@ public actor IMessageRPCClient {
             return try await withCheckedThrowingContinuation { continuation in
                 pending = Pending(id: id, method: method, continuation: continuation, maximumResponseBytes: maximumResponseBytes)
                 let current = generation
+                let clock = now
                 timeout = Task { [weak self] in
-                    do { try await Task.sleep(for: .seconds(max(0, dispatchDeadline.timeIntervalSinceNow))) }
+                    do { try await Task.sleep(for: .seconds(max(0, dispatchDeadline.timeIntervalSince(clock())))) }
                     catch { return }
                     await self?.expire(id: id, generation: current)
                 }
@@ -330,17 +405,19 @@ public actor IMessageRPCClient {
             guard let result = response.result else { throw IMessageRPCError.invalidResponse }
             return result
         } catch {
+            let failure = (error as? IMessageRPCError) ?? .invalidResponse
+            if failure == .invalidResponse { await failed(failure, generation: callGeneration) }
             if method == .send {
                 throw IMessageRPCError.outcomeUnknown
             }
-            throw (error as? IMessageRPCError) ?? .invalidResponse
+            throw failure
         }
     }
 
     private func write(_ data: Data, id: String, generation current: UInt64,
                        cancellation: IMessageRPCDispatchGate, deadline: Date) async {
         guard current == generation, pending?.id == id else { return }
-        if let rejection = cancellation.claim(before: deadline) {
+        if let rejection = cancellation.claim(before: deadline, now: now) {
             await failed(rejection, generation: current)
             return
         }
@@ -386,6 +463,7 @@ public actor IMessageRPCClient {
 
     private func failed(_ error: IMessageRPCError, generation current: UInt64) async {
         guard current == generation else { return }
+        if Self.isUnexpectedFailure(error, dispatched: pending?.dispatched ?? false) { restartBudget.recordUnexpectedFailure() }
         stopping = true
         started = false
         ready = false
@@ -399,6 +477,14 @@ public actor IMessageRPCClient {
         await joinCleanup(cleanup, generation: generation)
         if let request = failedRequest {
             request.continuation.resume(throwing: request.method == .send && request.dispatched ? IMessageRPCError.outcomeUnknown : error)
+        }
+    }
+
+    private static func isUnexpectedFailure(_ error: Error, dispatched: Bool) -> Bool {
+        switch error as? IMessageRPCError {
+        case .processExited, .invalidResponse, .frameTooLarge, .dependencyInvalid: true
+        case .deadlineExceeded: dispatched
+        default: false
         }
     }
 
@@ -510,10 +596,10 @@ internal final class IMessageRPCDispatchGate: @unchecked Sendable {
         cancelled = true
     }
 
-    func claim(before deadline: Date) -> IMessageRPCError? {
+    func claim(before deadline: Date, now: @Sendable () -> Date = Date.init) -> IMessageRPCError? {
         lock.lock(); defer { lock.unlock() }
         guard !cancelled else { return .cancelled }
-        guard Date() < deadline else { return .deadlineExceeded }
+        guard now() < deadline else { return .deadlineExceeded }
         guard !claimed else { return .invalidResponse }
         claimed = true
         return nil

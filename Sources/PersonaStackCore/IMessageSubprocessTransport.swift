@@ -13,6 +13,9 @@ public final class IMessageSubprocessTransport: IMessageRPCTransport, @unchecked
     private let readQueue = DispatchQueue(label: "ai.personastack.imessage.stdout")
     private let writeQueue = DispatchQueue(label: "ai.personastack.imessage.stdin")
     private var child: Child?
+    private var retiring = false
+    private var retiringPipes = 0
+    private var duplicatedPipes = 0
 
     private struct Child: @unchecked Sendable {
         let pid: pid_t
@@ -38,7 +41,7 @@ public final class IMessageSubprocessTransport: IMessageRPCTransport, @unchecked
     private func launchOwnedProcess() throws {
         lock.lock()
         defer { lock.unlock() }
-        guard child == nil else { throw IMessageRPCError.alreadyStarted }
+        guard child == nil, !retiring else { throw IMessageRPCError.alreadyStarted }
         guard let executableURL, executableURL.lastPathComponent == "imsg",
               executableURL.resolvingSymlinksInPath().path.hasPrefix(bundleURL.resolvingSymlinksInPath().path + "/"),
               FileManager.default.isExecutableFile(atPath: executableURL.path) else {
@@ -115,7 +118,7 @@ public final class IMessageSubprocessTransport: IMessageRPCTransport, @unchecked
         let descriptor = try duplicateDescriptor(output: true)
         return try await withCheckedThrowingContinuation { continuation in
             readQueue.async {
-                defer { _ = close(descriptor) }
+                defer { self.closeDuplicate(descriptor) }
                 var bytes = [UInt8](repeating: 0, count: maximumBytes)
                 var count: Int
                 repeat {
@@ -134,7 +137,7 @@ public final class IMessageSubprocessTransport: IMessageRPCTransport, @unchecked
         let descriptor = try duplicateDescriptor(output: false)
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             writeQueue.async {
-                defer { _ = close(descriptor) }
+                defer { self.closeDuplicate(descriptor) }
                 do { try Self.writeAll(data, descriptor: descriptor); continuation.resume() }
                 catch { continuation.resume(throwing: IMessageRPCError.processExited) }
             }
@@ -144,6 +147,7 @@ public final class IMessageSubprocessTransport: IMessageRPCTransport, @unchecked
     public func terminate() async {
         guard let owned = takeChild() else { return }
         try? owned.input.close()
+        setRetiringPipes(1)
         // The direct child remains unreaped until both group signals are sent.
         // Its reserved PID prevents this group identity being reused by a foreign owner.
         if owned.pid > 1, owned.processGroup == owned.pid, owned.processGroup != getpgrp() {
@@ -153,6 +157,22 @@ public final class IMessageSubprocessTransport: IMessageRPCTransport, @unchecked
         }
         await Task.detached { Self.reap(owned.pid) }.value
         try? owned.output.close()
+        finishRetiring()
+    }
+
+    public func resources() async -> IMessageProviderResources? { resourceSnapshot() }
+
+    private func resourceSnapshot() -> IMessageProviderResources {
+        lock.lock(); defer { lock.unlock() }
+        return .init(ownedChildren: (child == nil ? 0 : 1) + (retiring ? 1 : 0),
+            ownedPipeHandles: (child == nil ? 0 : 2) + retiringPipes + duplicatedPipes)
+    }
+
+    private func setRetiringPipes(_ count: Int) { lock.lock(); defer { lock.unlock() }; retiringPipes = count }
+    private func finishRetiring() { lock.lock(); defer { lock.unlock() }; retiring = false; retiringPipes = 0 }
+    private func closeDuplicate(_ descriptor: Int32) {
+        _ = close(descriptor)
+        lock.lock(); defer { lock.unlock() }; duplicatedPipes -= 1
     }
 
     private static func reap(_ pid: pid_t) {
@@ -170,6 +190,7 @@ public final class IMessageSubprocessTransport: IMessageRPCTransport, @unchecked
             _ = close(descriptor)
             throw IMessageRPCError.processExited
         }
+        duplicatedPipes += 1
         return descriptor
     }
 
@@ -219,6 +240,7 @@ public final class IMessageSubprocessTransport: IMessageRPCTransport, @unchecked
 
     private func takeChild() -> Child? {
         lock.lock(); defer { lock.unlock() }
+        if child != nil { retiring = true; retiringPipes = 2 }
         defer { child = nil }
         return child
     }

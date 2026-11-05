@@ -52,6 +52,7 @@ actor DesktopControlGatewayConnection {
     private var lastGatewayHeartbeat: ContinuousClock.Instant?
     private var commandTasks: [String: Task<Void, Never>] = [:]
     private var connected = false
+    private let onIMessageStatus: @Sendable (IMessageMenuState) async -> Void
     private var readiness = "unknown"
     private var readinessRevision: UInt64 = 0
     private var cachedDiagnostics: DesktopControlDiagnostics?
@@ -75,6 +76,7 @@ actor DesktopControlGatewayConnection {
          readinessProvider: @escaping DesktopControlReadinessProvider = { nil },
          afterConfigRevocation: @escaping DesktopControlConfigRevocationHandler = {},
          iMessageRuntime: IMessageRuntime? = nil,
+         onIMessageStatus: @escaping @Sendable (IMessageMenuState) async -> Void = { _ in },
          handler: @escaping DesktopControlCommandHandler) {
         self.installation = installation
         self.session = session ?? DesktopControlNetworkSession.makeWithoutRedirects()
@@ -86,6 +88,7 @@ actor DesktopControlGatewayConnection {
         self.readinessProvider = readinessProvider
         self.afterConfigRevocation = afterConfigRevocation
         self.iMessageRuntime = iMessageRuntime
+        self.onIMessageStatus = onIMessageStatus
         self.handler = handler
     }
 
@@ -212,6 +215,9 @@ actor DesktopControlGatewayConnection {
     func usesIMessageRuntime(_ runtime: IMessageRuntime) -> Bool {
         iMessageRuntime === runtime
     }
+    func acceptsIMessageHumanAction(_ runtime: IMessageRuntime) -> Bool {
+        connected && iMessageEnabled && iMessageRuntime === runtime
+    }
 
     func drainIMessage() async {
         retireIMessageConnection()
@@ -323,10 +329,12 @@ actor DesktopControlGatewayConnection {
                 return
             }
             iMessageRequestIDs.insert(requestID)
+            let configured: Bool
+            if case .configured = command.input { configured = true } else { configured = false }
             let failure = await iMessageRuntime.admit(command, connectionID: connectionID) { [weak self] response in
-                await self?.completeIMessage(response, requestID: requestID, connectionID: connectionID)
+                await self?.completeIMessage(response, requestID: requestID, connectionID: connectionID, configured: configured)
             }
-            if let failure { await completeIMessage(.failure(failure), requestID: requestID, connectionID: connectionID) }
+            if let failure { await completeIMessage(.failure(failure), requestID: requestID, connectionID: connectionID, configured: configured) }
         default: throw DesktopControlGatewayConnectionError.invalidFrame
         }
     }
@@ -344,11 +352,31 @@ actor DesktopControlGatewayConnection {
         try await send(DesktopControlFrame(type: "imessage", requestID: requestID, imessage: payload))
     }
 
-    private func completeIMessage(_ payload: IMessageGatewayPayload, requestID: String, connectionID: UUID) async {
+    private func completeIMessage(_ payload: IMessageGatewayPayload, requestID: String, connectionID: UUID, configured: Bool) async {
         guard iMessageConnectionID == connectionID, iMessageRequestIDs.contains(requestID) else { return }
         defer { if iMessageConnectionID == connectionID { iMessageRequestIDs.remove(requestID) } }
-        do { try await sendIMessage(payload, requestID: requestID, connectionID: connectionID) }
+        do {
+            try await sendIMessage(payload, requestID: requestID, connectionID: connectionID)
+            if configured, self.iMessageConnectionID == connectionID, let status = Self.menuObservation(payload) { await onIMessageStatus(status) }
+        }
         catch { await disconnected() }
+    }
+
+    private static func menuObservation(_ payload: IMessageGatewayPayload) -> IMessageMenuState? {
+        switch payload {
+        case .result(.configured(.status(let value))):
+            switch value.state {
+            case .connected: .connected
+            case .reconnecting: .connecting
+            case .offline: .offline
+            case .paused: .paused
+            case .disabled, .needsAttention: .needsAttention
+            }
+        case .result(.configured): .connected
+        case .failure(let value):
+            [.permissionRequired, .messagesUnavailable, .accountChanged, .dependencyInvalid].contains(value.code) ? .needsAttention : nil
+        default: nil
+        }
     }
 
     private func processCommand(_ frame: DesktopControlFrame) async {

@@ -20,7 +20,7 @@ extension IMessageSetupAccountReading {
 extension IMessageAccountReader: IMessageSetupAccountReading {}
 
 enum IMessageSetupPermissionState: Equatable, Sendable {
-    case ready, messagesNotRunning, fullDiskAccessRequired, automationRequired, sourceChanged, unavailable
+    case ready, messagesNotRunning, fullDiskAccessRequired, automationRequired, sourceChanged, retryRequired, unavailable
 }
 
 /// The app alone owns Apple account observation and the bundled provider child.
@@ -110,7 +110,8 @@ actor IMessageSetupProvider: IMessageSetupProviding {
     }
 
     private static func permissionState(for error: Error) -> IMessageSetupPermissionState {
-        switch error as? IMessageAccountError {
+        if (error as? IMessageRPCError) == .restartLimitReached { return .retryRequired }
+        return switch error as? IMessageAccountError {
         case .messagesNotRunning: .messagesNotRunning
         case .sourceUnavailable: .fullDiskAccessRequired
         case .automationRequired: .automationRequired
@@ -148,7 +149,7 @@ actor IMessageSetupProvider: IMessageSetupProviding {
             let ids = try selections.map { try IMessageRowID(decimal: $0.nativeChatRowID) }
             return try await bounded(deadline: deadline, generation: expected) {
                 try await self.refreshSelection(chatIDs: ids, expectedGUIDs: selections.map(\.expectedGUID), account: account,
-                    deadline: deadline, requireAvailable: true, expectedGeneration: expected)
+                    deadline: deadline, requireAvailable: false, proveEmptyAccount: true, expectedGeneration: expected)
             }
         } catch { throw await finishFailure(error, expectedGeneration: expected) }
     }
@@ -234,7 +235,7 @@ actor IMessageSetupProvider: IMessageSetupProviding {
     }
 
     private func refreshSelection(chatIDs: [IMessageRowID], expectedGUIDs: [String], account: IMessageSetupAccount, deadline: Date,
-                                  requireAvailable: Bool, validation: (@Sendable () async throws -> Bool)? = nil,
+                                  requireAvailable: Bool, proveEmptyAccount: Bool = false, validation: (@Sendable () async throws -> Bool)? = nil,
                                   expectedGeneration: UInt64? = nil) async throws -> IMessageSetupProviderVerification {
         _ = try await ready(deadline: deadline, validation: validation, expectedGeneration: expectedGeneration)
         let expected = expectedGeneration ?? generation
@@ -255,6 +256,14 @@ actor IMessageSetupProvider: IMessageSetupProviding {
                   observed.chatGUIDs == available else { throw IMessageSetupProviderError.accountChanged }
             rememberDisplay(observed.accountLabel, accountID: observed.accountID, sourceGeneration: observed.sourceGeneration)
             evidence = .init(accountID: observed.accountID, sourceGeneration: observed.sourceGeneration, chatGUIDs: available)
+        } else if proveEmptyAccount {
+            let observed = try await accounts.observeCurrentAccount()
+            try await requireContext(expected, deadline: deadline, validation: validation)
+            guard observed.accountID == account.accountID, observed.sourceGeneration == account.sourceGeneration else {
+                throw IMessageSetupProviderError.accountChanged
+            }
+            rememberDisplay(observed.accountLabel, accountID: observed.accountID, sourceGeneration: observed.sourceGeneration)
+            evidence = .init(accountID: observed.accountID, sourceGeneration: observed.sourceGeneration, chatGUIDs: [])
         }
         try await accounts.validateProviderConnection()
         try await requireContext(expected, deadline: deadline, validation: validation)
@@ -416,6 +425,14 @@ actor IMessageSetupProvider: IMessageSetupProviding {
         cleanup = nil
     }
 
+    /// Explicit native Retry only. The coordinator first withdraws queued work.
+    func retryAfterExplicitUserAction() async throws {
+        await stop()
+        try await client.retryAfterExplicitUserAction()
+    }
+
+    func diagnostics() async -> IMessageRPCDiagnostics { await client.diagnostics() }
+
     private func finishFailure(_ error: Error, expectedGeneration: UInt64) async -> IMessageSetupProviderError {
         if generation == expectedGeneration, Self.requiresFreshConnection(error) { await stop() }
         return Self.safeError(error)
@@ -425,7 +442,7 @@ actor IMessageSetupProvider: IMessageSetupProviding {
         if error is CancellationError { return true }
         if (error as? IMessageAccountError) == .sourceChanged || (error as? IMessageSetupProviderError) == .accountChanged { return true }
         switch error as? IMessageRPCError {
-        case .notStarted, .alreadyStarted, .invalidResponse, .frameTooLarge, .dependencyInvalid,
+        case .notStarted, .alreadyStarted, .invalidResponse, .frameTooLarge, .dependencyInvalid, .restartLimitReached,
              .processExited, .deadlineExceeded, .cancelled, .outcomeUnknown:
             return true
         default: return false

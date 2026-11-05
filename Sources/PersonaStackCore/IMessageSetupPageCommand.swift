@@ -11,7 +11,7 @@ public struct IMessageSetupPageCommand: Equatable, Sendable {
         case openFullDiskAccess = "open_full_disk_access", openAutomationSettings = "open_automation_settings"
         case openLoginItems = "open_login_items", restart, enableBackground = "enable_background"
         case allowMetadata = "allow_metadata", list, setSelected = "set_selected", verify, confirm, cancel
-        case startAgain = "start_again"
+        case startAgain = "start_again", retryProvider = "retry_provider"
     }
     public let action: Action
     public let scope: String

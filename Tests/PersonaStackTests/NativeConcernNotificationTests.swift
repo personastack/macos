@@ -61,16 +61,17 @@ struct NativeConcernNotificationTests {
         var destinations: [URL] = []
         var openedWindows = 0
         let delegate = PersonaStackTerminationDelegate(shutdown: { true }, terminate: { _ in }, timeout: .seconds(1),
-            navigateMainWindow: { destinations.append($0) })
+            navigateMainWindow: { destinations.append($0) }, registrationService: isolatedLoginRegistrationService())
         let notifications = DesktopNotificationCoordinator()
         notifications.installConcernNavigation { delegate.openMainPage($0) }
         notifications.handleResponse(requestIdentifier: request.identifier, actionIdentifier: UNNotificationDefaultActionIdentifier,
             userInfo: request.content.userInfo, appURL: appURL)
-        #expect(destinations.first?.absoluteString == "https://my.personastack.ai/user/concerns?workspace_id=ws_b&concern_id=specific-concern")
+        #expect(destinations.isEmpty)
         // A cold click can precede installation of SwiftUI's window opener.
         #expect(openedWindows == 0)
         delegate.installMainWindowReopener { openedWindows += 1 }
         #expect(openedWindows == 1)
+        #expect(destinations.first?.absoluteString == "https://my.personastack.ai/user/concerns?workspace_id=ws_b&concern_id=specific-concern")
         notifications.handleResponse(requestIdentifier: request.identifier, actionIdentifier: UNNotificationDefaultActionIdentifier,
             userInfo: request.content.userInfo, appURL: appURL)
         #expect(openedWindows == 2 && destinations.count == 2)

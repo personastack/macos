@@ -2,7 +2,7 @@ import Foundation
 
 public enum IMessageRPCError: Error, Equatable, Sendable {
     case notStarted, alreadyStarted, busy, invalidArguments, invalidResponse
-    case frameTooLarge, dependencyInvalid, processExited, deadlineExceeded, cancelled
+    case frameTooLarge, dependencyInvalid, restartLimitReached, processExited, deadlineExceeded, cancelled
     case providerRejected(code: Int, retrySafe: Bool)
     case outcomeUnknown
 }

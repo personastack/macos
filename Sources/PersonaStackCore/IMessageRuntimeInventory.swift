@@ -18,6 +18,10 @@ internal struct IMessageRuntimeInventory {
         let conversationID: String
         let metadata: IMessageConversation
         let expiresAt: Date
+        let expectedGUID: String?
+        init(conversationID: String, metadata: IMessageConversation, expiresAt: Date, expectedGUID: String? = nil) {
+            self.conversationID = conversationID; self.metadata = metadata; self.expiresAt = expiresAt; self.expectedGUID = expectedGUID
+        }
         var wire: IMessageGatewaySetupConversation { .init(conversationID: conversationID, metadata: metadata) }
     }
     struct Request {
@@ -79,7 +83,7 @@ internal struct IMessageRuntimeInventory {
         let rows = page.chats.map { metadata -> Option in
             let old = retained.first { $0.metadata.id == metadata.id && $0.metadata.guid == metadata.guid && $0.expiresAt > now }
             return Option(conversationID: old?.conversationID ?? makeID(), metadata: metadata,
-                          expiresAt: old?.expiresAt ?? current.expiresAt)
+                          expiresAt: old?.expiresAt ?? current.expiresAt, expectedGUID: old?.expectedGUID)
         }
         let nextToken = page.hasMore || !rows.isEmpty ? makeID() : nil
         let result = try boundedResult(rows: rows, page: page, snapshot: current, nextToken: nextToken)
@@ -116,7 +120,9 @@ internal struct IMessageRuntimeInventory {
         let known = pages.reversed().flatMap(\.rows) + selected
         let requested = try ids.map { id -> Option in
             guard let option = known.first(where: { $0.conversationID == id }), option.expiresAt > now,
-                  option.metadata.available else { throw IMessageRuntimeInventoryError.invalidSelection }
+                  option.metadata.available || selected.contains(where: { $0.conversationID == id }) else {
+                throw IMessageRuntimeInventoryError.invalidSelection
+            }
             return option
         }
         selected = requested
@@ -139,10 +145,13 @@ internal struct IMessageRuntimeInventory {
         pages.removeAll()
     }
 
-    func retained(now: Date) throws -> (rows: [IMessageGatewaySetupConversation], account: IMessageSetupAccount, expiresAt: Date) {
+    func retained(now: Date) throws -> (rows: [IMessageGatewaySetupConversation], account: IMessageSetupAccount,
+                                      expiresAt: Date, expectedSelections: [IMessageSetupDraft.Selection]) {
         let value = try verification(selected.map(\.conversationID), now: now)
         guard let expiry = selected.map(\.expiresAt).min() else { throw IMessageRuntimeInventoryError.invalidSelection }
-        return (value.rows, value.account, expiry)
+        let intentions = try selected.map { try IMessageSetupDraft.Selection(nativeChatRowID: $0.metadata.id.rawValue,
+            expectedGUID: $0.expectedGUID ?? $0.metadata.guid) }
+        return (value.rows, value.account, expiry, intentions)
     }
 
     mutating func restore(_ response: IMessageSetupProviderVerification, selections: [IMessageSetupDraft.Selection],
@@ -150,16 +159,21 @@ internal struct IMessageRuntimeInventory {
         guard validAccount(account), response.conversations.count == selections.count,
               let proof = response.liveAccount, proof.accountID == account.accountID,
               proof.sourceGeneration == account.sourceGeneration,
-              proof.chatGUIDs == selections.map(\.expectedGUID) else { throw IMessageRuntimeInventoryError.accountChanged }
+              proof.chatGUIDs == response.conversations.filter(\.available).map(\.guid) else { throw IMessageRuntimeInventoryError.accountChanged }
         for (choice, current) in zip(selections, response.conversations) {
-            guard current.id.rawValue == choice.nativeChatRowID, current.guid == choice.expectedGUID,
-                  current.available, current.service == "iMessage" else { throw IMessageRuntimeInventoryError.accountChanged }
+            guard current.id.rawValue == choice.nativeChatRowID else { throw IMessageRuntimeInventoryError.accountChanged }
+            if current.available {
+                guard current.guid == choice.expectedGUID, current.service == "iMessage" else { throw IMessageRuntimeInventoryError.accountChanged }
+            }
         }
         let oldIDs = Set((selected + pages.flatMap(\.rows)).map(\.conversationID))
-        let rows = response.conversations.map { Option(conversationID: makeID(), metadata: $0, expiresAt: expiresAt) }
+        let rows = zip(response.conversations, selections).map { Option(conversationID: makeID(), metadata: $0.0,
+            expiresAt: expiresAt, expectedGUID: $0.1.expectedGUID) }
         guard Set(rows.map(\.conversationID)).count == rows.count,
               rows.allSatisfy({ !oldIDs.contains($0.conversationID) }) else { throw IMessageRuntimeInventoryError.providerInvalid }
-        let wire = IMessageGatewayVerificationResult(conversations: rows.map(\.wire), liveAccount: proof)
+        // Public verification keeps its existing all-unavailable wire shape.
+        // The private fresh account proof above remains mandatory for restore.
+        let wire = IMessageGatewayVerificationResult(conversations: rows.map(\.wire), liveAccount: proof.chatGUIDs.isEmpty ? nil : proof)
         try IMessageGatewayWire.validate(.verification(wire))
         self = IMessageRuntimeInventory()
         self.account = account

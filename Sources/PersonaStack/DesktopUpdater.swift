@@ -75,6 +75,7 @@ final class DesktopUpdater: NSObject, ObservableObject {
     private let cancelAgentBridgeUpdate: @MainActor () async throws -> Void
     private let imessageNeedsHandoff: @MainActor () -> Bool
     private let prepareIMessageUpdate: @MainActor () async -> Void
+    private let registrationService: DesktopLoginItemRegistration.Service
     private var updater: (any DesktopUpdateClient)?
     private var userDriver: SPUStandardUserDriver?
     private var didStart = false
@@ -85,6 +86,10 @@ final class DesktopUpdater: NSObject, ObservableObject {
     private var replacementGeneration = UUID()
     private var preparationTask: (id: UUID, task: Task<Bool, Never>)?
     private var cancellationTask: Task<Void, Never>?
+    var admitsNativeIMessageOperations: Bool {
+        registrationService.isAcceptingRegistrations && preparationTask == nil && cancellationTask == nil
+            && !isAgentBridgeReplacementPrepared && !isImmediateInstallRequested
+    }
 
     private override convenience init() {
         self.init(updaterFactory: { SparkleUpdateClient(hostBundle: .main, userDriver: $0, delegate: $1) },
@@ -113,7 +118,9 @@ final class DesktopUpdater: NSObject, ObservableObject {
              IMessageSetupManager.shared.hasPendingShutdown || DesktopControlRuntime.shared.hasPendingIMessageCleanup
          },
          prepareIMessageUpdate: @escaping @MainActor () async -> Void = { await IMessageSetupLifetime.prepareForReplacement() },
-         cancelPermissionRestart: @escaping @MainActor () -> Void = {}) {
+         cancelPermissionRestart: @escaping @MainActor () -> Void = {},
+         registrationService: DesktopLoginItemRegistration.Service = .current) {
+        self.registrationService = registrationService
         self.updaterFactory = updaterFactory
         self.preferences = preferences
         self.presentAvailableReminder = presentAvailableReminder
@@ -278,8 +285,9 @@ final class DesktopUpdater: NSObject, ObservableObject {
     private func beginImmediateInstallation(_ immediateInstallHandler: @escaping () -> Void) {
         guard !isImmediateInstallRequested, cancellationTask == nil else { return }
         isImmediateInstallRequested = true
+        registrationService.stopAdmission()
         let generation = replacementGeneration
-        if !agentBridgeNeedsHandoff(), !imessageNeedsHandoff() { finishImmediateInstallation(immediateInstallHandler); return }
+        if !registrationService.hasPendingRegistration, !agentBridgeNeedsHandoff(), !imessageNeedsHandoff() { finishImmediateInstallation(immediateInstallHandler); return }
         Task { @MainActor in
             let prepared = await prepareBackgroundAgentsForUpdate()
             guard replacementGeneration == generation else { return }
@@ -298,7 +306,8 @@ final class DesktopUpdater: NSObject, ObservableObject {
     /// Native setup calls this before enabling a helper. Never enable one under
     /// an already staged automatic installer that cannot be canceled on Quit.
     func prepareToEnableBackgroundAgents() throws {
-        guard !isReady, immediateInstallHandler == nil, !isImmediateInstallRequested else { throw AgentBridgeFailure.busy }
+        guard registrationService.isAcceptingRegistrations, !isReady, immediateInstallHandler == nil,
+              !isImmediateInstallRequested else { throw AgentBridgeFailure.busy }
         suspendAutomaticDownloads()
     }
 
@@ -319,6 +328,7 @@ final class DesktopUpdater: NSObject, ObservableObject {
     func prepareBackgroundAgentsForUpdate() async -> Bool {
         guard cancellationTask == nil else { return false }
         if let preparationTask { return await preparationTask.task.value }
+        registrationService.stopAdmission()
         let generation = replacementGeneration
         let id = UUID()
         let task = Task { @MainActor in await self.performBackgroundPreparation(generation: generation) }
@@ -329,11 +339,12 @@ final class DesktopUpdater: NSObject, ObservableObject {
     }
 
     private func performBackgroundPreparation(generation: UUID) async -> Bool {
+        if imessageNeedsHandoff() { await prepareIMessageUpdate() }
+        // Fence the existing runtime immediately, then settle the independent
+        // registration even when this replacement was canceled while draining.
+        await registrationService.stopAdmissionAndDrain()
+        guard !Task.isCancelled, replacementGeneration == generation else { return false }
         do {
-            if imessageNeedsHandoff() {
-                await prepareIMessageUpdate()
-                guard !Task.isCancelled, replacementGeneration == generation else { return false }
-            }
             try await prepareAgentBridgeUpdate()
             guard replacementGeneration == generation else { return false }
             isAgentBridgeReplacementPrepared = true
@@ -367,6 +378,7 @@ final class DesktopUpdater: NSObject, ObservableObject {
             try await cancelAgentBridgeUpdate()
             isAgentBridgeReplacementPrepared = false
             waitsForBackgroundAgents = false
+            registrationService.resumeAdmission()
             if showStatus, isReady {
                 statusMessage = "Restart canceled. Background agents resumed. The update is still ready."
             }
