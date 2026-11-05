@@ -117,14 +117,10 @@ struct AgentBridgeMenu: View {
     }
 
     private func confirmLocalRemoval() -> Bool {
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "Remove local agent files?"
-        alert.informativeText = "This stops the managed runtime and permanently removes its local agent files. This cannot be undone. Cloud connections may still need attention in Settings. Hermes/OpenClaw files are unchanged."
-        alert.addButton(withTitle: "Remove Local Data")
-        alert.addButton(withTitle: "Cancel")
-        alert.buttons[0].keyEquivalent = ""
-        alert.buttons[1].keyEquivalent = "\r"
+        let alert = LocalClusterRemovalConfirmation.makeAlert(
+            messageText: "Remove local agent files?",
+            informativeText: "This stops the managed runtime and permanently removes its local agent files. This cannot be undone. Cloud connections may still need attention in Settings. Hermes/OpenClaw files are unchanged.",
+            alertStyle: .warning)
         return alert.runModal() == .alertFirstButtonReturn
     }
 

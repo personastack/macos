@@ -855,10 +855,9 @@ final class LocalClusterSetupManager: NSObject, WKScriptMessageHandlerWithReply 
         return trimmed.isEmpty ? "This Mac" : trimmed
     }
     private static func confirmLocalRemoval() -> Bool {
-        let alert = NSAlert()
-        alert.messageText = "Remove local cluster data?"
-        alert.informativeText = "This permanently deletes this Mac's cluster disk and agent files. Cloud connection retirement is separate. PersonaStack will report both results. This cannot be undone."
-        alert.addButton(withTitle: "Remove Local Data"); alert.addButton(withTitle: "Cancel")
+        let alert = LocalClusterRemovalConfirmation.makeAlert(
+            messageText: "Remove local cluster data?",
+            informativeText: "This permanently deletes this Mac's cluster disk and agent files. Cloud connection retirement is separate. PersonaStack will report both results. This cannot be undone.")
         return alert.runModal() == .alertFirstButtonReturn
     }
     private static func confirmBlankSetup() -> Bool {
