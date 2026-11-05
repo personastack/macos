@@ -212,6 +212,43 @@ private actor LocalClusterInstalledControlFixture: AgentBridgeControlTransport {
         #expect((rechecked["native_status"] as? [String: Any])?["safe_reason"] as? String != "background_approval_required")
         #expect(await transport.operations.allSatisfy { ["local_cluster_status", "local_cluster_runtime_status", "local_cluster_binding"].contains($0) })
     }
+    @Test(arguments: [false, true])
+    func deniedAndRevokedBackgroundApprovalRequireExplicitSettings(revoked: Bool) async throws {
+        let http = LocalClusterPageHTTPFixture(), transport = LocalClusterInstalledControlFixture()
+        let client = AgentBridgeControlClient(transport: transport)
+        let registration = LocalClusterApprovalRegistration()
+        registration.status = revoked ? .enabled : .requiresApproval
+        let preferences = try #require(UserDefaults(suiteName: "LocalClusterRevocation." + UUID().uuidString))
+        preferences.set(true, forKey: AgentBridgeService.disabledKey)
+        let service = AgentBridgeService(registration: registration, client: client, preferences: preferences, requireSignature: {}, clearDisabledPreference: {})
+        let keychain = LocalClusterMissingKeychain()
+        var settings = 0
+        let manager = LocalClusterSetupManager(client: client, hosted: LocalClusterEnrollmentClient(transport: http), service: service,
+            qualifiedRuntime: true, keychain: keychain, requireSignature: {}, prepareBackgroundEnable: {}, approveEnvironment: { _ in },
+            helperControlVersion: { 1 }, configuration: { _ in .production }, cookieReader: { _, _ in "personastack_session=fixture" }, openSettings: { settings += 1 })
+        let view = WKWebView(); manager.register(view, appURL: DesktopEnvironmentConfiguration.production.appURL)
+        let initial = try await manager.apply(command("state"), view: view)
+        let scope = try #require(initial["scope"] as? String)
+        // macOS projects a disabled previously registered item as requiresApproval.
+        registration.status = .requiresApproval
+        for _ in 0..<2 {
+            let blocked = try await manager.apply(command("repair", scope: scope), view: view)
+            #expect((blocked["native_status"] as? [String: Any])?["safe_reason"] as? String == "background_approval_required")
+            #expect((blocked["native_status"] as? [String: Any])?["action"] as? String == "open_settings")
+            _ = try await manager.apply(command("state", scope: scope), view: view)
+            #expect(settings == 0)
+        }
+        _ = try await manager.apply(command("open_settings", scope: scope), view: view)
+        #expect(settings == 1)
+        registration.status = .enabled
+        let recovered = try await manager.apply(command("state", scope: scope), view: view)
+        #expect((recovered["native_status"] as? [String: Any])?["safe_reason"] as? String != "background_approval_required")
+        #expect(settings == 1 && keychain.writeCount == 0)
+        #expect(preferences.bool(forKey: AgentBridgeService.disabledKey))
+        #expect(await transport.operations.allSatisfy { ["local_cluster_status", "local_cluster_runtime_status", "local_cluster_binding"].contains($0) })
+        #expect(await http.calls == 7)
+    }
+
     private func command(_ action: String, scope: String = "") throws -> LocalClusterPageCommand {
         try LocalClusterPageCommand.parse(["version": "1", "action": action, "scope": scope])
     }

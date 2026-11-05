@@ -46,7 +46,9 @@ private actor LocalRuntimeControlFixture: AgentBridgeControlTransport {
     var status: SMAppService.Status = .enabled
     var calls: [String] = []
     var canRegister: @MainActor () -> Bool = { true }
+    var permissionDenied = false
     func register() throws {
+        if permissionDenied { calls.append("register-denied"); throw NSError(domain: "SMAppServiceErrorDomain", code: Int(kSMErrorLaunchDeniedByUser)) }
         guard canRegister() else { throw AgentBridgeFailure.serviceUnavailable }
         calls.append("register"); status = .enabled
     }
@@ -89,6 +91,28 @@ private actor LocalRuntimeControlFixture: AgentBridgeControlTransport {
         UserDefaults(suiteName: "AgentBridgeLocalRuntimeLifecycleTests." + UUID().uuidString)!
     }
 
+
+    @Test @MainActor func registrationPermissionDenialPreservesIntentAndHasNoHelperEffects() async throws {
+        let control = LocalRuntimeControlFixture([])
+        let registration = LocalRuntimeRegistration(), settings = preferences()
+        registration.status = .notRegistered; registration.permissionDenied = true
+        settings.set(true, forKey: AgentBridgeService.disabledKey)
+        var startupClears = 0
+        let service = AgentBridgeService(registration: registration, client: .init(transport: control),
+            preferences: settings, requireSignature: {}, clearDisabledPreference: { startupClears += 1 })
+        do {
+            try await service.ensureLocalClusterEnabled()
+            Issue.record("Registration denial must fail explicit enablement")
+        } catch {
+            #expect((error as NSError).domain == "SMAppServiceErrorDomain")
+            #expect((error as NSError).code == Int(kSMErrorLaunchDeniedByUser))
+        }
+        #expect(registration.calls == ["register-denied"])
+        #expect(registration.status == .notRegistered)
+        #expect(startupClears == 1)
+        #expect(settings.bool(forKey: AgentBridgeService.disabledKey))
+        #expect(await control.operations.isEmpty)
+    }
 
     @Test @MainActor func localRemovalRemainsAvailableWhenExternalKeychainStatusFails() async throws {
         let removed = #"{"installed":false,"running":false,"kubernetes_available":false,"enabled":false,"installer_active":false,"safe_reason":"local_data_removed"}"#

@@ -22,7 +22,7 @@ private final class LocalClusterLifecycleKeychain: DesktopControlKeychainAccess,
     let events: LocalClusterLifecycleEvents
     init(key: Data, custody: Data, installationID: String, events: LocalClusterLifecycleEvents, refuseWrites: Bool) {
         entries["ai.personastack.desktop.local-cluster-installation/installation-ed25519-v1"] = key
-        entries["ai.personastack.desktop.local-cluster-custody/" + installationID] = custody
+        if !custody.isEmpty { entries["ai.personastack.desktop.local-cluster-custody/" + installationID] = custody }
         self.events = events; self.refuseWrites = refuseWrites
     }
     func read(service: String, account: String, interaction: DesktopControlKeychainInteraction) throws -> Data? {
@@ -63,6 +63,10 @@ private actor LocalClusterLifecycleHTTP: LocalClusterHTTPTransport {
     let readbackFailure: LocalClusterReadbackFailure?
     let readbackFence: LocalClusterReadbackFence
     let events: LocalClusterLifecycleEvents
+    var losesRedeemResponse = false
+    private(set) var scopeReads = 0
+    private(set) var canonicalTargetReadbacks = 0
+    func loseSuccessfulRedeemResponse() { losesRedeemResponse = true; visible = false }
     var status = "active"
     var version: Int64 = 7
     var visible = true
@@ -76,6 +80,8 @@ private actor LocalClusterLifecycleHTTP: LocalClusterHTTPTransport {
         #expect(request.value(forHTTPHeaderField: "X-PersonaStack-Native-Client") == "macos-local-cluster-v1")
         if path == "/user/kubernetes/clusters/native-scope" {
             #expect(request.httpMethod == "GET")
+            scopeReads += 1
+            if losesRedeemResponse && visible { canonicalTargetReadbacks += 1 }
             if status == "disabled", let readbackFailure {
                 events.append("cloud-readback-unavailable")
                 await readbackFence.readbackFailed()
@@ -97,6 +103,24 @@ private actor LocalClusterLifecycleHTTP: LocalClusterHTTPTransport {
         #expect(request.value(forHTTPHeaderField: "X-PersonaStack-Workspace-ID") == "ws-a")
         let requestBody = try #require(request.httpBody)
         let body = try #require(try JSONSerialization.jsonObject(with: requestBody) as? [String: Any])
+        if path == "/user/kubernetes/clusters/desktop-setups" && losesRedeemResponse {
+            #expect(Set(body.keys) == ["installation_public_key", "document_id", "operation", "name"])
+            #expect(body["operation"] as? String == "create")
+            events.append("cloud-create-prepare")
+            var receipt = body
+            receipt["setup_id"] = "setup-lost"
+            receipt["expires_at"] = ISO8601DateFormatter().string(from: Date().addingTimeInterval(120))
+            receipt["user_id"] = "user-a"; receipt["workspace_id"] = "ws-a"
+            receipt["app_origin"] = "https://my.personastack.ai"; receipt["installation_id"] = fingerprint
+            return (try JSONSerialization.data(withJSONObject: receipt), 200)
+        }
+        if path == "/user/kubernetes/clusters/desktop-setups/setup-lost/redeem" && losesRedeemResponse {
+            #expect(Set(body.keys) == ["installation_public_key", "document_id", "signature"])
+            #expect(Data(base64Encoded: try #require(body["signature"] as? String))?.count == 64)
+            events.append("cloud-redeem-response-lost")
+            visible = true // The API committed before the transport lost its response.
+            throw URLError(.networkConnectionLost)
+        }
         #expect(body["expected_config_version"] as? Int64 == version)
         switch path {
         case "/user/kubernetes/clusters/cluster-own/stop":
@@ -122,6 +146,8 @@ private actor LocalClusterLifecycleControl: AgentBridgeControlTransport {
     let events: LocalClusterLifecycleEvents
     var removed: Bool
     var blank = false
+    var unbound = false
+    func useUnboundInstallation() { unbound = true }
     var running: Bool
     var partial: Bool
     let repairFails: Bool
@@ -147,7 +173,7 @@ private actor LocalClusterLifecycleControl: AgentBridgeControlTransport {
             result = value
         case "local_cluster_binding":
             var value: [String: Any] = ["removed": removed]
-            if blank { value["previous_removed_binding"] = binding } else { value["binding"] = binding }
+            if blank { value["previous_removed_binding"] = binding } else if !unbound { value["binding"] = binding }
             if bindingChangesAfterReadbackFailure && events.values.contains("cloud-readback-unavailable") {
                 var changed = binding; changed["integration_id"] = "cluster-changed"
                 value["binding"] = changed
@@ -201,15 +227,17 @@ private actor LocalClusterLifecycleControl: AgentBridgeControlTransport {
         let keychain: LocalClusterLifecycleKeychain
         let events: LocalClusterLifecycleEvents
         let fingerprint: String
+        let http: LocalClusterLifecycleHTTP
+        let control: LocalClusterLifecycleControl
     }
-    private func rig(removed: Bool = false, disabled: Bool = false, wrongRetainedKey: Bool = false, changeCookieOnThirdRead: Bool = false, partial: Bool = false, repairFails: Bool = false, startupFailure: Bool = false, failStop: Bool = false, failRetire: Bool = false, refuseWrites: Bool = false, readbackFailure: LocalClusterReadbackFailure? = nil, readbackScopeChange: LocalClusterReadbackScopeChange = .none, localStopFails: Bool = false, bindingChangesAfterReadbackFailure: Bool = false) throws -> Rig {
+    private func rig(removed: Bool = false, disabled: Bool = false, wrongRetainedKey: Bool = false, changeCookieOnThirdRead: Bool = false, partial: Bool = false, repairFails: Bool = false, startupFailure: Bool = false, failStop: Bool = false, failRetire: Bool = false, refuseWrites: Bool = false, readbackFailure: LocalClusterReadbackFailure? = nil, readbackScopeChange: LocalClusterReadbackScopeChange = .none, localStopFails: Bool = false, bindingChangesAfterReadbackFailure: Bool = false, destructiveConsent: Bool = true, missingCustody: Bool = false) throws -> Rig {
         let key = try LocalClusterInstallationKey(rawRepresentation: Data(repeating: 7, count: 32))
         let retainedKey = wrongRetainedKey ? try LocalClusterInstallationKey(rawRepresentation: Data(repeating: 8, count: 32)) : key
         let events = LocalClusterLifecycleEvents()
         let enrollment = try JSONDecoder().decode(LocalClusterEnrollment.self, from: Data(#"{"cluster_id":"cluster-own","setup_manifest":"native-only-fixture"}"#.utf8))
         let scope = LocalClusterScope(appOrigin: "https://my.personastack.ai", accountID: "user-a", workspaceID: "ws-a", documentID: UUID())
         let custody = LocalClusterCredentialCustody(scope: scope, enrollment: enrollment)
-        let keychain = LocalClusterLifecycleKeychain(key: retainedKey.rawRepresentation, custody: try JSONEncoder().encode(custody), installationID: key.installationID, events: events, refuseWrites: refuseWrites)
+        let keychain = LocalClusterLifecycleKeychain(key: retainedKey.rawRepresentation, custody: missingCustody ? Data() : try JSONEncoder().encode(custody), installationID: key.installationID, events: events, refuseWrites: refuseWrites)
         let control = LocalClusterLifecycleControl(fingerprint: key.installationID, removed: removed, disabled: disabled, partial: partial, repairFails: repairFails, localStopFails: localStopFails, bindingChangesAfterReadbackFailure: bindingChangesAfterReadbackFailure, events: events)
         let client = AgentBridgeControlClient(transport: control)
         let readbackFence = LocalClusterReadbackFence(readbackScopeChange)
@@ -225,18 +253,72 @@ private actor LocalClusterLifecycleControl: AgentBridgeControlTransport {
                 cookieReads += 1
                 return changeCookieOnThirdRead && cookieReads >= 3 ? "personastack_session=changed" : readbackFence.cookie
             },
-            csrfReader: { _ in "csrf-fixture" }, confirmRemove: { true }, confirmNewSetup: { true }, confirmRotation: { Issue.record("Healthy custody must not rotate"); return false })
+            csrfReader: { _ in "csrf-fixture" }, confirmRemove: { destructiveConsent }, confirmNewSetup: { destructiveConsent }, confirmRotation: { events.append("rotation-review-declined"); return false })
         let view = WKWebView(); manager.register(view, appURL: DesktopEnvironmentConfiguration.production.appURL)
         readbackFence.invalidate = { [weak manager, weak view] in
             guard let view else { return }; manager?.invalidate(view)
         }
-        return Rig(manager: manager, view: view, keychain: keychain, events: events, fingerprint: key.installationID)
+        return Rig(manager: manager, view: view, keychain: keychain, events: events, fingerprint: key.installationID, http: http, control: control)
     }
     private func run(_ action: String, _ rig: Rig) async throws -> [String: Any] {
         let initial = try await rig.manager.apply(LocalClusterPageCommand.parse(["version": "1", "action": "state", "scope": ""]), view: rig.view)
         let scope = try #require(initial["scope"] as? String)
         return try await rig.manager.apply(LocalClusterPageCommand.parse(["version": "1", "action": action, "scope": scope]), view: rig.view)
     }
+    @Test func lostSuccessfulRedeemRecoversCanonicalTargetWithoutMutationReplayOrRotation() async throws {
+        let rig = try rig(missingCustody: true)
+        await rig.http.loseSuccessfulRedeemResponse()
+        await rig.control.useUnboundInstallation()
+        let prepared = try await run("repair", rig)
+        let scope = try #require(prepared["scope"] as? String)
+        await #expect(throws: URLError.self) { _ = try await run("continue", rig) }
+        let readsBefore = await rig.http.scopeReads
+        let recovered = try await rig.manager.apply(LocalClusterPageCommand.parse(["version": "1", "action": "state", "scope": scope]), view: rig.view)
+        #expect(await rig.http.scopeReads > readsBefore)
+        #expect(await rig.http.canonicalTargetReadbacks == 1)
+        #expect(recovered["api_readiness"] as? String == "unknown")
+        #expect(recovered["cluster_id"] == nil)
+        #expect(rig.events.values == ["local-repair", "cloud-create-prepare", "cloud-redeem-response-lost"])
+        await #expect(throws: AgentBridgeFailure.enrollmentUncertain) { _ = try await run("continue", rig) }
+        #expect(rig.events.values == ["local-repair", "cloud-create-prepare", "cloud-redeem-response-lost", "rotation-review-declined"])
+        let retained = try rig.keychain.read(service: "ai.personastack.desktop.local-cluster-installation", account: "installation-ed25519-v1", interaction: .forbidden)
+        let bytes = try #require(retained)
+        #expect(try LocalClusterInstallationKey(rawRepresentation: bytes).installationID == rig.fingerprint)
+    }
+
+    @Test(arguments: ["remove", "new_setup"])
+    func cancelledDestructiveReviewPreservesTargetCredentialsAndNativeState(action: String) async throws {
+        let rig = try rig(removed: action == "new_setup", destructiveConsent: false)
+        await #expect(throws: AgentBridgeFailure.busy) { _ = try await run(action, rig) }
+        #expect(rig.events.values.isEmpty)
+        let retainedValue = try rig.keychain.read(service: "ai.personastack.desktop.local-cluster-installation", account: "installation-ed25519-v1", interaction: .forbidden)
+        let retained = try #require(retainedValue)
+        #expect(try LocalClusterInstallationKey(rawRepresentation: retained).installationID == rig.fingerprint)
+        let response = try await run("state", rig)
+        #expect((response["lifecycle"] as? [String: Any])?["local"] as? String == (action == "new_setup" ? "removed" : "running"))
+        #expect(rig.events.values.isEmpty)
+    }
+
+    @Test(arguments: [false, true])
+    func sessionAndDocumentRetirementPreserveRunningVMAndBackgroundIntent(session: Bool) async throws {
+        let rig = try rig()
+        let initial = try await run("state", rig)
+        let scope = try #require(initial["scope"] as? String)
+        let readsBefore = await rig.http.scopeReads
+        if session { rig.manager.invalidateSession() } else { rig.manager.unregister(rig.view) }
+        await #expect(throws: AgentBridgeFailure.scopeChanged) {
+            _ = try await rig.manager.apply(LocalClusterPageCommand.parse(["version": "1", "action": "remove", "scope": scope]), view: rig.view)
+        }
+        #expect(rig.events.values.isEmpty)
+        #expect(await rig.http.scopeReads == readsBefore)
+        // A new authenticated document observes the same target and running VM.
+        rig.manager.register(rig.view, appURL: DesktopEnvironmentConfiguration.production.appURL)
+        let restored = try await run("state", rig)
+        #expect(restored["cluster_id"] as? String == "cluster-own")
+        #expect((restored["lifecycle"] as? [String: Any])?["local"] as? String == "running")
+        #expect(rig.events.values.isEmpty)
+    }
+
     @Test func disconnectRetainsIndependentStopFailureAfterDisableAndLocalStop() async throws {
         let rig = try rig(failStop: true)
         let response = try await run("disconnect", rig)
