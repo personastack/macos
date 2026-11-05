@@ -52,7 +52,7 @@ func (runtime *Runtime) Start(ctx context.Context, scope Scope) error {
 	if err != nil {
 		return runtimeCustodyFailure(ctx, err)
 	}
-	return runtime.start(ctx, tree, owner)
+	return runtime.start(ctx, tree, owner, false)
 }
 
 // Restore runs once on helper startup. It never creates a VM or authorizes a new
@@ -81,10 +81,10 @@ func (runtime *Runtime) Restore(ctx context.Context) error {
 	if !owner.Enabled {
 		return nil
 	}
-	return runtime.start(ctx, tree, owner)
+	return runtime.start(ctx, tree, owner, false)
 }
 
-func (runtime *Runtime) start(ctx context.Context, tree *ownedTree, owner runtimeOwner) error {
+func (runtime *Runtime) start(ctx context.Context, tree *ownedTree, owner runtimeOwner, explicitRepair bool) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	if ctx.Err() != nil {
@@ -119,6 +119,9 @@ func (runtime *Runtime) start(ctx context.Context, tree *ownedTree, owner runtim
 		}
 	}
 	err = runtime.waitKubernetes(ctx)
+	if err == nil && explicitRepair {
+		err = runtime.repairBootstrap(ctx)
+	}
 	if err != nil {
 		if started {
 			return runtime.abortStartedVM(ctx, err)

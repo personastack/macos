@@ -47,7 +47,7 @@ type runtimeDependencies struct {
 	runner    commandRunner
 	supported func() bool
 	alive     func(int) bool
-	fetch     func(context.Context, *ownedTree, *http.Client, Artifact) error
+	fetch     func(context.Context, *ownedTree, *http.Client, Artifact, func(int64)) error
 	capacity  func(context.Context, *ownedTree, VMResources, int64) error
 	device    func(int) (uint64, error)
 }

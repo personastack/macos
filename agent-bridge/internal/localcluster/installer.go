@@ -48,7 +48,7 @@ func (runtime *Runtime) Install(ctx context.Context, scope Scope, report func(Pr
 		return runtimeFailure(ctx, ReasonLocalDataRemoved, fmt.Errorf("explicit blank setup is required after removal"))
 	}
 	if owner.Bootstrapped {
-		return runtime.start(ctx, tree, owner)
+		return runtime.start(ctx, tree, owner, true)
 	}
 	return runtime.installFresh(ctx, tree, owner, report)
 }
@@ -75,7 +75,11 @@ func (runtime *Runtime) installFresh(ctx context.Context, tree *ownedTree, owner
 	}
 	progress(StageDownloading)
 	for _, artifact := range inputs {
-		err = runtime.dependencies.fetch(ctx, tree, runtime.dependencies.client, artifact)
+		err = runtime.dependencies.fetch(ctx, tree, runtime.dependencies.client, artifact, func(transferred int64) {
+			if report != nil {
+				report(Progress{Stage: StageDownloading, CompletedBytes: completed + transferred, TotalBytes: total})
+			}
+		})
 		if err != nil {
 			return runtimeFailure(ctx, ReasonArtifactUnavailable, err)
 		}

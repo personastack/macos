@@ -36,18 +36,30 @@ func TestArtifactDownloadVerifiesBeforeReuse(t *testing.T) {
 	digest := sha256.Sum256([]byte(content))
 	pin := Artifact{Component: K3s, Version: "v1", URL: "https://github.com/owner/project/releases/download/v1/input", SHA256: hex.EncodeToString(digest[:]), Size: int64(len(content))}
 	calls := 0
+	var activity []int64
+	report := func(bytes int64) { activity = append(activity, bytes) }
 	client := &http.Client{Transport: artifactTransport(func(request *http.Request) (*http.Response, error) {
+		if len(activity) != 0 {
+			t.Error("cached verification emitted transfer activity before request")
+		}
 		calls++
 		if request.URL.String() != pin.URL || request.Header.Get("Authorization") != "" {
 			t.Error("download escaped pinned URL or acquired credentials")
 		}
 		return &http.Response{StatusCode: 200, ContentLength: pin.Size, Body: io.NopCloser(strings.NewReader(content))}, nil
 	})}
-	err = acquireArtifact(context.Background(), tree, client, pin)
+	err = acquireArtifact(context.Background(), tree, client, pin, report)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = acquireArtifact(context.Background(), tree, client, pin)
+	if len(activity) != 1 || activity[0] != pin.Size {
+		t.Fatal("network transfer activity missing")
+	}
+	activity = nil
+	err = acquireArtifact(context.Background(), tree, client, pin, report)
+	if len(activity) != 0 {
+		t.Fatal("verified cache counted hashing as transfer")
+	}
 	if err != nil || calls != 1 {
 		t.Fatalf("verified input not reused: calls=%d err=%v", calls, err)
 	}
@@ -55,16 +67,20 @@ func TestArtifactDownloadVerifiesBeforeReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = acquireArtifact(context.Background(), tree, client, pin)
+	err = acquireArtifact(context.Background(), tree, client, pin, report)
 	if err != nil || calls != 2 {
 		t.Fatalf("corrupt cached input not repaired: calls=%d err=%v", calls, err)
 	}
+	activity = nil
 	content = "invalid bytes"
 	err = tree.write("artifacts/k3s", []byte("corruption"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = acquireArtifact(context.Background(), tree, client, pin)
+	err = acquireArtifact(context.Background(), tree, client, pin, report)
+	if len(activity) != 1 || activity[0] > pin.Size {
+		t.Fatal("invalid body activity exceeded pinned budget")
+	}
 	var failure *Failure
 	if !errors.As(err, &failure) || failure.Reason != ReasonIntegrityFailed {
 		t.Fatalf("unverified network bytes accepted: %v", err)

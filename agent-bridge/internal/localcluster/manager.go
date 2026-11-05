@@ -87,7 +87,8 @@ var (
 	ErrAttemptChanged  = errors.New("local cluster attempt changed")
 )
 
-// Progress counts aggregate verified installer input bytes, not API readiness.
+// Progress counts aggregate input transfer activity, not digest verification or
+// API readiness. Cached inputs advance only after their verification succeeds.
 // The concrete installer must not regress stages or completed byte counts.
 type Progress struct {
 	Stage          Stage `json:"stage"`

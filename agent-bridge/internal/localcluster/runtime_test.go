@@ -39,7 +39,7 @@ func newRuntimeFixture(t *testing.T) *runtimeFixture {
 	dependencies := runtimeDependencies{
 		runner: fixture, supported: func() bool { return true }, alive: func(int) bool { return false },
 		capacity: func(context.Context, *ownedTree, VMResources, int64) error { return nil },
-		fetch: func(ctx context.Context, tree *ownedTree, _ *http.Client, artifact Artifact) error {
+		fetch: func(ctx context.Context, tree *ownedTree, _ *http.Client, artifact Artifact, _ func(int64)) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}

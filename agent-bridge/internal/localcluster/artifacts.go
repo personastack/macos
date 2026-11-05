@@ -38,7 +38,7 @@ func validateDownloadURL(location *url.URL) error {
 	}
 }
 
-func acquireArtifact(ctx context.Context, tree *ownedTree, client *http.Client, artifact Artifact) error {
+func acquireArtifact(ctx context.Context, tree *ownedTree, client *http.Client, artifact Artifact, report func(int64)) error {
 	name := "artifacts/" + string(artifact.Component)
 	existing, err := tree.open(name, os.O_RDONLY)
 	if err == nil {
@@ -76,12 +76,33 @@ func acquireArtifact(ctx context.Context, tree *ownedTree, client *http.Client, 
 	if err != nil {
 		return runtimeCustodyFailure(ctx, fmt.Errorf("prepare owned artifact file: %w", err))
 	}
-	reader := io.TeeReader(contextReader{ctx, response.Body}, file)
+	transfer := &artifactTransfer{reader: contextReader{ctx, response.Body}, limit: artifact.Size, report: report}
+	reader := io.TeeReader(transfer, file)
 	err = verifyArtifact(artifact, reader)
 	if err != nil {
 		return runtimeFailure(ctx, ReasonIntegrityFailed, fmt.Errorf("verify downloaded artifact: %w", err))
 	}
 	return nil
+}
+
+// Transfer activity is distinct from digest verification. Report the first
+// received bytes and then at most once per quarter second, within the pin size.
+type artifactTransfer struct {
+	reader   io.Reader
+	limit    int64
+	report   func(int64)
+	received int64
+	last     time.Time
+}
+
+func (transfer *artifactTransfer) Read(data []byte) (int, error) {
+	n, err := transfer.reader.Read(data)
+	transfer.received += int64(n)
+	if n > 0 && transfer.report != nil && (transfer.last.IsZero() || time.Since(transfer.last) >= 250*time.Millisecond) {
+		transfer.report(min(transfer.received, transfer.limit))
+		transfer.last = time.Now()
+	}
+	return n, err
 }
 
 type contextReader struct {
