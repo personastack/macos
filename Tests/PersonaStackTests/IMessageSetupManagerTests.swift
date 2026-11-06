@@ -9,6 +9,11 @@ private let coordinatorNow = Date(timeIntervalSince1970: 1_800_000_000)
 private func coordinatorUTC(_ date: Date) -> String { ISO8601DateFormatter().string(from: date) }
 private func coordinatorJSON(_ value: [String: Any]) throws -> Data { try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]) }
 
+private func coordinatorSessionCSRF(_ cookies: String) -> String {
+    cookies.split(separator: ";").contains { $0.trimmingCharacters(in: .whitespaces) == "ps_session=changed" }
+        ? "changed-session-csrf" : "fixture-csrf"
+}
+
 private actor IMessageCoordinatorTransport: AgentBridgeHostedTransport {
     private(set) var requests: [URLRequest] = []
     private(set) var mutations: [String] = []
@@ -78,7 +83,7 @@ private actor IMessageCoordinatorTransport: AgentBridgeHostedTransport {
         case "/user/imessage/native-scope":
             #expect(request.httpMethod == "GET")
             return (try coordinatorJSON(["natural_user_id": "human", "workspace_id": workspace, "app_origin": DesktopEnvironmentConfiguration.production.appOrigin]), 200)
-        case "/user/mobile/bootstrap": return (try bootstrap(), 200)
+        case "/user/mobile/bootstrap": return (try bootstrap(request), 200)
         case "/user/imessage/setup": return try journeyRequest(request)
         case "/user/imessage/setup/reauthorize": return (try journey(), 200)
         case "/user/imessage/enrollment-ticket":
@@ -93,7 +98,7 @@ private actor IMessageCoordinatorTransport: AgentBridgeHostedTransport {
         case "/user/imessage/configs":
             #expect(request.value(forHTTPHeaderField: "Authorization") == nil)
             #expect(request.value(forHTTPHeaderField: "Cookie") == "ps_session=fixture")
-            #expect(request.value(forHTTPHeaderField: "X-CSRF-Token") == "fixture-csrf")
+            #expect(request.value(forHTTPHeaderField: "X-CSRF-Token") == coordinatorSessionCSRF(request.value(forHTTPHeaderField: "Cookie") ?? ""))
             configID = "canonical-config"
             return (try coordinatorJSON(["integration_config_id": "canonical-config"]), lostCreate ? 503 : 201)
         default: Issue.record("Unplanned coordinator route \(path)"); throw IMessageHostedSetupError.serviceUnavailable
@@ -103,7 +108,7 @@ private actor IMessageCoordinatorTransport: AgentBridgeHostedTransport {
         if request.httpMethod == "POST" {
             #expect(request.httpBody == Data("{}".utf8))
             #expect(request.value(forHTTPHeaderField: "Cookie") == "ps_session=fixture")
-            #expect(request.value(forHTTPHeaderField: "X-CSRF-Token") == "fixture-csrf")
+            #expect(request.value(forHTTPHeaderField: "X-CSRF-Token") == coordinatorSessionCSRF(request.value(forHTTPHeaderField: "Cookie") ?? ""))
             #expect(request.value(forHTTPHeaderField: "X-PersonaStack-Native-Client") == "macos-imessage-v1")
             #expect(request.value(forHTTPHeaderField: "X-PersonaStack-Workspace-ID") == workspace)
             #expect(request.value(forHTTPHeaderField: "Authorization") == nil)
@@ -142,7 +147,7 @@ private actor IMessageCoordinatorTransport: AgentBridgeHostedTransport {
         #expect(object["expected_config_version"] as? String == String(savedVersion))
         #expect(request.value(forHTTPHeaderField: "Cookie") == "ps_session=fixture")
         #expect(request.value(forHTTPHeaderField: "Authorization") == nil)
-        #expect(request.value(forHTTPHeaderField: "X-CSRF-Token") == "fixture-csrf")
+        #expect(request.value(forHTTPHeaderField: "X-CSRF-Token") == coordinatorSessionCSRF(request.value(forHTTPHeaderField: "Cookie") ?? ""))
         if request.url?.path.hasSuffix("/pause") == true {
             #expect(Set(object.keys) == ["expected_config_version"])
             savedPaused = true
@@ -214,13 +219,13 @@ private actor IMessageCoordinatorTransport: AgentBridgeHostedTransport {
         return (try coordinatorJSON(["status": ["integration_id": "saved", "state": "connected", "receive_state": "disabled",
             "read_enabled": savedRead, "send_enabled": savedSend, "receive_enabled": false, "pending_count": 0, "continuity_gap_conversation_ids": []]]), 200)
     }
-    private func bootstrap() throws -> Data {
+    private func bootstrap(_ request: URLRequest) throws -> Data {
         let active = bootstrapMismatch ? "personal" : workspace
         return try coordinatorJSON(["authenticated": true, "natural_user": ["id": "human", "role": "user"],
             "effective_user": ["id": "human", "role": "user", "display_name": "Human", "email": "", "avatar_url": "", "time_zone": ""],
             "impersonation_active": false, "session_expires_at": coordinatorUTC(coordinatorNow.addingTimeInterval(7200)),
             "workspaces": [["id": active, "display_name": "Team workspace", "status": "active", "organization_id": "org", "organization_name": "Team", "personal": false, "workspace_admin": false]],
-            "active_workspace_id": active, "no_accessible_workspace": false, "csrf_token": "private-csrf"])
+            "active_workspace_id": active, "no_accessible_workspace": false, "csrf_token": coordinatorSessionCSRF(request.value(forHTTPHeaderField: "Cookie") ?? "")])
     }
     private func verification(_ request: URLRequest) async throws -> Data {
         let body = try #require(request.httpBody)
@@ -411,7 +416,7 @@ private final class IMessageCoordinatorRandom: @unchecked Sendable {
         deps.configuredMenuAvailability = { [state] in state.physicalAvailable ? .connected : .offline }
         deps.pageURL = { [state] _ in state.pageURL }
         deps.store = { [store] _ in store }; deps.now = { coordinatorNow }; deps.preferences = preferences
-        deps.csrf = { _ in "fixture-csrf" }; deps.macName = { "Fixture Mac" }
+        deps.csrf = { [state] _ in coordinatorSessionCSRF(state.cookies) }; deps.macName = { "Fixture Mac" }
         deps.cookies = { [state] _, _ in state.cookies }
         deps.session = { [store, runtime] in
             let loaded = try store.load()
@@ -533,6 +538,53 @@ private final class IMessageCoordinatorRandom: @unchecked Sendable {
         preferences.removePersistentDomain(forName: suite)
         if FileManager.default.fileExists(atPath: directory.path) { try FileManager.default.removeItem(at: directory) }
     }
+}
+
+@Test @MainActor func iMessageSetupManagerAcceptsAuxiliaryCookieChangeForSameSession() async throws {
+    let f = try IMessageCoordinatorFixture()
+    let initial = try await f.apply("begin")
+    let scope = try #require(initial["scope"] as? String)
+    f.state.cookies = "ps_session=fixture; auxiliary=changed"
+    let reply = try await f.apply("continue", scope: scope)
+    #expect(reply["state"] as? String == "permissions")
+    #expect(reply["scope"] as? String == scope)
+    #expect(await f.transport.mutations.contains("/v1/desktop-control/enroll"))
+    #expect(f.state.automationRequests == 0)
+    #expect(await f.provider.restores == 0)
+    try await f.cleanup()
+}
+
+@Test @MainActor func iMessageSetupManagerRejectsNewSessionForSameActorAndWorkspace() async throws {
+    let f = try IMessageCoordinatorFixture()
+    let initial = try await f.apply("begin")
+    let scope = try #require(initial["scope"] as? String)
+    let mutations = await f.transport.mutations
+    f.state.cookies = "ps_session=changed"
+    await #expect(throws: IMessageSetupCoordinatorError.scopeChanged) {
+        _ = try await f.apply("continue", scope: scope)
+    }
+    #expect(await f.transport.mutations == mutations)
+    #expect(f.state.automationRequests == 0 && f.state.metadataConsentRequests == 0)
+    #expect(await f.provider.restores == 0)
+    try await f.cleanup()
+}
+
+@Test @MainActor func iMessageSetupManagerRejectsCookieChangeDuringAuthorityRead() async throws {
+    let f = try IMessageCoordinatorFixture()
+    let initial = try await f.apply("begin")
+    let scope = try #require(initial["scope"] as? String)
+    let mutations = await f.transport.mutations
+    f.state.cookies = "ps_session=fixture; auxiliary=first"
+    await f.transport.holdOnce("/user/mobile/bootstrap")
+    let pending = Task { @MainActor in _ = try await f.apply("continue", scope: scope) }
+    try await coordinatorAwaitTransportEntry(f.transport, task: pending)
+    f.state.cookies = "ps_session=fixture; auxiliary=second"
+    await f.transport.release()
+    await #expect(throws: IMessageSetupCoordinatorError.scopeChanged) { try await pending.value }
+    #expect(await f.transport.mutations == mutations)
+    #expect(f.state.automationRequests == 0 && f.state.metadataConsentRequests == 0)
+    #expect(await f.provider.restores == 0)
+    try await f.cleanup()
 }
 
 @Test @MainActor func iMessageSetupManagerRestoresOnlyFreshNativeSelectionAndFinalCancelCreatesNothing() async throws {

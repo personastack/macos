@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Testing
 import PersonaStackCore
 @testable import PersonaStack
@@ -427,6 +428,34 @@ func iMessageHostedSetupClientPinsPageAndSelectedProjectionContracts(reason: Str
     let context = try await IMessageHostedSetupClient(transport: transport).displayContext(configuration: .production,
         cookies: "fixture", expectedScope: hostedScopeFixture(), validateScope: {})
     #expect(context.workspaceName == "Team workspace" && context.workspaceID == "workspace" && context.naturalUserID == "human")
+    #expect(await transport.requests.count == 2)
+    await transport.requireExhausted()
+}
+
+@Test func iMessageHostedDisplayContextFingerprintTracksOnlySessionCSRF() throws {
+    let original = try JSONDecoder().decode(IMessageHostedDisplayContext.self, from: Data(hostedBootstrapJSON.utf8))
+    let renamed = hostedBootstrapJSON.replacingOccurrences(of: "Team workspace", with: "Renamed workspace")
+    let sameSession = try JSONDecoder().decode(IMessageHostedDisplayContext.self, from: Data(renamed.utf8))
+    let changed = hostedBootstrapJSON.replacingOccurrences(of: "private-csrf", with: "another-opaque.token+/=")
+    let differentSession = try JSONDecoder().decode(IMessageHostedDisplayContext.self, from: Data(changed.utf8))
+    #expect(original.sessionFingerprint == Data(SHA256.hash(data: Data("private-csrf".utf8))))
+    #expect(sameSession.sessionFingerprint == original.sessionFingerprint)
+    #expect(differentSession.sessionFingerprint != original.sessionFingerprint)
+    let maximum = hostedBootstrapJSON.replacingOccurrences(of: "private-csrf", with: String(repeating: "x", count: 512))
+    let bounded = try JSONDecoder().decode(IMessageHostedDisplayContext.self, from: Data(maximum.utf8))
+    #expect(bounded.sessionFingerprint.count == 32)
+}
+
+@Test(arguments: ["", String(repeating: "x", count: 513), String(repeating: "é", count: 257), "has space", "has\ttab", "has\nnewline", "has\u{00A0}space", "has\u{0000}control", "has\u{007F}control"])
+func iMessageHostedSetupClientRejectsInvalidSessionCSRFTokens(token: String) async throws {
+    var bootstrap = try #require(JSONSerialization.jsonObject(with: Data(hostedBootstrapJSON.utf8)) as? [String: Any])
+    bootstrap["csrf_token"] = token
+    let body = String(decoding: try JSONSerialization.data(withJSONObject: bootstrap), as: UTF8.self)
+    let transport = IMessageHostedTransportFixture([.scope, .init("GET", "/user/mobile/bootstrap", body)])
+    await #expect(throws: IMessageHostedSetupError.invalidResponse) {
+        try await IMessageHostedSetupClient(transport: transport).displayContext(configuration: .production,
+            cookies: "fixture", expectedScope: hostedScopeFixture(), validateScope: {})
+    }
     #expect(await transport.requests.count == 2)
     await transport.requireExhausted()
 }

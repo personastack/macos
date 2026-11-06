@@ -389,29 +389,37 @@ final class IMessageSetupManager: NSObject, ObservableObject, WKScriptMessageHan
     private func authorize(_ page: Page, view: WKWebView, generation: UUID,
                            validateIntention: (@MainActor @Sendable () throws -> Void)? = nil) async throws -> String {
         try validateIntention?()
+        let retainedScope = page.scope
+        let retainedSession = page.display?.sessionFingerprint
         let cookies = try await dependencies.cookies(view, page.configuration)
         try current(page, generation: generation)
-        try validateIntention?()
         let fingerprint = Data(SHA256.hash(data: Data(cookies.utf8)))
-        guard page.cookiesFingerprint == nil || page.cookiesFingerprint == fingerprint else {
-            invalidate(view); throw IMessageSetupCoordinatorError.scopeChanged
+        let validateCandidate: IMessageHostedSetupClient.ValidateScope = {
+            try self.current(page, generation: generation)
+            try validateIntention?()
+            let currentCookies = try await self.dependencies.cookies(view, page.configuration)
+            try self.current(page, generation: generation)
+            guard fingerprint == Data(SHA256.hash(data: Data(currentCookies.utf8))) else {
+                throw IMessageSetupCoordinatorError.scopeChanged
+            }
+            try validateIntention?()
+        }
+        let scope = try await hosted.nativeScope(configuration: page.configuration, cookies: cookies,
+            validateScope: validateCandidate)
+        guard retainedScope == nil || retainedScope == scope else { throw IMessageSetupCoordinatorError.scopeChanged }
+        let display = try await hosted.displayContext(configuration: page.configuration, cookies: cookies,
+            expectedScope: scope, validateScope: validateCandidate)
+        try await validateCandidate()
+        guard page.scope == retainedScope, page.display?.sessionFingerprint == retainedSession,
+              retainedSession == nil || retainedSession == display.sessionFingerprint else {
+            throw IMessageSetupCoordinatorError.scopeChanged
         }
         page.cookiesFingerprint = fingerprint
-        let scope = try await hosted.nativeScope(configuration: page.configuration, cookies: cookies) {
-            try await self.requireCurrent(page, view: view, generation: generation)
-            try validateIntention?()
-        }
-        try validateIntention?()
-        guard page.scope == nil || page.scope == scope else { throw IMessageSetupCoordinatorError.scopeChanged }
         page.scope = scope
-        let display = try await hosted.displayContext(configuration: page.configuration, cookies: cookies, expectedScope: scope) {
-            try await self.requireCurrent(page, view: view, generation: generation)
-            try validateIntention?()
-        }
-        try validateIntention?()
         page.display = display
         return cookies
     }
+
     private func current(_ page: Page, generation: UUID) throws {
         try Task.checkCancellation()
         guard dependencies.admitsOperations(), lifetimeAdmitsOperations(), !page.retired, page.generation == generation,

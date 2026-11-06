@@ -504,11 +504,12 @@ struct IMessageHostedSetupClient: Sendable {
     }
 }
 
-/// Display only. The separate native-scope response remains authority.
+/// Verified display context and session continuity. Native-scope remains identity authority.
 struct IMessageHostedDisplayContext: Decodable, Equatable, Sendable {
     let naturalUserID: String
     let workspaceID: String
     let workspaceName: String
+    let sessionFingerprint: Data
 
     init(from decoder: Decoder) throws {
         let c = try hostedContainer(decoder, Keys.self, optional: [.organization])
@@ -523,7 +524,12 @@ struct IMessageHostedDisplayContext: Decodable, Equatable, Sendable {
               workspaces.count <= 256, Set(workspaces.map(\.id)).count == workspaces.count,
               let selected = workspaces.first(where: { $0.id == activeWorkspaceID }) else { throw IMessageHostedSetupError.scopeChanged }
         _ = try c.decode(String.self, forKey: .sessionExpiresAt)
-        _ = try c.decode(String.self, forKey: .csrfToken)
+        let csrfToken = try c.decode(String.self, forKey: .csrfToken)
+        guard !csrfToken.isEmpty, csrfToken.utf8.count <= 512,
+              !csrfToken.contains(where: \.isWhitespace), !hostedHasControls(csrfToken) else {
+            throw IMessageHostedSetupError.invalidResponse
+        }
+        sessionFingerprint = Data(SHA256.hash(data: Data(csrfToken.utf8)))
         if c.contains(.organization) { _ = try c.decode(Organization.self, forKey: .organization) }
         naturalUserID = natural.id; workspaceID = activeWorkspaceID; workspaceName = selected.displayName
     }
