@@ -56,3 +56,35 @@ func TestLocalClusterHelperPreparationDoesNotInstallOrCreateData(t *testing.T) {
 		t.Fatalf("passive helper preparation created runtime files: %v, %v", entries, err)
 	}
 }
+
+func TestHeadlessRemovalWithoutRuntimeNeedsNoBundleOrCredentials(t *testing.T) {
+	t.Parallel()
+	root, err := os.MkdirTemp("/tmp", "ps-mac-remove-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	canonical, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(canonical, "PersonaStack", "AgentBridge")
+	for attempt := 0; attempt < 2; attempt++ {
+		err = removeLocalRuntimeForBundle(context.Background(), directory, filepath.Join(canonical, "missing.app"))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err = os.Stat(filepath.Join(canonical, "PSK8s"))
+	if !os.IsNotExist(err) {
+		t.Fatal("headless absent removal created runtime data")
+	}
+	owner, err := localcluster.AcquireProcessOwner(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if removeLocalRuntimeForBundle(context.Background(), directory, filepath.Join(canonical, "missing.app")) == nil {
+		t.Fatal("headless removal raced the live owner")
+	}
+}

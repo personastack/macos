@@ -16,6 +16,7 @@ import (
 	"github.com/personastack/macos/agent-bridge/internal/config"
 	"github.com/personastack/macos/agent-bridge/internal/control"
 	"github.com/personastack/macos/agent-bridge/internal/daemon"
+	"github.com/personastack/macos/agent-bridge/internal/localcluster"
 )
 
 func main() {
@@ -23,9 +24,18 @@ func main() {
 		fmt.Println(buildinfo.VersionString())
 		return
 	}
-	if len(os.Args) != 1 || runtime.GOOS != "darwin" || os.Geteuid() == 0 {
+	removeLocalRuntime := len(os.Args) == 2 && os.Args[1] == "--remove-local-runtime"
+	if (len(os.Args) != 1 && !removeLocalRuntime) || runtime.GOOS != "darwin" || os.Geteuid() == 0 {
 		log.Print("Private macOS user-session helper required.")
 		os.Exit(1)
+	}
+	if removeLocalRuntime {
+		err := removeLocalRuntimeData()
+		if err != nil {
+			log.Print("Local runtime removal failed. Stop background agents and retry before uninstalling PersonaStack.")
+			os.Exit(1)
+		}
+		return
 	}
 	err := run()
 	if err != nil {
@@ -42,6 +52,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	owner, err := localcluster.AcquireProcessOwner(directory)
+	if err != nil {
+		return err
+	}
+	defer owner.Close()
 	secrets := config.KeychainStore{}
 	seed, seedErr := config.InstallationSeed(secrets)
 	if seedErr != nil {

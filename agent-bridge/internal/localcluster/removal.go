@@ -77,11 +77,23 @@ func (runtime *Runtime) RemoveData(ctx context.Context, scope Scope, binding Tar
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 	tree, err := runtime.tree(false)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
 		return runtimeCustodyFailure(ctx, err)
 	}
 	defer tree.directory.Close()
 	owner, err := runtime.owner(tree, scope)
+	if errors.Is(err, os.ErrNotExist) && machineAction {
+		present, inspectErr := runtime.removalPayloadPresent(tree)
+		if inspectErr != nil {
+			return runtimeCustodyFailure(ctx, inspectErr)
+		}
+		if !present {
+			return nil
+		}
+	}
 	if err != nil {
 		return runtimeCustodyFailure(ctx, err)
 	}
@@ -110,9 +122,23 @@ func (runtime *Runtime) RemoveData(ctx context.Context, scope Scope, binding Tar
 	if err != nil {
 		return runtimeCustodyFailure(ctx, err)
 	}
-	if !present {
-		return nil
+	if present {
+		err = runtime.removeInstance(ctx, tree)
+		if err != nil {
+			return runtimeCustodyFailure(ctx, err)
+		}
 	}
+	count := 0
+	for _, name := range removalCacheNames {
+		err = removeOwnedEntry(ctx, int(tree.directory.Fd()), name, 0, &count, runtime.dependencies.device)
+		if err != nil {
+			return runtimeCustodyFailure(ctx, err)
+		}
+	}
+	return nil
+}
+
+func (runtime *Runtime) removeInstance(ctx context.Context, tree *ownedTree) error {
 	parent, err := tree.directoryHandle("l")
 	if err != nil {
 		return runtimeCustodyFailure(ctx, err)
@@ -128,6 +154,29 @@ func (runtime *Runtime) RemoveData(ctx context.Context, scope Scope, binding Tar
 		return runtimeCustodyFailure(ctx, err)
 	}
 	return nil
+}
+
+// Only these source-owned payloads are erased. The owner tombstone and
+// unrelated entries remain so removal cannot erase another feature's data.
+var removalCacheNames = []string{"artifacts", "home", "tmp", "vm.yaml"}
+
+func (runtime *Runtime) removalPayloadPresent(tree *ownedTree) (bool, error) {
+	present, err := tree.hasDirectory("l/" + InstanceName)
+	if err != nil || present {
+		return present, err
+	}
+	for _, name := range removalCacheNames {
+		var stat unix.Stat_t
+		err = unix.Fstatat(int(tree.directory.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("inspect runtime removal payload: %w", err)
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 // On the first removal, observe current stopped state. A retained tombstone
@@ -178,9 +227,9 @@ func (runtime *Runtime) NewSetupAfterRemoval(ctx context.Context, scope Scope, e
 	if expected != (TargetBinding{}) && owner.Binding != expected {
 		return runtimeCustodyFailure(ctx, fmt.Errorf("removed target changed"))
 	}
-	present, err := tree.hasDirectory("l/" + InstanceName)
+	present, err := runtime.removalPayloadPresent(tree)
 	if err != nil || present {
-		return runtimeCustodyFailure(ctx, fmt.Errorf("removed VM files remain"))
+		return runtimeCustodyFailure(ctx, fmt.Errorf("removed runtime files remain"))
 	}
 	if owner.Binding != (TargetBinding{}) {
 		owner.PreviousRemovedBinding = owner.Binding

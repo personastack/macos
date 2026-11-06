@@ -7,11 +7,11 @@ import WebKit
 @main
 @MainActor
 enum DesktopEntryPoint {
-    static func main() {
+    static func main() async {
         if CommandLine.arguments == [CommandLine.arguments[0], "--personastack-unregister-login"] {
-            do { try DesktopLoginItemRegistration.unregisterForUninstall() }
+            do { try await DesktopUninstall.run() }
             catch {
-                fputs("PersonaStack could not unregister Login Items. Quit PersonaStack and retry uninstall.\n", stderr)
+                fputs("PersonaStack could not confirm local runtime removal and Login Items cleanup. The app must remain installed. Quit PersonaStack and retry uninstall.\n", stderr)
                 exit(1)
             }
             return

@@ -76,7 +76,7 @@ func (runtime *Runtime) Binding(ctx context.Context, scope Scope) (TargetBinding
 		status.PreviousRemovedBinding = &previous
 	}
 	if owner.Removed {
-		present, presentErr := tree.hasDirectory("l/" + InstanceName)
+		present, presentErr := runtime.removalPayloadPresent(tree)
 		if presentErr != nil {
 			return TargetBindingStatus{}, runtimeCustodyFailure(ctx, presentErr)
 		}

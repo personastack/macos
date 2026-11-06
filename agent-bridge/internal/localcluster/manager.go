@@ -163,17 +163,18 @@ type installTask struct {
 // Manager owns at most one installer task for the helper lifetime. Its lock only
 // protects value snapshots. No workflow or cancellation callback runs under it.
 type Manager struct {
-	ctx         context.Context
-	workflow    Workflow
-	runtime     RuntimeWorkflow
-	owner       Scope
-	hasOwner    bool
-	quiesced    bool
-	cached      MachineStatus
-	stopFailure *setupGuidance
-	now         func() time.Time
-	mu          sync.Mutex
-	task        *installTask
+	ctx              context.Context
+	workflow         Workflow
+	runtime          RuntimeWorkflow
+	owner            Scope
+	hasOwner         bool
+	quiesced         bool
+	cached           MachineStatus
+	stopFailure      *setupGuidance
+	failureOperation Operation
+	now              func() time.Time
+	mu               sync.Mutex
+	task             *installTask
 }
 
 func NewManager(ctx context.Context, workflow Workflow, now func() time.Time) (*Manager, error) {
@@ -422,6 +423,9 @@ func (m *Manager) RuntimeStatus(ctx context.Context) (MachineStatus, error) {
 		status.Reason, status.Message, status.Action = guidance.reason, guidance.message, guidance.action
 		return status, nil
 	}
+	if task != nil && task.snapshot.Operation == OperationRemove && task.snapshot.State == StateCompleted && !observed.Installed && !observed.Enabled && !observed.Running && observed.Reason == ReasonNone {
+		observed.Reason = ReasonLocalDataRemoved
+	}
 	m.cached = MachineStatus{Installed: observed.Installed, Running: observed.Running, KubernetesAvailable: observed.KubernetesAvailable, Enabled: observed.Enabled, Action: ActionNone}
 	if observed.Reason != ReasonNone {
 		guidance := guidanceForReason(observed.Reason)
@@ -588,19 +592,23 @@ func (m *Manager) finishTask(ctx context.Context, task *installTask, err error) 
 		if snapshot.Operation == OperationInstall {
 			snapshot.State = StateInstalled
 		}
-		if snapshot.Operation == OperationStop || snapshot.Operation == OperationRemove {
+		if snapshot.Operation == OperationRemove || (snapshot.Operation == OperationStop && m.failureOperation != OperationRemove) {
 			m.stopFailure = nil
+			m.failureOperation = ""
 		}
 		if snapshot.Operation == OperationNewSetup {
 			m.owner, m.hasOwner = Scope{}, false
 		}
-	case snapshot.Operation == OperationStop:
+	case snapshot.Operation == OperationStop || snapshot.Operation == OperationRemove:
 		snapshot.State = StateFailed
 		guidance := failureGuidance(err)
 		if guidance.reason == ReasonSetupFailed {
 			guidance = failureGuidance(&Failure{Reason: ReasonStopFailed})
 		}
 		m.stopFailure = &guidance
+		if snapshot.Operation == OperationRemove || m.failureOperation != OperationRemove {
+			m.failureOperation = snapshot.Operation
+		}
 		snapshot.Reason, snapshot.Message, snapshot.Action = guidance.reason, guidance.message, guidance.action
 	case errors.Is(err, context.Canceled) && ctx.Err() != nil:
 		snapshot.State, snapshot.Action = StateCancelled, ActionRetry

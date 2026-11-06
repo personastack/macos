@@ -250,9 +250,52 @@ private actor LocalRuntimeControlFixture: AgentBridgeControlTransport {
         ])
         let registration = LocalRuntimeRegistration()
         let service = AgentBridgeService(registration: registration, client: .init(transport: control),
-            preferences: preferences(), requireSignature: {}, clearDisabledPreference: {}, runtimeOperationTimeout: .zero)
+            preferences: preferences(), requireSignature: {}, clearDisabledPreference: {}, removalOperationTimeout: .zero)
         await #expect(throws: AgentBridgeFailure.operationTimeout) { try await service.removeLocalRuntimeData() }
         #expect(registration.calls.isEmpty)
+    }
+
+    @Test @MainActor func uninstallRemovalNeverChangesDisabledIntentOrStartsService() async throws {
+        let removed = #"{"installed":false,"running":false,"kubernetes_available":false,"enabled":false,"installer_active":false,"safe_reason":"local_data_removed"}"#
+        let control = LocalRuntimeControlFixture([
+            ("local_cluster_remove", #"{"active":true}"#),
+            ("local_cluster_runtime_status", removed)
+        ], externalCredentialsUnavailable: true)
+        let registration = LocalRuntimeRegistration(), settings = preferences()
+        settings.set(true, forKey: AgentBridgeService.disabledKey)
+        let service = AgentBridgeService(registration: registration, client: .init(transport: control),
+            preferences: settings, requireSignature: { Issue.record("No registration") },
+            clearDisabledPreference: { Issue.record("Keep saved disabled intent") })
+        try await service.removeLocalRuntimeDataUsingControl()
+        #expect(registration.calls.isEmpty)
+        #expect(settings.bool(forKey: AgentBridgeService.disabledKey))
+        try await service.unregisterForUninstall()
+        #expect(registration.calls == ["unregister"])
+        #expect(await control.operations == ["status", "local_cluster_remove", "status", "local_cluster_runtime_status"])
+    }
+
+    @Test(arguments: [SMAppService.Status.notRegistered, .notFound])
+    @MainActor func uninstallAlreadyUnregisteredServiceIsANoOp(_ status: SMAppService.Status) async throws {
+        let control = LocalRuntimeControlFixture([]), registration = LocalRuntimeRegistration()
+        registration.status = status
+        let service = AgentBridgeService(registration: registration, client: .init(transport: control),
+            preferences: preferences(), requireSignature: { Issue.record("Do not register") },
+            clearDisabledPreference: { Issue.record("Do not enable") })
+        try await service.unregisterForUninstall()
+        try await service.unregisterForUninstall()
+        #expect(registration.calls.isEmpty)
+        #expect(await control.operations.isEmpty)
+    }
+
+    @Test @MainActor func uninstallRetiresApprovalPendingServiceWithoutStartingIt() async throws {
+        let control = LocalRuntimeControlFixture([]), registration = LocalRuntimeRegistration()
+        registration.status = .requiresApproval
+        let service = AgentBridgeService(registration: registration, client: .init(transport: control),
+            preferences: preferences(), requireSignature: { Issue.record("Do not register") },
+            clearDisabledPreference: { Issue.record("Do not enable") })
+        try await service.unregisterForUninstall()
+        #expect(registration.calls == ["unregister"])
+        #expect(await control.operations.isEmpty)
     }
 
 
@@ -267,7 +310,7 @@ private actor LocalRuntimeControlFixture: AgentBridgeControlTransport {
         ])
         let registration = LocalRuntimeRegistration()
         let service = AgentBridgeService(registration: registration, client: .init(transport: control),
-            preferences: preferences(), requireSignature: {}, clearDisabledPreference: {}, runtimeOperationTimeout: .zero)
+            preferences: preferences(), requireSignature: {}, clearDisabledPreference: {}, removalOperationTimeout: .zero)
         await #expect(throws: AgentBridgeFailure.operationTimeout) { try await service.removeLocalRuntimeData() }
         try await service.removeLocalRuntimeData()
         #expect(registration.calls.isEmpty)
@@ -275,22 +318,20 @@ private actor LocalRuntimeControlFixture: AgentBridgeControlTransport {
         #expect(operations.filter { $0 != "status" } == ["local_cluster_remove", "local_cluster_runtime_status", "local_cluster_remove", "local_cluster_runtime_status"])
     }
 
-    @Test @MainActor func removalCanRegisterWithPartialDataWithoutRequiringHealthyRuntimeState() async throws {
-        let partial = #"{"installed":false,"running":false,"kubernetes_available":false,"enabled":false,"installer_active":false,"safe_reason":"local_data_unavailable"}"#
-        let removed = #"{"installed":false,"running":false,"kubernetes_available":false,"enabled":false,"installer_active":false,"safe_reason":"local_data_removed"}"#
-        let control = LocalRuntimeControlFixture([
-            ("local_cluster_runtime_status", partial),
-            ("local_cluster_remove", #"{"active":true}"#),
-            ("local_cluster_runtime_status", removed)
-        ])
+    @Test(arguments: [SMAppService.Status.notRegistered, .notFound, .requiresApproval])
+    @MainActor func menuRemovalUsesOfflineOwnerWithoutRegistering(_ status: SMAppService.Status) async throws {
+        let control = LocalRuntimeControlFixture([])
         let registration = LocalRuntimeRegistration()
-        registration.status = .notRegistered
+        registration.status = status
+        var removals = 0
         let service = AgentBridgeService(registration: registration, client: .init(transport: control),
-            preferences: preferences(), requireSignature: {}, clearDisabledPreference: {})
+            preferences: preferences(), requireSignature: { Issue.record("Do not register") },
+            clearDisabledPreference: { Issue.record("Do not clear disabled intent") },
+            removeUsingBundledHelper: { removals += 1 })
         try await service.removeLocalRuntimeData()
-        #expect(registration.calls == ["register"])
-        let operations = await control.operations
-        #expect(!operations.contains("local_cluster_runtime_stop"))
+        #expect(removals == 1)
+        #expect(registration.calls.isEmpty)
+        #expect(await control.operations.isEmpty)
     }
 
     @Test @MainActor func nativeResumeWaitsForLocalKubernetesWithoutEnablingExternalAgents() async throws {

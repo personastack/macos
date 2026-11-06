@@ -72,3 +72,9 @@ Configure these repository settings once before the first tag. Renew expiring Ap
 The main package installs PersonaStack.app only. `scripts/package-desktop-installer.sh APP OUTPUT_PKG` builds it without installing it. For unsigned local validation, set `PERSONASTACK_SIGN_INSTALLER=0`. Release packaging retains Developer ID signing, notarization, and Sparkle verification.
 
 New packages do not install the old locked-control plugin. During upgrade, the package verifies the existing removal utility against the pinned signing certificate and runs its guarded policy restoration before removing the retired plugin and utility. A missing utility, invalid signature, or policy conflict stops the upgrade without deleting the legacy payload. Fresh installs skip this step. Homebrew uninstall also guards legacy cleanup and never removes standalone CUA.
+
+## Remove local hosting or uninstall
+
+Choose **Agents on This Mac → Remove Local Data…** in the menu bar. Confirm permanent deletion and wait for verified completion. This stops the managed VM and removes its disk and downloaded runtime payloads. Stop and Disconnect retain the disk.
+
+Before manually deleting PersonaStack.app, complete Remove Local Data, then quit the app. Finder Trash does not invoke cleanup. Homebrew uses the existing fail-closed uninstall command. It removes local hosting before unregistering helper/login services and removing the package. If cleanup fails, keep the app installed and retry. CUA and native external-agent profiles stay separate.

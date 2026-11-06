@@ -233,7 +233,7 @@ func (runtime *Runtime) probe(ctx context.Context, scope Scope) (RuntimeStatus, 
 	}
 	status.Enabled = owner.Enabled
 	if owner.Removed {
-		present, presentErr := tree.hasDirectory("l/" + InstanceName)
+		present, presentErr := runtime.removalPayloadPresent(tree)
 		if presentErr != nil {
 			return status, runtimeCustodyFailure(ctx, presentErr)
 		}

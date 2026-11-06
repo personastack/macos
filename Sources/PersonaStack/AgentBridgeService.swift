@@ -31,18 +31,23 @@ final class AgentBridgeService {
     private let clearDisabledPreference: @MainActor () throws -> Void
     private let waitForRuntimePoll: @MainActor () async throws -> Void
     private let runtimeOperationTimeout: Duration
+    private let removalOperationTimeout: Duration
+    let removeUsingBundledHelper: @MainActor () async throws -> Void
 
     init(registration: any AgentBridgeServiceRegistration = AgentBridgeSystemRegistration(),
          client: AgentBridgeControlClient = AgentBridgeControlClient(), preferences: UserDefaults = .standard,
          requireSignature: @escaping @MainActor () throws -> Void = AgentBridgeService.validateHelperIdentity,
          clearDisabledPreference: @escaping @MainActor () throws -> Void = { try AgentBridgeEnvironments.enable() },
          waitForRuntimePoll: @escaping @MainActor () async throws -> Void = { try await Task.sleep(for: .milliseconds(100)) },
-         runtimeOperationTimeout: Duration = .seconds(40)) {
+         runtimeOperationTimeout: Duration = .seconds(40), removalOperationTimeout: Duration = .seconds(60),
+         removeUsingBundledHelper: @escaping @MainActor () async throws -> Void = { try await DesktopLocalRuntimeRemoval.runBundledHelper() }) {
         self.registration = registration; self.client = client; self.preferences = preferences
         self.requireSignature = requireSignature
         self.clearDisabledPreference = clearDisabledPreference
         self.waitForRuntimePoll = waitForRuntimePoll
         self.runtimeOperationTimeout = runtimeOperationTimeout
+        self.removalOperationTimeout = removalOperationTimeout
+        self.removeUsingBundledHelper = removeUsingBundledHelper
     }
 
     var status: SMAppService.Status { registration.status }
@@ -152,13 +157,30 @@ final class AgentBridgeService {
     /// The native menu owns destructive confirmation. The common removal task
     /// owns initial Stop, stopped-process proof and partially erased retries.
     func removeLocalRuntimeData() async throws {
-        if registration.status != .enabled { try await ensureLocalClusterEnabled() }
+        try await DesktopLocalRuntimeRemoval.forService(self).run()
+    }
+
+    /// Uninstall must not register or enable the background service. An absent
+    /// transport is handled by the exact signed offline removal command.
+    func removeLocalRuntimeDataUsingControl() async throws {
         guard try await localClusterControlVersion() != nil else { throw AgentBridgeFailure.runtimeUnsupported }
-        let deadline = ContinuousClock.now.advanced(by: runtimeOperationTimeout)
+        let deadline = ContinuousClock.now.advanced(by: removalOperationTimeout)
         _ = try await client.send(AgentBridgeRequest(operation: "local_cluster_remove", payload: [:]),
                                   returning: AgentBridgeLocalRuntimeAcknowledgement.self)
         try await waitForLocalRuntime(deadline: deadline) {
             $0.safeReason == "local_data_removed" && !$0.installed && !$0.running && !$0.kubernetesAvailable && !$0.enabled && !$0.installerActive
+        }
+    }
+
+    /// Call only after the common removal owner has proved VM/data absence.
+    func unregisterForUninstall() async throws {
+        switch registration.status {
+        case .enabled, .requiresApproval:
+            try await unregisterObservedStopped()
+        case .notRegistered, .notFound:
+            return
+        @unknown default:
+            throw AgentBridgeFailure.serviceUnavailable
         }
     }
 
