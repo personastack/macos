@@ -208,6 +208,8 @@ Use in-process installer/service/transport fakes for passive-versus-explicit set
 
 ## iMessage provider boundary
 
+iMessage support and native acceptance target macOS 27.0 on Apple Silicon.
+
 The native iMessage adapter is independent of CUA and the Desktop Control lease. It uses only a pinned, bundled `imsg rpc` subprocess with the PersonaStack adapter revision. The executable is resolved from the signed app bundle. It never resolves a provider from PATH or accepts a caller-chosen executable, database path, shell command or private framework operation.
 
 The API relay-state response reports Desktop Control and iMessage registrations separately. The native transport model validates each family's active/reservation relationship. Older responses omit the iMessage fields and mean no iMessage registration. An active registration for either family keeps the shared connection and its reconnect lifecycle running. Desktop Control setup still reads only its own registration fields. Shared connection ownership does not grant CUA readiness or command permission. A malformed response or temporary authority failure preserves the existing retry behavior rather than declaring that every registration was removed.
