@@ -38,7 +38,7 @@ struct DesktopControlInstallation: Codable, Equatable, Sendable {
          configuration: DesktopEnvironmentConfiguration) throws {
         guard !installationID.isEmpty, installationID.utf8.count <= 256,
               installationID == installationID.trimmingCharacters(in: .whitespacesAndNewlines),
-              !installationID.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+              !installationID.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
               (43...44).contains(machineCredential.utf8.count),
               let credential = Self.decodeCredential(machineCredential), credential.count == 32,
               Self.validGatewayURL(gatewayWebsocketURL),

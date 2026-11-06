@@ -151,6 +151,57 @@ func machineResetReceiptFixture(pending: IMessagePendingEnrollment, generation: 
     #expect(await transport.calls == 1)
 }
 
+@Test(arguments: ["550e8400-e29b-41d4-a716-446655440000", "550E8400-E29B-41D4-A716-446655440000"])
+@MainActor func iMessageMachineAttachAcceptsPersistedUUIDAndResponseIdentity(id: String) async throws {
+    let pending = try machinePendingFixture()
+    let raw = try JSONSerialization.data(withJSONObject: [
+        "installation_id": id, "machine_credential": pending.machineCredential,
+        "gateway_websocket_url": DesktopEnvironmentConfiguration.production.gatewayWebsocketURL.absoluteString,
+        "environment_origin": DesktopEnvironmentConfiguration.production.appOrigin,
+    ])
+    let saved = try JSONDecoder().decode(DesktopControlInstallation.self, from: raw)
+    let transport = MachineTransportFixture(path: "/v1/desktop-control/attach", proof: pending.machineCredential,
+        installationID: id, response: try machineResponseFixture(id: id), status: 200)
+    let fence = MachineGenerationFence()
+    let returned = try await IMessageMachineSetupClient(transport: transport).attach(configuration: .production,
+        installation: saved, verifiedScope: machineScopeFixture(pending), journey: machineJourneyFixture(pending),
+        ticket: machineTicketFixture(), coordinatorGeneration: fence.generation, now: machineTestNow,
+        validateScope: { try fence.validate($0) })
+    #expect(returned == saved)
+    #expect(returned.installationID == id)
+    #expect(await transport.calls == 1)
+    #expect(fence.calls == 2)
+}
+
+@Test(arguments: ["\u{0000}", "\u{001F}", "\u{007F}", "\u{0085}"])
+@MainActor func iMessageMachineAttachRejectsEmbeddedControlScalarsBeforeTransport(control: String) async throws {
+    let pending = try machinePendingFixture()
+    let id = "550e8400-e29b-41d4-" + control + "a716-446655440000"
+    // Persisted installations use Codable. The attach boundary must reject
+    // invalid identities independently of the new-installation initializer.
+    let raw = try JSONSerialization.data(withJSONObject: [
+        "installation_id": id, "machine_credential": pending.machineCredential,
+        "gateway_websocket_url": DesktopEnvironmentConfiguration.production.gatewayWebsocketURL.absoluteString,
+        "environment_origin": DesktopEnvironmentConfiguration.production.appOrigin,
+    ])
+    let saved = try JSONDecoder().decode(DesktopControlInstallation.self, from: raw)
+    let transport = MachineTransportFixture(path: "/v1/desktop-control/attach", proof: pending.machineCredential,
+        installationID: id, response: Data(), status: 200)
+    let fence = MachineGenerationFence()
+    await #expect(throws: IMessageMachineSetupError.invalidRequest) {
+        try await IMessageMachineSetupClient(transport: transport).attach(configuration: .production,
+            installation: saved, verifiedScope: machineScopeFixture(pending), journey: machineJourneyFixture(pending),
+            ticket: machineTicketFixture(), coordinatorGeneration: fence.generation, now: machineTestNow,
+            validateScope: { try fence.validate($0) })
+    }
+    #expect(await transport.calls == 0)
+    #expect(fence.calls == 0)
+    #expect(throws: DesktopControlEnrollmentError.invalidResponse) {
+        try DesktopControlInstallation(installationID: id, machineCredential: pending.machineCredential,
+            gatewayWebsocketURL: DesktopEnvironmentConfiguration.production.gatewayWebsocketURL, configuration: .production)
+    }
+}
+
 @Test(arguments: [400, 401, 403, 404, 409, 410, 429, 500, 503, 302, 307])
 @MainActor func iMessageMachineOnlyExactEnrollGoneCreatesResetReceipt(status: Int) async throws {
     let pending = try machinePendingFixture()

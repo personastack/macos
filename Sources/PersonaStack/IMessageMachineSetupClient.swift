@@ -158,8 +158,9 @@ struct IMessageMachineSetupClient: Sendable {
     }
 
     private static func validID(_ value: String) -> Bool {
-        !value.isEmpty && value.utf8.count <= 256 && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
-            && !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+        let controls = CharacterSet.controlCharacters
+        return !value.isEmpty && value.utf8.count <= 256 && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+            && !value.unicodeScalars.contains(where: { controls.contains($0) })
     }
 
     private struct Request: Encodable {

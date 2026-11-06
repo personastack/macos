@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import OSLog
 import PersonaStackCore
 
 protocol IMessageSetupAccountReading: Sendable {
@@ -102,6 +103,15 @@ actor IMessageSetupProvider: IMessageSetupProviding {
             return result
         } catch {
             if Task.isCancelled || error is CancellationError { throw CancellationError() }
+            let failure: String
+            switch error {
+            case let typed as IMessageAccountError: failure = "account." + String(describing: typed)
+            case let typed as IMessageRPCError: failure = "rpc." + String(describing: typed)
+            case let typed as IMessageSetupProviderError: failure = "setup." + String(describing: typed)
+            default: failure = "unknown"
+            }
+            Logger(subsystem: "ai.personastack.desktop", category: "IMessageSetup")
+                .error("permission_check cause=\(failure, privacy: .public)")
             let state = Self.permissionState(for: error)
             if generation == expected, Self.requiresFreshConnection(error) || (error as? IMessageAccountError) != nil { await stop() }
             try Task.checkCancellation()
