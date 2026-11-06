@@ -61,8 +61,8 @@ final class LocalClusterSetupManager: NSObject, WKScriptMessageHandlerWithReply 
     private let showSetupBudgetDetails: @MainActor (AgentBridgeLocalClusterRequirements) -> Void
     private let physicalMemory: @MainActor () -> UInt64
     private let processorCount: @MainActor () -> Int
-    // Signed VZ execution and native image qualification have not passed.
-    // Handler presence and a running process cannot enable this feature.
+    // Enabled in source. Release still requires the matching API and ARM64 images.
+    // Native helper, signature and API readiness checks remain authoritative.
     private let qualifiedRuntime: Bool
     private let configuration: @MainActor (URL) throws -> DesktopEnvironmentConfiguration
     private let cookieReader: @MainActor (WKWebView, DesktopEnvironmentConfiguration) async throws -> String
@@ -78,7 +78,7 @@ final class LocalClusterSetupManager: NSObject, WKScriptMessageHandlerWithReply 
 
     init(client: AgentBridgeControlClient = AgentBridgeControlClient(),
          hosted: LocalClusterEnrollmentClient = LocalClusterEnrollmentClient(), service: AgentBridgeService = .shared,
-         qualifiedRuntime: Bool = false, keychain: any DesktopControlKeychainAccess = SystemDesktopControlKeychainAccess(),
+         qualifiedRuntime: Bool = true, keychain: any DesktopControlKeychainAccess = SystemDesktopControlKeychainAccess(),
          requireSignature: @escaping @MainActor () throws -> Void = AgentBridgeService.validateHelperIdentity,
          prepareBackgroundEnable: @escaping @MainActor () throws -> Void = { try DesktopUpdater.shared.prepareToEnableBackgroundAgents() },
          approveEnvironment: @escaping @MainActor (DesktopEnvironmentConfiguration) throws -> Void = { try AgentBridgeEnvironments.approve($0) },

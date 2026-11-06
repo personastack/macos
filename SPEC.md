@@ -276,7 +276,7 @@ Build-time provider preparation pins the archive, dependency lock and reviewed p
 
 ## App-managed Kubernetes on this Mac
 
-The managed-cluster capability stays inactive until ARM worker-image qualification, signed launcher execution and native acceptance pass. Handler presence does not advertise support.
+The managed-cluster capability is enabled in source. Native helper compatibility, signature checks and current API/gateway readiness remain required. Do not ship this source activation before the matching API/web rollout and customer-pullable ARM64 runtime images are available. Remaining native OS acceptance stays recorded in the workspace implementation plan.
 
 - One per-user Lima VZ guest runs single-node K3s and its embedded containerd. It uses a source-pinned Ubuntu ARM64 disk. PersonaStack bundles the reviewed ARM64 `limactl` launcher and ARM64 Linux guestagent. Packaging verifies the upstream archive and selected members. Signing seals the launcher under the PersonaStack certificate, hardened runtime, secure timestamp and exactly the virtualization entitlement. The helper verifies that signed bundle before execution. Downloaded upstream ad-hoc executables are never an execution fallback.
 - Only the pinned guest, K3s binary and airgap system images are downloaded during setup. Downloads have size, digest, origin, redirect and time bounds. Native custody belongs to the current OS user. The runtime never adopts `~/.lima`, `~/.kube`, another container application, host-directory mounts, SSH-agent forwarding or automatic service forwarding.

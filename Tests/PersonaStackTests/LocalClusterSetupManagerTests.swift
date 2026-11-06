@@ -82,10 +82,10 @@ private actor LocalClusterInstalledControlFixture: AgentBridgeControlTransport {
 }
 
 @Suite @MainActor struct LocalClusterSetupManagerTests {
-    @Test func handlerPresenceDoesNotAdvertiseQualifiedRuntimeOrAllowInstall() async throws {
+    @Test func explicitlyDisabledRuntimeDoesNotAdvertiseCapabilityOrAllowInstall() async throws {
         let http = LocalClusterPageHTTPFixture(), control = LocalClusterPageControlFixture()
         let manager = LocalClusterSetupManager(client: AgentBridgeControlClient(transport: control),
-            hosted: LocalClusterEnrollmentClient(transport: http), helperControlVersion: { 1 }, configuration: { _ in .production },
+            hosted: LocalClusterEnrollmentClient(transport: http), qualifiedRuntime: false, helperControlVersion: { 1 }, configuration: { _ in .production },
             cookieReader: { _, _ in "personastack_session=fixture" }, csrfReader: { _ in "csrf-fixture" })
         let view = WKWebView()
         manager.register(view, appURL: DesktopEnvironmentConfiguration.production.appURL)
@@ -103,7 +103,7 @@ private actor LocalClusterInstalledControlFixture: AgentBridgeControlTransport {
     @Test func documentAndSessionInvalidationRejectOldActionsBeforeProtectedRead() async throws {
         let http = LocalClusterPageHTTPFixture(), control = LocalClusterPageControlFixture()
         let manager = LocalClusterSetupManager(client: AgentBridgeControlClient(transport: control),
-            hosted: LocalClusterEnrollmentClient(transport: http), helperControlVersion: { 1 }, configuration: { _ in .production },
+            hosted: LocalClusterEnrollmentClient(transport: http), qualifiedRuntime: false, helperControlVersion: { 1 }, configuration: { _ in .production },
             cookieReader: { _, _ in "personastack_session=fixture" })
         let view = WKWebView()
         manager.register(view, appURL: DesktopEnvironmentConfiguration.production.appURL)
@@ -125,7 +125,7 @@ private actor LocalClusterInstalledControlFixture: AgentBridgeControlTransport {
         let http = LocalClusterPageHTTPFixture(), control = LocalClusterPageControlFixture(runtimeFailure: true)
         var settings = 0, updates = 0, details = 0
         let manager = LocalClusterSetupManager(client: AgentBridgeControlClient(transport: control),
-            hosted: LocalClusterEnrollmentClient(transport: http), helperControlVersion: { 1 }, configuration: { _ in .production },
+            hosted: LocalClusterEnrollmentClient(transport: http), qualifiedRuntime: false, helperControlVersion: { 1 }, configuration: { _ in .production },
             cookieReader: { _, _ in "personastack_session=fixture" },
             openSettings: { settings += 1 }, openUpdates: { updates += 1 }, showDetails: { details += 1 })
         let view = WKWebView()
@@ -173,10 +173,10 @@ private actor LocalClusterInstalledControlFixture: AgentBridgeControlTransport {
         // would fail the fixture and cannot be hidden by this error assertion.
         #expect(await http.calls == 4)
     }
-    @Test func legacyHelperCapabilityAbsenceNeverProbesNewOperations() async throws {
+    @Test func defaultRuntimeIsEnabledButLegacyHelperNeverProbesNewOperations() async throws {
         let http = LocalClusterPageHTTPFixture(), control = LocalClusterPageControlFixture()
         let manager = LocalClusterSetupManager(client: AgentBridgeControlClient(transport: control), hosted: LocalClusterEnrollmentClient(transport: http),
-            qualifiedRuntime: true, requireSignature: {}, helperControlVersion: { nil }, configuration: { _ in .production }, cookieReader: { _, _ in "personastack_session=fixture" })
+            requireSignature: {}, helperControlVersion: { nil }, configuration: { _ in .production }, cookieReader: { _, _ in "personastack_session=fixture" })
         let view = WKWebView()
         manager.register(view, appURL: DesktopEnvironmentConfiguration.production.appURL)
         let response = try await manager.apply(command("state"), view: view)
