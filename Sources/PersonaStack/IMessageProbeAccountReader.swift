@@ -118,14 +118,17 @@ actor IMessageAccountReader {
                 set observedAccountLabel to ""
                 tell application "/System/Applications/Messages.app"
                     repeat with candidateAccount in accounts
-                        if (service type of candidateAccount) is iMessage then
-                            if (enabled of candidateAccount) is true then
-                                if (connection status of candidateAccount) is connected then
-                                    set end of observedAccountIDs to id of candidateAccount as text
-                                    set observedAccountLabel to description of candidateAccount as text
+                        -- Only fully verified accounts qualify. Unreadable entries remain ineligible.
+                        try
+                            if (service type of candidateAccount) is iMessage then
+                                if (enabled of candidateAccount) is true then
+                                    if (connection status of candidateAccount) is connected then
+                                        set end of observedAccountIDs to id of candidateAccount as text
+                                        set observedAccountLabel to description of candidateAccount as text
+                                    end if
                                 end if
                             end if
-                        end if
+                        end try
                     end repeat
                 end tell
                 if (count of observedAccountIDs) is not 1 then return "unavailable"
