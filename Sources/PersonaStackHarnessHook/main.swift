@@ -16,15 +16,15 @@ private func run() async throws {
         var renewal = HarnessActivityRenewal(leaseStartedAt: Date())
         while true {
             try await Task.sleep(for: .seconds(15))
-            guard try await renewal.step(store: store, connectionID: connectionID, sessionID: sessionID, runID: runID, report: { state in
-                try await HarnessActivityReporter.report(credential, sessionID: sessionID, runID: runID, state: state)
+            guard try await renewal.step(store: store, connectionID: connectionID, sessionID: sessionID, runID: runID, report: { state, sequence in
+                try await HarnessActivityReporter.report(credential, sessionID: sessionID, runID: runID, state: state, sequence: sequence)
             }) else { return }
         }
     }
     guard let event = argument("--event") else { throw LocalSessionError.invalidRequest }
     let input = try HarnessHookInput.decode(FileHandle.standardInput.readData(ofLength: 512 * 1024 + 1))
-    let runID = try await HarnessHookDispatcher.dispatch(credential, event: event, input: input, store: store) { runID, state in
-        try await HarnessActivityReporter.report(credential, sessionID: input.sessionID, runID: runID, state: state)
+    let runID = try await HarnessHookDispatcher.dispatch(credential, event: event, input: input, store: store) { runID, state, sequence in
+        try await HarnessActivityReporter.report(credential, sessionID: input.sessionID, runID: runID, state: state, sequence: sequence)
     }
     if let runID {
         let process = Process()

@@ -46,6 +46,20 @@ public final class HarnessHookLockedSession: @unchecked Sendable {
     init(descriptor: Int32, path: URL) { self.descriptor = descriptor; self.path = path }
     deinit { unlock(); close(descriptor) }
     public func unlock() { if isLocked { _ = flock(descriptor, LOCK_UN); isLocked = false } }
+    /// Keep ordering in the existing locked inode, independently of turn JSON.
+    /// Persist before sending so another process cannot reuse an ambiguous report.
+    public func nextSequence() throws -> Int64 {
+        guard isLocked else { throw LocalSessionError.unsafeFiles }
+        var previous: UInt64 = 0
+        let count = pread(descriptor, &previous, MemoryLayout<UInt64>.size, 0)
+        guard count == 0 || count == MemoryLayout<UInt64>.size else { throw LocalSessionError.unsafeFiles }
+        let value = UInt64(littleEndian: previous)
+        guard value < UInt64(Int64.max) else { throw LocalSessionError.unsafeFiles }
+        var next = (value + 1).littleEndian
+        guard pwrite(descriptor, &next, MemoryLayout<UInt64>.size, 0) == MemoryLayout<UInt64>.size,
+              fsync(descriptor) == 0 else { throw LocalSessionError.unsafeFiles }
+        return Int64(value + 1)
+    }
     public func read() throws -> HarnessHookTurn? {
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: path.path) else { return nil }
         guard attributes[.type] as? FileAttributeType == .typeRegular,

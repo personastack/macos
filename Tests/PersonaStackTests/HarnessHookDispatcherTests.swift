@@ -22,15 +22,20 @@ struct HarnessHookDispatcherTests {
         defer { active.unlock() }
         return try active.read()
     }
-    private func report(_ credential: HarnessActivityCredential, input: HarnessHookInput, run: String, state: String) async throws -> Bool {
-        try await HarnessActivityReporter.report(credential, sessionID: input.sessionID, runID: run, state: state, transport: { request in
+    private func report(_ credential: HarnessActivityCredential, input: HarnessHookInput, run: String, state: String, sequence: Int64) async throws -> Bool {
+        try await HarnessActivityReporter.report(credential, sessionID: input.sessionID, runID: run, state: state, sequence: sequence, transport: { request in
             #expect(request.url?.absoluteString == "https://my.personastack.ai/desktop/harnesses/activity")
             #expect(request.httpMethod == "POST")
             #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer " + credential.activityToken)
             #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
             let data = try #require(request.httpBody)
-            let body = try #require(JSONSerialization.jsonObject(with: data) as? [String: String])
-            #expect(body == ["connection_id": credential.connectionID, "session_id": input.sessionID, "run_id": run, "state": state])
+            let body = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            #expect(body["connection_id"] as? String == credential.connectionID)
+            #expect(body["session_id"] as? String == input.sessionID)
+            #expect(body["run_id"] as? String == run)
+            #expect(body["state"] as? String == state)
+            #expect(body["sequence"] as? Int64 == sequence)
+            #expect(body.count == 5)
             let url = try #require(request.url)
             let response = try #require(HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil))
             return (Data("{\"applied\":true}".utf8), response)
@@ -58,9 +63,9 @@ struct HarnessHookDispatcherTests {
         let shared = try input(), siblingSession = try input("sibling-session")
         var reports: [String] = []
         func dispatch(_ credential: HarnessActivityCredential, _ event: String, _ input: HarnessHookInput) async throws -> String? {
-            try await HarnessHookDispatcher.dispatch(credential, event: event, input: input, store: store, ownerPID: getpid()) { run, state in
+            try await HarnessHookDispatcher.dispatch(credential, event: event, input: input, store: store, ownerPID: getpid()) { run, state, sequence in
                 reports.append(credential.connectionID + ":" + state)
-                return try await report(credential, input: input, run: run, state: state)
+                return try await report(credential, input: input, run: run, state: state, sequence: sequence)
             }
         }
         let firstRun = try #require(await dispatch(first, "UserPromptSubmit", shared))
@@ -85,12 +90,12 @@ struct HarnessHookDispatcherTests {
         let store = HarnessHookState(root: root), first = try credential(.codex), second = try credential(.codex)
         let old = try input(), newer = try input(turn: "new-turn")
         for current in [first, second] {
-            _ = try await HarnessHookDispatcher.dispatch(current, event: "UserPromptSubmit", input: old, store: store) { _, state in #expect(state == "start"); return true }
+            _ = try await HarnessHookDispatcher.dispatch(current, event: "UserPromptSubmit", input: old, store: store) { _, state, _ in #expect(state == "start"); return true }
         }
         let secondTurn = try read(store, second)
-        let newRun = try await HarnessHookDispatcher.dispatch(first, event: "UserPromptSubmit", input: newer, store: store) { _, state in #expect(state == "start"); return true }
+        let newRun = try await HarnessHookDispatcher.dispatch(first, event: "UserPromptSubmit", input: newer, store: store) { _, state, _ in #expect(state == "start"); return true }
         for (event, input) in [("UserPromptSubmit", newer), ("Stop", old)] {
-            #expect(try await HarnessHookDispatcher.dispatch(first, event: event, input: input, store: store) { _, _ in Issue.record("Fenced event must not report"); return true } == nil)
+            #expect(try await HarnessHookDispatcher.dispatch(first, event: event, input: input, store: store) { _, _, _ in Issue.record("Fenced event must not report"); return true } == nil)
         }
         #expect(try read(store, first)?.runID == newRun)
         #expect(try read(store, second) == secondTurn)
@@ -101,9 +106,9 @@ struct HarnessHookDispatcherTests {
         let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("hook-reject-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let store = HarnessHookState(root: root), first = try credential(.codex), second = try credential(.codex), input = try input()
-        let siblingRun = try await HarnessHookDispatcher.dispatch(second, event: "UserPromptSubmit", input: input, store: store) { _, _ in true }
+        let siblingRun = try await HarnessHookDispatcher.dispatch(second, event: "UserPromptSubmit", input: input, store: store) { _, _, _ in true }
         do {
-            let result = try await HarnessHookDispatcher.dispatch(first, event: "UserPromptSubmit", input: input, store: store) { _, _ in
+            let result = try await HarnessHookDispatcher.dispatch(first, event: "UserPromptSubmit", input: input, store: store) { _, _, _ in
                 if reason == "failed" { throw HarnessActivityReportError.authorizationDenied }
                 return false
             }
@@ -118,7 +123,7 @@ struct HarnessHookDispatcherTests {
         let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("hook-disabled-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let credential = HarnessActivityCredential(connectionID: UUID().uuidString.lowercased(), activityToken: "legacy-fixture", appURL: URL(string: "https://my.personastack.ai")!, harness: .codex, routingEnabled: false)
-        #expect(try await HarnessHookDispatcher.dispatch(credential, event: "UserPromptSubmit", input: input(), store: HarnessHookState(root: root)) { _, _ in Issue.record("Legacy credential must not report"); return true } == nil)
+        #expect(try await HarnessHookDispatcher.dispatch(credential, event: "UserPromptSubmit", input: input(), store: HarnessHookState(root: root)) { _, _, _ in Issue.record("Legacy credential must not report"); return true } == nil)
         #expect(!FileManager.default.fileExists(atPath: root.path))
     }
 }

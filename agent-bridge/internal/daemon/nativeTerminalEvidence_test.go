@@ -54,7 +54,7 @@ func TestObservedNativeTerminalEvidence(t *testing.T) {
 				got = append(got, frame)
 				return nil
 			})
-			if len(got) != 1 || got[0].MessageType != tc.typeName || got[0].RunID != "run" || got[0].AssignmentID != "assignment" || got[0].RunTerminal == nil || got[0].RunTerminal.ErrorCode != tc.code {
+			if len(got) != 1 || got[0].MessageType != tc.typeName || got[0].RunID != "run" || got[0].AssignmentID != "assignment" || got[0].RunTerminal == nil || got[0].RunTerminal.ErrorCode != tc.code || got[0].RunTerminal.NativeRunID != "native" {
 				t.Fatalf("terminal = %+v", got)
 			}
 		})

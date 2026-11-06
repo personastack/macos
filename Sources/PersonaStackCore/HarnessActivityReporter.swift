@@ -6,6 +6,20 @@ public enum HarnessActivityReportError: Error, Sendable {
 }
 
 public enum HarnessActivityReporter {
+    private struct ActivityBody: Encodable {
+        let connectionID: String
+        let sessionID: String
+        let runID: String
+        let state: String
+        let sequence: Int64
+        enum CodingKeys: String, CodingKey {
+            case connectionID = "connection_id", sessionID = "session_id", runID = "run_id", state, sequence
+        }
+    }
+    private struct RevokeBody: Encodable {
+        let connectionID: String
+        enum CodingKeys: String, CodingKey { case connectionID = "connection_id" }
+    }
     typealias Transport = @Sendable (URLRequest) async throws -> (Data, URLResponse)
     private final class NoRedirects: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
         func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
@@ -14,20 +28,20 @@ public enum HarnessActivityReporter {
         }
     }
 
-    public static func report(_ credential: HarnessActivityCredential, sessionID: String, runID: String, state: String) async throws -> Bool {
-        try await report(credential, sessionID: sessionID, runID: runID, state: state, transport: send)
+    public static func report(_ credential: HarnessActivityCredential, sessionID: String, runID: String, state: String, sequence: Int64) async throws -> Bool {
+        try await report(credential, sessionID: sessionID, runID: runID, state: state, sequence: sequence, transport: send)
     }
 
-    static func report(_ credential: HarnessActivityCredential, sessionID: String, runID: String, state: String, transport: Transport) async throws -> Bool {
-        guard ["start", "heartbeat", "stop"].contains(state), HarnessHookInput.safeID(sessionID), UUID(uuidString: runID) != nil else { throw LocalSessionError.invalidRequest }
-        return try await post(credential, path: "/desktop/harnesses/activity", body: ["connection_id": credential.connectionID, "session_id": sessionID, "run_id": runID, "state": state], transport: transport)
+    static func report(_ credential: HarnessActivityCredential, sessionID: String, runID: String, state: String, sequence: Int64, transport: Transport) async throws -> Bool {
+        guard ["start", "heartbeat", "stop"].contains(state), HarnessHookInput.safeID(sessionID), UUID(uuidString: runID) != nil, sequence > 0 else { throw LocalSessionError.invalidRequest }
+        return try await post(credential, path: "/desktop/harnesses/activity", body: ActivityBody(connectionID: credential.connectionID, sessionID: sessionID, runID: runID, state: state, sequence: sequence), transport: transport)
     }
 
     public static func revoke(_ credential: HarnessActivityCredential) async throws {
-        _ = try await post(credential, path: "/desktop/harnesses/revoke", body: ["connection_id": credential.connectionID], transport: send)
+        _ = try await post(credential, path: "/desktop/harnesses/revoke", body: RevokeBody(connectionID: credential.connectionID), transport: send)
     }
 
-    private static func post(_ credential: HarnessActivityCredential, path: String, body: [String: String], transport: Transport) async throws -> Bool {
+    private static func post<Body: Encodable>(_ credential: HarnessActivityCredential, path: String, body: Body, transport: Transport) async throws -> Bool {
         guard var components = URLComponents(url: credential.appURL, resolvingAgainstBaseURL: false),
               ["https", "http"].contains(components.scheme ?? ""), components.user == nil, components.password == nil else { throw LocalSessionError.invalidRequest }
         components.path = path; components.query = nil; components.fragment = nil
@@ -36,7 +50,7 @@ public enum HarnessActivityReporter {
         request.httpMethod = "POST"
         request.setValue("Bearer " + credential.activityToken, forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.httpBody = try JSONEncoder().encode(body)
         let (data, response) = try await transport(request)
         guard let http = response as? HTTPURLResponse else { throw LocalSessionError.mcpUnavailable }
         if [401, 403].contains(http.statusCode) { throw HarnessActivityReportError.authorizationDenied }
@@ -67,19 +81,19 @@ public struct HarnessActivityRenewal {
     public mutating func step(store: HarnessHookState, connectionID: String, sessionID: String, runID: String,
                               now: () -> Date = Date.init,
                               ownerAlive: (Int32) -> Bool = { kill($0, 0) == 0 || errno == EPERM },
-                              report: (String) async throws -> Bool) async throws -> Bool {
+                              report: (String, Int64) async throws -> Bool) async throws -> Bool {
         let active = try store.lock(connectionID: connectionID, sessionID: sessionID)
         defer { active.unlock() }
         guard let turn = try active.read(), turn.runID == runID else { return false }
         guard ownerAlive(turn.ownerPID) else {
             try active.clear()
-            _ = try? await report("stop")
+            _ = try? await report("stop", active.nextSequence())
             return false
         }
         let attemptTime = now()
         guard attemptTime.timeIntervalSince(lastAcceptedAt) < leaseDuration else { try active.clear(); return false }
         do {
-            guard try await report("heartbeat") else { try active.clear(); return false }
+            guard try await report("heartbeat", active.nextSequence()) else { try active.clear(); return false }
             lastAcceptedAt = attemptTime
             return true
         } catch HarnessActivityReportError.authorizationDenied {

@@ -962,9 +962,7 @@ func (r Runner) runBindingSession(ctx context.Context, binding config.Binding, s
 						return
 					}
 					if reason == externalagentprotocol.TerminalReasonExpired {
-						go func() {
-							_ = executionAdapter.CancelRun(nativeRunID)
-						}()
+						go r.cancelAndObserveExpiredRun(sessionCtx, binding, session, executionAdapter, frame, nativeRunID, runObservations, writeFrame)
 					}
 					return
 				}
@@ -978,7 +976,7 @@ func (r Runner) runBindingSession(ctx context.Context, binding config.Binding, s
 					status = externalagentprotocol.RunStatusCancelled
 					reason = externalagentprotocol.TerminalReasonCancelled
 				}
-				if writeErr := writeFrame(observedNativeRunTerminal(session, frame, status, reason, result.Output)); writeErr != nil {
+				if writeErr := writeFrame(observedNativeRunTerminal(session, frame, status, reason, result.Output, nativeRunID)); writeErr != nil {
 					return
 				}
 			}(frame, nativeRunID, runAdapter)
@@ -1224,14 +1222,9 @@ func (r Runner) activeRunConflict(binding config.Binding, frame externalagentpro
 	if activeRunID == strings.TrimSpace(frame.RunID) && strings.TrimSpace(latest.ActiveAssignmentID) == strings.TrimSpace(frame.AssignmentID) {
 		return "", false
 	}
-	if r.clearStaleActiveRunConflict(binding, latest) {
-		return "", false
-	}
+	// A different API assignment does not prove the previous native writer
+	// stopped. Keep its exact journal until terminal acknowledgement.
 	return activeRunID, true
-}
-
-func (r Runner) clearStaleActiveRunConflict(binding config.Binding, latest config.Binding) bool {
-	return r.clearRunState(binding, latest.ActiveRunID) == nil
 }
 
 func (r Runner) replayActiveRun(ctx context.Context, binding config.Binding, session bridge.Session, adapter runtime.Adapter, runObservations *runObservationRegistry, writeFrame func(externalagentprotocol.Frame) error) error {
@@ -1249,13 +1242,18 @@ func (r Runner) replayActiveRun(ctx context.Context, binding config.Binding, ses
 		return nil
 	}
 	if activeRunDeadlineExpired(latest.ActiveRunDeadlineAt, r.now()) {
-		nativeRunID := strings.TrimSpace(latest.ActiveNativeRunID)
-		if adapter != nil && nativeRunID != "" {
-			go func() {
-				_ = adapter.CancelRun(nativeRunID)
-			}()
+		request := externalagentprotocol.Frame{
+			MessageID: uuid.NewString(), RunID: latest.ActiveRunID, AssignmentID: latest.ActiveAssignmentID,
 		}
-		return r.clearRunState(binding, latest.ActiveRunID)
+		failure := unconfirmedNativeRunFailure(session, request, externalagentprotocol.TerminalReasonExpired, "external agent run deadline exceeded; native termination is not confirmed", latest.ActiveNativeRunID)
+		err := writeFrame(failure)
+		if err != nil {
+			return fmt.Errorf("report expired native run: %w", err)
+		}
+		if adapter != nil {
+			go r.cancelAndObserveExpiredRun(ctx, binding, session, adapter, request, latest.ActiveNativeRunID, runObservations, writeFrame)
+		}
+		return nil
 	}
 	accepted := session.RunAcceptedFrame(externalagentprotocol.Frame{
 		MessageID:    uuid.NewString(),
@@ -1320,9 +1318,7 @@ func (r Runner) observeActiveRun(ctx context.Context, binding config.Binding, se
 			return
 		}
 		if reason == externalagentprotocol.TerminalReasonExpired {
-			go func() {
-				_ = adapter.CancelRun(nativeRunID)
-			}()
+			go r.cancelAndObserveExpiredRun(ctx, binding, session, adapter, frame, nativeRunID, runObservations, writeFrame)
 		}
 		return
 	}
@@ -1336,9 +1332,17 @@ func (r Runner) observeActiveRun(ctx context.Context, binding config.Binding, se
 		status = externalagentprotocol.RunStatusCancelled
 		reason = externalagentprotocol.TerminalReasonCancelled
 	}
-	if writeErr := writeFrame(observedNativeRunTerminal(session, frame, status, reason, result.Output)); writeErr != nil {
+	if writeErr := writeFrame(observedNativeRunTerminal(session, frame, status, reason, result.Output, nativeRunID)); writeErr != nil {
 		return
 	}
+}
+
+// Expiry ends logical work, not observation of its physical writer. Keep
+// observing under the connection cancellation scope, not the expired work
+// deadline. Cancel acceptance or refusal alone cannot release native custody.
+func (r Runner) cancelAndObserveExpiredRun(ctx context.Context, binding config.Binding, session bridge.Session, adapter runtime.Adapter, frame externalagentprotocol.Frame, nativeRunID string, observations *runObservationRegistry, writeFrame func(externalagentprotocol.Frame) error) {
+	_ = adapter.CancelRun(nativeRunID)
+	r.observeActiveRun(ctx, binding, session, adapter, frame, nativeRunID, time.Time{}, observations, writeFrame)
 }
 
 func contextForRunDeadline(parent context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
@@ -1403,8 +1407,9 @@ func nativeRunNotStartedFailure(session bridge.Session, frame externalagentproto
 	return failed
 }
 
-func observedNativeRunTerminal(session bridge.Session, frame externalagentprotocol.Frame, status externalagentprotocol.RunStatus, reason externalagentprotocol.TerminalReason, output string) externalagentprotocol.Frame {
+func observedNativeRunTerminal(session bridge.Session, frame externalagentprotocol.Frame, status externalagentprotocol.RunStatus, reason externalagentprotocol.TerminalReason, output, nativeRunID string) externalagentprotocol.Frame {
 	terminal := session.RunTerminalFrame(frame, status, reason, output)
+	terminal.RunTerminal.NativeRunID = strings.TrimSpace(nativeRunID)
 	if status == externalagentprotocol.RunStatusFailed {
 		terminal.RunTerminal.ErrorCode = nativeTerminationConfirmed
 	}
