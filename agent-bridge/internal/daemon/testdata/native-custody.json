@@ -1,0 +1,184 @@
+{
+  "observations": [
+    {
+      "message_id": "uncertain-message",
+      "message_type": "run.failed",
+      "persona_id": "persona-1",
+      "connection_id": "conn-1",
+      "connection_generation": 3,
+      "run_id": "run-1",
+      "assignment_id": "run-1",
+      "sent_at": "2026-11-06T12:00:00Z",
+      "run_terminal": {
+        "status": "failed",
+        "completed_at": "2026-11-06T12:00:00Z",
+        "native_run_id": "native-1",
+        "error_code": "native_termination_unconfirmed"
+      }
+    },
+    {
+      "message_id": "proof-message",
+      "message_type": "run.failed",
+      "persona_id": "persona-1",
+      "connection_id": "conn-1",
+      "connection_generation": 3,
+      "run_id": "run-1",
+      "assignment_id": "run-1",
+      "sent_at": "2026-11-06T12:00:00Z",
+      "run_terminal": {
+        "status": "failed",
+        "completed_at": "2026-11-06T12:00:00Z",
+        "native_run_id": "native-1",
+        "error_code": "native_termination_confirmed"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "name": "original uncertainty",
+      "transport_generation": 3,
+      "frame": {
+        "message_id": "uncertain-message",
+        "message_type": "run.failed",
+        "persona_id": "persona-1",
+        "connection_id": "conn-1",
+        "connection_generation": 3,
+        "run_id": "run-1",
+        "assignment_id": "run-1",
+        "sent_at": "2026-11-06T12:00:00Z",
+        "run_terminal": {
+          "status": "failed",
+          "completed_at": "2026-11-06T12:00:00Z",
+          "native_run_id": "native-1",
+          "error_code": "native_termination_unconfirmed"
+        }
+      },
+      "forward": true,
+      "ack": false,
+      "http_status": 204,
+      "assignment_generation": 3
+    },
+    {
+      "name": "original positive proof",
+      "transport_generation": 3,
+      "frame": {
+        "message_id": "proof-message",
+        "message_type": "run.failed",
+        "persona_id": "persona-1",
+        "connection_id": "conn-1",
+        "connection_generation": 3,
+        "run_id": "run-1",
+        "assignment_id": "run-1",
+        "sent_at": "2026-11-06T12:00:00Z",
+        "run_terminal": {
+          "status": "failed",
+          "completed_at": "2026-11-06T12:00:00Z",
+          "native_run_id": "native-1",
+          "error_code": "native_termination_confirmed"
+        }
+      },
+      "forward": true,
+      "ack": true,
+      "http_status": 204,
+      "assignment_generation": 3
+    },
+    {
+      "name": "retired uncertainty",
+      "transport_generation": 4,
+      "frame": {
+        "message_id": "uncertain-message",
+        "message_type": "run.failed",
+        "persona_id": "persona-1",
+        "connection_id": "conn-1",
+        "connection_generation": 3,
+        "run_id": "run-1",
+        "assignment_id": "run-1",
+        "sent_at": "2026-11-06T12:00:00Z",
+        "run_terminal": {
+          "status": "failed",
+          "completed_at": "2026-11-06T12:00:00Z",
+          "native_run_id": "native-1",
+          "error_code": "native_termination_unconfirmed"
+        }
+      },
+      "forward": false,
+      "ack": false,
+      "http_status": 409,
+      "assignment_generation": 3
+    },
+    {
+      "name": "retired positive proof",
+      "transport_generation": 4,
+      "frame": {
+        "message_id": "proof-message",
+        "message_type": "run.failed",
+        "persona_id": "persona-1",
+        "connection_id": "conn-1",
+        "connection_generation": 3,
+        "run_id": "run-1",
+        "assignment_id": "run-1",
+        "sent_at": "2026-11-06T12:00:00Z",
+        "run_terminal": {
+          "status": "failed",
+          "completed_at": "2026-11-06T12:00:00Z",
+          "native_run_id": "native-1",
+          "error_code": "native_termination_confirmed"
+        }
+      },
+      "forward": true,
+      "ack": true,
+      "http_status": 204,
+      "assignment_generation": 3
+    },
+    {
+      "name": "legacy positive proof on current transport",
+      "transport_generation": 8,
+      "frame": {
+        "message_id": "proof-message",
+        "message_type": "run.failed",
+        "persona_id": "persona-1",
+        "connection_id": "conn-1",
+        "connection_generation": 8,
+        "run_id": "run-1",
+        "assignment_id": "run-1",
+        "sent_at": "2026-11-06T12:00:00Z",
+        "run_terminal": {
+          "status": "failed",
+          "completed_at": "2026-11-06T12:00:00Z",
+          "native_run_id": "native-1",
+          "error_code": "native_termination_confirmed"
+        }
+      },
+      "forward": true,
+      "ack": true,
+      "http_status": 204,
+      "assignment_generation": 0
+    },
+    {
+      "name": "retired affirmative never-started expiry",
+      "transport_generation": 4,
+      "assignment_generation": 3,
+      "never_started_expiry": true,
+      "frame": {
+        "message_id": "never-started-proof",
+        "message_type": "run.failed",
+        "persona_id": "persona-1",
+        "connection_id": "conn-1",
+        "connection_generation": 3,
+        "run_id": "run-1",
+        "assignment_id": "run-1",
+        "sent_at": "2026-11-06T12:00:00Z",
+        "run_terminal": {
+          "status": "failed",
+          "completed_at": "2026-11-06T12:00:00Z",
+          "native_run_id": "",
+          "error_code": "native_not_started",
+          "reason": "expired"
+        }
+      },
+      "forward": true,
+      "ack": true,
+      "http_status": 204
+    }
+  ]
+}

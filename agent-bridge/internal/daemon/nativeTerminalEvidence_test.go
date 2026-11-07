@@ -50,8 +50,13 @@ func TestObservedNativeTerminalEvidence(t *testing.T) {
 			session := bridge.Session{Binding: binding}
 			request := externalagentprotocol.Frame{RunID: "run", AssignmentID: "assignment"}
 			var got []externalagentprotocol.Frame
-			Runner{}.observeActiveRun(t.Context(), binding, session, tc.adapter, request, "native", tc.deadline, nil, func(frame externalagentprotocol.Frame) error {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			Runner{}.observeActiveRun(ctx, binding, session, tc.adapter, request, "native", tc.deadline, nil, func(frame externalagentprotocol.Frame) error {
 				got = append(got, frame)
+				if tc.code == nativeTerminationUnconfirmed {
+					cancel()
+				}
 				return nil
 			})
 			if len(got) != 1 || got[0].MessageType != tc.typeName || got[0].RunID != "run" || got[0].AssignmentID != "assignment" || got[0].RunTerminal == nil || got[0].RunTerminal.ErrorCode != tc.code || got[0].RunTerminal.NativeRunID != "native" {

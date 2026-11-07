@@ -427,10 +427,20 @@ func (r Runner) runBindingSession(ctx context.Context, binding config.Binding, s
 		}
 	}()
 	var writeMu sync.Mutex
+	terminalReceipts := &nativeTerminalReceipts{}
 	var writeFailureOnce sync.Once
 	writeFrame := func(frame externalagentprotocol.Frame) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
+		prepared, send, prepareErr := r.prepareAssignedRunFrame(binding, frame)
+		if prepareErr != nil {
+			return prepareErr
+		}
+		if !send {
+			return nil
+		}
+		frame = prepared
+		terminalReceipts.record(r, binding, frame)
 		err := conn.WriteJSON(frame)
 		if err != nil {
 			writeFailureOnce.Do(func() {
@@ -629,7 +639,7 @@ func (r Runner) runBindingSession(ctx context.Context, binding config.Binding, s
 		}
 		return nil
 	}
-	if accepted.ConnectAccepted.ProtocolVersion != externalagentprotocol.ProtocolVersionV4 {
+	if accepted.ConnectAccepted.ProtocolVersion != externalagentprotocol.ProtocolVersionV4 || r.canReplayNeverStartedNative(binding) {
 		if err := r.replayActiveRun(sessionCtx, binding, session, adapter, runObservations, writeFrame); err != nil {
 			return err
 		}
@@ -820,10 +830,14 @@ func (r Runner) runBindingSession(ctx context.Context, binding config.Binding, s
 			if frame.RunTerminalAck == nil {
 				continue
 			}
-			runObservations.cancel(frame.RunID)
-			if err := r.clearRunState(binding, frame.RunID); err != nil {
-				return fmt.Errorf("clear acknowledged run state: %w", err)
+			released, ackErr := r.acknowledgeNativeTerminal(binding, frame, terminalReceipts)
+			if ackErr != nil {
+				return fmt.Errorf("clear acknowledged run state: %w", ackErr)
 			}
+			if !released {
+				continue
+			}
+			runObservations.cancel(frame.RunID)
 			if pendingRuntimeRefresh != nil {
 				refresh := *pendingRuntimeRefresh
 				pendingRuntimeRefresh = nil
@@ -846,76 +860,24 @@ func (r Runner) runBindingSession(ctx context.Context, binding config.Binding, s
 				}
 				continue
 			}
-			latestBinding, exists := config.BindingFor(r.Store, binding)
-			if !exists || latestBinding.Quiesced {
-				if err := writeFrame(nativeRunNotStartedFailure(session, frame, "background agent quiesced")); err != nil {
-					return err
-				}
-				continue
-			}
-			if r.activeRunMatchesWithoutNativeRunID(binding, frame) {
-				failed := unconfirmedNativeRunFailure(session, frame, externalagentprotocol.TerminalReasonFailed, "active run native id missing", "")
-				commandCache.storeReply(frame, failed)
-				if writeErr := writeFrame(failed); writeErr != nil {
-					return fmt.Errorf("write active run missing native id: %w", writeErr)
-				}
-				continue
-			}
-			if activeRunID, conflict := r.activeRunConflict(binding, frame); conflict {
-				failed := nativeRunNotStartedFailure(session, frame, "external persona already has active run "+activeRunID)
-				commandCache.storeReply(frame, failed)
-				if writeErr := writeFrame(failed); writeErr != nil {
-					return fmt.Errorf("write active run conflict: %w", writeErr)
-				}
-				continue
-			}
-			runAdapter := adapter
-			readiness := runtime.Detection{}
+			snapshot := runtimeSnapshot{}
 			if accepted.ConnectAccepted.ProtocolVersion == externalagentprotocol.ProtocolVersionV4 {
-				snapshot := reconciler.snapshotCopy()
-				if snapshot.Target == nil || !runtimeTargetsEqual(snapshot.Target, frame.RunStart.RuntimeTarget) || snapshot.Adapter == nil {
-					failed := nativeRunNotStartedFailure(session, frame, "external runtime is not ready: selected target is unavailable")
-					commandCache.storeReply(frame, failed)
-					if writeErr := writeFrame(failed); writeErr != nil {
-						return fmt.Errorf("write runtime target failure: %w", writeErr)
-					}
-					continue
-				}
-				runAdapter = snapshot.Adapter
-				readiness = snapshot.Detection
-			} else {
-				readiness = r.bindingReadiness(runAdapter, binding)
+				snapshot = reconciler.snapshotCopy()
 			}
-			if !canStartRunWithReadiness(readiness.State, lastSessionWakeProbeAt()) {
-				failed := nativeRunNotStartedFailure(session, frame, "external runtime is not ready: "+readiness.State.String())
-				commandCache.storeReply(frame, failed)
-				if writeErr := writeFrame(failed); writeErr != nil {
-					return fmt.Errorf("write run readiness failure: %w", writeErr)
-				}
-				continue
+			runAdapter, nativeRunID, failure, submitErr := r.dispatchNativeRunStart(sessionCtx, binding, session, adapter, frame, accepted.ConnectAccepted.ProtocolVersion, snapshot, lastSessionWakeProbeAt())
+			if submitErr != nil {
+				return submitErr
 			}
-			if err := r.activateRun(binding, frame); err != nil {
-				failed := nativeRunNotStartedFailure(session, frame, safeDiagnosticNote(err.Error()))
-				commandCache.storeReply(frame, failed)
-				if writeErr := writeFrame(failed); writeErr != nil {
-					return fmt.Errorf("write run activation failure: %w", writeErr)
-				}
-				continue
-			}
-			nativeRunID, err := runAdapter.StartRun(assignedRunRequest(frame))
-			if err != nil {
-				failed := unconfirmedNativeRunFailure(session, frame, externalagentprotocol.TerminalReasonFailed, safeDiagnosticNote(err.Error()), "")
-				commandCache.storeReply(frame, failed)
-				if writeErr := writeFrame(failed); writeErr != nil {
-					return fmt.Errorf("write run failure: %w", writeErr)
+			if failure != nil {
+				commandCache.storeReply(frame, *failure)
+				if writeErr := writeFrame(*failure); writeErr != nil {
+					return fmt.Errorf("write run refusal: %w", writeErr)
 				}
 				continue
 			}
 			if err := r.recordNativeRunID(binding, frame.RunID, nativeRunID); err != nil {
-				failed := runRecordFailureTerminal(runAdapter, session, frame, nativeRunID, err)
-				commandCache.storeReply(frame, failed)
-				if writeErr := writeFrame(failed); writeErr != nil {
-					return fmt.Errorf("write run journal failure: %w", writeErr)
+				if recoverErr := r.observeNativeRunAfterJournalFailure(sessionCtx, binding, session, runAdapter, frame, nativeRunID, err, runObservations, commandCache, writeFrame); recoverErr != nil {
+					return recoverErr
 				}
 				continue
 			}
@@ -932,54 +894,18 @@ func (r Runner) runBindingSession(ctx context.Context, binding config.Binding, s
 				commandCache.storeReplies(frame, []externalagentprotocol.Frame{accepted, started})
 				return writeFrame(started)
 			}
-			go func(frame externalagentprotocol.Frame, nativeRunID string, executionAdapter runtime.Adapter) {
-				observeCtx, cancelObserve := contextForRunDeadline(sessionCtx, frame.RunStart.DeadlineAt)
-				defer runObservations.track(frame.RunID, cancelObserve)()
-				result, err := executionAdapter.StreamOrPollRun(observeCtx, nativeRunID, func(event runtime.RunEvent) error {
-					switch event.Kind {
-					case runtime.RunEventStarted:
-						return writeStarted(event.StartedAt)
-					case runtime.RunEventOutputDelta:
-						return writeFrame(session.RunOutputDeltaFrame(frame, event.Delta))
-					case runtime.RunEventToolEvent:
-						return writeFrame(session.RunToolEventFrame(frame, event.ToolName, event.ToolPhase, event.Summary))
-					default:
-						return nil
-					}
-				})
-				if err != nil {
-					if errors.Is(observeCtx.Err(), context.Canceled) {
-						return
-					}
-					reason := externalagentprotocol.TerminalReasonFailed
-					output := safeDiagnosticNote(err.Error())
-					if errors.Is(observeCtx.Err(), context.DeadlineExceeded) {
-						reason = externalagentprotocol.TerminalReasonExpired
-						output = "external agent run deadline exceeded"
-					}
-					failed := unconfirmedNativeRunFailure(session, frame, reason, output, nativeRunID)
-					if writeErr := writeFrame(failed); writeErr != nil {
-						return
-					}
-					if reason == externalagentprotocol.TerminalReasonExpired {
-						go r.cancelAndObserveExpiredRun(sessionCtx, binding, session, executionAdapter, frame, nativeRunID, runObservations, writeFrame)
-					}
-					return
+			go r.observeAssignedNativeRun(sessionCtx, binding, session, runAdapter, frame, nativeRunID, frame.RunStart.DeadlineAt, runObservations, writeFrame, func(event runtime.RunEvent) error {
+				switch event.Kind {
+				case runtime.RunEventStarted:
+					return writeStarted(event.StartedAt)
+				case runtime.RunEventOutputDelta:
+					return writeFrame(session.RunOutputDeltaFrame(frame, event.Delta))
+				case runtime.RunEventToolEvent:
+					return writeFrame(session.RunToolEventFrame(frame, event.ToolName, event.ToolPhase, event.Summary))
+				default:
+					return nil
 				}
-				status := externalagentprotocol.RunStatusCompleted
-				reason := externalagentprotocol.TerminalReasonSucceeded
-				if result.Status == runtime.RunStatusFailed {
-					status = externalagentprotocol.RunStatusFailed
-					reason = externalagentprotocol.TerminalReasonFailed
-				}
-				if result.Status == runtime.RunStatusCancelled {
-					status = externalagentprotocol.RunStatusCancelled
-					reason = externalagentprotocol.TerminalReasonCancelled
-				}
-				if writeErr := writeFrame(observedNativeRunTerminal(session, frame, status, reason, result.Output, nativeRunID)); writeErr != nil {
-					return
-				}
-			}(frame, nativeRunID, runAdapter)
+			})
 		case externalagentprotocol.FrameTypeRunCancel:
 			if err := r.cancelAssignedRun(binding, frame, adapter, reconciler, commandCache); err != nil {
 				log.Printf("assigned native cancel failed connection_id=%s run_id=%s", binding.ConnectionID, frame.RunID)
@@ -1151,6 +1077,14 @@ func (r Runner) runStartReplayReplies(binding config.Binding, frame externalagen
 	if replies, ok := cache.cachedReplies(frame); ok {
 		return replies, true
 	}
+	if r.Store != nil {
+		if latest, found := config.BindingFor(r.Store, binding); found && latest.ConnectionGeneration == binding.ConnectionGeneration && nativeNeverStartedJournal(latest) && latest.ActiveRunID == frame.RunID && latest.ActiveAssignmentID == frame.AssignmentID {
+			failure := r.nativeNeverStartedReplayFrame(session, frame, latest.ActiveRunDeadlineAt)
+			replies := []externalagentprotocol.Frame{failure}
+			cache.storeReplies(frame, replies)
+			return replies, true
+		}
+	}
 	native, ok := r.activeNativeRunIDForRunStart(binding, frame)
 	if !ok {
 		return nil, false
@@ -1238,6 +1172,11 @@ func (r Runner) replayActiveRun(ctx context.Context, binding config.Binding, ses
 	if latest.ConnectionGeneration != binding.ConnectionGeneration {
 		return nil
 	}
+	if nativeNeverStartedJournal(latest) {
+		request := externalagentprotocol.Frame{MessageID: uuid.NewString(), RunID: latest.ActiveRunID, AssignmentID: latest.ActiveAssignmentID}
+		failure := r.nativeNeverStartedReplayFrame(session, request, latest.ActiveRunDeadlineAt)
+		return writeFrame(failure)
+	}
 	if strings.TrimSpace(latest.ActiveRunID) == "" || strings.TrimSpace(latest.ActiveAssignmentID) == "" || strings.TrimSpace(latest.ActiveNativeRunID) == "" {
 		return nil
 	}
@@ -1289,12 +1228,7 @@ func (r Runner) observeReplayedActiveRun(ctx context.Context, binding config.Bin
 }
 
 func (r Runner) observeActiveRun(ctx context.Context, binding config.Binding, session bridge.Session, adapter runtime.Adapter, frame externalagentprotocol.Frame, nativeRunID string, deadline time.Time, runObservations *runObservationRegistry, writeFrame func(externalagentprotocol.Frame) error) {
-	if adapter == nil {
-		return
-	}
-	observeCtx, cancelObserve := contextForRunDeadline(ctx, deadline)
-	defer runObservations.track(frame.RunID, cancelObserve)()
-	result, err := adapter.StreamOrPollRun(observeCtx, nativeRunID, func(event runtime.RunEvent) error {
+	r.observeAssignedNativeRun(ctx, binding, session, adapter, frame, nativeRunID, deadline, runObservations, writeFrame, func(event runtime.RunEvent) error {
 		switch event.Kind {
 		case runtime.RunEventOutputDelta:
 			return writeFrame(session.RunOutputDeltaFrame(frame, event.Delta))
@@ -1304,37 +1238,6 @@ func (r Runner) observeActiveRun(ctx context.Context, binding config.Binding, se
 			return nil
 		}
 	})
-	if err != nil {
-		if errors.Is(observeCtx.Err(), context.Canceled) {
-			return
-		}
-		reason := externalagentprotocol.TerminalReasonFailed
-		output := safeDiagnosticNote(err.Error())
-		if errors.Is(observeCtx.Err(), context.DeadlineExceeded) {
-			reason = externalagentprotocol.TerminalReasonExpired
-			output = "external agent run deadline exceeded"
-		}
-		if writeErr := writeFrame(unconfirmedNativeRunFailure(session, frame, reason, output, nativeRunID)); writeErr != nil {
-			return
-		}
-		if reason == externalagentprotocol.TerminalReasonExpired {
-			go r.cancelAndObserveExpiredRun(ctx, binding, session, adapter, frame, nativeRunID, runObservations, writeFrame)
-		}
-		return
-	}
-	status := externalagentprotocol.RunStatusCompleted
-	reason := externalagentprotocol.TerminalReasonSucceeded
-	if result.Status == runtime.RunStatusFailed {
-		status = externalagentprotocol.RunStatusFailed
-		reason = externalagentprotocol.TerminalReasonFailed
-	}
-	if result.Status == runtime.RunStatusCancelled {
-		status = externalagentprotocol.RunStatusCancelled
-		reason = externalagentprotocol.TerminalReasonCancelled
-	}
-	if writeErr := writeFrame(observedNativeRunTerminal(session, frame, status, reason, result.Output, nativeRunID)); writeErr != nil {
-		return
-	}
 }
 
 // Expiry ends logical work, not observation of its physical writer. Keep
@@ -1342,7 +1245,8 @@ func (r Runner) observeActiveRun(ctx context.Context, binding config.Binding, se
 // deadline. Cancel acceptance or refusal alone cannot release native custody.
 func (r Runner) cancelAndObserveExpiredRun(ctx context.Context, binding config.Binding, session bridge.Session, adapter runtime.Adapter, frame externalagentprotocol.Frame, nativeRunID string, observations *runObservationRegistry, writeFrame func(externalagentprotocol.Frame) error) {
 	_ = adapter.CancelRun(nativeRunID)
-	r.observeActiveRun(ctx, binding, session, adapter, frame, nativeRunID, time.Time{}, observations, writeFrame)
+	failure := unconfirmedNativeRunFailure(session, frame, externalagentprotocol.TerminalReasonExpired, "external agent run deadline exceeded; native termination is not confirmed", nativeRunID)
+	r.observeActiveRun(ctx, binding, session, adapter, failure, nativeRunID, time.Time{}, observations, writeFrame)
 }
 
 func contextForRunDeadline(parent context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
@@ -1383,6 +1287,8 @@ func (r Runner) activateRun(binding config.Binding, frame externalagentprotocol.
 		if latest.Quiesced {
 			return fmt.Errorf("binding quiesced")
 		}
+		latest.ActiveRunConnectionGeneration = binding.ConnectionGeneration
+		latest.ActiveRunNotStarted = false
 		latest.ActiveRunID = strings.TrimSpace(frame.RunID)
 		latest.ActiveAssignmentID = strings.TrimSpace(frame.AssignmentID)
 		if frame.RunStart != nil {
@@ -1409,6 +1315,10 @@ func nativeRunNotStartedFailure(session bridge.Session, frame externalagentproto
 
 func observedNativeRunTerminal(session bridge.Session, frame externalagentprotocol.Frame, status externalagentprotocol.RunStatus, reason externalagentprotocol.TerminalReason, output, nativeRunID string) externalagentprotocol.Frame {
 	terminal := session.RunTerminalFrame(frame, status, reason, output)
+	terminal.MessageID = uuid.NewString()
+	if frame.ConnectionGeneration > 0 {
+		terminal.ConnectionGeneration = frame.ConnectionGeneration
+	}
 	terminal.RunTerminal.NativeRunID = strings.TrimSpace(nativeRunID)
 	if status == externalagentprotocol.RunStatusFailed {
 		terminal.RunTerminal.ErrorCode = nativeTerminationConfirmed
@@ -1434,6 +1344,7 @@ func (r Runner) recordNativeRunID(binding config.Binding, runID string, nativeRu
 			return fmt.Errorf("active run changed")
 		}
 		latest.ActiveNativeRunID = strings.TrimSpace(nativeRunID)
+		latest.ActiveRunNotStarted = false
 		return nil
 	})
 }
@@ -1446,6 +1357,8 @@ func (r Runner) clearRunState(binding config.Binding, runID string) error {
 		if latest.ActiveRunID != strings.TrimSpace(runID) {
 			return nil
 		}
+		latest.ActiveRunConnectionGeneration = 0
+		latest.ActiveRunNotStarted = false
 		latest.ActiveRunID = ""
 		latest.ActiveAssignmentID = ""
 		latest.ActiveNativeRunID = ""

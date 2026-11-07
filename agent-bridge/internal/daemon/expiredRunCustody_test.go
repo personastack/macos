@@ -50,7 +50,7 @@ func TestExpiredAssignedRunRetainsCustodyUntilNativeTerminal(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
-			binding := config.Binding{EnvironmentID: "https://app.example", PersonaID: "persona", ConnectionID: "connection", ConnectionGeneration: 3, ActiveRunID: "old-run", ActiveAssignmentID: "old-assignment", ActiveNativeRunID: "old-native", ActiveRunDeadlineAt: now}
+			binding := config.Binding{EnvironmentID: "https://app.example", PersonaID: "persona", ConnectionID: "connection", ConnectionGeneration: 3, ActiveRunConnectionGeneration: 3, ActiveRunID: "old-run", ActiveAssignmentID: "old-assignment", ActiveNativeRunID: "old-native", ActiveRunDeadlineAt: now}
 			store := config.NewMemoryStore(config.State{Bindings: []config.Binding{binding}})
 			runner := Runner{Store: &store, Now: func() time.Time { return now }}
 			settle := make(chan struct{})
@@ -59,16 +59,25 @@ func TestExpiredAssignedRunRetainsCustodyUntilNativeTerminal(t *testing.T) {
 				adapter.cancelError = errors.New("native cancellation refused")
 			}
 			frames := make(chan externalagentprotocol.Frame, 2)
+			receipts := &nativeTerminalReceipts{}
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			writeFrame := func(frame externalagentprotocol.Frame) error {
-				frames <- frame
+				prepared, send, prepareErr := runner.prepareAssignedRunFrame(binding, frame)
+				if prepareErr != nil {
+					return prepareErr
+				}
+				if !send {
+					return nil
+				}
+				receipts.record(runner, binding, prepared)
+				frames <- prepared
 				return nil
 			}
 			var err error
 			if tc.liveObservation {
 				request := externalagentprotocol.Frame{RunID: binding.ActiveRunID, AssignmentID: binding.ActiveAssignmentID}
-				runner.observeActiveRun(ctx, binding, bridge.Session{Binding: binding}, adapter, request, binding.ActiveNativeRunID, time.Unix(1, 0), newRunObservationRegistry(), writeFrame)
+				go runner.observeActiveRun(ctx, binding, bridge.Session{Binding: binding}, adapter, request, binding.ActiveNativeRunID, time.Unix(1, 0), newRunObservationRegistry(), writeFrame)
 			} else {
 				err = runner.replayActiveRun(ctx, binding, bridge.Session{Binding: binding}, adapter, newRunObservationRegistry(), writeFrame)
 			}
@@ -104,8 +113,13 @@ func TestExpiredAssignedRunRetainsCustodyUntilNativeTerminal(t *testing.T) {
 			if current.ActiveRunID != binding.ActiveRunID {
 				t.Fatal("native terminal released custody before acknowledgement")
 			}
-			// The existing authenticated terminal ACK owns journal release.
-			err = runner.clearRunState(binding, terminal.RunID)
+			// The production ACK receipt gate owns journal release.
+			ack := externalagentprotocol.Frame{MessageID: terminal.MessageID, MessageType: externalagentprotocol.FrameTypeRunTerminalAck, ConnectionID: string(binding.ConnectionID), PersonaID: string(binding.PersonaID), ConnectionGeneration: binding.ConnectionGeneration, RunID: terminal.RunID, AssignmentID: terminal.AssignmentID, RunTerminalAck: &externalagentprotocol.RunTerminalAckPayload{}}
+			released, ackErr := runner.acknowledgeNativeTerminal(binding, ack, receipts)
+			err = ackErr
+			if !released {
+				t.Fatal("exact physical proof ACK did not release journal")
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
