@@ -3,9 +3,9 @@ import WebKit
 
 @MainActor
 final class MainWindowNavigation: NSTitlebarAccessoryViewController {
-    let refreshButton = NSButton()
-    let backButton = NSButton()
-    let forwardButton = NSButton()
+    let refreshButton = WindowChromeButton(frame: .zero)
+    let backButton = WindowChromeButton(frame: .zero)
+    let forwardButton = WindowChromeButton(frame: .zero)
     private weak var webView: WKWebView?
     private var historyObservations: [NSKeyValueObservation] = []
 
@@ -35,6 +35,7 @@ final class MainWindowNavigation: NSTitlebarAccessoryViewController {
         controls.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 4)
         controls.frame = NSRect(x: 0, y: 0, width: 88, height: 22)
         view = controls
+        view.appearance = NSAppearance(named: .darkAqua)
         configure(refreshButton, symbol: "arrow.clockwise", label: "Refresh", action: #selector(refreshPage))
         configure(backButton, symbol: "chevron.left", label: "Back", action: #selector(goBack))
         configure(forwardButton, symbol: "chevron.right", label: "Forward", action: #selector(goForward))
@@ -60,9 +61,6 @@ final class MainWindowNavigation: NSTitlebarAccessoryViewController {
     private func configure(_ button: NSButton, symbol: String, label: String, action: Selector) {
         button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)?
             .withSymbolConfiguration(.init(pointSize: 11, weight: .medium))
-        // Keep titlebar symbols light even when AppKit changes the window
-        // emphasis or applies its disabled-control treatment.
-        button.contentTintColor = NSColor(white: 0.88, alpha: 1)
         button.imagePosition = .imageOnly
         button.bezelStyle = .regularSquare
         button.isBordered = false

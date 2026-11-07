@@ -4,6 +4,10 @@ import WebKit
 @MainActor
 public enum WindowPresentation {
     public static let canvasColor = NSColor(srgbRed: 10.0 / 255, green: 10.0 / 255, blue: 20.0 / 255, alpha: 1)
+    public static let headerForeground = NSColor(srgbRed: 229.0 / 255, green: 231.0 / 255, blue: 235.0 / 255, alpha: 1)
+    public static let headerSecondary = NSColor(srgbRed: 156.0 / 255, green: 163.0 / 255, blue: 175.0 / 255, alpha: 1)
+    public static let headerHover = NSColor(srgbRed: 22.0 / 255, green: 22.0 / 255, blue: 40.0 / 255, alpha: 1)
+    public static let headerAccent = NSColor(srgbRed: 51.0 / 255, green: 116.0 / 255, blue: 255.0 / 255, alpha: 1)
 
     public static func configureWebView(_ configuration: WKWebViewConfiguration) {
         configuration.applicationNameForUserAgent = "PersonaStackDesktop/1"

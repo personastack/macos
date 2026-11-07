@@ -81,6 +81,7 @@ struct PersonaStackApp: App {
             .overlay(alignment: .bottomTrailing) {
                 DesktopDownloadToast().padding(18)
             }
+            .preferredColorScheme(.dark)
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 IMessageSetupManager.shared.recheckAfterActivation(MainWebViewHost.shared.webView)
             }

@@ -11,6 +11,52 @@ final class PopoutTestPreferences {
 }
 
 struct PopoutWindowPresentationTests {
+    @MainActor @Test func restoredChatTitleClearsControlsBeforeAnyResize() throws {
+        _ = NSApplication.shared
+        let preferences = PopoutTestPreferences()
+        PopoutGeometryStore(defaults: preferences.defaults).save(NSRect(x: 50, y: 100, width: 340, height: 500),
+            kind: .chat, collapsed: false, fullscreen: false)
+        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false,
+            defaults: preferences.defaults) {}
+        defer { chat.dispose() }
+        chat.presentation.updateTitle("Production Engineer with a long persona name · Chat")
+        chat.window.layoutIfNeeded()
+        let frameView = try #require(chat.window.contentView?.superview)
+        frameView.layoutSubtreeIfNeeded()
+        let title = try #require(Self.titleField(in: frameView, text: chat.window.title))
+        let titleRect = title.convert(title.bounds, to: nil)
+        for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            let button = try #require(chat.window.standardWindowButton(type))
+            #expect(titleRect.minX >= button.convert(button.bounds, to: nil).maxX)
+        }
+        #expect(titleRect.maxX <= chat.presentation.pinButton.convert(chat.presentation.pinButton.bounds, to: nil).minX)
+    }
+
+    @MainActor @Test func longChatTitleClearsNativeControlsAtMinimumWidth() throws {
+        _ = NSApplication.shared
+        let preferences = PopoutTestPreferences()
+        let chat = PersonaChatWindow(url: URL(string: "https://example.invalid")!, loadPage: false,
+            defaults: preferences.defaults) {}
+        defer { chat.dispose() }
+        chat.presentation.updateTitle("Production Engineer with a long persona name · Chat")
+        for width in [340.0, 390.0, 600.0] {
+            chat.window.setFrame(NSRect(x: 50, y: 100, width: width, height: 500), display: false)
+            chat.window.layoutIfNeeded()
+            let frameView = try #require(chat.window.contentView?.superview)
+            frameView.layoutSubtreeIfNeeded()
+            let title = try #require(Self.titleField(in: frameView, text: chat.window.title))
+            let titleRect = title.convert(title.bounds, to: nil)
+            #expect(titleRect.width > 0)
+            for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+                let button = try #require(chat.window.standardWindowButton(type))
+                #expect(titleRect.minX >= button.convert(button.bounds, to: nil).maxX)
+            }
+            #expect(titleRect.maxX <= chat.presentation.pinButton.convert(chat.presentation.pinButton.bounds, to: nil).minX)
+            #expect(chat.presentation.pinButton.frame.size == NSSize(width: 24, height: 24))
+            #expect(chat.presentation.resetButton.frame.size == NSSize(width: 24, height: 24))
+        }
+    }
+
     @MainActor @Test func stackTitlesClearWindowButtonsOnInitialLayoutAndResize() throws {
         _ = NSApplication.shared
         let preferences = PopoutTestPreferences()
@@ -53,6 +99,7 @@ struct PopoutWindowPresentationTests {
     }
 
     @MainActor private static func titleField(in view: NSView, text: String) -> NSTextField? {
+        guard !view.isHiddenOrHasHiddenAncestor else { return nil }
         if let field = view as? NSTextField, field.stringValue == text { return field }
         return view.subviews.lazy.compactMap { titleField(in: $0, text: text) }.first
     }
@@ -117,7 +164,7 @@ struct PopoutWindowPresentationTests {
             let chrome = PopoutWindowPresentation(window: window, webView: webView, kind: kind, defaults: preferences.defaults)
             defer { chrome.invalidate(); window.close() }
             #expect(window.title == kind.fallbackTitle)
-            #expect(window.titleVisibility == .visible)
+            #expect(window.titleVisibility == (kind == .chat ? .hidden : .visible))
             #expect(window.appearance?.name == .darkAqua)
             #expect(window.toolbarStyle == (kind.usesTitlebarAccessory ? .automatic : .unified))
             #expect(!window.styleMask.contains(.fullSizeContentView))
@@ -137,6 +184,11 @@ struct PopoutWindowPresentationTests {
                 #expect(window.titlebarAccessoryViewControllers.count == 1)
                 #expect(window.titlebarAccessoryViewControllers.contains { $0.layoutAttribute == .right })
                 if kind == .chat {
+                    #expect(!chrome.pinButton.isBordered)
+                    #expect(!chrome.resetButton.isBordered)
+                    #expect(chrome.pinButton.accessibilityLabel() == "Always on top")
+                    let pinImageRect = try #require(chrome.pinButton.cell).imageRect(forBounds: chrome.pinButton.bounds)
+                    #expect(pinImageRect.height >= 12)
                     #expect(chrome.resetButton.accessibilityLabel() == "Reset chat")
                     #expect(chrome.resetButton.image != nil)
                     let accessory = try #require(chrome.resetButton.superview)
@@ -149,7 +201,7 @@ struct PopoutWindowPresentationTests {
                     #expect(resets == 1)
                 }
                 #expect(chrome.pinButton.controlSize == .small)
-                #expect(chrome.pinButton.frame.size == NSSize(width: 24, height: 24))
+                #expect(chrome.pinButton.frame.size == NSSize(width: 24, height: 24), "\(kind.rawValue) pin frame")
             } else {
                 #expect(chromeHeight >= 48 && chromeHeight <= 52)
             }
@@ -162,6 +214,13 @@ struct PopoutWindowPresentationTests {
             chrome.pinButton.performClick(nil)
             #expect(window.level == .normal)
             #expect(chrome.pinButton.state == .off)
+            if kind == .chat {
+                chrome.setCollapsed(true)
+                chrome.setCollapsed(false)
+                #expect(!chrome.pinButton.isBordered)
+                #expect(!chrome.resetButton.isBordered)
+                #expect(window.appearance?.name == .darkAqua)
+            }
             chrome.updateTitle("  Name · Chat  ")
             #expect(window.title == "Name · Chat")
             for invalid in [nil, "", "  ", "bad\nname", String(repeating: "x", count: 1025)] {

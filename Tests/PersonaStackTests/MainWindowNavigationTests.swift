@@ -1,9 +1,74 @@
 import AppKit
 import Testing
 import WebKit
+import PersonaStackCore
 @testable import PersonaStack
 
 struct MainWindowNavigationTests {
+    @MainActor @Test func chromeIconRenderingPreservesShapeAndColorAcrossStates() throws {
+        _ = NSApplication.shared
+        let button = WindowChromeButton(frame: NSRect(x: 0, y: 0, width: 24, height: 24))
+        button.appearance = NSAppearance(named: .darkAqua)
+        button.imagePosition = .imageOnly
+        button.image = NSImage(size: NSSize(width: 16, height: 16), flipped: false) { rect in
+            NSColor.white.setFill()
+            rect.insetBy(dx: 4, dy: 4).fill()
+            return true
+        }
+        func pixel(_ x: Int, _ y: Int) throws -> NSColor {
+            let bitmap = try #require(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 24, pixelsHigh: 24,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+            let context = try #require(NSGraphicsContext(bitmapImageRep: bitmap))
+            NSGraphicsContext.saveGraphicsState()
+            defer { NSGraphicsContext.restoreGraphicsState() }
+            context.cgContext.translateBy(x: 0, y: 24)
+            context.cgContext.scaleBy(x: 1, y: -1)
+            NSGraphicsContext.current = NSGraphicsContext(cgContext: context.cgContext, flipped: true)
+            WindowPresentation.canvasColor.setFill()
+            button.bounds.fill()
+            button.draw(button.bounds)
+            context.flushGraphics()
+            return try #require(bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB))
+        }
+        func matches(_ actual: NSColor, _ expected: NSColor) -> Bool {
+            abs(actual.redComponent - expected.redComponent) < 0.01
+                && abs(actual.greenComponent - expected.greenComponent) < 0.01
+                && abs(actual.blueComponent - expected.blueComponent) < 0.01
+        }
+        for state in [NSControl.StateValue.off, .on] {
+            button.state = state
+            #expect(try matches(pixel(12, 12), WindowPresentation.headerForeground))
+            #expect(try matches(pixel(5, 5), WindowPresentation.canvasColor))
+        }
+        button.isEnabled = false
+        #expect(try matches(pixel(12, 12), WindowPresentation.headerSecondary))
+        #expect(try matches(pixel(5, 5), WindowPresentation.canvasColor))
+        button.isEnabled = true
+        button.mouseEntered(with: try #require(NSEvent.enterExitEvent(with: .mouseEntered, location: .zero,
+            modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 1,
+            trackingNumber: 0, userData: nil)))
+        #expect(try matches(pixel(5, 5), WindowPresentation.headerHover))
+        let window = NSWindow(contentRect: button.bounds, styleMask: .borderless, backing: .buffered, defer: true)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        window.contentView = button
+        #expect(window.makeFirstResponder(button))
+        #expect(try matches(pixel(1, 12), WindowPresentation.headerAccent))
+        window.makeFirstResponder(nil)
+        button.mouseExited(with: try #require(NSEvent.enterExitEvent(with: .mouseExited, location: .zero,
+            modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 2,
+            trackingNumber: 0, userData: nil)))
+        // An asymmetric upper marker detects inversion inside flipped native controls.
+        button.image = NSImage(size: NSSize(width: 16, height: 16), flipped: false) { _ in
+            NSColor.white.setFill()
+            NSRect(x: 4, y: 8, width: 8, height: 4).fill()
+            return true
+        }
+        #expect(try matches(pixel(12, 9), WindowPresentation.headerForeground))
+        #expect(try matches(pixel(12, 15), WindowPresentation.canvasColor))
+    }
+
     @MainActor @Test func clicksFollowHistoryAvailability() {
         _ = NSApplication.shared
         let webView = HistoryTestWebView()
