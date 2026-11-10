@@ -1,5 +1,11 @@
 # macos instructions
 
+## PersonaStack workspace
+
+- Use the `personastack-agent` skill before working on this repository.
+- If unavailable, locate or clone `git@github.com:personastack/agent-root.git` and read its `AGENTS.md`.
+- Follow `docs/REPOSITORY_STRUCTURE.md` and work from this repository’s mapped directory.
+- Preserve existing work. Report any workspace preparation blocker.
 
 ## Cross-repository workspace setup
 
