@@ -132,6 +132,40 @@ struct DesktopCuaRemoteWorkflowTests {
             ownerDisplay: .init(personaName: name, workspaceName: "Fixture workspace"))
     }
 
+    @Test(arguments: [false, true])
+    func harnessConnectionOwnerReusesOnlyItsOwnCUASession(managedFirst: Bool) async throws {
+        let uuid = "11111111-1111-4111-8111-111111111111"
+        let owner = namedTarget("Researcher", run: managedFirst ? uuid : "harness:\(uuid)")
+        let other = namedTarget("Researcher", run: managedFirst ? "harness:\(uuid)" : uuid)
+        let sibling = namedTarget("Researcher", run: "harness:22222222-2222-4222-8222-222222222222")
+        let steps: [WorkflowCua.Expected] = [.init(name: "start_session"), .init(name: "get_config"),
+            .init(name: "get_config"), .init(name: "end_session", timeout: 5)]
+        let proxy = WorkflowCua(steps + [.init(name: "start_session"), .init(name: "get_config"), .init(name: "end_session", timeout: 5)])
+        let executor = DesktopControlCommandExecutor()
+        let token = try await acquire(executor, target: owner)
+        #expect(await call(executor, proxy, token, "get_config", target: owner).type == "result")
+        let originalSession = try #require(await proxy.observedSession())
+        #expect(try await acquire(executor, target: owner) == token)
+        for contender in [other, sibling] {
+            #expect(await executor.handle(frame("desktop_control_acquire", target: contender), proxy: nil).errorCode == "desktop_busy")
+            #expect(await call(executor, proxy, token, "get_config", target: contender).errorCode == "desktop_control_required")
+            #expect(await executor.handle(frame("desktop_control_release", ["control_token": .string(token)], target: contender), proxy: proxy).errorCode == "desktop_control_required")
+        }
+        #expect(await proxy.callCount() == 2)
+        #expect(await call(executor, proxy, token, "get_config", target: owner).type == "result")
+        #expect(await proxy.observedSession() == originalSession)
+        #expect(await executor.handle(frame("desktop_control_release", ["control_token": .string(token)], target: owner), proxy: proxy).type == "result")
+        let replacement = try await acquire(executor, target: other)
+        #expect(replacement != token)
+        #expect(await call(executor, proxy, token, "get_config", target: other).errorCode == "desktop_control_required")
+        #expect(await call(executor, proxy, replacement, "get_config", target: other).type == "result")
+        #expect(await proxy.observedSession() != originalSession)
+        #expect(await executor.handle(frame("desktop_control_release", ["control_token": .string(replacement)], target: other), proxy: proxy).type == "result")
+        #expect(await proxy.callCount() == 7)
+        await proxy.assertDrained()
+        #expect(await executor.close())
+    }
+
     @Test(arguments: ["Lumina", "  Lumina  ", "default", "__cua_runtime_persona", "研究者 🌟"])
     func personaCursorLabelKeepsItsNameWithAFreshIdentityForEachLease(name: String) async throws {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)

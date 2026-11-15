@@ -3,6 +3,23 @@ import PersonaStackCore
 import Testing
 @testable import PersonaStack
 
+@Test func desktopControlProtocolPreservesOpaqueHarnessOwner() throws {
+    let owner = "harness:11111111-1111-4111-8111-111111111111"
+    let target = DesktopControlTarget(installationID: "install", workspaceID: "workspace", configID: "config",
+        personaID: "persona", runID: owner, generation: 1, configVersion: 2)
+    let command = DesktopControlFrame(type: "command", requestID: "harness-request", target: target,
+        operation: "desktop_control_acquire", arguments: .object([:]), deadlineAt: Date().addingTimeInterval(30))
+    let encoded = try DesktopControlFrameCodec.encode(command)
+    let decoded = try DesktopControlFrameCodec.decode(encoded)
+    #expect(decoded.target?.runID == owner)
+    #expect(DesktopControlGatewayConnection.validCommand(decoded, installationID: "install"))
+    let emptyOwner = DesktopControlTarget(installationID: "install", workspaceID: "workspace", configID: "config",
+        personaID: "persona", runID: "", generation: 1, configVersion: 2)
+    let invalid = DesktopControlFrame(type: "command", requestID: "harness-request", target: emptyOwner,
+        operation: "desktop_control_acquire", arguments: .object([:]), deadlineAt: command.deadlineAt)
+    #expect(!DesktopControlGatewayConnection.validCommand(invalid, installationID: "install"))
+}
+
 @Test func desktopControlProtocolUsesGoCompatibleFramesAndFractionalTimestamps() throws {
     let raw = Data(#"{"version":1,"type":"command","request_id":"r-1","target":{"installation_id":"i-1","workspace_id":"w-1","config_id":"c-1","persona_id":"p-1","run_id":"run-1","generation":2,"owner_display":{"persona_name":"Researcher","workspace_name":"Lab"}},"operation":"desktop_control_observe","arguments":{"mode":"screenshot"},"deadline_at":"2026-09-23T18:30:00.123456Z"}"#.utf8)
     let frame = try DesktopControlFrameCodec.decode(raw)

@@ -126,18 +126,19 @@ private actor DesktopCLIFake: DesktopShellControlling {
 }
 
 @Suite @MainActor struct DesktopCLILeaseTests {
-    private func target(_ persona: String = "persona") -> DesktopControlTarget {
+    private func target(_ persona: String = "persona", run: String = "run") -> DesktopControlTarget {
         DesktopControlTarget(installationID: "installation", workspaceID: "workspace", configID: "config",
-                             personaID: persona, runID: "run", generation: 1, configVersion: 1)
+                             personaID: persona, runID: run, generation: 1, configVersion: 1)
     }
     private func frame(_ operation: String, target: DesktopControlTarget, args: [String: DesktopControlJSONValue] = [:]) -> DesktopControlFrame {
         DesktopControlFrame(type: "command", requestID: UUID().uuidString, target: target, operation: operation,
                             arguments: .object(args), deadlineAt: Date().addingTimeInterval(45))
     }
-    @Test func sharedLeaseWorkflowAndForeignScopeDenials() async throws {
+    @Test(arguments: ["run", "harness:11111111-1111-4111-8111-111111111111"])
+    func sharedLeaseWorkflowAndForeignScopeDenials(run: String) async throws {
         let fake = DesktopCLIFake()
         let executor = DesktopControlCommandExecutor(shell: fake)
-        let owner = target()
+        let owner = target(run: run)
         let acquired = await executor.handle(frame("desktop_control_acquire", target: owner), proxy: nil)
         guard case .object(let lease)? = acquired.result, let token = lease["control_token"] else { Issue.record("missing token"); return }
         let started = await executor.handle(frame("desktop_control_execute", target: owner, args: ["control_token": token,
@@ -169,10 +170,11 @@ private actor DesktopCLIFake: DesktopShellControlling {
         #expect(await executor.handle(frame("desktop_control_exec_status", target: owner, args: args), proxy: nil).errorCode == "desktop_control_required")
         #expect(await executor.close())
     }
-    @Test func staleVersionAndRevokedConfigCannotReadOrResumeOwnedCLI() async throws {
+    @Test(arguments: ["run", "harness:11111111-1111-4111-8111-111111111111"])
+    func staleVersionAndRevokedConfigCannotReadOrResumeOwnedCLI(run: String) async throws {
         let fake = DesktopCLIFake()
         let executor = DesktopControlCommandExecutor(shell: fake)
-        let owner = target()
+        let owner = target(run: run)
         let acquired = await executor.handle(frame("desktop_control_acquire", target: owner), proxy: nil)
         guard case .object(let lease)? = acquired.result, let token = lease["control_token"] else { Issue.record("missing token"); return }
         let start = await executor.handle(frame("desktop_control_execute", target: owner, args: ["control_token": token,
@@ -180,7 +182,7 @@ private actor DesktopCLIFake: DesktopShellControlling {
         guard case .object(let result)? = start.result, let id = result["execution_id"] else { Issue.record("missing id"); return }
         let args = ["control_token": token, "execution_id": id]
         let stale = DesktopControlTarget(installationID: "installation", workspaceID: "workspace", configID: "config",
-                                       personaID: "persona", runID: "run", generation: 1, configVersion: 0)
+                                       personaID: "persona", runID: run, generation: 1, configVersion: 0)
         let before = await fake.history()
         #expect(await executor.handle(frame("desktop_control_exec_read", target: stale, args: args), proxy: nil).errorCode == "desktop_control_config_revoked")
         #expect(await fake.history() == before)
@@ -193,15 +195,64 @@ private actor DesktopCLIFake: DesktopShellControlling {
         #expect(await executor.close())
     }
 
-    @Test func expiryAndCloseStopCommandsBeforeAnotherOwnerAcquires() async {
+    @Test(arguments: ["run", "harness:11111111-1111-4111-8111-111111111111"])
+    func expiryAndCloseStopCommandsBeforeAnotherOwnerAcquires(run: String) async {
         let fake = DesktopCLIFake()
         var clock = ContinuousClock.now
         let executor = DesktopControlCommandExecutor(now: { clock }, shell: fake)
-        _ = await executor.handle(frame("desktop_control_acquire", target: target()), proxy: nil)
+        _ = await executor.handle(frame("desktop_control_acquire", target: target(run: run)), proxy: nil)
         clock += .seconds(91)
         _ = await executor.handle(frame("desktop_control_acquire", target: target("next")), proxy: nil)
         #expect(await fake.history() == ["stop", "close"])
         #expect(await executor.close())
         #expect(await fake.history() == ["stop", "close", "stop", "close"])
+    }
+
+    @Test(arguments: [false, true])
+    func harnessConnectionAndEqualUUIDManagedRunCannotBorrowCLILease(managedFirst: Bool) async throws {
+        let uuid = "11111111-1111-4111-8111-111111111111"
+        let fake = DesktopCLIFake()
+        let executor = DesktopControlCommandExecutor(shell: fake)
+        let owner = target(run: managedFirst ? uuid : "harness:\(uuid)")
+        let acquired = await executor.handle(frame("desktop_control_acquire", target: owner), proxy: nil)
+        guard case .object(let lease)? = acquired.result, let token = lease["control_token"] else {
+            Issue.record("missing token"); return
+        }
+        let reused = await executor.handle(frame("desktop_control_acquire", target: owner), proxy: nil)
+        #expect(reused.result == acquired.result)
+        #expect(executor.currentLease?.runID == owner.runID)
+        let started = await executor.handle(frame("desktop_control_execute", target: owner, args: ["control_token": token,
+            "command": .string("command with ' shell syntax; $(code)"), "working_directory": .string("/tmp")]), proxy: nil)
+        guard case .object(let fields)? = started.result, let id = fields["execution_id"] else {
+            Issue.record("missing execution handle"); return
+        }
+        let before = await fake.history()
+        let contenders = [target(run: managedFirst ? "harness:\(uuid)" : uuid),
+                          target(run: "harness:22222222-2222-4222-8222-222222222222")]
+        for contender in contenders {
+            #expect(await executor.handle(frame("desktop_control_acquire", target: contender), proxy: nil).errorCode == "desktop_busy")
+            for operation in ["desktop_control_exec_read", "desktop_control_exec_status", "desktop_control_exec_cancel", "desktop_control_exec_write"] {
+                var args = ["control_token": token, "execution_id": id]
+                if operation == "desktop_control_exec_write" { args["close_stdin"] = .bool(true) }
+                #expect(await executor.handle(frame(operation, target: contender, args: args), proxy: nil).errorCode == "desktop_control_required")
+            }
+            #expect(await executor.handle(frame("desktop_control_release", target: contender, args: ["control_token": token]), proxy: nil).errorCode == "desktop_control_required")
+        }
+        #expect(await fake.history() == before)
+        #expect(await executor.handle(frame("desktop_control_exec_status", target: owner,
+            args: ["control_token": token, "execution_id": id]), proxy: nil).type == "result")
+        #expect(await executor.handle(frame("desktop_control_release", target: owner, args: ["control_token": token]), proxy: nil).type == "result")
+        #expect(await fake.history().suffix(2) == ["stop", "close"])
+        let successor = contenders[0]
+        let replacement = await executor.handle(frame("desktop_control_acquire", target: successor), proxy: nil)
+        guard case .object(let newLease)? = replacement.result, let newToken = newLease["control_token"] else {
+            Issue.record("missing replacement token"); return
+        }
+        #expect(newToken != token)
+        let afterCleanup = await fake.history()
+        #expect(await executor.handle(frame("desktop_control_exec_status", target: successor,
+            args: ["control_token": newToken, "execution_id": id]), proxy: nil).errorCode == "desktop_execution_not_found")
+        #expect(await fake.history() == afterCleanup)
+        #expect(await executor.close())
     }
 }
