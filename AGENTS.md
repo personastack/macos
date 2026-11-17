@@ -25,3 +25,7 @@ Fetch `origin` separately in every repository the task will inspect or change. F
 ## Environment reference
 
 Keep [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) aligned in the same change as owned environment readers, helper inputs, generated child bindings, defaults and workflow mappings. Document names and behavior without credential values.
+
+## Test Skill Routing
+
+- Use `development-patterns:practical-testing` when writing or modifying tests. Also use it when reviewing, consolidating, or removing tests or changing test gates. If the installed skill is unavailable, read `~/git/development-patterns/skills/practical-testing/SKILL.md`. Apply it alongside the root Fast Go Contract Coverage requirements.
