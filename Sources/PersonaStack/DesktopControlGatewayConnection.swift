@@ -422,9 +422,9 @@ actor DesktopControlGatewayConnection {
 
     private func heartbeatTick() async {
         guard connected else { return }
-        // Match the gateway's 45-second presence TTL. A successful local send
-        // does not prove that a half-open TCP path reached the gateway.
-        guard let lastGatewayHeartbeat, lastGatewayHeartbeat.duration(to: now()) < .seconds(45) else {
+        // The 60-second presence window allows two missed 15-second samples and delivery jitter.
+        // A successful send does not prove that a half-open path reached Gateway.
+        guard let lastGatewayHeartbeat, lastGatewayHeartbeat.duration(to: now()) < .seconds(60) else {
             await disconnected(error: .socketUnavailable)
             return
         }
