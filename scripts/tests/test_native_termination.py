@@ -23,7 +23,31 @@ import AppKit
 @MainActor enum DesktopCrashRecoveryPolicy {
     static func recordTerminationIntent(isUpdateRelaunch: Bool, preferences: UserDefaults) {}
 }
-@MainActor enum DesktopLoginItemRegistration { static func enableOnFirstLaunch() {} }
+@MainActor enum DesktopLoginItemRegistration {
+    @MainActor final class Service {
+        static let current = Service()
+        var isAcceptingRegistrations = true
+        var hasPendingRegistration = false
+        func stopAdmission(terminal: Bool) { isAcceptingRegistrations = false }
+        func stopAdmissionAndDrain() async {}
+        func cancelTerminalAdmission() { isAcceptingRegistrations = true }
+    }
+}
+@MainActor final class IMessageSetupManager {
+    static let shared = IMessageSetupManager()
+    var hasPendingShutdown = false
+    func shutdown() async {}
+}
+struct IMessageSetupHandoff {
+    static func parseDeepLink(_ url: URL) throws -> Self { throw CocoaError(.featureUnsupported) }
+}
+struct IMessageSavedHandoff {
+    static func parseDeepLink(_ url: URL) throws -> Self { throw CocoaError(.featureUnsupported) }
+}
+struct LaunchConfiguration {
+    let appURL: URL
+    static func selectedEnvironment() throws -> Self { throw CocoaError(.featureUnsupported) }
+}
 @MainActor final class DesktopNotificationCoordinator {
     static let shared = DesktopNotificationCoordinator()
     func install() {}
@@ -42,7 +66,6 @@ import AppKit
     var mainWindow: NSWindow?
     func navigate(to destination: URL) {}
 }
-@MainActor final class NavigationProbe { func start(_ destination: URL) {} }
 @MainActor final class DesktopUpdater {
     static let shared = DesktopUpdater()
     static let foregroundUpdateRelaunchKey = "probe-update"
@@ -58,7 +81,9 @@ import AppKit
 @MainActor final class DesktopApplicationRestart {
     static let foregroundArgument = "probe-relaunch"
     static let resumesPermissionSetup = false
+    static let resumesIMessageSetup = false
     static let shared = DesktopApplicationRestart()
+    static func initialIMessagePageURL(_ appURL: URL, resume: Bool) -> URL { appURL }
     func cancelPendingRestart() {}
 }
 '''
