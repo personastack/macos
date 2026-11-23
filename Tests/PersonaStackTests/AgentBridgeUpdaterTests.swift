@@ -6,6 +6,7 @@ import Testing
 
 @MainActor
 private final class AgentBridgeUpdaterClient: DesktopUpdateClient {
+    var checkReadinessChanged: (@MainActor () -> Void)?
     var canCheckForUpdates = true
     var automaticallyChecksForUpdates = true
     var automaticallyDownloadsUpdates = true
@@ -30,7 +31,7 @@ private final class AgentBridgeUpdaterState {
         #expect(!(await updater.prepareBackgroundAgentsForUpdate()))
         #expect(updater.waitsForBackgroundAgents)
         #expect(!updater.allowsTermination())
-        #expect(updater.statusMessage == "Stop agents on this Mac from the PersonaStack menu, then retry Restart Now. Your local files are retained.")
+        #expect(updater.statusMessage == "Stop agents on this Mac from the PersonaStack menu, then retry Restart to Update. Your local files are retained.")
     }
 
     @Test(arguments: [AgentBridgeFailure.busy, .serviceUnavailable]) @MainActor

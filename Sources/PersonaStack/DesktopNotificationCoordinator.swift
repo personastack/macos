@@ -63,7 +63,7 @@ final class DesktopNotificationCoordinator: NSObject, UNUserNotificationCenterDe
     func install() {
         center.delegate = self
         let download = UNNotificationAction(identifier: "PERSONASTACK_DOWNLOAD_UPDATE", title: "Download Update…", options: [.foreground])
-        let restart = UNNotificationAction(identifier: "PERSONASTACK_RESTART_UPDATE", title: "Restart Now", options: [.foreground])
+        let restart = UNNotificationAction(identifier: "PERSONASTACK_RESTART_UPDATE", title: "Restart to Update", options: [.foreground])
         let later = UNNotificationAction(identifier: "PERSONASTACK_LATER", title: "Later")
         center.setNotificationCategories([
             UNNotificationCategory(identifier: availableCategory, actions: [download, later], intentIdentifiers: []),
@@ -128,7 +128,7 @@ final class DesktopNotificationCoordinator: NSObject, UNUserNotificationCenterDe
     func postUpdateReady(version: String) {
         let content = UNMutableNotificationContent()
         content.title = "PersonaStack update ready"
-        content.body = "Restarting closes PersonaStack windows and stops Desktop Control tasks. Choose Restart Now to install version \(version)."
+        content.body = "Restarting closes PersonaStack windows and stops Desktop Control tasks. Choose Restart to Update to install version \(version)."
         content.categoryIdentifier = readyCategory
         let request = UNNotificationRequest(
             identifier: "personastack-update-ready-\(version)",

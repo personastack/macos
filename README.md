@@ -43,7 +43,7 @@ Desktop Control includes same-account CLI execution with pipe or interactive PTY
 
 ## Updates
 
-PersonaStack checks for updates while it is running. Open the menu-bar dropdown or the **PersonaStack** menu and choose **Check for Updates…** to check now. You can opt into background downloads in the menu-bar dropdown. Prepared updates install when you quit PersonaStack. The app does not restart without your action.
+PersonaStack checks for updates while it is running. Choose **Check for Updates…** in the **PersonaStack** app menu or under **Updates** in the menu-bar dropdown. If a check or download is already running, the action shows its current progress. When an update is ready, choose **Restart to Update** when you want to install it. You can opt into background downloads in the menu-bar dropdown. Prepared updates install when you quit PersonaStack. The app does not restart without your action.
 
 ## Publish a release
 

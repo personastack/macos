@@ -14,6 +14,7 @@ enum ScheduledUpdateStage: Sendable {
 @MainActor
 protocol DesktopUpdateClient: AnyObject {
     var canCheckForUpdates: Bool { get }
+    var checkReadinessChanged: (@MainActor () -> Void)? { get set }
     var automaticallyChecksForUpdates: Bool { get set }
     var automaticallyDownloadsUpdates: Bool { get set }
     func start() throws
@@ -23,9 +24,15 @@ protocol DesktopUpdateClient: AnyObject {
 @MainActor
 private final class SparkleUpdateClient: DesktopUpdateClient {
     private let updater: SPUUpdater
+    private var checkReadinessObservation: NSKeyValueObservation?
+    var checkReadinessChanged: (@MainActor () -> Void)?
 
     init(hostBundle: Bundle, userDriver: SPUStandardUserDriver, delegate: SPUUpdaterDelegate) {
         updater = SPUUpdater(hostBundle: hostBundle, applicationBundle: hostBundle, userDriver: userDriver, delegate: delegate)
+        checkReadinessObservation = updater.observe(\.canCheckForUpdates, options: [.new]) { [weak self] _, _ in
+            // Sparkle can publish readiness before finishing the current cycle.
+            Task { @MainActor in self?.checkReadinessChanged?() }
+        }
     }
 
     var canCheckForUpdates: Bool { updater.canCheckForUpdates }
@@ -60,6 +67,7 @@ final class DesktopUpdater: NSObject, ObservableObject {
     @Published private(set) var applicationsInstallInstruction: String?
     @Published private(set) var statusMessage = ""
     @Published private(set) var waitsForBackgroundAgents = false
+    @Published private(set) var isWaitingToCheck = false
     private let updaterFactory: (SPUStandardUserDriver, SPUUpdaterDelegate) -> any DesktopUpdateClient
     private let preferences: UserDefaults
     private let presentAvailableReminder: (@MainActor (String) -> Void)?
@@ -70,6 +78,8 @@ final class DesktopUpdater: NSObject, ObservableObject {
     private let confirmRestart: @MainActor () -> Bool
     private let cancelPermissionRestart: @MainActor () -> Void
     private let presentApplicationsInstallInstruction: @MainActor (String) -> Void
+    private let presentUpdateStatus: @MainActor (DesktopUpdater) -> Void
+    private let dismissUpdateStatus: @MainActor () -> Void
     private let agentBridgeNeedsHandoff: @MainActor () -> Bool
     private let prepareAgentBridgeUpdate: @MainActor () async throws -> Void
     private let cancelAgentBridgeUpdate: @MainActor () async throws -> Void
@@ -77,9 +87,10 @@ final class DesktopUpdater: NSObject, ObservableObject {
     private let prepareIMessageUpdate: @MainActor () async -> Void
     private let registrationService: DesktopLoginItemRegistration.Service
     private var updater: (any DesktopUpdateClient)?
-    private var userDriver: SPUStandardUserDriver?
-    private var didStart = false
-    private var activeUpdateCheck: SPUUpdateCheck = .updates
+    private var userDriver: DesktopUpdateUserDriver?
+    private var canRetryStartup = false
+    private var activeUpdateCheck: SPUUpdateCheck?
+    private var showsBackgroundCheckResult = false
     private var immediateInstallHandler: (() -> Void)?
     private var isImmediateInstallRequested = false
     private var isAgentBridgeReplacementPrepared = false
@@ -93,6 +104,8 @@ final class DesktopUpdater: NSObject, ObservableObject {
 
     private override convenience init() {
         self.init(updaterFactory: { SparkleUpdateClient(hostBundle: .main, userDriver: $0, delegate: $1) },
+                  presentUpdateStatus: { DesktopUpdateStatusWindow.shared.present(updater: $0) },
+                  dismissUpdateStatus: { DesktopUpdateStatusWindow.shared.dismiss() },
                   cancelPermissionRestart: { DesktopApplicationRestart.shared.cancelPendingRestart() })
     }
 
@@ -111,6 +124,8 @@ final class DesktopUpdater: NSObject, ObservableObject {
          },
          confirmRestart: @escaping @MainActor () -> Bool = DesktopUpdater.confirmReadyRestart,
          presentApplicationsInstallInstruction: @escaping @MainActor (String) -> Void = DesktopUpdater.showApplicationsInstallInstruction,
+         presentUpdateStatus: @escaping @MainActor (DesktopUpdater) -> Void = { _ in },
+         dismissUpdateStatus: @escaping @MainActor () -> Void = {},
          agentBridgeNeedsHandoff: @escaping @MainActor () -> Bool = { AgentBridgeUpdateHandoff.shared.needsHandoff },
          prepareAgentBridgeUpdate: @escaping @MainActor () async throws -> Void = DesktopUpdater.prepareAgentBridgeReplacement,
          cancelAgentBridgeUpdate: @escaping @MainActor () async throws -> Void = { try await AgentBridgeUpdateHandoff.shared.cancelReplacement() },
@@ -131,6 +146,8 @@ final class DesktopUpdater: NSObject, ObservableObject {
         self.confirmRestart = confirmRestart
         self.cancelPermissionRestart = cancelPermissionRestart
         self.presentApplicationsInstallInstruction = presentApplicationsInstallInstruction
+        self.presentUpdateStatus = presentUpdateStatus
+        self.dismissUpdateStatus = dismissUpdateStatus
         self.agentBridgeNeedsHandoff = agentBridgeNeedsHandoff
         self.prepareAgentBridgeUpdate = prepareAgentBridgeUpdate
         self.cancelAgentBridgeUpdate = cancelAgentBridgeUpdate
@@ -149,7 +166,8 @@ final class DesktopUpdater: NSObject, ObservableObject {
     }
 
     func start(publicKey: String?, feed: String?, bundleURL: URL? = nil, volumeIsReadOnly: Bool = false) {
-        guard !didStart else { return }
+        guard !isAvailable else { return }
+        canRetryStartup = false
         if let bundleURL, DesktopUpdatePolicy.requiresApplicationsInstall(bundleURL: bundleURL,
                                                                           volumeIsReadOnly: volumeIsReadOnly) {
             applicationsInstallInstruction = Self.applicationsInstallMessage
@@ -159,6 +177,10 @@ final class DesktopUpdater: NSObject, ObservableObject {
             return
         }
         guard DesktopUpdatePolicy.hasTrustedFeed(publicKey: publicKey, feed: feed) else { return }
+        startTrustedUpdater()
+    }
+
+    private func startTrustedUpdater() {
         let driver = DesktopUpdateUserDriver(hostBundle: .main, delegate: self, updateReady: { [weak self] in
             guard let self else { return }
             projectReady(version: offeredVersion, notifyWhenInactive: false)
@@ -170,7 +192,7 @@ final class DesktopUpdater: NSObject, ObservableObject {
             await self?.prepareBackgroundAgentsForUpdate() ?? false
         }, cancelReplacement: { [weak self] in
             await self?.resumeBackgroundAgentsAfterCanceledUpdate()
-        }, mustCancelDeferredInstallation: agentBridgeNeedsHandoff)
+        }, mustCancelDeferredInstallation: agentBridgeNeedsHandoff, checkPresentationBegan: dismissUpdateStatus)
         let updater = updaterFactory(driver, self)
         // Sparkle's install-on-quit hook does not allow canceling that behavior.
         // Pause its actual automatic downloads while preserving the preference.
@@ -180,12 +202,14 @@ final class DesktopUpdater: NSObject, ObservableObject {
         else { restoreAutomaticDownloadsAfterAgentsStopped() }
         do {
             try updater.start()
-            didStart = true
             isAvailable = true
+            canRetryStartup = false
+            updater.checkReadinessChanged = { [weak self] in self?.resumeWaitingUpdateCheck() }
         } catch {
             self.updater = nil
             userDriver = nil
-            statusMessage = "Automatic updates couldn't start. Check the connection and try again."
+            canRetryStartup = true
+            statusMessage = "Updates couldn't start. Try checking again. If this keeps happening, reopen PersonaStack."
         }
     }
 
@@ -212,28 +236,61 @@ final class DesktopUpdater: NSObject, ObservableObject {
         }
     }
 
-    var canCheckForUpdates: Bool {
-        !isReady && !isAutomaticallyDownloading &&
-            (updateAvailable || ((updater?.canCheckForUpdates ?? false) && !isChecking))
-    }
-
     func checkForUpdates() {
-        guard !isReady, !isAutomaticallyDownloading else { return }
-        if updateAvailable {
-            isAvailableToastVisible = false
-            statusMessage = "Opening the update confirmation…"
-            updater?.checkForUpdates()
+        if let applicationsInstallInstruction {
+            presentApplicationsInstallInstruction(applicationsInstallInstruction)
             return
         }
-        guard (updater?.canCheckForUpdates ?? false) && !isChecking else { return }
-        isChecking = true
-        statusMessage = "Checking for updates…"
-        updater?.checkForUpdates()
+        if canRetryStartup { startTrustedUpdater() }
+        guard let updater, isAvailable, !isReady else {
+            isWaitingToCheck = false
+            if !isAvailable && !canRetryStartup {
+                statusMessage = "Updates are unavailable in this copy. Open a copy installed from the official PersonaStack installer."
+            }
+            presentUpdateStatus(self)
+            return
+        }
+        if userDriver?.focusCheckOrDownload() == true {
+            dismissUpdateStatus()
+            return
+        }
+        if isChecking || isAutomaticallyDownloading || (activeUpdateCheck != nil && !updater.canCheckForUpdates) {
+            showsBackgroundCheckResult = activeUpdateCheck == .updatesInBackground
+            presentUpdateStatus(self)
+            return
+        }
+        guard updater.canCheckForUpdates else {
+            isWaitingToCheck = true
+            statusMessage = "Waiting to check for updates…"
+            presentUpdateStatus(self)
+            return
+        }
+        isWaitingToCheck = false
+        if updateAvailable {
+            dismissUpdateStatus()
+            isAvailableToastVisible = false
+            statusMessage = "Opening the update confirmation…"
+        } else {
+            isChecking = true
+            statusMessage = "Checking for updates…"
+            presentUpdateStatus(self)
+        }
+        updater.checkForUpdates()
+    }
+
+    private func resumeWaitingUpdateCheck() {
+        guard isWaitingToCheck, updater?.canCheckForUpdates == true else { return }
+        checkForUpdates()
     }
 
     func downloadLatestUpdate() {
         guard updateAvailable, !isReady else { return }
         checkForUpdates()
+    }
+
+    var availableUpdateActionTitle: String {
+        if isInformationalUpdate { return "View Update Information…" }
+        return isWaitingForApproval ? "Continue Update…" : "Download Latest Update…"
     }
 
     func dismissAvailableToast() {
@@ -355,9 +412,9 @@ final class DesktopUpdater: NSObject, ObservableObject {
             waitsForBackgroundAgents = true
             switch error as? AgentBridgeFailure {
             case .localRuntimeActive:
-                statusMessage = "Stop agents on this Mac from the PersonaStack menu, then retry Restart Now. Your local files are retained."
+                statusMessage = "Stop agents on this Mac from the PersonaStack menu, then retry Restart to Update. Your local files are retained."
             case .busy:
-                statusMessage = "Finish or Stop assigned persona work, then retry Restart Now. Cancel the restart to resume background agents."
+                statusMessage = "Finish or Stop assigned persona work, then retry Restart to Update. Cancel the restart to resume background agents."
             default:
                 statusMessage = "Background agents could not stop safely. Cancel the restart and retry."
             }
@@ -404,7 +461,7 @@ final class DesktopUpdater: NSObject, ObservableObject {
     func allowsTermination() -> Bool {
         guard isReady, agentBridgeNeedsHandoff(), !isAgentBridgeReplacementPrepared else { return true }
         if !waitsForBackgroundAgents {
-            statusMessage = "A staged update cannot replace active background agents on Quit. Use Restart Now to finish the update."
+            statusMessage = "A staged update cannot replace active background agents on Quit. Use Restart to Update to finish the update."
         }
         return false
     }
@@ -420,6 +477,7 @@ final class DesktopUpdater: NSObject, ObservableObject {
             offeredVersion: version
         )
         guard isNewReadyTransition else { return }
+        isWaitingToCheck = false
         isReady = true
         isWaitingForApproval = false
         isInformationalUpdate = false
@@ -452,7 +510,7 @@ final class DesktopUpdater: NSObject, ObservableObject {
         let alert = NSAlert()
         alert.messageText = "PersonaStack is ready to update"
         alert.informativeText = "Restarting closes PersonaStack windows and stops active Desktop Control tasks. You can restart now or install the update the next time you quit."
-        alert.addButton(withTitle: "Restart Now")
+        alert.addButton(withTitle: "Restart to Update")
         alert.addButton(withTitle: "Later")
         alert.alertStyle = .informational
         return alert.runModal() == .alertFirstButtonReturn
@@ -525,6 +583,8 @@ final class DesktopUpdateUserDriver: SPUStandardUserDriver {
     private let prepareReplacement: @MainActor () async -> Bool
     private let cancelReplacement: @MainActor () async -> Void
     private let mustCancelDeferredInstallation: @MainActor () -> Bool
+    private let checkPresentationBegan: @MainActor () -> Void
+    private var hasProgressPresentation = false
     private var expectedDownloadBytes: UInt64 = 0
     private var downloadedBytes: UInt64 = 0
 
@@ -536,7 +596,8 @@ final class DesktopUpdateUserDriver: SPUStandardUserDriver {
          confirmReady: @escaping @MainActor () -> Bool,
          prepareReplacement: @escaping @MainActor () async -> Bool = { true },
          cancelReplacement: @escaping @MainActor () async -> Void = {},
-         mustCancelDeferredInstallation: @escaping @MainActor () -> Bool = { false }) {
+         mustCancelDeferredInstallation: @escaping @MainActor () -> Bool = { false },
+         checkPresentationBegan: @escaping @MainActor () -> Void = {}) {
         self.updateReady = updateReady
         self.restartRequested = restartRequested
         self.statusChanged = statusChanged
@@ -544,10 +605,25 @@ final class DesktopUpdateUserDriver: SPUStandardUserDriver {
         self.prepareReplacement = prepareReplacement
         self.cancelReplacement = cancelReplacement
         self.mustCancelDeferredInstallation = mustCancelDeferredInstallation
+        self.checkPresentationBegan = checkPresentationBegan
         super.init(hostBundle: hostBundle, delegate: delegate)
     }
 
+    func focusCheckOrDownload() -> Bool {
+        guard hasProgressPresentation else { return false }
+        (self as any SPUUserDriver).showUpdateInFocus?()
+        return true
+    }
+
+    override func showUserInitiatedUpdateCheck(cancellation: @escaping () -> Void) {
+        hasProgressPresentation = true
+        checkPresentationBegan()
+        super.showUserInitiatedUpdateCheck(cancellation: cancellation)
+    }
+
     override func showDownloadInitiated(cancellation: @escaping () -> Void) {
+        hasProgressPresentation = true
+        checkPresentationBegan()
         expectedDownloadBytes = 0
         downloadedBytes = 0
         statusChanged("Downloading update…")
@@ -590,7 +666,7 @@ final class DesktopUpdateUserDriver: SPUStandardUserDriver {
     }
 
     override func showReadyToInstallAndRelaunch() async -> SPUUserUpdateChoice {
-        super.dismissUpdateInstallation()
+        dismissUpdateInstallation()
         updateReady()
         guard confirmReady() else {
             await cancelReplacement()
@@ -601,6 +677,11 @@ final class DesktopUpdateUserDriver: SPUStandardUserDriver {
         guard await prepareReplacement() else { return .dismiss }
         restartRequested()
         return .install
+    }
+
+    override func dismissUpdateInstallation() {
+        hasProgressPresentation = false
+        super.dismissUpdateInstallation()
     }
 }
 
@@ -691,7 +772,15 @@ extension DesktopUpdater: SPUUpdaterDelegate {
     }
 
     func updater(_ updater: SPUUpdater, mayPerform updateCheck: SPUUpdateCheck) throws {
+        beginUpdateCheck(updateCheck)
+    }
+
+    func beginUpdateCheck(_ updateCheck: SPUUpdateCheck) {
         activeUpdateCheck = updateCheck
+        if isWaitingToCheck {
+            showsBackgroundCheckResult = updateCheck == .updatesInBackground
+            isWaitingToCheck = false
+        }
         isChecking = true
         if updateCheck == .updatesInBackground {
             statusMessage = "Checking for updates…"
@@ -699,6 +788,14 @@ extension DesktopUpdater: SPUUpdaterDelegate {
     }
 
     func updaterDidNotFindUpdate(_ updater: SPUUpdater, error: Error) {
+        let sparkleError = error as NSError
+        let userInitiated = (sparkleError.userInfo[SPUNoUpdateFoundUserInitiatedKey] as? Bool)
+            ?? (activeUpdateCheck == .updates)
+        let reason = noUpdateReason(sparkleError.userInfo[SPUNoUpdateFoundReasonKey] as? NSNumber)
+        projectCheckResult(domain: sparkleError.domain, code: sparkleError.code, reason: reason, userInitiated: userInitiated)
+    }
+
+    func projectCheckResult(domain: String, code: Int, reason: DesktopUpdatePolicy.NoUpdateReason?, userInitiated: Bool) {
         isChecking = false
         isAutomaticallyDownloading = false
         isWaitingForApproval = false
@@ -707,15 +804,11 @@ extension DesktopUpdater: SPUUpdaterDelegate {
         updateAvailable = false
         isReady = false
         offeredVersion = nil
-        let sparkleError = error as NSError
-        let userInitiated = (sparkleError.userInfo[SPUNoUpdateFoundUserInitiatedKey] as? NSNumber)?.boolValue
-            ?? (activeUpdateCheck == .updates)
-        let reason = noUpdateReason(sparkleError.userInfo[SPUNoUpdateFoundReasonKey] as? NSNumber)
-        switch DesktopUpdatePolicy.checkResult(errorDomain: sparkleError.domain,
-                                               errorCode: sparkleError.code,
+        switch DesktopUpdatePolicy.checkResult(errorDomain: domain,
+                                               errorCode: code,
                                                noUpdateReason: reason) {
         case .upToDate:
-            statusMessage = userInitiated ? "You're up to date." : ""
+            statusMessage = userInitiated || showsBackgroundCheckResult ? "You're up to date." : ""
         case .noCompatibleUpdate:
             statusMessage = "No compatible update is available for this version of macOS."
         case .unavailable:
@@ -727,7 +820,8 @@ extension DesktopUpdater: SPUUpdaterDelegate {
 
     func updater(_ updater: SPUUpdater, didFinishUpdateCycleFor updateCheck: SPUUpdateCheck, error: Error?) {
         isChecking = false
-        activeUpdateCheck = .updates
+        activeUpdateCheck = nil
+        showsBackgroundCheckResult = false
     }
 
     func userDidCancelDownload(_ updater: SPUUpdater) {
@@ -740,6 +834,7 @@ extension DesktopUpdater: SPUUpdaterDelegate {
     }
 
     func handleUpdateFailure(domain: String, code: Int) {
+        let failedCheck = isChecking && offeredVersion == nil
         isChecking = false
         isAutomaticallyDownloading = false
         isWaitingForApproval = false
@@ -748,7 +843,9 @@ extension DesktopUpdater: SPUUpdaterDelegate {
         cancelBackgroundUpdate()
         immediateInstallHandler = nil
         isImmediateInstallRequested = false
-        statusMessage = "Update couldn't finish. PersonaStack is still available. Try again."
+        statusMessage = failedCheck
+            ? "Couldn't check for updates. Check your connection and try again."
+            : "Update couldn't finish. PersonaStack is still available. Try again."
         if let offeredVersion {
             clearUpdateNotifications(offeredVersion)
             preferences.removeObject(forKey: "desktopUpdateReadyReminderVersion")
@@ -851,7 +948,6 @@ struct DesktopUpdateCommands: Commands {
     var body: some Commands {
         CommandGroup(after: .appInfo) {
             Button("Check for Updates…") { updater.checkForUpdates() }
-                .disabled(!updater.isAvailable || !updater.canCheckForUpdates)
         }
     }
 }
@@ -871,23 +967,79 @@ struct DesktopUpdatesMenuSection: View {
         if !updater.statusMessage.isEmpty { Text(updater.statusMessage).font(.caption) }
         Divider()
         if updater.isReady {
-            Button("Restart Now") { updater.restartToInstall() }
+            Button("Restart to Update") { updater.restartToInstall() }
             Button("Later") { updater.dismissReadyToast() }
         }
         if updater.waitsForBackgroundAgents {
             Button("Cancel Restart and Resume Background Agents") { updater.cancelBackgroundUpdate(showStatus: true) }
         }
         Button("Check for Updates…") { updater.checkForUpdates() }
-            .disabled(!updater.isAvailable || !updater.canCheckForUpdates || updater.isChecking)
         if updater.updateAvailable && !updater.isReady {
-            Button(updateActionTitle) { updater.downloadLatestUpdate() }
+            Button(updater.availableUpdateActionTitle) { updater.downloadLatestUpdate() }
                 .disabled(!updater.isAvailable || !updater.updateAvailable || updater.isReady)
         }
     }
+}
 
-    private var updateActionTitle: String {
-        if updater.isInformationalUpdate { return "View Update Information…" }
-        return updater.isWaitingForApproval ? "Continue Update…" : "Download Latest Update…"
+@MainActor
+private final class DesktopUpdateStatusWindow {
+    static let shared = DesktopUpdateStatusWindow()
+    private var window: NSWindow?
+
+    func present(updater: DesktopUpdater) {
+        if window == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 160),
+                                  styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            window.title = "PersonaStack Updates"
+            window.isReleasedWhenClosed = false
+            window.contentViewController = NSHostingController(rootView: DesktopUpdateStatusView(updater: updater))
+            window.center()
+            self.window = window
+        }
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func dismiss() {
+        window?.orderOut(nil)
+    }
+}
+
+private struct DesktopUpdateStatusView: View {
+    @ObservedObject var updater: DesktopUpdater
+
+    var body: some View {
+        let busy = updater.isWaitingToCheck || updater.isChecking || updater.isAutomaticallyDownloading
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top, spacing: 12) {
+                if busy { ProgressView().controlSize(.small) }
+                Text(updater.statusMessage)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button(updater.isReady ? "Later" : "Close") { DesktopUpdateStatusWindow.shared.dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                if updater.isReady {
+                    Button("Restart to Update") { updater.restartToInstall() }
+                        .buttonStyle(.borderedProminent)
+                } else if !busy {
+                    if updater.updateAvailable {
+                        Button(updater.availableUpdateActionTitle) { updater.downloadLatestUpdate() }
+                            .buttonStyle(.borderedProminent)
+                    } else {
+                        Button("Check Again") { updater.checkForUpdates() }
+                            .buttonStyle(.borderedProminent)
+                    }
+                }
+            }
+            if updater.waitsForBackgroundAgents {
+                Button("Cancel Restart and Resume Background Agents") { updater.cancelBackgroundUpdate(showStatus: true) }
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
     }
 }
 
@@ -908,7 +1060,7 @@ struct DesktopAutomaticUpdatesMenuItem: View {
             return "Updates are paused in this location. Your saved preference resumes when you open PersonaStack from Applications."
         }
         if AgentBridgeUpdateHandoff.shared.needsHandoff {
-            return "Your preference is saved. Background agents require explicit Restart Now so assigned work can finish before replacement."
+            return "Your preference is saved. Background agents require explicit Restart to Update so assigned work can finish before replacement."
         }
         return "Downloads updates in the background and installs them when PersonaStack quits. It never restarts the app automatically."
     }
@@ -961,7 +1113,7 @@ struct DesktopUpdateToast: View {
     }
 
     private var availableActionTitle: String {
-        if updater.isReady { return "Restart Now" }
+        if updater.isReady { return "Restart to Update" }
         if updater.isInformationalUpdate { return "View Details…" }
         return updater.isWaitingForApproval ? "Continue Update…" : "Download Update…"
     }

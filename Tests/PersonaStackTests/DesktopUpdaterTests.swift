@@ -8,7 +8,9 @@ import Testing
 private final class FakeDesktopUpdateClient: DesktopUpdateClient {
     private let preferences: UserDefaults
     private let automaticDownloadsKey = "SUAutomaticallyUpdate"
-    var canCheckForUpdates = true
+    var checkReadinessChanged: (@MainActor () -> Void)?
+    var canCheckForUpdates = true { didSet { checkReadinessChanged?() } }
+    var startupError: Error?
     private(set) var didStart = false
     private(set) var checkCount = 0
 
@@ -26,7 +28,10 @@ private final class FakeDesktopUpdateClient: DesktopUpdateClient {
         set { preferences.set(newValue, forKey: automaticDownloadsKey) }
     }
 
-    func start() throws { didStart = true }
+    func start() throws {
+        if let startupError { throw startupError }
+        didStart = true
+    }
     func checkForUpdates() { checkCount += 1 }
 }
 
@@ -64,11 +69,13 @@ private final class RestartConfirmationState {
         let preferences = isolatedUpdatePreferences()
         preferences.set(true, forKey: "SUAutomaticallyUpdate")
         let client = FakeDesktopUpdateClient(preferences: preferences)
+        var presented: [String] = []
         let updater = DesktopUpdater(
             updaterFactory: { _, _ in client },
             preferences: preferences,
             clearAvailableNotification: { _ in },
-            clearUpdateNotifications: { _ in }
+            clearUpdateNotifications: { _ in },
+            presentApplicationsInstallInstruction: { presented.append($0) }
         , registrationService: isolatedLoginRegistrationService())
         let publicKey = Data(repeating: 3, count: 32).base64EncodedString()
 
@@ -82,7 +89,6 @@ private final class RestartConfirmationState {
         #expect(!client.didStart)
         #expect(updater.applicationsInstallInstruction == DesktopUpdater.applicationsInstallMessage)
         #expect(!updater.isAvailable)
-        #expect(!updater.canCheckForUpdates)
         #expect(!updater.isReady)
         #expect(updater.automaticallyDownloadsUpdates)
         updater.checkForUpdates()
@@ -90,6 +96,7 @@ private final class RestartConfirmationState {
         updater.applicationWillTerminate()
 
         #expect(client.checkCount == 0)
+        #expect(presented == [DesktopUpdater.applicationsInstallMessage])
         #expect(preferences.bool(forKey: "SUAutomaticallyUpdate"))
         #expect(preferences.string(forKey: "desktopUpdateRestartTargetVersion") == nil)
     }
@@ -156,15 +163,120 @@ private final class RestartConfirmationState {
         #expect(updater.updateAvailable)
     }
 
+    @Test @MainActor func manualCheckCoalescesWhileSparkleSchedules() {
+        let preferences = isolatedUpdatePreferences()
+        let client = FakeDesktopUpdateClient(preferences: preferences)
+        var presented: [String] = []
+        let updater = DesktopUpdater(
+            updaterFactory: { _, _ in client },
+            preferences: preferences,
+            presentUpdateStatus: { presented.append($0.statusMessage) },
+            registrationService: isolatedLoginRegistrationService()
+        )
+        updater.start(publicKey: Data(repeating: 4, count: 32).base64EncodedString(), feed: DesktopUpdatePolicy.feedURL)
+        client.canCheckForUpdates = false
+
+        updater.checkForUpdates()
+        updater.checkForUpdates()
+
+        #expect(client.checkCount == 0)
+        #expect(updater.isWaitingToCheck)
+        #expect(presented == Array(repeating: "Waiting to check for updates…", count: 2))
+
+        client.canCheckForUpdates = true
+        updater.checkForUpdates()
+
+        #expect(client.checkCount == 1)
+        #expect(!updater.isWaitingToCheck)
+        #expect(presented.last == "Checking for updates…")
+    }
+
+    @Test(arguments: [false, true]) @MainActor
+    func manualClickShowsBackgroundCheckResult(backgroundStartsFirst: Bool) {
+        let preferences = isolatedUpdatePreferences()
+        let client = FakeDesktopUpdateClient(preferences: preferences)
+        var presented: [String] = []
+        let updater = DesktopUpdater(
+            updaterFactory: { _, _ in client },
+            preferences: preferences,
+            presentUpdateStatus: { presented.append($0.statusMessage) },
+            registrationService: isolatedLoginRegistrationService()
+        )
+        updater.start(publicKey: Data(repeating: 4, count: 32).base64EncodedString(), feed: DesktopUpdatePolicy.feedURL)
+        client.canCheckForUpdates = false
+        if backgroundStartsFirst { updater.beginUpdateCheck(.updatesInBackground) }
+        updater.checkForUpdates()
+        if !backgroundStartsFirst { updater.beginUpdateCheck(.updatesInBackground) }
+
+        #expect(presented.count == 1)
+        #expect(updater.isChecking)
+        #expect(!updater.isWaitingToCheck)
+        updater.projectCheckResult(domain: "SUSparkleErrorDomain", code: 1001, reason: .currentVersion, userInitiated: false)
+        client.canCheckForUpdates = true
+
+        #expect(client.checkCount == 0)
+        #expect(updater.statusMessage == "You're up to date.")
+        #expect(!updater.isChecking)
+    }
+
+    @Test @MainActor func failedManualCheckHasAVisibleRetry() {
+        let preferences = isolatedUpdatePreferences()
+        let client = FakeDesktopUpdateClient(preferences: preferences)
+        var presented: [String] = []
+        let updater = DesktopUpdater(
+            updaterFactory: { _, _ in client },
+            preferences: preferences,
+            presentUpdateStatus: { presented.append($0.statusMessage) },
+            cancelAgentBridgeUpdate: {},
+            registrationService: isolatedLoginRegistrationService()
+        )
+        updater.start(publicKey: Data(repeating: 4, count: 32).base64EncodedString(), feed: DesktopUpdatePolicy.feedURL)
+
+        updater.checkForUpdates()
+        updater.handleUpdateFailure(domain: NSURLErrorDomain, code: NSURLErrorNotConnectedToInternet)
+        #expect(updater.statusMessage == "Couldn't check for updates. Check your connection and try again.")
+        updater.checkForUpdates()
+
+        #expect(client.checkCount == 2)
+        #expect(presented == ["Checking for updates…", "Checking for updates…"])
+    }
+
+    @Test @MainActor func trustedUpdaterStartupFailureCanBeRetriedFromTheMenu() {
+        let preferences = isolatedUpdatePreferences()
+        let client = FakeDesktopUpdateClient(preferences: preferences)
+        client.startupError = CocoaError(.executableNotLoadable)
+        var presented: [String] = []
+        let updater = DesktopUpdater(
+            updaterFactory: { _, _ in client },
+            preferences: preferences,
+            presentUpdateStatus: { presented.append($0.statusMessage) },
+            registrationService: isolatedLoginRegistrationService()
+        )
+        updater.start(publicKey: Data(repeating: 4, count: 32).base64EncodedString(), feed: DesktopUpdatePolicy.feedURL)
+        updater.checkForUpdates()
+
+        #expect(!updater.isAvailable)
+        #expect(client.checkCount == 0)
+        #expect(presented.last?.contains("Try checking again") == true)
+
+        client.startupError = nil
+        updater.checkForUpdates()
+
+        #expect(updater.isAvailable)
+        #expect(client.checkCount == 1)
+    }
+
     @Test @MainActor func automaticScheduledUpdateShowsBackgroundDownloadAndBlocksDuplicateChecks() {
         let preferences = isolatedUpdatePreferences()
         let client = FakeDesktopUpdateClient(preferences: preferences)
         client.automaticallyDownloadsUpdates = true
         var reminders: [String] = []
+        var presented: [String] = []
         let updater = DesktopUpdater(
             updaterFactory: { _, _ in client },
             preferences: preferences,
-            presentAvailableReminder: { reminders.append($0) }
+            presentAvailableReminder: { reminders.append($0) },
+            presentUpdateStatus: { presented.append($0.statusMessage) }
         , registrationService: isolatedLoginRegistrationService())
         let publicKey = Data(repeating: 4, count: 32).base64EncodedString()
         updater.start(publicKey: publicKey, feed: DesktopUpdatePolicy.feedURL)
@@ -174,10 +286,39 @@ private final class RestartConfirmationState {
 
         #expect(updater.isAutomaticallyDownloading)
         #expect(!updater.updateAvailable)
-        #expect(!updater.canCheckForUpdates)
         #expect(reminders.isEmpty)
         #expect(client.checkCount == 0)
         #expect(updater.statusMessage.contains("Downloading version 0.2.1"))
+        #expect(presented == [updater.statusMessage])
+    }
+
+    @Test @MainActor func checkingPreparedUpdatePresentsRestartWithoutRequestingIt() {
+        let preferences = isolatedUpdatePreferences()
+        let client = FakeDesktopUpdateClient(preferences: preferences)
+        var installCount = 0
+        var restartConfirmations = 0
+        var presented: [String] = []
+        let updater = DesktopUpdater(
+            updaterFactory: { _, _ in client },
+            preferences: preferences,
+            presentReadyReminder: { _ in },
+            clearAvailableNotification: { _ in },
+            confirmRestart: { restartConfirmations += 1; return false },
+            presentUpdateStatus: { presented.append($0.statusMessage) },
+            registrationService: isolatedLoginRegistrationService()
+        )
+        updater.start(publicKey: Data(repeating: 4, count: 32).base64EncodedString(), feed: DesktopUpdatePolicy.feedURL)
+        #expect(updater.retainAutomaticInstallHandler(version: "0.2.1", handler: { installCount += 1 }))
+
+        updater.checkForUpdates()
+
+        #expect(client.checkCount == 0)
+        #expect(restartConfirmations == 0)
+        #expect(installCount == 0)
+        #expect(presented == ["Version 0.2.1 is ready. Restart to finish updating."])
+        updater.restartToInstall()
+        #expect(restartConfirmations == 1)
+        #expect(installCount == 0)
     }
 
     @Test @MainActor func scheduledAuthorizationFallbackOffersContinuationForEachSparkleStage() {
@@ -206,7 +347,6 @@ private final class RestartConfirmationState {
             #expect(!updater.isAutomaticallyDownloading)
             #expect(updater.isWaitingForApproval)
             #expect(updater.updateAvailable)
-            #expect(updater.canCheckForUpdates)
             #expect(updater.statusMessage.contains(expectedMessage))
             #expect(reminders == [version])
 
@@ -287,7 +427,6 @@ private final class RestartConfirmationState {
         #expect(!updater.updateAvailable)
         #expect(updater.offeredVersion == nil)
         #expect(preferences.string(forKey: "desktopUpdateAvailableReminderVersion") == nil)
-        #expect(updater.canCheckForUpdates)
     }
 
     @Test @MainActor func canceledDownloadClearsProgressAndKeepsTheOfferRetryable() {
@@ -305,18 +444,26 @@ private final class RestartConfirmationState {
         #expect(!updater.isChecking)
         #expect(!updater.isAutomaticallyDownloading)
         #expect(updater.updateAvailable)
-        #expect(updater.canCheckForUpdates)
     }
 
     @Test @MainActor func rejectsAnUntrustedFeedBeforeStartingTheClient() {
         let preferences = isolatedUpdatePreferences()
         let client = FakeDesktopUpdateClient(preferences: preferences)
-        let updater = DesktopUpdater(updaterFactory: { _, _ in client }, preferences: preferences, registrationService: isolatedLoginRegistrationService())
+        var presented: [String] = []
+        let updater = DesktopUpdater(
+            updaterFactory: { _, _ in client },
+            preferences: preferences,
+            presentUpdateStatus: { presented.append($0.statusMessage) },
+            registrationService: isolatedLoginRegistrationService()
+        )
         let publicKey = Data(repeating: 5, count: 32).base64EncodedString()
 
         updater.start(publicKey: publicKey, feed: "http://updates.example.test/appcast.xml")
+        updater.checkForUpdates()
         #expect(!client.didStart)
         #expect(!updater.isAvailable)
+        #expect(client.checkCount == 0)
+        #expect(presented.last?.contains("official PersonaStack installer") == true)
     }
 
     @Test @MainActor func readyPromptLaterDismissesWithoutRequestingRestart() async {

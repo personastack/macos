@@ -820,6 +820,7 @@ private struct IMessageReplacementRelayState: DesktopControlRelayStateReading {
 }
 
 @MainActor private final class IMessageReplacementUpdateClient: DesktopUpdateClient {
+    var checkReadinessChanged: (@MainActor () -> Void)?
     var canCheckForUpdates = true
     var automaticallyChecksForUpdates = false
     var automaticallyDownloadsUpdates = false

@@ -49,7 +49,7 @@ class MenuBarLayoutTests(unittest.TestCase):
             "connectionStatus",
             "Text(loginItemError)",
             "Button(action.title)",
-            'Menu("Desktop Control")',
+            'Text("Desktop Control")',
             'Menu("Settings")',
             'Menu("Updates")',
             'Button("Quit PersonaStack")',
@@ -64,7 +64,10 @@ class MenuBarLayoutTests(unittest.TestCase):
 
     def test_setup_and_recovery_keep_their_existing_handlers_and_guards(self):
         body = block(self.menu, "var body: some View")
-        self.assertIn("desktopControlActions", block(body, 'Menu("Desktop Control")'))
+        self.assertRegex(
+            body,
+            r'Menu\s*\{\s*desktopControlActions\s*\}\s*label:\s*\{\s*Label\s*\{\s*Text\("Desktop Control"\)',
+        )
         controls = block(self.menu, "private var desktopControlActions")
         self.assertIn("CuaSetupWindow.shared.presentForRepair()",
                       block(controls, 'Button("Set Up CUA…")'))
@@ -101,14 +104,18 @@ class MenuBarLayoutTests(unittest.TestCase):
 
     def test_updates_preserve_check_download_and_prepared_restart_actions(self):
         updates = block(self.updater, "struct DesktopUpdatesMenuSection")
+        commands = block(self.updater, "struct DesktopUpdateCommands")
+        check = 'Button("Check for Updates…") { updater.checkForUpdates() }'
+        for entry in (updates, commands):
+            self.assertIn(check, entry)
+            self.assertNotRegex(entry, re.escape(check) + r"\s*\.disabled")
         for action in ("updater.checkForUpdates()", "updater.downloadLatestUpdate()",
                        "updater.restartToInstall()", "updater.dismissReadyToast()"):
             self.assertIn(action, updates)
         self.assertIn("if updater.isReady", updates)
         self.assertIn("if updater.updateAvailable && !updater.isReady", updates)
-        self.assertIn(".disabled(!updater.isAvailable || !updater.canCheckForUpdates || updater.isChecking)", updates)
-        self.assertIn("updater.isInformationalUpdate", updates)
-        self.assertIn("updater.isWaitingForApproval", updates)
+        self.assertIn('Button("Restart to Update") { updater.restartToInstall() }', updates)
+        self.assertIn("updater.availableUpdateActionTitle", updates)
         self.assertIn("updater.applicationsInstallInstruction", updates)
         self.assertIn("updater.statusMessage", updates)
         self.assertNotIn('Toggle(', updates)
