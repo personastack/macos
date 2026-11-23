@@ -244,16 +244,22 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
 }
 
 @Test @MainActor func desktopStatusAndHeartbeatRecheckActivityAfterMissedSessionActivation() async throws {
-    let snapshot = DesktopSessionSnapshotFixture(.inactive)
-    let monitor = DesktopControlSessionLock(observeSystem: false, snapshotReader: { snapshot.value })
-    monitor.reconcile()
     let installation = try JSONDecoder().decode(DesktopControlInstallation.self, from: Data(#"{"installation_id":"install-recovery","machine_credential":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","gateway_websocket_url":"wss://gateway.test/v1/desktop-control/ws"}"#.utf8))
     let connection = UUID()
-    let preferences = try #require(UserDefaults(suiteName: "DesktopSessionRecovery.\(UUID().uuidString)"))
-    let runtime = DesktopControlRuntime.makeForTesting(
-        installer: ReadinessInstaller(), credentials: ReadinessCredentials(),
-        connectionID: connection, installation: installation, connected: true,
-        readiness: "locked", sessionMonitor: monitor, preferences: preferences)
+    // A runtime that observes session loss invalidates its gateway connection.
+    // Start each recovery path inactive so it can reconcile a missed activation.
+    func makeInactiveRuntime() throws -> (DesktopControlRuntime, DesktopControlSessionLock, DesktopSessionSnapshotFixture) {
+        let snapshot = DesktopSessionSnapshotFixture(.inactive)
+        let monitor = DesktopControlSessionLock(observeSystem: false, snapshotReader: { snapshot.value })
+        monitor.reconcile()
+        let preferences = try #require(UserDefaults(suiteName: "DesktopSessionRecovery.\(UUID().uuidString)"))
+        let runtime = DesktopControlRuntime.makeForTesting(
+            installer: ReadinessInstaller(), credentials: ReadinessCredentials(),
+            connectionID: connection, installation: installation, connected: true,
+            readiness: "locked", sessionMonitor: monitor, scheduleReconnect: false, preferences: preferences)
+        return (runtime, monitor, snapshot)
+    }
+    let (runtime, monitor, snapshot) = try makeInactiveRuntime()
     let target = DesktopControlTarget(installationID: installation.installationID, workspaceID: "w", configID: "c",
                                       personaID: "p", runID: "r", generation: 1)
     let status = DesktopControlFrame(type: "command", requestID: "recovery-status", target: target,
@@ -269,17 +275,23 @@ private actor ReadinessStateEnrollment: DesktopControlSetupEnrollment {
     #expect(recoveredResult["locked"] == .bool(false))
     // CUA is deliberately absent. Recovery must reach its check, never invent readiness.
     #expect(recoveredResult["gui_readiness"] == .string("cua_unavailable"))
-    snapshot.value = .inactive
-    monitor.reconcile()
-    snapshot.value = .active
     let acquire = DesktopControlFrame(type: "command", requestID: "recovery-acquire", target: target,
         operation: "desktop_control_acquire", arguments: .object([:]), deadlineAt: .distantFuture)
-    #expect(await runtime.handleForTesting(acquire, connectionID: connection).errorCode == "cua_unavailable")
     snapshot.value = .inactive
     monitor.reconcile()
     snapshot.value = .active
-    #expect(await runtime.heartbeatReadinessForTesting() == "cua_unavailable")
-    #expect(monitor.isAwakeAndActive)
+    #expect(await runtime.handleForTesting(acquire, connectionID: connection).errorCode == "desktop_connection_stale")
+    await runtime.waitForLockCleanupForTesting()
+
+    let (acquireRuntime, acquireMonitor, acquireSnapshot) = try makeInactiveRuntime()
+    acquireSnapshot.value = .active
+    #expect(await acquireRuntime.handleForTesting(acquire, connectionID: connection).errorCode == "cua_unavailable")
+    #expect(acquireMonitor.isAwakeAndActive)
+
+    let (heartbeatRuntime, heartbeatMonitor, heartbeatSnapshot) = try makeInactiveRuntime()
+    heartbeatSnapshot.value = .active
+    #expect(await heartbeatRuntime.heartbeatReadinessForTesting() == "cua_unavailable")
+    #expect(heartbeatMonitor.isAwakeAndActive)
 }
 
 @Test @MainActor func desktopExpiredCommandDoesNotProbeCuaOrChangeReadiness() async throws {
