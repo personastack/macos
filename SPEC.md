@@ -1,5 +1,12 @@
 # PersonaStack for macOS specification
 
+This specification defines the intended system behavior for this repository.
+All code in this repository must implement and support that behavior.
+Only humans decide the intended behavior. Agents may add or change behavior
+requirements only when a human explicitly supplies the intended behavior and
+directs the edit.
+Edit this file using the [Integrii spec-driven-development skill](https://github.com/integrii/development-patterns/blob/main/skills/spec-driven-development/SKILL.md).
+
 Environment-variable reference: [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md).
 
 ## Purpose
